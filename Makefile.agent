@@ -1,0 +1,16 @@
+# Build agent system
+CC = gcc
+CFLAGS = -Wall -Wextra -g -O2 -pthread
+
+all: agent-test
+
+agent-test:
+	$(CC) $(CFLAGS) -c src/swarmrt_v2.c -o build/swarmrt_v2.o 2>&1 | head -20
+	$(CC) $(CFLAGS) -c src/swarmrt_agent.c -o build/swarmrt_agent.o 2>&1 | head -20
+	$(CC) $(CFLAGS) build/swarmrt_v2.o build/swarmrt_agent.o src/test_agent.c -o bin/agent-test $(LDFLAGS) 2>&1
+
+run: agent-test
+	./bin/agent-test
+
+clean:
+	rm -f build/*.o bin/agent-test
