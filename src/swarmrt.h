@@ -19,7 +19,7 @@ typedef struct sw_scheduler sw_scheduler_t;
 typedef struct sw_msg sw_msg_t;
 typedef struct sw_term sw_term_t;
 
-/* === Term Types (Erlang-like) === */
+/* === Term Types === */
 typedef enum {
     SW_ATOM,
     SW_INTEGER,

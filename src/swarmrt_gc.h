@@ -10,7 +10,7 @@
  * - When heap fills, GC runs before the next allocation
  * - Roots: process stack, mailbox, registered references
  *
- * Since SwarmRT uses void* pointers (not tagged values like BEAM),
+ * Since SwarmRT uses void* pointers (not tagged values),
  * GC is conservative: it scans for pointers that fall within heap bounds.
  *
  * otonomy.ai

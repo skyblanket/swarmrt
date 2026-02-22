@@ -1,10 +1,10 @@
 /*
- * SwarmRT-BEAM Assembly Context Switching
+ * SwarmRT Assembly Context Switching
  *
- * Fast user-space context switching for x86_64 and ARM64
- * Based on BEAM's process_main context switching
+ * Fast user-space context switching for x86_64 and ARM64.
+ * Performance target: ~100-200ns per context switch.
  *
- * Performance target: ~100-200ns (faster than BEAM's ~300ns)
+ * otonomy.ai
  */
 
 #ifdef __APPLE__
@@ -22,15 +22,15 @@
  * Plus: rsp (stack pointer), rip (return address)
  *
  * Calling convention:
- *   rdi = from process (sw_beam_process_t*)
- *   rsi = to process (sw_beam_process_t*)
+ *   rdi = from process (sw_process_t*)
+ *   rsi = to process (sw_process_t*)
  * ============================================================================ */
 
 .text
-.globl CNAME(sw_beam_context_swap_asm)
+.globl CNAME(sw_proc_context_swap_asm)
 .align 16
 
-CNAME(sw_beam_context_swap_asm):
+CNAME(sw_proc_context_swap_asm):
     /* Get pointer to env buffer from process struct */
     leaq 256(%rdi), %r8        /* &from->env (env is at offset ~256) */
 
@@ -73,10 +73,10 @@ CNAME(sw_beam_context_swap_asm):
 /* ============================================================================
  * Get current time stamp counter for benchmarking
  * ============================================================================ */
-.globl CNAME(sw_beam_rdtsc)
+.globl CNAME(sw_proc_rdtsc)
 .align 16
 
-CNAME(sw_beam_rdtsc):
+CNAME(sw_proc_rdtsc):
     rdtsc                      /* Returns TSC in edx:eax */
     shlq $32, %rdx
     orq %rdx, %rax
@@ -90,10 +90,10 @@ CNAME(sw_beam_rdtsc):
  * ============================================================================ */
 
 .text
-.globl CNAME(sw_beam_context_swap_asm)
+.globl CNAME(sw_proc_context_swap_asm)
 .align 4
 
-CNAME(sw_beam_context_swap_asm):
+CNAME(sw_proc_context_swap_asm):
     /* x0 = from process, x1 = to process */
 
     /* Get pointer to env buffer */
@@ -134,10 +134,10 @@ CNAME(sw_beam_context_swap_asm):
     ret
 
 /* Get CNTPCT (virtual timer) for ARM64 */
-.globl CNAME(sw_beam_read_cntpct)
+.globl CNAME(sw_proc_read_cntpct)
 .align 4
 
-CNAME(sw_beam_read_cntpct):
+CNAME(sw_proc_read_cntpct):
     mrs x0, cntvct_el0
     ret
 

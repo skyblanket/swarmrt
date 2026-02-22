@@ -1,6 +1,5 @@
 /*
- * SwarmRT Full - Erlang Parity for the AI Age
- * Complete BEAM-compatible runtime with AI-native extensions
+ * SwarmRT Full - Complete Runtime with AI-Native Extensions
  */
 
 #ifndef SWARMRT_FULL_H
@@ -17,9 +16,9 @@
 #define SWARM_MAX_SWARMS        256
 #define SWARM_MAX_PROCESSES     (1 << 22)   /* 4M processes */
 #define SWARM_STACK_SIZE        1024        /* 1KB initial */
-#define SWARM_REDUCTIONS        2000        /* BEAM default */
+#define SWARM_REDUCTIONS        2000        /* reductions per time slice */
 
-/* === Term Types (Full Erlang) === */
+/* === Term Types === */
 typedef enum {
     SW_IMMEDIATE = 0,       /* Small ints, atoms, pids, ports */
     SW_CONS = 1,            /* List [Head|Tail] */
@@ -28,13 +27,13 @@ typedef enum {
     SW_FUN = 4,             /* Fun, closures */
 } sw_term_tag_t;
 
-/* Erlang term representation (tagged pointers) */
+/* Term representation (tagged pointers) */
 typedef uintptr_t sw_term_t;
 
 #define SW_TAG_MASK     0x3
 #define SW_TAG_SHIFT    2
 
-/* === Process Structure (Full BEAM parity) === */
+/* === Process Structure === */
 typedef struct sw_process {
     /* Frequently accessed (cache line 1) */
     sw_term_t *htop;                /* Heap top */

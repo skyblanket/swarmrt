@@ -36,7 +36,7 @@ static char *read_file(const char *path) {
 }
 
 static void print_usage(const char *prog) {
-    printf("SwarmRT - Minimal BEAM-alike Runtime\n\n");
+    printf("SwarmRT - Actor Runtime\n\n");
     printf("Usage:\n");
     printf("  %s parse <file.sw>    Parse and print AST\n", prog);
     printf("  %s run <file.sw>      Run a Swarm program\n", prog);

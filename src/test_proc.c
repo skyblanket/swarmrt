@@ -1,5 +1,5 @@
 /*
- * SwarmRT-BEAM Test Suite
+ * SwarmRT Process Subsystem Test Suite
  * Tests reduction counting, copying message passing, work stealing
  */
 
@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
-#include "swarmrt_beam.h"
+#include "swarmrt_proc.h"
 
 static volatile int counter = 0;
 static volatile int messages_received = 0;
@@ -24,9 +24,9 @@ static void reduction_test_worker(void *arg) {
         /* Each iteration would consume reductions in real bytecode */
         __sync_fetch_and_add(&counter, 1);
         
-        /* Simulate yield point (like BEAM function call) */
+        /* Simulate yield point */
         if (i % 100 == 0) {
-            /* In real BEAM, this would happen automatically when fcalls == 0 */
+            /* In preemptive mode, this happens automatically when fcalls == 0 */
         }
     }
     
@@ -49,8 +49,8 @@ static double get_time_us(void) {
 int main() {
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════╗\n");
-    printf("║     SwarmRT-BEAM Test Suite                              ║\n");
-    printf("║     Testing BEAM Parity Features                         ║\n");
+    printf("║     SwarmRT Process Test Suite                            ║\n");
+    printf("║     Testing Process Subsystem Features                   ║\n");
     printf("╚═══════════════════════════════════════════════════════════╝\n");
     printf("\n");
     
@@ -61,7 +61,7 @@ int main() {
     printf("\n");
     
     /* Initialize with 4 schedulers */
-    int swarm = swarm_beam_init("beam_test", 4);
+    int swarm = swarm_proc_init("proc_test", 4);
     if (swarm < 0) {
         fprintf(stderr, "Failed to initialize swarm\n");
         return 1;
@@ -78,7 +78,7 @@ int main() {
     
     int num_workers = 100;
     for (int i = 0; i < num_workers; i++) {
-        sw_beam_spawn_on(swarm, i % 4, reduction_test_worker, (void *)(uintptr_t)i);
+        sw_proc_spawn_on(swarm, i % 4, reduction_test_worker, (void *)(uintptr_t)i);
     }
     
     sleep(3); /* Let them run */
@@ -101,7 +101,7 @@ int main() {
     int num_spawns = 10000;
     
     for (int i = 0; i < num_spawns; i++) {
-        sw_beam_spawn_on(swarm, i % 4, benchmark_worker, NULL);
+        sw_proc_spawn_on(swarm, i % 4, benchmark_worker, NULL);
     }
     
     /* Wait for completion */
@@ -126,11 +126,11 @@ int main() {
     }
     
     /* === Stats === */
-    swarm_beam_stats(swarm);
+    swarm_proc_stats(swarm);
     
     /* Cleanup */
     printf("--- Shutting down ---\n");
-    swarm_beam_shutdown(swarm);
+    swarm_proc_shutdown(swarm);
     
     /* Summary */
     printf("\n");

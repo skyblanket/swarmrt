@@ -112,7 +112,7 @@ swapcontext(&proc->ctx, &proc->scheduler->ctx);
 proc->state = RUNNING;
 ```
 
-This is how BEAM does it - and now SwarmRT does it too.
+This is the standard approach for user-space process suspension.
 
 ---
 

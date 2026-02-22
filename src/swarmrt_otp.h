@@ -1,5 +1,5 @@
 /*
- * SwarmRT OTP Behaviours - GenServer + Supervisor
+ * SwarmRT Behaviours - GenServer + Supervisor
  *
  * Built on Phase 1 primitives: links, monitors, registry, tagged messages.
  * Pure C, no new scheduler changes needed.

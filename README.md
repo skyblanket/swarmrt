@@ -1,8 +1,10 @@
 # SwarmRT
 
-A native runtime and compiler for concurrent programs. BEAM-inspired process model, lock-free message passing, and an ahead-of-time compiler that turns `.sw` source files into standalone binaries.
+A native runtime and compiler for concurrent programs. Lock-free message passing, lightweight processes, and an ahead-of-time compiler that turns `.sw` source files into standalone binaries.
 
 ~20,000 lines of C. No dependencies beyond libc and pthreads.
+
+Built by [Otonomy](https://otonomy.ai).
 
 ---
 
@@ -14,7 +16,7 @@ SwarmRT is a from-scratch implementation of the actor model with:
 - **Lock-free mailboxes** — Vyukov MPSC queues, zero-contention send path
 - **Work-stealing schedulers** — per-core threads with priority run queues
 - **Preemptive scheduling** — reduction counting, cooperative yields
-- **OTP behaviours** — GenServer, Supervisor, Task, GenStateMachine, ETS
+- **Behaviours** — GenServer, Supervisor, Task, GenStateMachine, ETS
 - **Ahead-of-time compiler** — `.sw` source to native binary via C codegen
 
 The language is designed for AI agents to read and write. Minimal punctuation, explicit keywords, no indentation sensitivity.
@@ -38,7 +40,7 @@ make swc libswarmrt
 
 ## The Language
 
-```erlang
+```
 module Counter
 export [main, counter]
 
@@ -151,7 +153,7 @@ Lock-free MPSC (multi-producer, single-consumer) design:
 - **Receive path**: bulk steal from signal stack, reverse to FIFO, scan private queue
 - **Tagged messages**: selective receive by tag (call, cast, exit, down, timer, port)
 
-### OTP Layer
+### Behaviours
 
 Built on top of the native runtime:
 
@@ -216,25 +218,26 @@ cc -O2 -o counter generated.c -I/path/to/src -L/path/to/bin -lswarmrt -pthread
 src/
   swarmrt_native.{c,h}    Core runtime: scheduler, spawn, send/receive, arena
   swarmrt_asm.S            ARM64 context switching (register save/restore)
-  swarmrt_otp.{c,h}       GenServer, Supervisor
-  swarmrt_task.{c,h}      Task (async/await)
-  swarmrt_ets.{c,h}       ETS tables
-  swarmrt_phase4.{c,h}    Agent, Application, DynamicSupervisor
-  swarmrt_phase5.{c,h}    GenStateMachine, Process Groups
-  swarmrt_io.{c,h}        kqueue async I/O, TCP ports
-  swarmrt_hotload.{c,h}   Hot code reload with versioning
-  swarmrt_gc.{c,h}        Per-process generational GC
-  swarmrt_node.{c,h}      Multi-node distribution
-  swarmrt_lang.{c,h}      Lexer, parser, tree-walking interpreter
-  swarmrt_codegen.{c,h}   AST-to-C code generation
-  swarmrt_obfusc.c        String XOR encoding + symbol mangling
-  swc.c                   Compiler CLI driver
+  swarmrt_otp.{c,h}        GenServer, Supervisor
+  swarmrt_task.{c,h}       Task (async/await)
+  swarmrt_ets.{c,h}        ETS tables
+  swarmrt_phase4.{c,h}     Agent, Application, DynamicSupervisor
+  swarmrt_phase5.{c,h}     GenStateMachine, Process Groups
+  swarmrt_io.{c,h}         kqueue async I/O, TCP ports
+  swarmrt_hotload.{c,h}    Hot code reload with versioning
+  swarmrt_gc.{c,h}         Per-process generational GC
+  swarmrt_node.{c,h}       Multi-node distribution
+  swarmrt_lang.{c,h}       Lexer, parser, tree-walking interpreter
+  swarmrt_codegen.{c,h}    AST-to-C code generation
+  swarmrt_obfusc.c         String XOR encoding + symbol mangling
+  swc.c                    Compiler CLI driver
 
 examples/
-  counter.sw              Process spawning, send/receive, pattern matching
-  hello.sw                Minimal program
+  counter.sw               Process spawning, send/receive, pattern matching
+  pingpong.sw              Bidirectional message passing between processes
+  hello.sw                 Minimal program
 
-Makefile                  All build targets
+Makefile                   All build targets
 ```
 
 ---
@@ -283,7 +286,7 @@ after     timeout in receive block
 
 Receive clauses match on structure:
 
-```erlang
+```
 receive {
     {'ok', value}    -> handle(value)      # match tuple with atom tag
     {'error', reason} -> fail(reason)
@@ -298,7 +301,7 @@ Variables in patterns bind to the matched value. Atoms (single-quoted) match lit
 
 Self-recursive calls in tail position are compiled to `goto`, so recursive process loops don't grow the stack:
 
-```erlang
+```
 fun loop(state) {
     receive {
         {'update', new} -> loop(new)    # compiled to: state = new; goto top
@@ -325,4 +328,4 @@ An agent can write a `.sw` file, compile it with `swc`, and run the resulting bi
 
 ## License
 
-MIT
+MIT — Copyright 2026 Otonomy

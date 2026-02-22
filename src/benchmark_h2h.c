@@ -1,7 +1,7 @@
 /*
  * SwarmRT Head-to-Head Benchmark
  *
- * Same benchmarks as beam_bench.erl for direct comparison.
+ * Head-to-head benchmarks for process spawn, messaging, and scheduling.
  * Each benchmark re-initializes the runtime to avoid interference.
  *
  * otonomy.ai

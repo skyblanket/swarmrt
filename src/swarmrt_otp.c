@@ -1,5 +1,5 @@
 /*
- * SwarmRT OTP Behaviours - GenServer + Supervisor Implementation
+ * SwarmRT Behaviours - GenServer + Supervisor Implementation
  *
  * GenServer: callback-based server with call/cast/info.
  * Supervisor: fault-tolerant child process management.

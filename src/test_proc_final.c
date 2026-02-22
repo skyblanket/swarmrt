@@ -1,6 +1,5 @@
 /*
- * SwarmRT-BEAM Final Test
- * Tests full BEAM parity features
+ * SwarmRT Process Subsystem - Full Test
  */
 
 #include <stdio.h>
@@ -9,7 +8,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
-#include "swarmrt_beam.h"
+#include "swarmrt_proc.h"
 
 static volatile int counter = 0;
 
@@ -28,8 +27,8 @@ static void worker(void *arg) {
 int main() {
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════╗\n");
-    printf("║     SwarmRT-BEAM Test Suite                              ║\n");
-    printf("║     Full BEAM Parity Implementation                      ║\n");
+    printf("║     SwarmRT Process Test Suite                              ║\n");
+    printf("║     Full Process Subsystem Test                      ║\n");
     printf("╚═══════════════════════════════════════════════════════════╝\n");
     printf("\n");
     printf("Features:\n");
@@ -52,14 +51,14 @@ int main() {
         printf("[Test] Testing with %d scheduler(s)...\n", num_sched);
         
         counter = 0;
-        int swarm = swarm_beam_init("test", num_sched);
+        int swarm = swarm_proc_init("test", num_sched);
         sleep(1);
         
         double start = get_time_us();
         int num_procs = 100 * num_sched;
         
         for (int i = 0; i < num_procs; i++) {
-            sw_beam_spawn_on(swarm, i % num_sched, worker, NULL);
+            sw_proc_spawn_on(swarm, i % num_sched, worker, NULL);
         }
         
         /* Wait for completion */
@@ -83,7 +82,7 @@ int main() {
             tests_failed++;
         }
         
-        swarm_beam_shutdown(swarm);
+        swarm_proc_shutdown(swarm);
     }
     
     printf("╔═══════════════════════════════════════════════════════════╗\n");

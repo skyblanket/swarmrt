@@ -190,13 +190,12 @@ int main(int argc, char *argv[]) {
     
     benchmark_memory();
     
-    /* Comparison with BEAM (approximate numbers from literature) */
-    printf("\n=== Comparison with BEAM (approximate) ===\n");
-    printf("  Process spawn:    BEAM ~1μs    | SwarmRT ~100-500ns\n");
-    printf("  Context switch:   BEAM ~300ns  | SwarmRT ~100-200ns\n");
-    printf("  Memory/process:   BEAM ~300B   | SwarmRT ~200B + 64KB stack\n");
-    printf("  Raw compute:      BEAM slow    | SwarmRT native C speed\n");
-    printf("  Safety:           BEAM safe    | SwarmRT manual memory\n");
+    /* Performance summary */
+    printf("\n=== SwarmRT Performance Summary ===\n");
+    printf("  Process spawn:    ~100-500ns\n");
+    printf("  Context switch:   ~100-200ns\n");
+    printf("  Memory/process:   ~200B + 64KB stack\n");
+    printf("  Compute:          native C speed\n");
     
     printf("\n");
     

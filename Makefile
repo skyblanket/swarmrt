@@ -1,4 +1,4 @@
-# SwarmRT Makefile v4 - Full BEAM Parity
+# SwarmRT Makefile
 
 CC = cc
 CFLAGS = -Wall -Wextra -g -O2 -pthread -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wno-macro-redefined
@@ -16,12 +16,12 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v1 v2 beam native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 \
-        test test-v1 test-v2 test-beam test-native test-otp test-phase2 test-phase3 test-phase4 \
+.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 \
+        test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-all benchmark benchmark-native stats \
         swc libswarmrt example-counter
 
-all: v1 v2 beam native
+all: v1 v2 proc native
 
 # Compile rules for core objects
 $(BUILD_DIR)/swarmrt_asm.o: $(SRC_DIR)/swarmrt_asm.S | dirs
@@ -41,19 +41,18 @@ v2: dirs
 	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_v2.c -o $(BUILD_DIR)/swarmrt_v2.o
 	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_v2.o $(SRC_DIR)/test_v2.c -o $(BIN_DIR)/swarmrt-v2 $(LDFLAGS)
 
-# BEAM Parity Build (with optional assembly context switching)
-beam: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_beam.c -o $(BUILD_DIR)/swarmrt_beam.o
-	@# Compile assembly context switching (optional, fallback to setjmp/longjmp)
+# Process subsystem build (with optional assembly context switching)
+proc: dirs
+	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_proc.c -o $(BUILD_DIR)/swarmrt_proc.o
 	@$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_context.S -o $(BUILD_DIR)/swarmrt_context.o 2>/dev/null || true
-	@$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_beam.o $(BUILD_DIR)/swarmrt_context.o $(SRC_DIR)/test_beam.c -o $(BIN_DIR)/swarmrt-beam $(LDFLAGS) 2>/dev/null || \
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_beam.o $(SRC_DIR)/test_beam.c -o $(BIN_DIR)/swarmrt-beam $(LDFLAGS)
+	@$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(BUILD_DIR)/swarmrt_context.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS) 2>/dev/null || \
+	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS)
 
-# Native BEAM-class runtime (benchmark)
+# Native runtime (benchmark)
 native: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/benchmark_native.c -o $(BIN_DIR)/swarmrt-native $(LDFLAGS)
 
-# OTP feature tests
+# Behaviour feature tests
 otp-test: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/test_otp.c -o $(BIN_DIR)/test-otp $(LDFLAGS)
 
@@ -83,8 +82,8 @@ test-v1: v1
 test-v2: v2
 	./$(BIN_DIR)/swarmrt-v2
 
-test-beam: beam
-	./$(BIN_DIR)/swarmrt-beam
+test-proc: proc
+	./$(BIN_DIR)/swarmrt-proc
 
 test-native: native
 	./$(BIN_DIR)/swarmrt-native
@@ -143,12 +142,9 @@ test-phase10: phase10
 h2h: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/benchmark_h2h.c -o $(BIN_DIR)/bench-h2h $(LDFLAGS)
 
-bench-beam:
-	cd bench && erlc beam_bench.erl
+test: test-v1 test-v2 test-proc
 
-test: test-v1 test-v2 test-beam
-
-test-all: test-v1 test-v2 test-beam test-native
+test-all: test-v1 test-v2 test-proc test-native
 
 # Benchmarks
 benchmark: v1

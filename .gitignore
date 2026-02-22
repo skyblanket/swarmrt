@@ -3,6 +3,4 @@ build/
 *.o
 *.dSYM
 *.gen.c
-*.beam
-erl_crash.dump
 .DS_Store

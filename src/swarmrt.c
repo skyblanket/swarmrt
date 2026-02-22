@@ -1,5 +1,5 @@
 /*
- * SwarmRT - Minimal BEAM-alike Runtime in C
+ * SwarmRT - Minimal Actor Runtime in C
  * Built for AI-agent coordination
  */
 

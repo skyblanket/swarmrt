@@ -1,7 +1,7 @@
 /*
  * SwarmRT v2 - Full User-Space Threading
  * M:N threading: M user processes on N OS threads
- * Goal: Match BEAM performance (~1μs spawn, ~300ns context switch)
+ * Goal: sub-microsecond spawn, ~100-300ns context switch
  */
 
 #ifndef SWARMRT_V2_H
@@ -17,7 +17,7 @@
 #define SWARM_MAX_SCHEDULERS       64
 #define SWARM_MAX_PROCESSES        1000000    /* 1M processes */
 #define SWARM_STACK_SIZE           1024       /* 1KB initial stack (not 64KB!) */
-#define SWARM_REDUCTIONS           2000       /* Same as BEAM */
+#define SWARM_REDUCTIONS           2000       /* reductions per time slice */
 #define SWARM_MAX_SWARMS           16
 
 /* === Forward Declarations === */
@@ -155,7 +155,7 @@ struct sw_msg {
     sw_msg_t *next;
 };
 
-/* === Term Types (Erlang-like) === */
+/* === Term Types === */
 typedef enum {
     SW_ATOM,
     SW_INTEGER,

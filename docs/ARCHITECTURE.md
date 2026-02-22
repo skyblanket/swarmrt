@@ -1,232 +1,154 @@
-# SwarmRT vs BEAM/Elixir - Architecture Comparison
+# SwarmRT Architecture
 
-## Philosophy
+## Overview
 
-| Aspect | BEAM/Elixir | SwarmRT |
-|--------|-------------|---------|
-| **Primary Use** | Telecom/Enterprise | AI Agent Coordination |
-| **Process Model** | Actor model | Actor model |
-| **Scheduling** | Preemptive (reduction counting) | Cooperative (yield points) |
-| **Memory Safety** | GC'd processes | Manual (C) - fast but unsafe |
-| **Distribution** | Native | Planned |
-| **Hot Reloading** | Yes | Planned |
-| **Syntax** | Ruby-like functional | AI-friendly minimal |
+SwarmRT is a native actor-model runtime written in C. It provides lightweight processes, lock-free message passing, work-stealing schedulers, and a compiler that translates `.sw` source files to native binaries.
 
 ---
 
-## Code Comparison
+## Runtime Layers
 
-### Hello World
-
-**Elixir:**
-```elixir
-defmodule Hello do
-  def main do
-    IO.puts("Hello, World!")
-  end
-end
 ```
-
-**SwarmRT:**
-```erlang
-module Hello
-
-export [main]
-
-fun main() {
-    print("Hello, World!")
-}
-```
-
-### Spawn Process
-
-**Elixir:**
-```elixir
-pid = spawn(fn -> loop() end)
-send(pid, {:hello, self()})
-
-receive do
-  {:hello, from} -> send(from, :world)
-end
-```
-
-**SwarmRT:**
-```erlang
-pid = spawn(loop())
-send(pid, {hello, self()})
-
-receive {
-    {hello, from} -> send(from, world)
-}
-```
-
-### Parallel Map
-
-**Elixir (Task module):**
-```elixir
-results = 
-  files
-  |> Enum.map(&Task.async(fn -> analyze(&1) end))
-  |> Enum.map(&Task.await/1)
-```
-
-**SwarmRT (native primitive):**
-```erlang
-results = swarm map(analyze, files)
-# or with pipe:
-results = files |> swarm map(analyze)
+┌─────────────────────────────────────────┐
+│           .sw Language Layer            │
+│  Lexer → Parser → AST → C Codegen      │
+├─────────────────────────────────────────┤
+│         Behaviour Layer                 │
+│  GenServer, Supervisor, Task, ETS       │
+│  GenStateMachine, Registry              │
+├─────────────────────────────────────────┤
+│         Native Runtime                  │
+│  Scheduler, Spawn, Send/Receive         │
+│  Links, Monitors, Timers, Signals       │
+├─────────────────────────────────────────┤
+│         Infrastructure                  │
+│  Arena Allocator, GC, Hot Reload        │
+│  IO/Ports, Distribution, Context Switch │
+└─────────────────────────────────────────┘
 ```
 
 ---
 
-## Runtime Architecture
+## Process Model
 
-### BEAM
+Each process is a 2KB arena-allocated slot:
+
 ```
-┌─────────────────────────────────┐
-│          Erlang VM              │
-├─────────────────────────────────┤
-│  Scheduler 1  │  Scheduler 2    │
-│  ┌─────────┐  │  ┌─────────┐    │
-│  │Process A│  │  │Process C│    │
-│  │Process B│  │  │Process D│    │
-│  └─────────┘  │  └─────────┘    │
-├───────────────┴─────────────────┤
-│  ETS Tables  │  Ports  │  NIFs  │
-├─────────────────────────────────┤
-│  Memory Allocator (per sched)   │
-├─────────────────────────────────┤
-│  Distribution Layer             │
-└─────────────────────────────────┘
+┌──────────────────────────────┐
+│     sw_process_t (2KB)       │
+├──────────────────────────────┤
+│ pid          uint64_t        │
+│ state        RUNNING/WAIT/..  │
+│ mailbox      MPSC queue      │
+│ stack        64KB mmap       │
+│ reductions   int32_t         │
+│ links        linked list     │
+│ monitors     linked list     │
+│ timer        optional        │
+│ context      saved registers │
+└──────────────────────────────┘
 ```
 
-### SwarmRT
-```
-┌─────────────────────────────────┐
-│       Swarm Scheduler           │
-├─────────────────────────────────┤
-│  Scheduler 0  │  Scheduler 1    │
-│  (pthread)    │  (pthread)      │
-│  Run Queue    │  Run Queue      │
-│  ┌─┬─┬─┐      │  ┌─┬─┬─┐        │
-│  │P│P│P│      │  │P│P│P│        │
-│  └─┴─┴─┘      │  └─┴─┴─┘        │
-├───────────────┴─────────────────┤
-│  Process Table (PID → PCB)      │
-├─────────────────────────────────┤
-│  malloc per process (64KB)      │
-├─────────────────────────────────┤
-│  (Distribution planned)         │
-└─────────────────────────────────┘
-```
+Processes come from a pre-allocated slab — no malloc on the spawn hot path.
 
 ---
 
-## Key Differences
-
-### 1. Process Isolation
-
-**BEAM:**
-- Each process has isolated heap
-- GC per process (no stop-the-world)
-- Message passing copies data
-
-**SwarmRT:**
-- Shared address space (C)
-- No automatic GC (manual memory)
-- Message passing shares pointers (unsafe but fast)
-
-### 2. Scheduling
-
-**BEAM:**
-- Reduction counting (every function call decrements)
-- Preemptive - guaranteed fairness
-- 2000 reductions ≈ 1ms time slice
-
-**SwarmRT:**
-- Cooperative (process must call `yield()`)
-- Simpler to implement
-- Risk of runaway processes
-
-### 3. Fault Tolerance
-
-**BEAM:**
-- Supervision trees built-in
-- "Let it crash" philosophy
-- Process linking and monitors
-
-**SwarmRT:**
-- Supervisor specs defined
-- Not yet fully implemented
-- Will use similar patterns
-
-### 4. Syntax Design
-
-**Elixir:**
-- Ruby-inspired, pipeline operator `|>`
-- Pattern matching with `case`
-- Macros and metaprogramming
-
-**SwarmRT:**
-- Minimal punctuation for AI generation
-- Keywords over symbols
-- No metaprogramming (simpler parsing)
-
----
-
-## Performance Characteristics (Expected)
-
-| Metric | BEAM | SwarmRT (projected) |
-|--------|------|---------------------|
-| Process spawn | ~1μs | ~100ns (C) |
-| Message pass | ~50ns (local) | ~10ns (pointer) |
-| Context switch | ~300ns | ~100ns |
-| Memory/process | ~300 bytes + heap | ~200 bytes + 64KB stack |
-| Max processes | Millions | 100,000 (configurable) |
-| Raw compute | Slow (bytecode) | Fast (native) |
-| FFI overhead | NIF complexity | Direct C calls |
-
----
-
-## Trade-offs
-
-### SwarmRT Advantages
-- **Speed**: Native C performance for compute
-- **Memory efficiency**: Fixed stack size per process
-- **Simplicity**: ~1400 lines vs BEAM's 200K+
-- **FFI**: Direct C interop, no NIF complexity
-- **AI-friendly syntax**: Easier to generate correctly
-
-### SwarmRT Disadvantages  
-- **Safety**: Manual memory management risks
-- **Scheduling**: Cooperative (not preemptive)
-- **Ecosystem**: No libraries (yet)
-- **Maturity**: Days old vs 30 years of BEAM
-- **Distribution**: Not implemented
-
----
-
-## Integration Strategy
-
-Since `version-ctrl` already runs on BEAM:
+## Scheduler Architecture
 
 ```
-┌─────────────────────────────────────┐
-│         version-ctrl Cloud          │
-│  ┌─────────────────────────────┐    │
-│  │  Elixir/Phoenix API         │    │
-│  │  - GraphQL                  │    │
-│  │  - Swarm Coordination       │    │
-│  └─────────────────────────────┘    │
-├─────────────────────────────────────┤
-│  NIF Bridge or Port                 │
-├─────────────────────────────────────┤
-│  ┌─────────────────────────────┐    │
-│  │  SwarmRT                    │    │
-│  │  - Fast compute kernels     │    │
-│  │  - AI agent primitives      │    │
-│  └─────────────────────────────┘    │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│                   sw_swarm_t                     │
+│  ┌───────────┬───────────┬───────────┐          │
+│  │ Scheduler │ Scheduler │ Scheduler │  ...     │
+│  │  thread 0 │  thread 1 │  thread N │          │
+│  └─────┬─────┴─────┬─────┴─────┬─────┘          │
+│        │           │           │                 │
+│   ┌────▼────┐ ┌────▼────┐ ┌────▼────┐           │
+│   │ Run Q   │ │ Run Q   │ │ Run Q   │           │
+│   │ [P P P] │ │ [P P P] │ │ [P P P] │           │
+│   └─────────┘ └─────────┘ └─────────┘           │
+│                                                  │
+│  Arena: single mmap, partitioned per-scheduler   │
+│  Registry: lock-free named process lookup        │
+│  Timers: sorted list with millisecond resolution │
+└──────────────────────────────────────────────────┘
 ```
 
-Best of both: BEAM for reliability/coordination, SwarmRT for raw compute.
+- One OS thread per scheduler
+- Each scheduler has its own run queue with 4 priority levels
+- Work stealing: idle schedulers steal from busy ones
+- Reduction counting: 2000 reductions per time slice
+
+---
+
+## Message Passing
+
+Lock-free MPSC (multi-producer, single-consumer):
+
+1. **Send**: atomic CAS push to signal stack — no locks
+2. **Receive**: bulk steal from signal stack, reverse to FIFO
+3. **Selective receive**: scan queue by tag (call, cast, exit, down, timer, port)
+
+Messages are tagged with a type for selective receive:
+
+| Tag | Purpose |
+|-----|---------|
+| `SW_TAG_CALL` | Synchronous request-reply |
+| `SW_TAG_CAST` | Async fire-and-forget |
+| `SW_TAG_EXIT` | Process exit signal |
+| `SW_TAG_DOWN` | Monitor notification |
+| `SW_TAG_TIMER` | Timer expiration |
+| `SW_TAG_PORT` | IO port message |
+
+---
+
+## Behaviours
+
+| Behaviour | What it does |
+|-----------|-------------|
+| GenServer | Request-reply (`sw_call`) and async cast (`sw_cast`) with state management |
+| Supervisor | Child specs, restart strategies (one-for-one, one-for-all, rest-for-one) |
+| Task | Async/await with automatic linking |
+| GenStateMachine | State machines with event-driven transitions |
+| ETS | Concurrent in-memory tables (set, ordered_set, bag) |
+| Registry | Named process lookup with O(1) hash table |
+
+---
+
+## Compiler Pipeline
+
+```
+counter.sw ──parse──> AST ──codegen──> counter.c ──cc──> counter
+                                  │
+                            obfuscate (optional)
+                            XOR strings + symbol mangle
+```
+
+The compiler emits C code that calls the runtime API directly:
+- `sw_spawn()` for process creation
+- `sw_send_tagged()` for message sending
+- `sw_receive_any()` for blocking receive
+- `sw_val_*()` constructors for the value system
+
+---
+
+## Performance Characteristics
+
+| Metric | Value |
+|--------|-------|
+| Process spawn | ~100-500ns |
+| Context switch | ~100-200ns |
+| Message send | ~10ns (pointer sharing) |
+| Memory per process | ~200B + 64KB stack |
+| Max processes | 100K+ (configurable) |
+| Compute | native C speed |
+
+---
+
+## Additional Systems
+
+- **IO/Ports** — kqueue-based async I/O, TCP accept/read/write as port messages
+- **Hot code reload** — module versioning, swap running code without stopping processes
+- **Generational GC** — per-process heaps with minor/major collection
+- **Distribution** — multi-node TCP message routing with automatic reconnection
+- **Context switching** — ARM64 assembly for register save/restore (~100ns)

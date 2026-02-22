@@ -1,5 +1,5 @@
 /*
- * SwarmRT OTP Feature Tests
+ * SwarmRT Behaviour Feature Tests
  *
  * Tests Phase 1: Links, Monitors, Registry, Timers, Selective Receive
  */
@@ -411,7 +411,7 @@ int main(void) {
 
     printf("\n");
     printf("============================================\n");
-    printf("  SwarmRT Phase 1: OTP Feature Tests\n");
+    printf("  SwarmRT Phase 1: Behaviour Feature Tests\n");
     printf("  Links | Monitors | Registry | Timers\n");
     printf("============================================\n");
 
@@ -436,7 +436,7 @@ int main(void) {
     sw_stats(0);
 
     printf("\n============================================\n");
-    printf("  Phase 1 OTP Tests Complete\n");
+    printf("  Phase 1 Behaviour Tests Complete\n");
     printf("============================================\n\n");
 
     sw_shutdown(0);

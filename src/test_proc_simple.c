@@ -1,5 +1,5 @@
 /*
- * SwarmRT-BEAM Simple Test
+ * SwarmRT Process Subsystem - Simple Test
  */
 
 #include <stdio.h>
@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
-#include "swarmrt_beam.h"
+#include "swarmrt_proc.h"
 
 static volatile int counter = 0;
 
@@ -24,10 +24,10 @@ static void simple_worker(void *arg) {
 }
 
 int main() {
-    printf("\n=== SwarmRT-BEAM Simple Test ===\n\n");
+    printf("\n=== SwarmRT Process Simple Test ===\n\n");
     
     printf("Initializing swarm with 2 schedulers...\n");
-    int swarm = swarm_beam_init("simple_test", 2);
+    int swarm = swarm_proc_init("simple_test", 2);
     if (swarm < 0) {
         fprintf(stderr, "Failed to initialize swarm\n");
         return 1;
@@ -38,7 +38,7 @@ int main() {
     
     printf("Spawning 10 processes...\n");
     for (int i = 0; i < 10; i++) {
-        sw_beam_process_t *p = sw_beam_spawn_on(swarm, i % 2, simple_worker, (void *)(uintptr_t)i);
+        sw_proc_process_t *p = sw_proc_spawn_on(swarm, i % 2, simple_worker, (void *)(uintptr_t)i);
         if (!p) {
             fprintf(stderr, "Failed to spawn process %d\n", i);
         }
@@ -55,8 +55,8 @@ int main() {
         printf("✗ Test FAILED\n");
     }
     
-    swarm_beam_stats(swarm);
-    swarm_beam_shutdown(swarm);
+    swarm_proc_stats(swarm);
+    swarm_proc_shutdown(swarm);
     
     printf("\n=== Test completed ===\n");
     return (counter == 1000) ? 0 : 1;
