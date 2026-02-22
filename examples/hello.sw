@@ -1,5 +1,4 @@
-# Simple Hello World
-# AI-friendly syntax - minimal punctuation
+# Hello World — minimal SwarmRT program
 
 module Hello
 

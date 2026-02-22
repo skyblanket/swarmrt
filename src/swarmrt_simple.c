@@ -4,10 +4,12 @@
  */
 
 #define _GNU_SOURCE
+#define _DARWIN_C_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -166,7 +168,11 @@ sw_term_t *sw_receive(uint64_t timeout_ms) {
 
 /* Scheduling - NO-OP in simple version */
 void sw_yield(void) {
-    pthread_yield_np();
+    #ifdef __APPLE__
+        pthread_yield_np();
+    #else
+        pthread_yield();
+    #endif
 }
 
 void sw_schedule(sw_process_t *proc) {
