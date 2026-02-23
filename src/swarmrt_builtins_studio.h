@@ -752,8 +752,7 @@ static sw_val_t *_builtin_process_list(sw_val_t **a, int n) {
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
     sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
     for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
-        if (slab[i].pid > 0 && slab[i].state != SW_PROC_EXITING &&
-            slab[i].entry != NULL) {
+        if (slab[i].state != SW_PROC_FREE && slab[i].state != SW_PROC_EXITING) {
             if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
             items[cnt++] = sw_val_pid(&slab[i]);
         }
@@ -1252,7 +1251,7 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
  * llm_complete(prompt, opts_map)
  *   opts: %{model: "...", api_key: "...", url: "...", max_tokens: 4096, temperature: 0.7}
  *   defaults: model="gpt-4o-mini", reads OTONOMY_API_KEY or OPENAI_API_KEY env
- *   url default: "https://api.otonomy.ai/v1/chat/completions"
+ *   url default: "https://otonomy-inference-production.up.railway.app/v1/chat/completions"
  * Returns: string (the completion text)
  */
 static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
@@ -1260,9 +1259,9 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     const char *prompt = a[0]->v.str;
 
     /* Defaults */
-    const char *model = "gpt-4o-mini";
+    const char *model = "otonomy-orc";
     const char *api_key = NULL;
-    const char *url = "https://api.otonomy.ai/v1/chat/completions";
+    const char *url = "https://otonomy-inference-production.up.railway.app/v1/chat/completions";
     int max_tokens = 4096;
     double temperature = 0.7;
 
@@ -1332,19 +1331,21 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     sw_val_t *resp = _builtin_http_post(post_args, 3);
     if (!resp || resp->type != SW_VAL_STRING) return sw_val_string("error: no response");
 
-    /* Extract content from response: choices[0].message.content */
-    const char *content_key = "\"content\"";
-    const char *found = strstr(resp->v.str, content_key);
-    if (!found) return resp; /* Return raw response if can't parse */
-
-    found += strlen(content_key);
-    while (*found && (*found == ':' || *found == ' ' || *found == '\t')) found++;
-    if (*found != '"') return resp;
-
-    /* Parse the content string value */
-    const char *p = found;
-    sw_val_t *content = _json_parse_string(&p);
-    return content ? content : resp;
+    /* Extract content from response: choices[0].message.content
+     * Falls back to "reasoning" field if content is empty (kimi/reasoning models) */
+    const char *try_keys[] = {"\"content\"", "\"reasoning\""};
+    for (int ki = 0; ki < 2; ki++) {
+        const char *found = strstr(resp->v.str, try_keys[ki]);
+        if (!found) continue;
+        found += strlen(try_keys[ki]);
+        while (*found && (*found == ':' || *found == ' ' || *found == '\t')) found++;
+        if (*found != '"') continue;
+        const char *p = found;
+        sw_val_t *content = _json_parse_string(&p);
+        if (content && content->type == SW_VAL_STRING && strlen(content->v.str) > 0)
+            return content;
+    }
+    return resp; /* Return raw response if can't parse */
 }
 
 /* === Extra String Utilities === */
