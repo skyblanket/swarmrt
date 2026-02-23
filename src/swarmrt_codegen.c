@@ -153,10 +153,36 @@ static int is_builtin(const char *name) {
            strcmp(name, "string_upper") == 0 || strcmp(name, "string_lower") == 0 ||
            strcmp(name, "string_starts_with") == 0 ||
            strcmp(name, "string_ends_with") == 0 ||
+           strcmp(name, "string_truncate") == 0 ||
+           /* Agent utilities */
+           strcmp(name, "clean_json") == 0 ||
+           strcmp(name, "strip_html") == 0 ||
            /* Process introspection */
            strcmp(name, "process_info") == 0 ||
            strcmp(name, "process_list") == 0 ||
-           strcmp(name, "registered") == 0;
+           strcmp(name, "registered") == 0 ||
+           /* LiveView HTTP/WS */
+           strcmp(name, "http_listen") == 0 ||
+           strcmp(name, "http_respond") == 0 ||
+           strcmp(name, "ws_send") == 0 ||
+           strcmp(name, "ws_close") == 0 ||
+           strcmp(name, "ws_set_handler") == 0 ||
+           strcmp(name, "live_js") == 0 ||
+           /* Phase 15: Feature Expansion */
+           strcmp(name, "query_parse") == 0 ||
+           strcmp(name, "http_serve_file") == 0 ||
+           strcmp(name, "pubsub_subscribe") == 0 ||
+           strcmp(name, "pubsub_broadcast") == 0 ||
+           strcmp(name, "pubsub_unsubscribe") == 0 ||
+           strcmp(name, "telemetry_emit") == 0 ||
+           strcmp(name, "telemetry_subscribe") == 0 ||
+           strcmp(name, "telemetry_unsubscribe") == 0 ||
+           strcmp(name, "breaker_new") == 0 ||
+           strcmp(name, "breaker_call") == 0 ||
+           strcmp(name, "breaker_state") == 0 ||
+           strcmp(name, "llm_stream") == 0 ||
+           strcmp(name, "ets_list") == 0 ||
+           strcmp(name, "ets_count") == 0;
 }
 
 static int is_self_call(cg_ctx_t *ctx, node_t *n) {
@@ -1058,10 +1084,36 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "string_upper") == 0 || strcmp(fname, "string_lower") == 0 ||
              strcmp(fname, "string_starts_with") == 0 ||
              strcmp(fname, "string_ends_with") == 0 ||
+             strcmp(fname, "string_truncate") == 0 ||
+             /* Agent utilities */
+             strcmp(fname, "clean_json") == 0 ||
+             strcmp(fname, "strip_html") == 0 ||
              /* Process introspection */
              strcmp(fname, "process_info") == 0 ||
              strcmp(fname, "process_list") == 0 ||
-             strcmp(fname, "registered") == 0)
+             strcmp(fname, "registered") == 0 ||
+             /* LiveView HTTP/WS */
+             strcmp(fname, "http_listen") == 0 ||
+             strcmp(fname, "http_respond") == 0 ||
+             strcmp(fname, "ws_send") == 0 ||
+             strcmp(fname, "ws_close") == 0 ||
+             strcmp(fname, "ws_set_handler") == 0 ||
+             strcmp(fname, "live_js") == 0 ||
+             /* Phase 15: Feature Expansion */
+             strcmp(fname, "query_parse") == 0 ||
+             strcmp(fname, "http_serve_file") == 0 ||
+             strcmp(fname, "pubsub_subscribe") == 0 ||
+             strcmp(fname, "pubsub_broadcast") == 0 ||
+             strcmp(fname, "pubsub_unsubscribe") == 0 ||
+             strcmp(fname, "telemetry_emit") == 0 ||
+             strcmp(fname, "telemetry_subscribe") == 0 ||
+             strcmp(fname, "telemetry_unsubscribe") == 0 ||
+             strcmp(fname, "breaker_new") == 0 ||
+             strcmp(fname, "breaker_call") == 0 ||
+             strcmp(fname, "breaker_state") == 0 ||
+             strcmp(fname, "llm_stream") == 0 ||
+             strcmp(fname, "ets_list") == 0 ||
+             strcmp(fname, "ets_count") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)
@@ -1650,6 +1702,7 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
     fprintf(f, "    (void)argc; (void)argv;\n");
     fprintf(f, "    setvbuf(stdout, NULL, _IONBF, 0);\n");
     fprintf(f, "    sw_init(\"%s\", 4);\n", ctx->mod_name);
+    fprintf(f, "    sw_io_init();\n");
     fprintf(f, "    sw_spawn(_main_entry, NULL);\n");
     fprintf(f, "    while(1) usleep(60000000); /* run forever */\n");
     fprintf(f, "    sw_shutdown(0);\n");
