@@ -2,8 +2,8 @@
  * SwarmRT Compiler CLI: swc
  *
  * Usage:
- *   swc build <file.sw> [-o name] [-O] [--obfusc] [--strip] [--emit-c]
- *   swc emit  <file.sw>
+ *   swc build <file.sw> [lib.sw ...] [-o name] [-O] [--obfusc] [--strip] [--emit-c]
+ *   swc emit  <file.sw> [lib.sw ...]
  *
  * Pipeline: .sw → parse → AST → codegen → .c → cc → binary
  *
@@ -67,7 +67,8 @@ int main(int argc, char **argv) {
     if (argc < 3) { usage(); return 1; }
 
     const char *cmd = argv[1];
-    const char *input = NULL;
+    const char *inputs[64];
+    int ninputs = 0;
     const char *output_name = NULL;
     int optimize = 0, obfusc = 0, strip = 0, emit_c = 0;
 
@@ -83,34 +84,59 @@ int main(int argc, char **argv) {
             strip = 1;
         else if (strcmp(argv[i], "--emit-c") == 0)
             emit_c = 1;
-        else if (argv[i][0] != '-')
-            input = argv[i];
-        else {
+        else if (argv[i][0] != '-' && ninputs < 64)
+            inputs[ninputs++] = argv[i];
+        else if (argv[i][0] == '-') {
             fprintf(stderr, "swc: unknown option '%s'\n", argv[i]);
             return 1;
         }
     }
 
-    if (!input) { fprintf(stderr, "swc: no input file\n"); return 1; }
+    if (ninputs == 0) { fprintf(stderr, "swc: no input file\n"); return 1; }
+    const char *input = inputs[0]; /* primary input */
 
-    /* Read source */
-    char *source = read_file(input);
-    if (!source) return 1;
+    /* Parse all input files */
+    void *asts[64];
+    int nasts = 0;
+    int main_idx = 0;
 
-    /* Parse */
-    void *ast = sw_lang_parse(source);
-    free(source);
-    if (!ast) { fprintf(stderr, "swc: parse failed\n"); return 1; }
+    for (int i = 0; i < ninputs; i++) {
+        char *source = read_file(inputs[i]);
+        if (!source) return 1;
+        void *ast = sw_lang_parse(source);
+        free(source);
+        if (!ast) { fprintf(stderr, "swc: parse failed for %s\n", inputs[i]); return 1; }
+        asts[nasts] = ast;
 
-    const char *mod_name = get_mod_name(ast);
+        /* Find which module has main() */
+        const char *fnames[64];
+        int nf = get_func_names(ast, fnames, 64);
+        for (int j = 0; j < nf; j++)
+            if (strcmp(fnames[j], "main") == 0) main_idx = nasts;
+        nasts++;
+    }
+
+    const char *mod_name = get_mod_name(asts[main_idx]);
 
     /* ---- emit command ---- */
     if (strcmp(cmd, "emit") == 0) {
-        char *code = sw_codegen_to_string(ast, 0);
+        char *code = NULL;
+        if (nasts > 1) {
+            /* Multi-module: combine all ASTs */
+            char *buf = NULL; size_t blen = 0;
+            FILE *mf = open_memstream(&buf, &blen);
+            if (!mf || sw_codegen_multi(asts, nasts, main_idx, mf) != 0) {
+                fprintf(stderr, "swc: codegen failed\n"); return 1;
+            }
+            fclose(mf);
+            code = buf;
+        } else {
+            code = sw_codegen_to_string(asts[main_idx], 0);
+        }
         if (!code) { fprintf(stderr, "swc: codegen failed\n"); return 1; }
         if (obfusc) {
             const char *fnames[64];
-            int nfuncs = get_func_names(ast, fnames, 64);
+            int nfuncs = get_func_names(asts[main_idx], fnames, 64);
             char *obf = sw_obfuscate(code, mod_name, fnames, nfuncs);
             free(code);
             code = obf;
@@ -127,13 +153,24 @@ int main(int argc, char **argv) {
     }
 
     /* Generate C code */
-    char *code = sw_codegen_to_string(ast, 0);
+    char *code = NULL;
+    if (nasts > 1) {
+        char *buf = NULL; size_t blen = 0;
+        FILE *mf = open_memstream(&buf, &blen);
+        if (!mf || sw_codegen_multi(asts, nasts, main_idx, mf) != 0) {
+            fprintf(stderr, "swc: codegen failed\n"); return 1;
+        }
+        fclose(mf);
+        code = buf;
+    } else {
+        code = sw_codegen_to_string(asts[main_idx], 0);
+    }
     if (!code) { fprintf(stderr, "swc: codegen failed\n"); return 1; }
 
     /* Apply obfuscation if requested */
     if (obfusc) {
         const char *fnames[64];
-        int nfuncs = get_func_names(ast, fnames, 64);
+        int nfuncs = get_func_names(asts[main_idx], fnames, 64);
         char *obf = sw_obfuscate(code, mod_name, fnames, nfuncs);
         free(code);
         code = obf;
@@ -208,7 +245,10 @@ int main(int argc, char **argv) {
         swc_dir, swc_dir,
         strip ? "-s" : "");
 
-    fprintf(stderr, "swc: compiling %s → %s\n", input, out_path);
+    if (nasts > 1)
+        fprintf(stderr, "swc: compiling %d modules → %s\n", nasts, out_path);
+    else
+        fprintf(stderr, "swc: compiling %s → %s\n", input, out_path);
     int rc = system(cmd_buf);
 
     /* Cleanup temp file */

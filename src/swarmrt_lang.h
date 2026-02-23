@@ -47,8 +47,11 @@ struct sw_val {
             char *name;
             char **params;
             int num_params;
-            void *body;              /* ast_node_t* */
-            sw_env_t *closure_env;
+            void *body;              /* ast_node_t* (interpreter) */
+            sw_env_t *closure_env;   /* interpreter closure env */
+            void *cfunc;             /* compiled function pointer */
+            sw_val_t **captures;     /* captured variable values */
+            int ncaptures;
         } fun;
     } v;
 };
@@ -104,6 +107,9 @@ sw_val_t *sw_val_atom(const char *s);
 sw_val_t *sw_val_pid(sw_process_t *p);
 sw_val_t *sw_val_tuple(sw_val_t **items, int count);
 sw_val_t *sw_val_list(sw_val_t **items, int count);
+sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
+                             sw_val_t **captures, int ncaptures);
+sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
 
 /* Value inspection */
 int sw_val_is_truthy(sw_val_t *v);
@@ -157,7 +163,7 @@ typedef struct node {
         /* N_FLOAT */
         double fval;
         /* N_STRING, N_ATOM, N_IDENT */
-        char sval[256];
+        char sval[2048];
         /* N_TUPLE, N_LIST */
         struct { struct node **items; int count; } coll;
     } v;

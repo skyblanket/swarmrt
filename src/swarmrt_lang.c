@@ -81,7 +81,7 @@ typedef enum {
 
 typedef struct {
     tok_type_t type;
-    char text[256];
+    char text[2048];
     int line;
     int col;
     double num_val;
@@ -100,9 +100,6 @@ static struct { const char *w; tok_type_t t; } kw_table[] = {
     {"send",      TOK_SEND},
     {"after",     TOK_AFTER},
     {"swarm",     TOK_SWARM},
-    {"map",       TOK_MAP},
-    {"reduce",    TOK_REDUCE},
-    {"supervise", TOK_SUPERVISE},
     {"module",    TOK_MODULE},
     {"export",    TOK_EXPORT},
     {"fun",       TOK_FUN},
@@ -162,7 +159,7 @@ static tok_t lnext(lex_t *l) {
     /* Strings */
     if (c == '"') {
         ladv(l); int i = 0;
-        while (lpeek(l) && lpeek(l) != '"') {
+        while (lpeek(l) && lpeek(l) != '"' && i < (int)sizeof(t.text) - 2) {
             if (lpeek(l) == '\\') { ladv(l); t.text[i++] = ladv(l); }
             else t.text[i++] = ladv(l);
         }
@@ -361,12 +358,21 @@ static node_t *par_primary(par_t *p) {
     if (t.type == TOK_IDENT) {
         par_adv(p);
 
+        /* Module-qualified call: Module.function(args) */
+        char qualified[256];
+        strncpy(qualified, t.text, sizeof(qualified)-1);
+        if (p->cur.type == TOK_DOT) {
+            par_adv(p); /* . */
+            tok_t fname = par_expect(p, TOK_IDENT, "function name");
+            snprintf(qualified, sizeof(qualified), "%s.%s", t.text, fname.text);
+        }
+
         /* Function call: ident( args ) */
         if (p->cur.type == TOK_LPAREN) {
             par_adv(p); /* ( */
             node_t *call = mknode(N_CALL, t.line);
             node_t *fn = mknode(N_IDENT, t.line);
-            strncpy(fn->v.sval, t.text, sizeof(fn->v.sval)-1);
+            strncpy(fn->v.sval, qualified, sizeof(fn->v.sval)-1);
             call->v.call.func = fn;
             call->v.call.args = NULL;
             call->v.call.nargs = 0;
@@ -383,8 +389,36 @@ static node_t *par_primary(par_t *p) {
         }
 
         node_t *n = mknode(N_IDENT, t.line);
-        strncpy(n->v.sval, t.text, sizeof(n->v.sval)-1);
+        strncpy(n->v.sval, qualified, sizeof(n->v.sval)-1);
         return n;
+    }
+
+    /* Anonymous function: fun(params) { body } */
+    if (t.type == TOK_FUN) {
+        par_adv(p);
+        if (p->cur.type == TOK_LPAREN) {
+            par_adv(p); /* ( */
+            node_t *fn = mknode(N_FUN, t.line);
+            fn->v.fun.name[0] = '\0'; /* empty name = anonymous */
+            fn->v.fun.nparams = 0;
+            if (p->cur.type != TOK_RPAREN) {
+                do {
+                    tok_t param = par_expect(p, TOK_IDENT, "parameter");
+                    strncpy(fn->v.fun.params[fn->v.fun.nparams], param.text, 127);
+                    fn->v.fun.nparams++;
+                } while (par_match(p, TOK_COMMA));
+            }
+            par_expect(p, TOK_RPAREN, "')'");
+            par_expect(p, TOK_LBRACE, "'{'");
+            fn->v.fun.body = par_block(p);
+            par_expect(p, TOK_RBRACE, "'}'");
+            return fn;
+        }
+        /* Not anonymous — error in expression context */
+        p->err = 1;
+        snprintf(p->errmsg, sizeof(p->errmsg),
+                 "line %d: named functions not allowed in expressions", t.line);
+        return mknode(N_INT, t.line);
     }
 
     /* Spawn expression */
@@ -431,7 +465,7 @@ static node_t *par_primary(par_t *p) {
                 lex_t save_lex = p->lex;
                 tok_t save_cur = p->cur;
                 int save_err = p->err;
-                node_t *expr = par_expr(p);
+                node_t *expr = par_stmt(p);
                 if (p->cur.type == TOK_ARROW) {
                     /* This is the next clause's pattern — backtrack */
                     p->lex = save_lex;
@@ -785,6 +819,38 @@ sw_val_t *sw_val_list(sw_val_t **items, int count) {
     return v;
 }
 
+sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
+                             sw_val_t **captures, int ncaptures) {
+    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    v->type = SW_VAL_FUN;
+    v->v.fun.cfunc = fn_ptr;
+    v->v.fun.num_params = nparams;
+    v->v.fun.ncaptures = ncaptures;
+    if (ncaptures > 0 && captures) {
+        v->v.fun.captures = malloc(sizeof(sw_val_t*) * ncaptures);
+        memcpy(v->v.fun.captures, captures, sizeof(sw_val_t*) * ncaptures);
+    }
+    return v;
+}
+
+sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
+    if (!fun || fun->type != SW_VAL_FUN || !fun->v.fun.cfunc)
+        return sw_val_nil();
+    typedef sw_val_t *(*sw_fn_t)(sw_val_t **, int);
+    sw_fn_t fn = (sw_fn_t)fun->v.fun.cfunc;
+    if (fun->v.fun.ncaptures > 0) {
+        int total = nargs + fun->v.fun.ncaptures;
+        sw_val_t **all = malloc(sizeof(sw_val_t*) * total);
+        if (nargs > 0) memcpy(all, args, sizeof(sw_val_t*) * nargs);
+        memcpy(all + nargs, fun->v.fun.captures,
+               sizeof(sw_val_t*) * fun->v.fun.ncaptures);
+        sw_val_t *result = fn(all, total);
+        free(all);
+        return result;
+    }
+    return fn(args, nargs);
+}
+
 void sw_val_free(sw_val_t *v) {
     if (!v) return;
     switch (v->type) {
@@ -813,6 +879,9 @@ int sw_val_is_truthy(sw_val_t *v) {
 int sw_val_equal(sw_val_t *a, sw_val_t *b) {
     if (!a && !b) return 1;
     if (!a || !b) return 0;
+    /* Treat atom "nil" as equivalent to SW_VAL_NIL */
+    if (a->type == SW_VAL_NIL && b->type == SW_VAL_ATOM && strcmp(b->v.str, "nil") == 0) return 1;
+    if (b->type == SW_VAL_NIL && a->type == SW_VAL_ATOM && strcmp(a->v.str, "nil") == 0) return 1;
     if (a->type != b->type) return 0;
     switch (a->type) {
     case SW_VAL_NIL: return 1;

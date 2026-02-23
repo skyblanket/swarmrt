@@ -167,6 +167,11 @@ swc: core-objs
 example-counter: swc libswarmrt
 	./$(BIN_DIR)/swc build $(EXAMPLES_DIR)/counter.sw -o $(BIN_DIR)/counter --emit-c
 
+# Atelier Mally — autonomous creative studio
+atelier: swc libswarmrt
+	@mkdir -p studio/output
+	./$(BIN_DIR)/swc build studio/atelier.sw -o $(BIN_DIR)/atelier --emit-c
+
 parse-test: v1
 	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/hello.sw
 	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/counter.sw

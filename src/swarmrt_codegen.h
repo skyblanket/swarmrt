@@ -43,6 +43,26 @@ char *sw_codegen_to_string(void *ast, int obfuscate);
  * Returns new malloc'd string with obfuscated code, or NULL on error.
  * Caller must free().
  */
+/*
+ * Generate C code for a single module (no preamble, no main entry).
+ * Used for multi-module compilation — library modules.
+ *
+ * Emits forward declarations + functions only.
+ */
+int sw_codegen_module(void *ast, FILE *out);
+
+/*
+ * Multi-module compilation: generate one C file from multiple module ASTs.
+ *
+ * modules:    array of parsed module ASTs (node_t* of type N_MODULE)
+ * nmodules:   number of modules
+ * main_idx:   index of the module containing main()
+ * out:        FILE* to write generated C code to
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out);
+
 char *sw_obfuscate(const char *code, const char *mod_name,
                    const char **func_names, int nfuncs);
 
