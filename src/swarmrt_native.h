@@ -128,6 +128,7 @@ typedef struct {
     uint64_t *old_top;
     size_t old_size;
     uint32_t gen_gcs;
+    uint8_t arena_backed;     /* 1 if start points into arena (don't free) */
 } sw_heap_t;
 
 /* === Stack (growable) === */
@@ -326,6 +327,17 @@ struct sw_swarm {
     /* Link/monitor graph lock */
     pthread_mutex_t link_lock;
 
+    /* Global overflow run queue for work stealing.
+     * When a scheduler's local queue grows too large, excess is pushed here.
+     * Idle schedulers steal from here before sleeping. Mutex-protected
+     * since the steal path is cold (only when scheduler has no work). */
+    struct {
+        sw_process_t *head;
+        sw_process_t *tail;
+        uint32_t count;
+        pthread_mutex_t lock;
+    } overflow_rq;
+
     /* Monotonic counters */
     _Atomic uint64_t next_monitor_ref;
     _Atomic uint64_t next_timer_ref;
@@ -340,6 +352,9 @@ extern uint64_t sw_rdtsc(void);
 /* Swarm lifecycle */
 int sw_init(const char *name, uint32_t num_schedulers);
 void sw_shutdown(int swarm_id);
+
+/* Process table lookup by PID */
+sw_process_t *sw_find_by_pid(uint64_t pid);
 
 /* Process management */
 sw_process_t *sw_spawn(void (*func)(void*), void *arg);
@@ -393,6 +408,12 @@ int sw_cancel_timer(uint64_t ref);
 void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg);
 void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms);
 void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
+
+/* Selective receive: scan mailbox without consuming, remove matched msg */
+void sw_mailbox_drain_signals(void);         /* Drain signal stack → private queue */
+sw_msg_t *sw_mailbox_peek(void);             /* First message in private queue (no pop) */
+void sw_mailbox_remove_msg(sw_msg_t *m);     /* Remove specific message from queue */
+int sw_mailbox_wait_new(uint64_t timeout_ms);/* Block until new message or timeout. Returns 1 if msg, 0 if timeout */
 
 /* === Internal === */
 sw_process_t *sw_schedule(sw_scheduler_t *sched);

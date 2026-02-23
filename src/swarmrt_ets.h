@@ -11,7 +11,7 @@
 
 #include "swarmrt_native.h"
 
-typedef enum { SW_ETS_SET } sw_ets_type_t;
+typedef enum { SW_ETS_SET, SW_ETS_ORDERED_SET, SW_ETS_BAG } sw_ets_type_t;
 typedef enum { SW_ETS_PUBLIC, SW_ETS_PROTECTED, SW_ETS_PRIVATE } sw_ets_access_t;
 
 typedef struct {

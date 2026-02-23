@@ -522,8 +522,6 @@ static sw_val_t *_http_post_once(const char *url, sw_val_t *headers, const char 
     }
     unlink(outf);
 
-    fprintf(stderr, "[HTTP] status=%d rlen=%zu\n", status, rlen);
-    fflush(stderr);
     return NULL; /* just use rlen via resp_out */
 }
 
@@ -537,13 +535,8 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     /* Retry up to 3 times with exponential backoff */
     int delays[] = {0, 5, 15};
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (delays[attempt] > 0) {
-            fprintf(stderr, "[HTTP] retry %d, waiting %ds...\n", attempt + 1, delays[attempt]);
-            fflush(stderr);
+        if (delays[attempt] > 0)
             sleep(delays[attempt]);
-        }
-        fprintf(stderr, "[HTTP] attempt %d: curl to %s\n", attempt + 1, url);
-        fflush(stderr);
         _http_post_once(url, a[1], body, resp, rcap);
         size_t rlen = strlen(resp);
         /* Check for server error or empty response */
@@ -553,7 +546,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
             free(resp);
             return r;
         }
-        if (rlen > 0) fprintf(stderr, "[HTTP] got error: %.100s\n", resp);
+        (void)0; /* retry */
     }
     /* Return whatever we got after retries */
     sw_val_t *r = sw_val_string(resp);
@@ -640,7 +633,7 @@ static sw_val_t *_builtin_supervise(sw_val_t **a, int n) {
 
 /* node_start(name, port) → 'ok' | 'error' */
 static sw_val_t *_builtin_node_start(sw_val_t **a, int n) {
-    if (n < 2 || a[0]->type != SW_VAL_STRING || a[0]->type == SW_VAL_NIL)
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_atom("error");
     int port = (a[1]->type == SW_VAL_INT) ? (int)a[1]->v.i : 0;
     int ok = sw_node_start(a[0]->v.str, (uint16_t)port);
@@ -696,20 +689,108 @@ static sw_val_t *_builtin_node_peers(sw_val_t **a, int n) {
     return result;
 }
 
+/* Forward declare JSON encoder (defined in Phase 13 section below) */
+static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos);
+
 /* node_send(node_name, reg_name, msg) → 'ok' | 'error'
- * Serializes msg sw_val_t to bytes and sends via sw_node_send. */
+ * Serializes msg sw_val_t to JSON and sends via sw_node_send. */
 static sw_val_t *_builtin_node_send(sw_val_t **a, int n) {
     if (n < 3) return sw_val_atom("error");
     if (a[0]->type != SW_VAL_STRING || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
-    /* Serialize the sw_val_t message to the wire format */
-    void *data = a[2]; /* send raw pointer — recipient deserializes */
-    int ok = sw_node_send(a[0]->v.str, a[1]->v.str, 11 /* SW_TAG_CAST */,
-                          data, sizeof(sw_val_t));
+    /* Serialize sw_val_t to JSON for cross-node transport */
+    size_t cap = 262144;
+    char *buf = (char *)malloc(cap);
+    size_t pos = 0;
+    _json_encode_val(a[2], buf, cap, &pos);
+    buf[pos] = 0;
+    int ok = sw_node_send(a[0]->v.str, a[1]->v.str, SW_TAG_NONE,
+                          buf, (uint32_t)(pos + 1));
+    free(buf);
     return sw_val_atom(ok == 0 ? "ok" : "error");
 }
 
 /* === Map Builtins === */
+
+/* === Process Introspection === */
+
+/* process_info(pid) → map with process details */
+static sw_val_t *_builtin_process_info(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_PID || !a[0]->v.pid)
+        return sw_val_nil();
+    sw_process_t *proc = a[0]->v.pid;
+
+    sw_val_t *keys[8], *vals[8];
+    int c = 0;
+    keys[c] = sw_val_atom("pid");     vals[c] = sw_val_int((int64_t)proc->pid); c++;
+    keys[c] = sw_val_atom("status");
+    switch (proc->state) {
+        case SW_PROC_RUNNING:  vals[c] = sw_val_atom("running"); break;
+        case SW_PROC_RUNNABLE: vals[c] = sw_val_atom("runnable"); break;
+        case SW_PROC_WAITING:  vals[c] = sw_val_atom("waiting"); break;
+        case SW_PROC_EXITING:  vals[c] = sw_val_atom("exiting"); break;
+        default:               vals[c] = sw_val_atom("unknown"); break;
+    }
+    c++;
+    keys[c] = sw_val_atom("reductions");  vals[c] = sw_val_int((int64_t)proc->reductions_done); c++;
+    keys[c] = sw_val_atom("messages");    vals[c] = sw_val_int((int64_t)proc->mailbox.count); c++;
+    keys[c] = sw_val_atom("heap_used");   vals[c] = sw_val_int((int64_t)(proc->heap.top - proc->heap.start)); c++;
+    keys[c] = sw_val_atom("heap_size");   vals[c] = sw_val_int((int64_t)proc->heap.size); c++;
+    if (proc->reg_entry)
+        { keys[c] = sw_val_atom("name"); vals[c] = sw_val_string(proc->reg_entry->name); c++; }
+
+    return sw_val_map_new(keys, vals, c);
+}
+
+/* process_list() → list of pids of all alive processes */
+static sw_val_t *_builtin_process_list(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    extern sw_swarm_t *g_swarm;
+    if (!g_swarm) return sw_val_list(NULL, 0);
+
+    int cap = 256, cnt = 0;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+    for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
+        if (slab[i].pid > 0 && slab[i].state != SW_PROC_EXITING &&
+            slab[i].entry != NULL) {
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+            items[cnt++] = sw_val_pid(&slab[i]);
+        }
+    }
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+/* registered() → list of {name, pid} tuples for all registered processes */
+static sw_val_t *_builtin_registered(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    extern sw_swarm_t *g_swarm;
+    if (!g_swarm || !g_swarm->registry.buckets) return sw_val_list(NULL, 0);
+
+    int cap = 64, cnt = 0;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+
+    pthread_rwlock_rdlock(&g_swarm->registry.lock);
+    for (uint32_t i = 0; i < g_swarm->registry.num_buckets; i++) {
+        sw_reg_entry_t *e = g_swarm->registry.buckets[i];
+        while (e) {
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+            sw_val_t **pair = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
+            pair[0] = sw_val_string(e->name);
+            pair[1] = sw_val_pid(e->proc);
+            items[cnt++] = sw_val_tuple(pair, 2);
+            free(pair);
+            e = e->next;
+        }
+    }
+    pthread_rwlock_unlock(&g_swarm->registry.lock);
+
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
 
 /* map_new() → empty map */
 static sw_val_t *_builtin_map_new(sw_val_t **a, int n) {
@@ -781,6 +862,583 @@ static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     extern __thread sw_val_t *_sw_error;
     _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
     return sw_val_nil();
+}
+
+/* ================================================================
+ * Phase 13: Agent Stdlib Batteries
+ *
+ * http_get, shell, json_encode, json_decode, file_exists, file_list,
+ * file_delete, after, every, llm_complete, string_split, string_trim,
+ * string_upper, string_lower, string_starts_with, string_ends_with
+ * ================================================================ */
+
+/* === HTTP GET with retry === */
+
+static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *url = a[0]->v.str;
+    size_t rcap = 524288;
+    char *resp = (char *)malloc(rcap);
+
+    size_t cmdcap = strlen(url) + 4096;
+    char *cmd = (char *)malloc(cmdcap);
+
+    char outf[256];
+    snprintf(outf, sizeof(outf), "/tmp/sw_http_out_%d_%u.json", getpid(), arc4random());
+
+    int off = 0;
+    off += snprintf(cmd + off, cmdcap - off,
+        "curl -sS --connect-timeout 30 --max-time 120");
+
+    /* Optional headers (second arg) */
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) {
+        for (int i = 0; i < a[1]->v.tuple.count; i++) {
+            sw_val_t *h = a[1]->v.tuple.items[i];
+            if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
+                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
+                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
+                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
+        }
+    }
+    off += snprintf(cmd + off, cmdcap - off, " '%s' -o %s 2>/dev/null", url, outf);
+
+    int delays[] = {0, 3, 10};
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (delays[attempt] > 0) sleep(delays[attempt]);
+        system(cmd);
+        resp[0] = 0;
+        FILE *fp = fopen(outf, "r");
+        if (fp) {
+            size_t rlen = fread(resp, 1, rcap - 1, fp);
+            resp[rlen] = 0;
+            fclose(fp);
+            if (rlen > 0) { unlink(outf); break; }
+        }
+    }
+    unlink(outf);
+    free(cmd);
+    sw_val_t *r = sw_val_string(resp);
+    free(resp);
+    return r;
+}
+
+/* === Shell: run command, capture stdout === */
+
+static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *cmd = a[0]->v.str;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return sw_val_nil();
+
+    size_t cap = 65536, len = 0;
+    char *buf = (char *)malloc(cap);
+    while (len < cap - 1) {
+        size_t rd = fread(buf + len, 1, cap - len - 1, fp);
+        if (rd == 0) break;
+        len += rd;
+    }
+    buf[len] = 0;
+    int status = pclose(fp);
+
+    /* Return {status, output} tuple */
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
+    items[0] = sw_val_int(WEXITSTATUS(status));
+    items[1] = sw_val_string(buf);
+    sw_val_t *r = sw_val_tuple(items, 2);
+    free(buf);
+    free(items);
+    return r;
+}
+
+/* === JSON encode: sw_val_t → JSON string === */
+
+static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos);
+
+static void _json_append(char *buf, size_t cap, size_t *pos, const char *s) {
+    size_t len = strlen(s);
+    if (*pos + len < cap) { memcpy(buf + *pos, s, len); *pos += len; }
+}
+
+static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos) {
+    if (!v || v->type == SW_VAL_NIL) {
+        _json_append(buf, cap, pos, "null");
+    } else if (v->type == SW_VAL_INT) {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.i);
+        _json_append(buf, cap, pos, tmp);
+    } else if (v->type == SW_VAL_FLOAT) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+        _json_append(buf, cap, pos, tmp);
+    } else if (v->type == SW_VAL_STRING) {
+        _json_append(buf, cap, pos, "\"");
+        /* Escape string contents */
+        for (const char *p = v->v.str; *p && *pos < cap - 6; p++) {
+            switch (*p) {
+                case '"':  _json_append(buf, cap, pos, "\\\""); break;
+                case '\\': _json_append(buf, cap, pos, "\\\\"); break;
+                case '\n': _json_append(buf, cap, pos, "\\n"); break;
+                case '\r': _json_append(buf, cap, pos, "\\r"); break;
+                case '\t': _json_append(buf, cap, pos, "\\t"); break;
+                default:
+                    if ((unsigned char)*p < 0x20) {
+                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
+                        _json_append(buf, cap, pos, esc);
+                    } else {
+                        buf[(*pos)++] = *p;
+                    }
+            }
+        }
+        _json_append(buf, cap, pos, "\"");
+    } else if (v->type == SW_VAL_ATOM) {
+        if (strcmp(v->v.str, "true") == 0) _json_append(buf, cap, pos, "true");
+        else if (strcmp(v->v.str, "false") == 0) _json_append(buf, cap, pos, "false");
+        else if (strcmp(v->v.str, "nil") == 0) _json_append(buf, cap, pos, "null");
+        else {
+            _json_append(buf, cap, pos, "\"");
+            _json_append(buf, cap, pos, v->v.str);
+            _json_append(buf, cap, pos, "\"");
+        }
+    } else if (v->type == SW_VAL_LIST || v->type == SW_VAL_TUPLE) {
+        _json_append(buf, cap, pos, "[");
+        for (int i = 0; i < v->v.tuple.count; i++) {
+            if (i > 0) _json_append(buf, cap, pos, ",");
+            _json_encode_val(v->v.tuple.items[i], buf, cap, pos);
+        }
+        _json_append(buf, cap, pos, "]");
+    } else if (v->type == SW_VAL_MAP) {
+        _json_append(buf, cap, pos, "{");
+        for (int i = 0; i < v->v.map.count; i++) {
+            if (i > 0) _json_append(buf, cap, pos, ",");
+            /* Key: always stringify */
+            _json_append(buf, cap, pos, "\"");
+            if (v->v.map.keys[i]->type == SW_VAL_STRING ||
+                v->v.map.keys[i]->type == SW_VAL_ATOM)
+                _json_append(buf, cap, pos, v->v.map.keys[i]->v.str);
+            else {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.map.keys[i]->v.i);
+                _json_append(buf, cap, pos, tmp);
+            }
+            _json_append(buf, cap, pos, "\":");
+            _json_encode_val(v->v.map.vals[i], buf, cap, pos);
+        }
+        _json_append(buf, cap, pos, "}");
+    } else {
+        _json_append(buf, cap, pos, "null");
+    }
+}
+
+/* json_encode(val) → JSON string */
+static sw_val_t *_builtin_json_encode(sw_val_t **a, int n) {
+    if (n < 1) return sw_val_string("null");
+    size_t cap = 262144;
+    char *buf = (char *)malloc(cap);
+    size_t pos = 0;
+    _json_encode_val(a[0], buf, cap, &pos);
+    buf[pos] = 0;
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+/* === JSON decode: JSON string → sw_val_t === */
+
+static sw_val_t *_json_parse(const char **pp);
+
+static void _json_skip_ws(const char **pp) {
+    while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
+}
+
+static sw_val_t *_json_parse_string(const char **pp) {
+    (*pp)++; /* skip opening " */
+    size_t cap = 4096;
+    char *buf = (char *)malloc(cap);
+    size_t len = 0;
+    while (**pp && **pp != '"') {
+        if (**pp == '\\') {
+            (*pp)++;
+            switch (**pp) {
+                case '"': case '\\': case '/': buf[len++] = **pp; break;
+                case 'n': buf[len++] = '\n'; break;
+                case 'r': buf[len++] = '\r'; break;
+                case 't': buf[len++] = '\t'; break;
+                default: buf[len++] = **pp; break;
+            }
+        } else {
+            buf[len++] = **pp;
+        }
+        (*pp)++;
+        if (len >= cap - 1) { cap *= 2; buf = (char *)realloc(buf, cap); }
+    }
+    if (**pp == '"') (*pp)++;
+    buf[len] = 0;
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+static sw_val_t *_json_parse_array(const char **pp) {
+    (*pp)++; /* skip [ */
+    _json_skip_ws(pp);
+    int cap = 64, cnt = 0;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    while (**pp && **pp != ']') {
+        items[cnt++] = _json_parse(pp);
+        if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+        _json_skip_ws(pp);
+        if (**pp == ',') (*pp)++;
+        _json_skip_ws(pp);
+    }
+    if (**pp == ']') (*pp)++;
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+static sw_val_t *_json_parse_object(const char **pp) {
+    (*pp)++; /* skip { */
+    _json_skip_ws(pp);
+    int cap = 32, cnt = 0;
+    sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    while (**pp && **pp != '}') {
+        _json_skip_ws(pp);
+        if (**pp != '"') break;
+        /* Parse key as atom (for dot access) */
+        sw_val_t *key_str = _json_parse_string(pp);
+        keys[cnt] = sw_val_atom(key_str->v.str);
+        _json_skip_ws(pp);
+        if (**pp == ':') (*pp)++;
+        _json_skip_ws(pp);
+        vals[cnt] = _json_parse(pp);
+        cnt++;
+        if (cnt >= cap) { cap *= 2; keys = (sw_val_t **)realloc(keys, sizeof(sw_val_t *) * cap); vals = (sw_val_t **)realloc(vals, sizeof(sw_val_t *) * cap); }
+        _json_skip_ws(pp);
+        if (**pp == ',') (*pp)++;
+        _json_skip_ws(pp);
+    }
+    if (**pp == '}') (*pp)++;
+    sw_val_t *r = sw_val_map_new(keys, vals, cnt);
+    free(keys);
+    free(vals);
+    return r;
+}
+
+static sw_val_t *_json_parse(const char **pp) {
+    _json_skip_ws(pp);
+    if (**pp == '"') return _json_parse_string(pp);
+    if (**pp == '[') return _json_parse_array(pp);
+    if (**pp == '{') return _json_parse_object(pp);
+    if (**pp == 't' && strncmp(*pp, "true", 4) == 0) { *pp += 4; return sw_val_atom("true"); }
+    if (**pp == 'f' && strncmp(*pp, "false", 5) == 0) { *pp += 5; return sw_val_atom("false"); }
+    if (**pp == 'n' && strncmp(*pp, "null", 4) == 0) { *pp += 4; return sw_val_nil(); }
+    /* Number */
+    const char *start = *pp;
+    int is_float = 0;
+    if (**pp == '-') (*pp)++;
+    while (**pp >= '0' && **pp <= '9') (*pp)++;
+    if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
+    if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
+    if (*pp == start) { (*pp)++; return sw_val_nil(); } /* junk */
+    char tmp[64];
+    size_t numlen = *pp - start;
+    if (numlen > 63) numlen = 63;
+    memcpy(tmp, start, numlen); tmp[numlen] = 0;
+    if (is_float) return sw_val_float(strtod(tmp, NULL));
+    return sw_val_int(strtoll(tmp, NULL, 10));
+}
+
+/* json_decode(str) → sw_val_t (map, list, string, int, etc.) */
+static sw_val_t *_builtin_json_decode(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *p = a[0]->v.str;
+    return _json_parse(&p);
+}
+
+/* === File I/O extensions === */
+
+#include <dirent.h>
+
+/* file_exists(path) → 'true' | 'false' */
+static sw_val_t *_builtin_file_exists(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_atom("false");
+    struct stat st;
+    return sw_val_atom(stat(a[0]->v.str, &st) == 0 ? "true" : "false");
+}
+
+/* file_list(dir) → list of filenames */
+static sw_val_t *_builtin_file_list(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_list(NULL, 0);
+    DIR *d = opendir(a[0]->v.str);
+    if (!d) return sw_val_list(NULL, 0);
+    int cap = 128, cnt = 0;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' && (ent->d_name[1] == 0 ||
+            (ent->d_name[1] == '.' && ent->d_name[2] == 0))) continue;
+        if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+        items[cnt++] = sw_val_string(ent->d_name);
+    }
+    closedir(d);
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+/* file_delete(path) → 'ok' | 'error' */
+static sw_val_t *_builtin_file_delete(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_atom("error");
+    return sw_val_atom(unlink(a[0]->v.str) == 0 ? "ok" : "error");
+}
+
+/* file_append(path, content) → 'ok' | 'error' */
+static sw_val_t *_builtin_file_append(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("error");
+    FILE *f = fopen(a[0]->v.str, "a");
+    if (!f) return sw_val_atom("error");
+    fputs(a[1]->v.str, f);
+    fclose(f);
+    return sw_val_atom("ok");
+}
+
+/* === Timers: after & every === */
+
+typedef struct { sw_val_t *fn; uint64_t ms; } _timer_closure_t;
+
+static void _after_entry(void *raw) {
+    _timer_closure_t *c = (_timer_closure_t *)raw;
+    usleep((useconds_t)(c->ms * 1000));
+    sw_val_apply(c->fn, NULL, 0);
+    free(c);
+}
+
+/* delay(ms, fn) → pid — run fn once after ms milliseconds */
+static sw_val_t *_builtin_delay(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1]) return sw_val_nil();
+    _timer_closure_t *c = (_timer_closure_t *)malloc(sizeof(_timer_closure_t));
+    c->fn = a[1];
+    c->ms = (uint64_t)a[0]->v.i;
+    sw_process_t *p = sw_spawn(_after_entry, c);
+    return p ? sw_val_pid(p) : sw_val_nil();
+}
+
+static void _every_entry(void *raw) {
+    _timer_closure_t *c = (_timer_closure_t *)raw;
+    for (;;) {
+        usleep((useconds_t)(c->ms * 1000));
+        sw_val_apply(c->fn, NULL, 0);
+    }
+}
+
+/* interval(ms, fn) → pid — run fn repeatedly every ms milliseconds */
+static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1]) return sw_val_nil();
+    _timer_closure_t *c = (_timer_closure_t *)malloc(sizeof(_timer_closure_t));
+    c->fn = a[1];
+    c->ms = (uint64_t)a[0]->v.i;
+    sw_process_t *p = sw_spawn(_every_entry, c);
+    return p ? sw_val_pid(p) : sw_val_nil();
+}
+
+/* === LLM Client === */
+
+/*
+ * llm_complete(prompt)
+ * llm_complete(prompt, opts_map)
+ *   opts: %{model: "...", api_key: "...", url: "...", max_tokens: 4096, temperature: 0.7}
+ *   defaults: model="gpt-4o-mini", reads OTONOMY_API_KEY or OPENAI_API_KEY env
+ *   url default: "https://api.otonomy.ai/v1/chat/completions"
+ * Returns: string (the completion text)
+ */
+static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *prompt = a[0]->v.str;
+
+    /* Defaults */
+    const char *model = "gpt-4o-mini";
+    const char *api_key = NULL;
+    const char *url = "https://api.otonomy.ai/v1/chat/completions";
+    int max_tokens = 4096;
+    double temperature = 0.7;
+
+    /* Parse opts map if provided */
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_MAP) {
+        sw_val_t *m = a[1];
+        for (int i = 0; i < m->v.map.count; i++) {
+            const char *k = m->v.map.keys[i]->v.str;
+            sw_val_t *v = m->v.map.vals[i];
+            if (strcmp(k, "model") == 0 && v->type == SW_VAL_STRING) model = v->v.str;
+            else if (strcmp(k, "api_key") == 0 && v->type == SW_VAL_STRING) api_key = v->v.str;
+            else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) url = v->v.str;
+            else if (strcmp(k, "max_tokens") == 0 && v->type == SW_VAL_INT) max_tokens = (int)v->v.i;
+            else if (strcmp(k, "temperature") == 0) {
+                if (v->type == SW_VAL_FLOAT) temperature = v->v.f;
+                else if (v->type == SW_VAL_INT) temperature = (double)v->v.i;
+            }
+        }
+    }
+
+    /* Resolve API key from env if not provided */
+    if (!api_key) api_key = getenv("OTONOMY_API_KEY");
+    if (!api_key) api_key = getenv("OPENAI_API_KEY");
+    if (!api_key) return sw_val_string("error: no API key (set OTONOMY_API_KEY or pass api_key in opts)");
+
+    /* Escape prompt for JSON */
+    size_t plen = strlen(prompt);
+    size_t esc_cap = plen * 2 + 64;
+    char *esc_prompt = (char *)malloc(esc_cap);
+    size_t ep = 0;
+    for (size_t i = 0; i < plen && ep < esc_cap - 6; i++) {
+        switch (prompt[i]) {
+            case '"':  esc_prompt[ep++] = '\\'; esc_prompt[ep++] = '"'; break;
+            case '\\': esc_prompt[ep++] = '\\'; esc_prompt[ep++] = '\\'; break;
+            case '\n': esc_prompt[ep++] = '\\'; esc_prompt[ep++] = 'n'; break;
+            case '\r': esc_prompt[ep++] = '\\'; esc_prompt[ep++] = 'r'; break;
+            case '\t': esc_prompt[ep++] = '\\'; esc_prompt[ep++] = 't'; break;
+            default:   esc_prompt[ep++] = prompt[i]; break;
+        }
+    }
+    esc_prompt[ep] = 0;
+
+    /* Build JSON body */
+    size_t body_cap = ep + 512;
+    char *body = (char *)malloc(body_cap);
+    snprintf(body, body_cap,
+        "{\"model\":\"%s\",\"max_tokens\":%d,\"temperature\":%.2f,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+        model, max_tokens, temperature, esc_prompt);
+    free(esc_prompt);
+
+    /* Build headers */
+    sw_val_t **hdrs = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
+    sw_val_t **h0 = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
+    h0[0] = sw_val_string("Content-Type"); h0[1] = sw_val_string("application/json");
+    hdrs[0] = sw_val_tuple(h0, 2); free(h0);
+    char auth_hdr[512];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", api_key);
+    sw_val_t **h1 = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
+    h1[0] = sw_val_string("Authorization"); h1[1] = sw_val_string(auth_hdr);
+    hdrs[1] = sw_val_tuple(h1, 2); free(h1);
+    sw_val_t *hdr_list = sw_val_list(hdrs, 2); free(hdrs);
+
+    /* Call http_post */
+    sw_val_t *post_args[3] = { sw_val_string(url), hdr_list, sw_val_string(body) };
+    free(body);
+    sw_val_t *resp = _builtin_http_post(post_args, 3);
+    if (!resp || resp->type != SW_VAL_STRING) return sw_val_string("error: no response");
+
+    /* Extract content from response: choices[0].message.content */
+    const char *content_key = "\"content\"";
+    const char *found = strstr(resp->v.str, content_key);
+    if (!found) return resp; /* Return raw response if can't parse */
+
+    found += strlen(content_key);
+    while (*found && (*found == ':' || *found == ' ' || *found == '\t')) found++;
+    if (*found != '"') return resp;
+
+    /* Parse the content string value */
+    const char *p = found;
+    sw_val_t *content = _json_parse_string(&p);
+    return content ? content : resp;
+}
+
+/* === Extra String Utilities === */
+
+/* string_split(str, delim) → list of strings */
+static sw_val_t *_builtin_string_split(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_list(NULL, 0);
+    const char *str = a[0]->v.str;
+    const char *delim = a[1]->v.str;
+    size_t dlen = strlen(delim);
+    if (dlen == 0) {
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *));
+        items[0] = a[0];
+        sw_val_t *r = sw_val_list(items, 1);
+        free(items);
+        return r;
+    }
+    int cap = 32, cnt = 0;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    const char *p = str;
+    while (*p) {
+        const char *f = strstr(p, delim);
+        if (!f) f = p + strlen(p);
+        size_t slen = f - p;
+        char *seg = (char *)malloc(slen + 1);
+        memcpy(seg, p, slen); seg[slen] = 0;
+        if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+        items[cnt++] = sw_val_string(seg);
+        free(seg);
+        if (*f == 0) break;
+        p = f + dlen;
+        /* Handle trailing delimiter */
+        if (*p == 0) { items[cnt++] = sw_val_string(""); break; }
+    }
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+/* string_trim(str) → str with leading/trailing whitespace removed */
+static sw_val_t *_builtin_string_trim(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_string("");
+    const char *s = a[0]->v.str;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r')) len--;
+    char *buf = (char *)malloc(len + 1);
+    memcpy(buf, s, len); buf[len] = 0;
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+/* string_upper(str) → UPPERCASE */
+static sw_val_t *_builtin_string_upper(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_string("");
+    size_t len = strlen(a[0]->v.str);
+    char *buf = (char *)malloc(len + 1);
+    for (size_t i = 0; i <= len; i++)
+        buf[i] = (a[0]->v.str[i] >= 'a' && a[0]->v.str[i] <= 'z') ? a[0]->v.str[i] - 32 : a[0]->v.str[i];
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+/* string_lower(str) → lowercase */
+static sw_val_t *_builtin_string_lower(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_string("");
+    size_t len = strlen(a[0]->v.str);
+    char *buf = (char *)malloc(len + 1);
+    for (size_t i = 0; i <= len; i++)
+        buf[i] = (a[0]->v.str[i] >= 'A' && a[0]->v.str[i] <= 'Z') ? a[0]->v.str[i] + 32 : a[0]->v.str[i];
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+/* string_starts_with(str, prefix) → 'true' | 'false' */
+static sw_val_t *_builtin_string_starts_with(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("false");
+    size_t plen = strlen(a[1]->v.str);
+    return sw_val_atom(strncmp(a[0]->v.str, a[1]->v.str, plen) == 0 ? "true" : "false");
+}
+
+/* string_ends_with(str, suffix) → 'true' | 'false' */
+static sw_val_t *_builtin_string_ends_with(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("false");
+    size_t slen = strlen(a[0]->v.str);
+    size_t plen = strlen(a[1]->v.str);
+    if (plen > slen) return sw_val_atom("false");
+    return sw_val_atom(strcmp(a[0]->v.str + slen - plen, a[1]->v.str) == 0 ? "true" : "false");
 }
 
 #endif /* SWARMRT_BUILTINS_STUDIO_H */

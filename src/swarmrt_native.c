@@ -249,6 +249,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->heap.old_top = NULL;
     proc->heap.old_size = 0;
     proc->heap.gen_gcs = 0;
+    proc->heap.arena_backed = 1;  /* arena-allocated — never free() */
 
     proc->htop = block;
     proc->stop = NULL;
@@ -258,11 +259,22 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->entry = entry;
     proc->arg = arg;
 
-    /* Allocate process stack (lazy — reuse across process slot lifetimes) */
-#define SW_PROC_STACK_SIZE  (8 * 1024)  /* 8KB per process stack */
+    /* Allocate process stack with guard page (lazy — reuse across lifetimes).
+     * Layout: [GUARD PAGE | usable stack ... ]
+     * Stack grows downward; guard page at bottom catches overflow via SIGSEGV. */
+#define SW_PROC_STACK_SIZE  (8 * 1024)  /* 8KB usable per process stack */
     if (!proc->stack_mem) {
-        proc->stack_mem = malloc(SW_PROC_STACK_SIZE);
-        proc->stack_size = SW_PROC_STACK_SIZE;
+        long page_size = sysconf(_SC_PAGESIZE);
+        size_t total = (size_t)page_size + SW_PROC_STACK_SIZE;
+        /* Round up to page alignment */
+        total = (total + page_size - 1) & ~(page_size - 1);
+        void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) { return -1; }
+        /* Bottom page is guard — no access */
+        mprotect(mem, page_size, PROT_NONE);
+        proc->stack_mem = (uint8_t *)mem + page_size;  /* usable region */
+        proc->stack_size = total - page_size;
     }
 
     /* Initialize context for first context switch → trampoline */
@@ -534,14 +546,47 @@ sw_process_t *sw_pick_next(sw_scheduler_t *sched) {
 }
 
 /*
- * Work stealing: MPSC queues are single-consumer, so we can't directly
- * steal from another scheduler's queue. For now, return NULL — with
- * round-robin assignment, work is pre-balanced.
- * TODO: Implement push-based load balancing (victim pushes excess to shared queue).
+ * Work stealing via global overflow queue.
+ * When a scheduler has no local work, it tries to steal from the shared queue.
+ * Mutex-protected since this is the cold path (idle schedulers only).
  */
 sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
-    (void)sched;
-    return NULL;
+    if (!g_swarm) return NULL;
+    sched->steal_attempts++;
+
+    pthread_mutex_lock(&g_swarm->overflow_rq.lock);
+    sw_process_t *proc = g_swarm->overflow_rq.head;
+    if (proc) {
+        g_swarm->overflow_rq.head = (sw_process_t *)atomic_load_explicit(
+            &proc->rq_next, memory_order_relaxed);
+        if (!g_swarm->overflow_rq.head)
+            g_swarm->overflow_rq.tail = NULL;
+        g_swarm->overflow_rq.count--;
+        atomic_store_explicit(&proc->rq_next, NULL, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
+
+    return proc;
+}
+
+/*
+ * Push a process to the global overflow queue.
+ * Called when spawning and the target scheduler's queue is heavily loaded.
+ */
+static void overflow_rq_push(sw_process_t *proc) {
+    if (!g_swarm) return;
+    atomic_store_explicit(&proc->rq_next, NULL, memory_order_relaxed);
+
+    pthread_mutex_lock(&g_swarm->overflow_rq.lock);
+    if (g_swarm->overflow_rq.tail) {
+        atomic_store_explicit(&g_swarm->overflow_rq.tail->rq_next, proc, memory_order_relaxed);
+        g_swarm->overflow_rq.tail = proc;
+    } else {
+        g_swarm->overflow_rq.head = proc;
+        g_swarm->overflow_rq.tail = proc;
+    }
+    g_swarm->overflow_rq.count++;
+    pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
 }
 
 /* ============================================================================
@@ -670,6 +715,12 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     atomic_store(&g_swarm->next_monitor_ref, 1);
     atomic_store(&g_swarm->next_timer_ref, 1);
 
+    /* Initialize global overflow run queue for work stealing */
+    g_swarm->overflow_rq.head = NULL;
+    g_swarm->overflow_rq.tail = NULL;
+    g_swarm->overflow_rq.count = 0;
+    pthread_mutex_init(&g_swarm->overflow_rq.lock, NULL);
+
     /* Create schedulers (still malloc'd — only a few, not on hot path) */
     g_swarm->schedulers = (sw_scheduler_t **)calloc(num_schedulers,
                                                       sizeof(sw_scheduler_t *));
@@ -758,13 +809,19 @@ void sw_shutdown(int swarm_id) {
     }
 
     pthread_mutex_destroy(&g_swarm->link_lock);
+    pthread_mutex_destroy(&g_swarm->overflow_rq.lock);
 
-    /* Free process stacks (lazily allocated, not part of arena mmap) */
+    /* Free process stacks (mmap'd with guard page) */
     if (g_swarm->arena.proc_slab) {
+        long page_size = sysconf(_SC_PAGESIZE);
         sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
         for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
             if (slab[i].stack_mem) {
-                free(slab[i].stack_mem);
+                /* stack_mem points past the guard page — subtract to get mmap base */
+                void *base = (uint8_t *)slab[i].stack_mem - page_size;
+                size_t total = slab[i].stack_size + page_size;
+                total = (total + page_size - 1) & ~(page_size - 1);
+                munmap(base, total);
                 slab[i].stack_mem = NULL;
             }
         }
@@ -869,6 +926,20 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
     sw_add_to_runq(&sched->runq, proc);
 
     return proc;
+}
+
+/*
+ * sw_find_by_pid: Linear scan of process slab to find a live process by PID.
+ * O(n) but only used for distribution routing (rare path).
+ */
+sw_process_t *sw_find_by_pid(uint64_t pid) {
+    if (!g_swarm || pid == 0) return NULL;
+    sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+    for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
+        if (slab[i].pid == pid && slab[i].state != SW_PROC_EXITING && slab[i].entry)
+            return &slab[i];
+    }
+    return NULL;
 }
 
 /*
@@ -1142,6 +1213,99 @@ void *sw_receive(uint64_t timeout_ms) {
 
 void *sw_receive_nowait(void) {
     return sw_receive(0);
+}
+
+/* ============================================================================
+ * SELECTIVE RECEIVE HELPERS
+ *
+ * These enable OTP-style selective receive: scan the mailbox for a matching
+ * message without consuming non-matching ones. The codegen emits:
+ *   1. drain signals
+ *   2. walk private queue (peek + next)
+ *   3. on match: remove_msg, execute body
+ *   4. no match: wait_new, goto 1
+ * ============================================================================ */
+
+void sw_mailbox_drain_signals(void) {
+    sw_process_t *proc = tls_current;
+    if (proc) mailbox_drain(&proc->mailbox);
+}
+
+sw_msg_t *sw_mailbox_peek(void) {
+    sw_process_t *proc = tls_current;
+    if (!proc) return NULL;
+    mailbox_drain(&proc->mailbox);
+    return proc->mailbox.priv_head;
+}
+
+void sw_mailbox_remove_msg(sw_msg_t *m) {
+    sw_process_t *proc = tls_current;
+    if (!proc || !m) return;
+    sw_mailbox_t *mb = &proc->mailbox;
+    if (m->prev) m->prev->next = m->next;
+    else mb->priv_head = m->next;
+    if (m->next) m->next->prev = m->prev;
+    else mb->priv_tail = m->prev;
+    mb->count--;
+    proc->messages_recv++;
+}
+
+int sw_mailbox_wait_new(uint64_t timeout_ms) {
+    sw_process_t *proc = tls_current;
+    if (!proc) return 0;
+    if (timeout_ms == 0) return 0;
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* Set waiting flag BEFORE checking signal stack (prevents lost wake-ups) */
+    proc->state = SW_PROC_WAITING;
+    atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_release);
+
+    /* Check if new signals arrived AFTER we set waiting flag */
+    sw_msg_t *sig = atomic_load_explicit(&proc->mailbox.sig_head, memory_order_acquire);
+    if (sig) {
+        /* New messages on signal stack — drain and let caller re-scan */
+        int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
+        if (was) {
+            proc->state = SW_PROC_RUNNING;
+            mailbox_drain(&proc->mailbox);
+            return 1;
+        }
+        /* Sender already enqueued us — context swap for clean dequeue */
+        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        proc->state = SW_PROC_RUNNING;
+        mailbox_drain(&proc->mailbox);
+        return 1;
+    }
+
+    /* No new signals — set up timeout and sleep */
+    uint64_t timer_ref = 0;
+    if (timeout_ms != (uint64_t)-1) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t elapsed = (now.tv_sec - start.tv_sec) * 1000 +
+                           (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed >= timeout_ms) {
+            int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
+            if (was) { proc->state = SW_PROC_RUNNING; return 0; }
+            sw_context_swap(proc, &proc->scheduler->sched_proc);
+            proc->state = SW_PROC_RUNNING;
+            return 0;
+        }
+        timer_ref = sw_send_after(timeout_ms - elapsed, proc, SW_TAG_NONE, NULL);
+    }
+
+    /* Context swap — will be woken by sender or timer */
+    sw_context_swap(proc, &proc->scheduler->sched_proc);
+    proc->state = SW_PROC_RUNNING;
+
+    if (timer_ref) sw_cancel_timer(timer_ref);
+    if (proc->kill_flag) return 0;
+
+    /* Drain newly arrived signals */
+    mailbox_drain(&proc->mailbox);
+    return 1;
 }
 
 /* ============================================================================

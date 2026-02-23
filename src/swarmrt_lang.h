@@ -195,4 +195,7 @@ typedef struct node {
     } v;
 } node_t;
 
+/* JSON decode for distribution layer */
+sw_val_t *sw_lang_json_decode(const char *s);
+
 #endif /* SWARMRT_LANG_H */

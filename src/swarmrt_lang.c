@@ -16,6 +16,12 @@
 #include <stdarg.h>
 #include "swarmrt_lang.h"
 
+/* Weak stubs for runtime functions — allows linking swc without the runtime.
+ * These are only called by the interpreter, never by the compiler. */
+__attribute__((weak)) void *sw_receive_any(uint64_t t, uint64_t *tag) { (void)t; (void)tag; return NULL; }
+__attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) { (void)to; (void)tag; (void)msg; }
+__attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
+
 /* =========================================================================
  * Lexer
  * ========================================================================= */
@@ -625,7 +631,7 @@ static node_t *par_primary(par_t *p) {
         recv->v.recv.clauses = NULL;
         recv->v.recv.nclauses = 0;
         recv->v.recv.after_body = NULL;
-        recv->v.recv.after_ms = 0;
+        recv->v.recv.after_ms = -1;  /* sentinel: no after clause */
 
         while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF) {
             node_t *cl = mknode(N_CLAUSE, p->cur.line);
@@ -1818,7 +1824,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
 
     case N_RECEIVE: {
         /* Simplified receive: wait for a message, try to match clauses */
-        uint64_t timeout = n->v.recv.after_ms > 0 ? (uint64_t)n->v.recv.after_ms : 5000;
+        uint64_t timeout = n->v.recv.after_ms >= 0 ? (uint64_t)n->v.recv.after_ms : 5000;
         uint64_t tag = 0;
         void *raw = sw_receive_any(timeout, &tag);
         if (!raw) {
@@ -1926,4 +1932,90 @@ void sw_lang_free(sw_interp_t *interp) {
     if (interp->module_ast) node_free(interp->module_ast);
     env_free(interp->global_env);
     free(interp);
+}
+
+/* === JSON decode for distribution layer === */
+
+static sw_val_t *_jd_parse(const char **pp);
+
+static void _jd_skip_ws(const char **pp) {
+    while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
+}
+
+static sw_val_t *_jd_parse_string(const char **pp) {
+    (*pp)++;
+    char buf[8192];
+    int len = 0;
+    while (**pp && **pp != '"' && len < (int)sizeof(buf) - 2) {
+        if (**pp == '\\') {
+            (*pp)++;
+            switch (**pp) {
+                case 'n': buf[len++] = '\n'; break;
+                case 't': buf[len++] = '\t'; break;
+                case 'r': buf[len++] = '\r'; break;
+                default:  buf[len++] = **pp; break;
+            }
+        } else buf[len++] = **pp;
+        (*pp)++;
+    }
+    if (**pp == '"') (*pp)++;
+    buf[len] = 0;
+    return sw_val_string(buf);
+}
+
+static sw_val_t *_jd_parse(const char **pp) {
+    _jd_skip_ws(pp);
+    if (**pp == '"') return _jd_parse_string(pp);
+    if (**pp == '[') {
+        (*pp)++; _jd_skip_ws(pp);
+        sw_val_t *items[256]; int cnt = 0;
+        while (**pp && **pp != ']' && cnt < 256) {
+            items[cnt++] = _jd_parse(pp);
+            _jd_skip_ws(pp);
+            if (**pp == ',') (*pp)++;
+            _jd_skip_ws(pp);
+        }
+        if (**pp == ']') (*pp)++;
+        return sw_val_list(items, cnt);
+    }
+    if (**pp == '{') {
+        (*pp)++; _jd_skip_ws(pp);
+        sw_val_t *keys[128], *vals[128]; int cnt = 0;
+        while (**pp && **pp != '}' && cnt < 128) {
+            _jd_skip_ws(pp);
+            if (**pp != '"') break;
+            sw_val_t *k = _jd_parse_string(pp);
+            keys[cnt] = sw_val_atom(k->v.str);
+            _jd_skip_ws(pp);
+            if (**pp == ':') (*pp)++;
+            vals[cnt] = _jd_parse(pp);
+            cnt++;
+            _jd_skip_ws(pp);
+            if (**pp == ',') (*pp)++;
+        }
+        if (**pp == '}') (*pp)++;
+        return sw_val_map_new(keys, vals, cnt);
+    }
+    if (**pp == 't' && strncmp(*pp, "true", 4) == 0)  { *pp += 4; return sw_val_atom("true"); }
+    if (**pp == 'f' && strncmp(*pp, "false", 5) == 0) { *pp += 5; return sw_val_atom("false"); }
+    if (**pp == 'n' && strncmp(*pp, "null", 4) == 0)  { *pp += 4; return sw_val_nil(); }
+    /* Number */
+    const char *start = *pp;
+    int is_float = 0;
+    if (**pp == '-') (*pp)++;
+    while (**pp >= '0' && **pp <= '9') (*pp)++;
+    if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
+    if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
+    if (*pp == start) { (*pp)++; return sw_val_nil(); }
+    char tmp[64];
+    size_t numlen = *pp - start;
+    if (numlen > 63) numlen = 63;
+    memcpy(tmp, start, numlen); tmp[numlen] = 0;
+    return is_float ? sw_val_float(strtod(tmp, NULL)) : sw_val_int(strtoll(tmp, NULL, 10));
+}
+
+sw_val_t *sw_lang_json_decode(const char *s) {
+    if (!s) return sw_val_nil();
+    const char *p = s;
+    return _jd_parse(&p);
 }

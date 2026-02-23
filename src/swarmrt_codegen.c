@@ -141,7 +141,22 @@ static int is_builtin(const char *name) {
            strcmp(name, "map_has_key") == 0 ||
            /* Error */
            strcmp(name, "error") == 0 ||
-           strcmp(name, "typeof") == 0;
+           strcmp(name, "typeof") == 0 ||
+           /* Phase 13: Agent stdlib */
+           strcmp(name, "http_get") == 0 || strcmp(name, "shell") == 0 ||
+           strcmp(name, "json_encode") == 0 || strcmp(name, "json_decode") == 0 ||
+           strcmp(name, "file_exists") == 0 || strcmp(name, "file_list") == 0 ||
+           strcmp(name, "file_delete") == 0 || strcmp(name, "file_append") == 0 ||
+           strcmp(name, "delay") == 0 || strcmp(name, "interval") == 0 ||
+           strcmp(name, "llm_complete") == 0 ||
+           strcmp(name, "string_split") == 0 || strcmp(name, "string_trim") == 0 ||
+           strcmp(name, "string_upper") == 0 || strcmp(name, "string_lower") == 0 ||
+           strcmp(name, "string_starts_with") == 0 ||
+           strcmp(name, "string_ends_with") == 0 ||
+           /* Process introspection */
+           strcmp(name, "process_info") == 0 ||
+           strcmp(name, "process_list") == 0 ||
+           strcmp(name, "registered") == 0;
 }
 
 static int is_self_call(cg_ctx_t *ctx, node_t *n) {
@@ -817,7 +832,7 @@ static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
                 val, val, (long long)pat->v.ival);
         break;
     case N_FLOAT:
-        fprintf(f, "%s->type == SW_VAL_FLOAT && %s->v.f == %g",
+        fprintf(f, "%s->type == SW_VAL_FLOAT && %s->v.f == %.17g",
                 val, val, pat->v.fval);
         break;
     case N_STRING: {
@@ -1031,7 +1046,22 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "map_put") == 0 || strcmp(fname, "map_keys") == 0 ||
              strcmp(fname, "map_values") == 0 || strcmp(fname, "map_merge") == 0 ||
              strcmp(fname, "map_has_key") == 0 || strcmp(fname, "error") == 0 ||
-             strcmp(fname, "typeof") == 0)
+             strcmp(fname, "typeof") == 0 ||
+             /* Phase 13: Agent stdlib */
+             strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||
+             strcmp(fname, "json_encode") == 0 || strcmp(fname, "json_decode") == 0 ||
+             strcmp(fname, "file_exists") == 0 || strcmp(fname, "file_list") == 0 ||
+             strcmp(fname, "file_delete") == 0 || strcmp(fname, "file_append") == 0 ||
+             strcmp(fname, "delay") == 0 || strcmp(fname, "interval") == 0 ||
+             strcmp(fname, "llm_complete") == 0 ||
+             strcmp(fname, "string_split") == 0 || strcmp(fname, "string_trim") == 0 ||
+             strcmp(fname, "string_upper") == 0 || strcmp(fname, "string_lower") == 0 ||
+             strcmp(fname, "string_starts_with") == 0 ||
+             strcmp(fname, "string_ends_with") == 0 ||
+             /* Process introspection */
+             strcmp(fname, "process_info") == 0 ||
+             strcmp(fname, "process_list") == 0 ||
+             strcmp(fname, "registered") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)
@@ -1060,7 +1090,7 @@ static void emit_send(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     char to_var[32], msg_var[32];
     emit_expr(ctx, n->v.send.to, 0, to_var, sizeof(to_var));
     emit_expr(ctx, n->v.send.msg, 0, msg_var, sizeof(msg_var));
-    fprintf(f, "    sw_send_tagged(%s->v.pid, 11, %s);\n", to_var, msg_var);
+    fprintf(f, "    sw_send_tagged(%s->v.pid, SW_TAG_NONE, %s);\n", to_var, msg_var);
     strncpy(out, msg_var, osz - 1);
 }
 
@@ -1098,65 +1128,83 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
 
 static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
-    char tag[32], raw[32], msg[32], res[32];
-    fresh_var(ctx, tag, sizeof(tag));
-    fresh_var(ctx, raw, sizeof(raw));
-    fresh_var(ctx, msg, sizeof(msg));
+    char res[32], cur[32], msg[32];
     fresh_var(ctx, res, sizeof(res));
+    fresh_var(ctx, cur, sizeof(cur));
+    fresh_var(ctx, msg, sizeof(msg));
 
-    /* Result variable */
-    fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
-
-    /* Receive with timeout */
-    uint64_t timeout = (n->v.recv.after_ms > 0)
+    uint64_t timeout = (n->v.recv.after_ms >= 0)
         ? (uint64_t)n->v.recv.after_ms : (uint64_t)-1;
-    fprintf(f, "    uint64_t %s;\n", tag);
-    fprintf(f, "    void *%s = sw_receive_any(%lluULL, &%s);\n", raw, (unsigned long long)timeout, tag);
-    fprintf(f, "    sw_val_t *%s = %s ? (sw_val_t *)%s : sw_val_nil();\n", msg, raw, raw);
+
+    fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
+    fprintf(f, "    { /* selective receive */\n");
+    fprintf(f, "      int _matched = 0;\n");
+    fprintf(f, "      while (!_matched) {\n");
+    fprintf(f, "        sw_mailbox_drain_signals();\n");
+    fprintf(f, "        sw_msg_t *%s = sw_mailbox_peek();\n", cur);
+    fprintf(f, "        while (%s && !_matched) {\n", cur);
+    fprintf(f, "          sw_msg_t *_next = %s->next;\n", cur);
+    fprintf(f, "          sw_val_t *%s = %s->payload ? (sw_val_t *)%s->payload : sw_val_nil();\n",
+            msg, cur, cur);
 
     /* Pattern matching clauses */
     for (int i = 0; i < n->v.recv.nclauses; i++) {
         node_t *cl = n->v.recv.clauses[i];
-        if (i == 0)
-            fprintf(f, "    if (%s && ", raw);
-        else
-            fprintf(f, "    } else if (%s && ", raw);
+        fprintf(f, "          %sif (", i == 0 ? "" : "} else ");
         emit_pattern_cond(ctx, cl->v.clause.pattern, msg);
         fprintf(f, ") {\n");
 
         int saved_ndeclared = ctx->ndeclared;
-        emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
 
-        /* Guard check */
+        /* Guard check — if guard fails, don't match */
         if (cl->v.clause.guard) {
+            emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
             char guard_res[32];
             emit_expr(ctx, cl->v.clause.guard, 0, guard_res, sizeof(guard_res));
-            fprintf(f, "      if (sw_val_is_truthy(%s)) {\n", guard_res);
+            fprintf(f, "            if (sw_val_is_truthy(%s)) {\n", guard_res);
+            fprintf(f, "              sw_mailbox_remove_msg(%s);\n", cur);
+            fprintf(f, "              _matched = 1;\n");
+            char body_res[32];
+            emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
+            if (body_res[0])
+                fprintf(f, "              %s = %s;\n", res, body_res);
+            fprintf(f, "            }\n");
+        } else {
+            fprintf(f, "            sw_mailbox_remove_msg(%s);\n", cur);
+            fprintf(f, "            _matched = 1;\n");
+            emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
+            char body_res[32];
+            emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
+            if (body_res[0])
+                fprintf(f, "            %s = %s;\n", res, body_res);
         }
-
-        char body_res[32];
-        emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
-        if (body_res[0])
-            fprintf(f, "        %s = %s;\n", res, body_res);
-
-        if (cl->v.clause.guard)
-            fprintf(f, "      }\n");
 
         ctx->ndeclared = saved_ndeclared;
     }
 
     if (n->v.recv.nclauses > 0)
-        fprintf(f, "    }\n");
+        fprintf(f, "          }\n");
+
+    fprintf(f, "          if (!_matched) %s = _next;\n", cur);
+    fprintf(f, "        }\n");  /* end inner while (cursor) */
+
+    /* No match in current queue — wait for new messages or timeout */
+    fprintf(f, "        if (!_matched) {\n");
+    fprintf(f, "          if (!sw_mailbox_wait_new(%lluULL)) break;\n", (unsigned long long)timeout);
+    fprintf(f, "        }\n");
+    fprintf(f, "      }\n");  /* end outer while (!matched) */
 
     /* After clause (timeout handler) */
     if (n->v.recv.after_body) {
-        fprintf(f, "    if (!%s) {\n", raw);
+        fprintf(f, "      if (!_matched) {\n");
         char after_res[32];
         emit_expr(ctx, n->v.recv.after_body, 0, after_res, sizeof(after_res));
         if (after_res[0])
             fprintf(f, "        %s = %s;\n", res, after_res);
-        fprintf(f, "    }\n");
+        fprintf(f, "      }\n");
     }
+
+    fprintf(f, "    }\n");  /* end selective receive block */
 
     strncpy(out, res, osz - 1);
 }

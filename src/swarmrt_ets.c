@@ -45,15 +45,66 @@ static pthread_mutex_t g_ets_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static sw_ets_table_t *g_ets_tables = NULL;
 static _Atomic uint32_t g_next_ets_tid = 1;
 
+/* === Key Comparison (value equality for sw_val_t, pointer for raw) === */
+
+#include "swarmrt_lang.h"
+
+static int ets_key_eq(void *a, void *b) {
+    if (a == b) return 1;
+    /* Try sw_val_t value equality */
+    sw_val_t *va = (sw_val_t *)a, *vb = (sw_val_t *)b;
+    if (!va || !vb) return 0;
+    if (va->type != vb->type) return 0;
+    switch (va->type) {
+        case SW_VAL_INT:    return va->v.i == vb->v.i;
+        case SW_VAL_FLOAT:  return va->v.f == vb->v.f;
+        case SW_VAL_ATOM:
+        case SW_VAL_STRING: return va->v.str && vb->v.str && strcmp(va->v.str, vb->v.str) == 0;
+        default: return a == b;
+    }
+}
+
+/* Key ordering for ordered_set (returns <0, 0, >0) */
+static int ets_key_cmp(void *a, void *b) {
+    if (a == b) return 0;
+    sw_val_t *va = (sw_val_t *)a, *vb = (sw_val_t *)b;
+    if (!va || !vb) return (va ? 1 : -1);
+    /* Type ordering: int < float < atom < string < other */
+    if (va->type != vb->type) return (int)va->type - (int)vb->type;
+    switch (va->type) {
+        case SW_VAL_INT:    return (va->v.i < vb->v.i) ? -1 : (va->v.i > vb->v.i ? 1 : 0);
+        case SW_VAL_FLOAT:  return (va->v.f < vb->v.f) ? -1 : (va->v.f > vb->v.f ? 1 : 0);
+        case SW_VAL_ATOM:
+        case SW_VAL_STRING: return strcmp(va->v.str ? va->v.str : "", vb->v.str ? vb->v.str : "");
+        default: return (a < b) ? -1 : (a > b ? 1 : 0);
+    }
+}
+
 /* === Hash Function === */
 
 static uint32_t ets_hash_key(void *key) {
-    /* Pointer hash using multiplicative mixing */
-    uint64_t k = (uint64_t)(uintptr_t)key;
+    /* Try value-based hash for sw_val_t keys */
+    sw_val_t *v = (sw_val_t *)key;
+    uint64_t k;
+    if (v && v->type == SW_VAL_INT) k = (uint64_t)v->v.i;
+    else if (v && v->type == SW_VAL_ATOM && v->v.str) {
+        /* FNV-1a on string */
+        k = 0xcbf29ce484222325ULL;
+        for (const char *p = v->v.str; *p; p++) {
+            k ^= (uint8_t)*p;
+            k *= 0x100000001b3ULL;
+        }
+    } else if (v && v->type == SW_VAL_STRING && v->v.str) {
+        k = 0xcbf29ce484222325ULL;
+        for (const char *p = v->v.str; *p; p++) {
+            k ^= (uint8_t)*p;
+            k *= 0x100000001b3ULL;
+        }
+    } else {
+        k = (uint64_t)(uintptr_t)key;
+    }
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
-    k ^= k >> 33;
-    k *= 0xc4ceb9fe1a85ec53ULL;
     k ^= k >> 33;
     return (uint32_t)(k % SW_ETS_BUCKETS);
 }
@@ -132,28 +183,53 @@ int sw_ets_insert(sw_ets_tid_t tid, void *key, void *value) {
 
     pthread_rwlock_wrlock(&table->rwlock);
 
-    /* Scan chain for existing key (replace if found) */
-    sw_ets_entry_t *e = table->buckets[bucket];
-    while (e) {
-        if (e->key == key) {
-            e->value = value;
-            pthread_rwlock_unlock(&table->rwlock);
-            return 0;
+    if (table->opts.type == SW_ETS_BAG) {
+        /* Bag: always insert, allow duplicate keys */
+        sw_ets_entry_t *entry = (sw_ets_entry_t *)malloc(sizeof(sw_ets_entry_t));
+        if (!entry) { pthread_rwlock_unlock(&table->rwlock); return -1; }
+        entry->key = key;
+        entry->value = value;
+        entry->next = table->buckets[bucket];
+        table->buckets[bucket] = entry;
+        table->count++;
+    } else if (table->opts.type == SW_ETS_ORDERED_SET) {
+        /* Ordered set: replace if key exists, else insert in sorted order */
+        sw_ets_entry_t **pp = &table->buckets[bucket];
+        while (*pp) {
+            if (ets_key_eq((*pp)->key, key)) {
+                (*pp)->value = value;
+                pthread_rwlock_unlock(&table->rwlock);
+                return 0;
+            }
+            if (ets_key_cmp(key, (*pp)->key) < 0) break;
+            pp = &(*pp)->next;
         }
-        e = e->next;
+        sw_ets_entry_t *entry = (sw_ets_entry_t *)malloc(sizeof(sw_ets_entry_t));
+        if (!entry) { pthread_rwlock_unlock(&table->rwlock); return -1; }
+        entry->key = key;
+        entry->value = value;
+        entry->next = *pp;
+        *pp = entry;
+        table->count++;
+    } else {
+        /* Set: replace if key exists (value equality) */
+        sw_ets_entry_t *e = table->buckets[bucket];
+        while (e) {
+            if (ets_key_eq(e->key, key)) {
+                e->value = value;
+                pthread_rwlock_unlock(&table->rwlock);
+                return 0;
+            }
+            e = e->next;
+        }
+        sw_ets_entry_t *entry = (sw_ets_entry_t *)malloc(sizeof(sw_ets_entry_t));
+        if (!entry) { pthread_rwlock_unlock(&table->rwlock); return -1; }
+        entry->key = key;
+        entry->value = value;
+        entry->next = table->buckets[bucket];
+        table->buckets[bucket] = entry;
+        table->count++;
     }
-
-    /* New entry — prepend to chain */
-    sw_ets_entry_t *entry = (sw_ets_entry_t *)malloc(sizeof(sw_ets_entry_t));
-    if (!entry) {
-        pthread_rwlock_unlock(&table->rwlock);
-        return -1;
-    }
-    entry->key = key;
-    entry->value = value;
-    entry->next = table->buckets[bucket];
-    table->buckets[bucket] = entry;
-    table->count++;
 
     pthread_rwlock_unlock(&table->rwlock);
     return 0;
@@ -170,7 +246,7 @@ void *sw_ets_lookup(sw_ets_tid_t tid, void *key) {
 
     sw_ets_entry_t *e = table->buckets[bucket];
     while (e) {
-        if (e->key == key) {
+        if (ets_key_eq(e->key, key)) {
             void *val = e->value;
             pthread_rwlock_unlock(&table->rwlock);
             return val;
@@ -193,11 +269,24 @@ int sw_ets_delete(sw_ets_tid_t tid, void *key) {
 
     sw_ets_entry_t **pp = &table->buckets[bucket];
     while (*pp) {
-        if ((*pp)->key == key) {
+        if (ets_key_eq((*pp)->key, key)) {
             sw_ets_entry_t *rm = *pp;
             *pp = rm->next;
             free(rm);
             table->count--;
+            /* For bag: remove ALL entries with this key */
+            if (table->opts.type == SW_ETS_BAG) {
+                while (*pp) {
+                    if (ets_key_eq((*pp)->key, key)) {
+                        rm = *pp;
+                        *pp = rm->next;
+                        free(rm);
+                        table->count--;
+                    } else {
+                        pp = &(*pp)->next;
+                    }
+                }
+            }
             pthread_rwlock_unlock(&table->rwlock);
             return 0;
         }

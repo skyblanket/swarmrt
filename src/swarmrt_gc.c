@@ -219,17 +219,18 @@ int sw_gc_major(sw_process_t *proc) {
         }
     }
 
-    /* Save old heap as "old generation" */
-    if (proc->heap.old_heap) free(proc->heap.old_heap);
+    /* Save old heap as "old generation" — only free if it was malloc'd */
+    if (proc->heap.old_heap && !proc->heap.arena_backed)
+        free(proc->heap.old_heap);
     proc->heap.old_heap = proc->heap.start;
     proc->heap.old_top = proc->heap.top;
     proc->heap.old_size = proc->heap.size;
 
-    /* Install new heap */
+    /* Install new heap (malloc'd — safe to free later) */
     proc->heap.start = new_heap;
     proc->heap.top = new_heap + dst;
     proc->heap.end = new_heap + new_size;
-    /* size stays the same */
+    proc->heap.arena_backed = 0;  /* new heap is malloc'd */
     proc->heap.gen_gcs++;
 
     size_t reclaimed = heap_words - live_words;

@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <arpa/inet.h>
 #include "swarmrt_node.h"
+#include "swarmrt_lang.h"
 
 /* === Global State === */
 
@@ -74,18 +75,34 @@ static void handle_remote_data(uint8_t *data, uint32_t len) {
         memcpy(payload, data + sizeof(sw_remote_msg_t), plen);
     }
 
-    /* Route to local process */
+    /* Route to local process — try PID first, then name */
     sw_process_t *target = NULL;
     if (hdr->to_pid > 0) {
-        /* PID-based routing — not easily done without process table lookup.
-         * For now, fall through to name-based. */
+        target = sw_find_by_pid(hdr->to_pid);
     }
-    if (hdr->to_name[0]) {
+    if (!target && hdr->to_name[0]) {
         target = sw_whereis(hdr->to_name);
     }
 
-    if (target) {
-        sw_send_tagged(target, hdr->tag, payload);
+    if (target && payload) {
+        /* Deserialize JSON payload back to sw_val_t */
+        extern sw_val_t *sw_val_nil(void);
+        extern sw_val_t *sw_val_string(const char *s);
+        const char *p = (const char *)payload;
+        /* Try JSON parse — if it looks like JSON, parse it */
+        sw_val_t *msg = NULL;
+        if (p[0] == '{' || p[0] == '[' || p[0] == '"' ||
+            (p[0] >= '0' && p[0] <= '9') || p[0] == '-' ||
+            p[0] == 't' || p[0] == 'f' || p[0] == 'n') {
+            /* Forward-declare json_decode from lang */
+            extern sw_val_t *sw_lang_json_decode(const char *s);
+            msg = sw_lang_json_decode(p);
+        }
+        if (!msg) msg = sw_val_string(p);
+        free(payload);
+        sw_send_tagged(target, hdr->tag, msg);
+    } else if (target) {
+        sw_send_tagged(target, hdr->tag, NULL);
     } else {
         if (payload) free(payload);
     }
