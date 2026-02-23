@@ -1229,7 +1229,7 @@ void sw_val_print(sw_val_t *v) {
     switch (v->type) {
     case SW_VAL_NIL: printf("nil"); break;
     case SW_VAL_INT: printf("%lld", (long long)v->v.i); break;
-    case SW_VAL_FLOAT: printf("%g", v->v.f); break;
+    case SW_VAL_FLOAT: printf("%.17g", v->v.f); break;
     case SW_VAL_STRING: printf("%s", v->v.str); break;
     case SW_VAL_ATOM: printf(":%s", v->v.str); break;
     case SW_VAL_PID: printf("<pid:%llu>", v->v.pid ? v->v.pid->pid : 0); break;

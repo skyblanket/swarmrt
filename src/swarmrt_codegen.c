@@ -1305,7 +1305,7 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     }
     case N_FLOAT: {
         char v[32]; fresh_var(ctx, v, sizeof(v));
-        fprintf(f, "    sw_val_t *%s = sw_val_float(%g);\n", v, n->v.fval);
+        fprintf(f, "    sw_val_t *%s = sw_val_float(%.17g);\n", v, n->v.fval);
         strncpy(out, v, osz - 1);
         break;
     }

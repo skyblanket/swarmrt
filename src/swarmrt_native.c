@@ -31,7 +31,7 @@
 #include "swarmrt_hotload.h"
 
 /* === Global State === */
-static sw_swarm_t *g_swarm = NULL;
+sw_swarm_t *g_swarm = NULL;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread sw_scheduler_t *tls_scheduler = NULL;
 static __thread sw_process_t *tls_current = NULL;
