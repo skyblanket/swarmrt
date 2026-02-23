@@ -55,14 +55,7 @@ fun extract_reply(resp) {
     result
 }
 
-# Truncate string to max_len chars
-fun trunc(s, max_len) {
-    result = s
-    if (string_length(s) > max_len) {
-        result = string_sub(s, 0, max_len)
-    }
-    result
-}
+# string_truncate() is now a runtime builtin — removed string_truncate() helper.
 
 fun call_opus(sys, msg) {
     body = "{\"model\":\"otonomy-orc\",\"max_tokens\":4096,\"messages\":[{\"role\":\"system\",\"content\":" ++ json_escape(sys) ++ "},{\"role\":\"user\",\"content\":" ++ json_escape(msg) ++ "}]}"
@@ -126,7 +119,7 @@ fun directeur(tables) {
             ets_put(elem(tables, 1), project_id, direction)
             ets_put(elem(tables, 0), project_id, {'concepting', 0})
             # Truncate direction for downstream agents to keep payload small
-            dir_short = trunc(direction, 400)
+            dir_short = string_truncate(direction, 400)
             send(whereis("concepteur"), {'design', project_id, dir_short})
             send(whereis("typographe"), {'copy', project_id, dir_short})
             send(whereis("mouvement"), {'motion', project_id, dir_short})
@@ -246,7 +239,7 @@ fun ingenieur_front(tables) {
             direction = ets_get(elem(tbls, 1), project_id)
             print("[ingenieur] Specs loaded — building HTML...")
             # Truncate each spec to keep payload under proxy limit
-            prompt = "Build a landing page.\nDirection: " ++ trunc(to_string(direction), 200) ++ "\nDesign: " ++ trunc(to_string(design), 200) ++ "\nCopy: " ++ trunc(to_string(copy), 200) ++ "\nAnimation: " ++ trunc(to_string(motion), 200)
+            prompt = "Build a landing page.\nDirection: " ++ string_truncate(to_string(direction), 200) ++ "\nDesign: " ++ string_truncate(to_string(design), 200) ++ "\nCopy: " ++ string_truncate(to_string(copy), 200) ++ "\nAnimation: " ++ string_truncate(to_string(motion), 200)
             html = call_sonnet_long(prompt_ingenieur(), prompt)
             print("[ingenieur] Code generated. Writing files...")
             out_dir = "studio/output/project_" ++ to_string(project_id)
@@ -261,7 +254,7 @@ fun ingenieur_front(tables) {
             print("[ingenieur] Revising project " ++ to_string(project_id))
             feedback = ets_get(elem(tbls, 6), project_id)
             old_html = ets_get(elem(tbls, 5), {'html', project_id})
-            prompt = "Revise this HTML.\nFeedback: " ++ trunc(to_string(feedback), 200) ++ "\nHTML: " ++ trunc(to_string(old_html), 400)
+            prompt = "Revise this HTML.\nFeedback: " ++ string_truncate(to_string(feedback), 200) ++ "\nHTML: " ++ string_truncate(to_string(old_html), 400)
             html = call_sonnet_long(prompt_ingenieur(), prompt)
             out_dir = "studio/output/project_" ++ to_string(project_id)
             file_write(out_dir ++ "/index.html", html)
@@ -298,7 +291,7 @@ fun critique(tables) {
             print("[critique] Reviewing project " ++ to_string(project_id))
             html = ets_get(elem(tbls, 5), {'html', project_id})
             direction = ets_get(elem(tbls, 1), project_id)
-            review_msg = "Review:\nDirection: " ++ trunc(to_string(direction), 150) ++ "\nHTML: " ++ trunc(to_string(html), 500)
+            review_msg = "Review:\nDirection: " ++ string_truncate(to_string(direction), 150) ++ "\nHTML: " ++ string_truncate(to_string(html), 500)
             review = call_opus(prompt_critique(), review_msg)
             print("[critique] Review complete.")
             avg = json_get(review, "average")

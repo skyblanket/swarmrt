@@ -8,6 +8,7 @@ module ResearchLab
 export [main, director, researcher_a, researcher_b, analyst, editor, findings_collector, keeper]
 
 # ── LLM Helpers ──
+# string_truncate() is now a runtime builtin.
 
 fun call_orc(prompt) {
     llm_complete(prompt, %{model: "otonomy-orc", max_tokens: 4096, temperature: 0.7})
@@ -17,14 +18,6 @@ fun call_swarm(prompt) {
     llm_complete(prompt, %{model: "otonomy-swarm", max_tokens: 4096, temperature: 0.7})
 }
 
-fun trunc(s, max_len) {
-    result = s
-    if (string_length(s) > max_len) {
-        result = string_sub(s, 0, max_len)
-    }
-    result
-}
-
 # ── The Director ──
 # Receives question, decomposes into 2 sub-questions, coordinates pipeline.
 
@@ -32,7 +25,7 @@ fun director(tables) {
     receive {
         {'question', project_id, question} ->
             print("[director] Research question received for project " ++ to_string(project_id))
-            print("[director] Q: " ++ trunc(question, 120))
+            print("[director] Q: " ++ string_truncate(question, 120))
 
             decompose_prompt = "You are a research director. Given this research question, decompose it into exactly 2 focused sub-questions for parallel investigation by two researchers. The sub-questions should cover different complementary angles. Output ONLY valid JSON with no markdown fences: {\"sub_q1\": \"...\", \"sub_q2\": \"...\"}\n\nQuestion: " ++ question
             raw = call_orc(decompose_prompt)
@@ -49,8 +42,8 @@ fun director(tables) {
                 sub_q2 = "Analyze the implications and future outlook for: " ++ question
             }
 
-            print("[director] Sub-Q1: " ++ trunc(to_string(sub_q1), 100))
-            print("[director] Sub-Q2: " ++ trunc(to_string(sub_q2), 100))
+            print("[director] Sub-Q1: " ++ string_truncate(to_string(sub_q1), 100))
+            print("[director] Sub-Q2: " ++ string_truncate(to_string(sub_q2), 100))
 
             ets_put(elem(tables, 0), project_id, {'researching', 0})
 
@@ -88,7 +81,7 @@ fun director(tables) {
 fun researcher_a(tables) {
     receive {
         {'research', project_id, sub_question, original_q} ->
-            print("[researcher_a] Investigating: " ++ trunc(to_string(sub_question), 80))
+            print("[researcher_a] Investigating: " ++ string_truncate(to_string(sub_question), 80))
 
             prompt = "You are a deep research analyst (Researcher A). Provide a thorough 300-500 word analysis of the following sub-question. Include key findings, evidence, reasoning, and specific examples.\n\nOriginal research question: " ++ to_string(original_q) ++ "\n\nYour assigned sub-question: " ++ to_string(sub_question)
             findings = call_swarm(prompt)
@@ -105,7 +98,7 @@ fun researcher_a(tables) {
 fun researcher_b(tables) {
     receive {
         {'research', project_id, sub_question, original_q} ->
-            print("[researcher_b] Investigating: " ++ trunc(to_string(sub_question), 80))
+            print("[researcher_b] Investigating: " ++ string_truncate(to_string(sub_question), 80))
 
             prompt = "You are a deep research analyst (Researcher B). Provide a thorough 300-500 word analysis of the following sub-question. Include key findings, evidence, reasoning, and specific examples.\n\nOriginal research question: " ++ to_string(original_q) ++ "\n\nYour assigned sub-question: " ++ to_string(sub_question)
             findings = call_swarm(prompt)
@@ -149,7 +142,7 @@ fun analyst(tables) {
             finding_a = ets_get(elem(tables, 1), {'finding_a', project_id})
             finding_b = ets_get(elem(tables, 1), {'finding_b', project_id})
 
-            prompt = "You are a research analyst. Synthesize these two independent research findings into a unified analysis of 400-600 words. Identify patterns, contradictions, complementary insights, and draw connections. Highlight the most important takeaways.\n\nResearcher A's findings:\n" ++ trunc(to_string(finding_a), 1500) ++ "\n\nResearcher B's findings:\n" ++ trunc(to_string(finding_b), 1500)
+            prompt = "You are a research analyst. Synthesize these two independent research findings into a unified analysis of 400-600 words. Identify patterns, contradictions, complementary insights, and draw connections. Highlight the most important takeaways.\n\nResearcher A's findings:\n" ++ string_truncate(to_string(finding_a), 1500) ++ "\n\nResearcher B's findings:\n" ++ string_truncate(to_string(finding_b), 1500)
             analysis = call_orc(prompt)
 
             print("[analyst] Synthesis complete (" ++ to_string(string_length(analysis)) ++ " chars)")
@@ -171,7 +164,7 @@ fun editor(tables) {
             finding_b = ets_get(elem(tables, 1), {'finding_b', project_id})
             analysis = ets_get(elem(tables, 2), project_id)
 
-            prompt = "You are a professional research report editor. Using the synthesis and raw findings below, produce a polished final research report in markdown format with these sections:\n\n# Executive Summary\n(2-3 concise sentences)\n\n# Key Findings\n(Bulleted list of 4-6 key findings)\n\n# Detailed Analysis\n(The core synthesis, 400-600 words, well-structured with subheadings)\n\n# Conclusions & Implications\n(3-4 sentences on what this means going forward)\n\n---\n\nSynthesis:\n" ++ trunc(to_string(analysis), 2000) ++ "\n\nRaw Finding A:\n" ++ trunc(to_string(finding_a), 800) ++ "\n\nRaw Finding B:\n" ++ trunc(to_string(finding_b), 800)
+            prompt = "You are a professional research report editor. Using the synthesis and raw findings below, produce a polished final research report in markdown format with these sections:\n\n# Executive Summary\n(2-3 concise sentences)\n\n# Key Findings\n(Bulleted list of 4-6 key findings)\n\n# Detailed Analysis\n(The core synthesis, 400-600 words, well-structured with subheadings)\n\n# Conclusions & Implications\n(3-4 sentences on what this means going forward)\n\n---\n\nSynthesis:\n" ++ string_truncate(to_string(analysis), 2000) ++ "\n\nRaw Finding A:\n" ++ string_truncate(to_string(finding_a), 800) ++ "\n\nRaw Finding B:\n" ++ string_truncate(to_string(finding_b), 800)
             report = call_swarm(prompt)
 
             print("[editor] Report polished (" ++ to_string(string_length(report)) ++ " chars)")

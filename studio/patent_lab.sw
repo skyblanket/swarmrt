@@ -18,6 +18,8 @@ export [main, director, tool_agent, search_worker, wait_all_3, research_agent,
         market_analyst, pitch_writer, keeper]
 
 # ── LLM Helpers ──
+# strip_html(), clean_json(), string_truncate() are now runtime builtins.
+# llm_complete() now supports retries & min_chars in opts map.
 
 fun call_orc(prompt) {
     llm_complete(prompt, %{model: "otonomy-orc", max_tokens: 4096, temperature: 0.7})
@@ -27,75 +29,30 @@ fun call_swarm(prompt) {
     llm_complete(prompt, %{model: "otonomy-swarm", max_tokens: 4096, temperature: 0.7})
 }
 
-fun call_orc_long(prompt) {
-    llm_complete(prompt, %{model: "otonomy-orc", max_tokens: 16384, temperature: 0.7})
-}
-
-fun call_swarm_long(prompt) {
-    llm_complete(prompt, %{model: "otonomy-swarm", max_tokens: 16384, temperature: 0.7})
-}
-
 fun call_llm(prompt, model) {
     result = ""
     if (model == 'orc') { result = call_orc(prompt) }
     if (model == 'swarm') { result = call_swarm(prompt) }
-    if (model == 'orc_long') { result = call_orc_long(prompt) }
-    if (model == 'swarm_long') { result = call_swarm_long(prompt) }
+    if (model == 'orc_long') { result = llm_complete(prompt, %{model: "otonomy-orc", max_tokens: 16384, temperature: 0.7}) }
+    if (model == 'swarm_long') { result = llm_complete(prompt, %{model: "otonomy-swarm", max_tokens: 16384, temperature: 0.7}) }
     result
 }
 
 fun call_with_retry(prompt, model, retries) {
-    result = call_llm(prompt, model)
-    len = 0
-    if (result != nil) {
-        len = string_length(to_string(result))
-    }
-    if (len < 50) {
-        if (retries > 0) {
-            print("[retry] Short/empty response (" ++ to_string(len) ++ " chars), retrying...")
-            sleep(2000)
-            result = call_with_retry(prompt, model, retries - 1)
-        }
-    }
+    result = ""
+    if (model == 'orc') { result = llm_complete(prompt, %{model: "otonomy-orc", max_tokens: 4096, retries: retries}) }
+    if (model == 'swarm') { result = llm_complete(prompt, %{model: "otonomy-swarm", max_tokens: 4096, retries: retries}) }
+    if (model == 'orc_long') { result = llm_complete(prompt, %{model: "otonomy-orc", max_tokens: 16384, retries: retries}) }
+    if (model == 'swarm_long') { result = llm_complete(prompt, %{model: "otonomy-swarm", max_tokens: 16384, retries: retries}) }
     result
-}
-
-fun trunc(s, max_len) {
-    result = s
-    if (string_length(s) > max_len) {
-        result = string_sub(s, 0, max_len)
-    }
-    result
-}
-
-fun clean_json(raw) {
-    text = string_trim(to_string(raw))
-    text = string_replace(text, "```json", "")
-    text = string_replace(text, "```JSON", "")
-    text = string_replace(text, "```", "")
-    string_trim(text)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WEB TOOL HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-fun strip_html(html) {
-    result = ""
-    if (html != nil) {
-        text = to_string(html)
-        if (string_length(text) > 10) {
-            tmp = "/tmp/sw_" ++ to_string(random_int(100000, 999999))
-            file_write(tmp, text)
-            stripped = shell("sed -e 's/<script[^>]*>[^<]*<\\/script>//gi' -e 's/<style[^>]*>[^<]*<\\/style>//gi' -e 's/<nav[^>]*>[^<]*<\\/nav>//gi' -e 's/<[^>]*>//g' " ++ tmp ++ " | tr -s '[:space:]' ' ' | head -c 8000; rm -f " ++ tmp)
-            result = elem(stripped, 1)
-        }
-    }
-    result
-}
-
 fun web_search(query) {
-    print("[tool] SEARCH: " ++ trunc(to_string(query), 60))
+    print("[tool] SEARCH: " ++ string_truncate(to_string(query), 60))
     encoded = string_replace(string_replace(string_replace(to_string(query), " ", "+"), "&", "%26"), "#", "%23")
     url = "https://html.duckduckgo.com/html/?q=" ++ encoded
     raw = http_get(url)
@@ -108,7 +65,7 @@ fun web_search(query) {
 }
 
 fun fetch_url(url) {
-    print("[tool] FETCH: " ++ trunc(to_string(url), 80))
+    print("[tool] FETCH: " ++ string_truncate(to_string(url), 80))
     safe_url = string_replace(string_replace(to_string(url), "'", ""), "\"", "")
     raw = http_get(safe_url)
     result = strip_html(raw)
@@ -120,12 +77,12 @@ fun fetch_url(url) {
 }
 
 fun search_patents(query) {
-    print("[tool] PATENTS: " ++ trunc(to_string(query), 60))
+    print("[tool] PATENTS: " ++ string_truncate(to_string(query), 60))
     web_search(to_string(query) ++ " patent site:patents.google.com OR site:uspto.gov")
 }
 
 fun search_scholar(query) {
-    print("[tool] SCHOLAR: " ++ trunc(to_string(query), 60))
+    print("[tool] SCHOLAR: " ++ string_truncate(to_string(query), 60))
     web_search(to_string(query) ++ " research paper site:arxiv.org OR site:scholar.google.com")
 }
 
@@ -166,7 +123,7 @@ fun tool_agent(system, task, depth, max_depth, model) {
         if (depth < max_depth) {
             query = extract_tool_arg(response, "SEARCH: ")
             tool_result = web_search(query)
-            new_task = task ++ "\n\n--- Your previous response ---\n" ++ trunc(response, 500) ++ "\n\n--- Search results for '" ++ trunc(query, 40) ++ "' ---\n" ++ trunc(tool_result, 3000)
+            new_task = task ++ "\n\n--- Your previous response ---\n" ++ string_truncate(response, 500) ++ "\n\n--- Search results for '" ++ string_truncate(query, 40) ++ "' ---\n" ++ string_truncate(tool_result, 3000)
             result = tool_agent(system, new_task, depth + 1, max_depth, model)
             used_tool = 'true'
         }
@@ -177,7 +134,7 @@ fun tool_agent(system, task, depth, max_depth, model) {
             if (depth < max_depth) {
                 url = extract_tool_arg(response, "FETCH: ")
                 tool_result = fetch_url(url)
-                new_task = task ++ "\n\n--- Your previous response ---\n" ++ trunc(response, 500) ++ "\n\n--- Content from " ++ trunc(url, 60) ++ " ---\n" ++ trunc(tool_result, 3000)
+                new_task = task ++ "\n\n--- Your previous response ---\n" ++ string_truncate(response, 500) ++ "\n\n--- Content from " ++ string_truncate(url, 60) ++ " ---\n" ++ string_truncate(tool_result, 3000)
                 result = tool_agent(system, new_task, depth + 1, max_depth, model)
                 used_tool = 'true'
             }
@@ -189,7 +146,7 @@ fun tool_agent(system, task, depth, max_depth, model) {
             if (depth < max_depth) {
                 query = extract_tool_arg(response, "PATENTS: ")
                 tool_result = search_patents(query)
-                new_task = task ++ "\n\n--- Your previous response ---\n" ++ trunc(response, 500) ++ "\n\n--- Patent results for '" ++ trunc(query, 40) ++ "' ---\n" ++ trunc(tool_result, 3000)
+                new_task = task ++ "\n\n--- Your previous response ---\n" ++ string_truncate(response, 500) ++ "\n\n--- Patent results for '" ++ string_truncate(query, 40) ++ "' ---\n" ++ string_truncate(tool_result, 3000)
                 result = tool_agent(system, new_task, depth + 1, max_depth, model)
                 used_tool = 'true'
             }
@@ -201,7 +158,7 @@ fun tool_agent(system, task, depth, max_depth, model) {
             if (depth < max_depth) {
                 query = extract_tool_arg(response, "SCHOLAR: ")
                 tool_result = search_scholar(query)
-                new_task = task ++ "\n\n--- Your previous response ---\n" ++ trunc(response, 500) ++ "\n\n--- Academic results for '" ++ trunc(query, 40) ++ "' ---\n" ++ trunc(tool_result, 3000)
+                new_task = task ++ "\n\n--- Your previous response ---\n" ++ string_truncate(response, 500) ++ "\n\n--- Academic results for '" ++ string_truncate(query, 40) ++ "' ---\n" ++ string_truncate(tool_result, 3000)
                 result = tool_agent(system, new_task, depth + 1, max_depth, model)
             }
         }
@@ -258,9 +215,9 @@ fun research_agent(system, task, model) {
     if (q3 == nil) { q3 = "" }
 
     print("[research_agent] 3 parallel searches:")
-    print("[research_agent]   Q1: " ++ trunc(to_string(q1), 60))
-    print("[research_agent]   Q2: " ++ trunc(to_string(q2), 60))
-    print("[research_agent]   Q3: " ++ trunc(to_string(q3), 60))
+    print("[research_agent]   Q1: " ++ string_truncate(to_string(q1), 60))
+    print("[research_agent]   Q2: " ++ string_truncate(to_string(q2), 60))
+    print("[research_agent]   Q3: " ++ string_truncate(to_string(q3), 60))
 
     # Phase 2: Execute all 3 searches as spawned parallel processes
     t_search = ets_new()
@@ -279,7 +236,7 @@ fun research_agent(system, task, model) {
     if (r3 == nil) { r3 = "" }
 
     # Phase 3: Single LLM call with all gathered data
-    analysis_prompt = system ++ "\n\nUse these web research results to inform your analysis. Cite specific findings and data.\n\nSearch 1 (" ++ trunc(to_string(q1), 40) ++ "):\n" ++ trunc(to_string(r1), 2000) ++ "\n\nSearch 2 (" ++ trunc(to_string(q2), 40) ++ "):\n" ++ trunc(to_string(r2), 2000) ++ "\n\nSearch 3 (" ++ trunc(to_string(q3), 40) ++ "):\n" ++ trunc(to_string(r3), 2000) ++ "\n\nTask:\n" ++ task
+    analysis_prompt = system ++ "\n\nUse these web research results to inform your analysis. Cite specific findings and data.\n\nSearch 1 (" ++ string_truncate(to_string(q1), 40) ++ "):\n" ++ string_truncate(to_string(r1), 2000) ++ "\n\nSearch 2 (" ++ string_truncate(to_string(q2), 40) ++ "):\n" ++ string_truncate(to_string(r2), 2000) ++ "\n\nSearch 3 (" ++ string_truncate(to_string(q3), 40) ++ "):\n" ++ string_truncate(to_string(r3), 2000) ++ "\n\nTask:\n" ++ task
     call_llm(analysis_prompt, model)
 }
 
@@ -291,7 +248,7 @@ fun director(tables) {
     receive {
         {'question', project_id, question} ->
             print("[director] Research question received for project " ++ to_string(project_id))
-            print("[director] Q: " ++ trunc(question, 120))
+            print("[director] Q: " ++ string_truncate(question, 120))
             ets_put(elem(tables, 0), {'question', project_id}, question)
             ets_put(elem(tables, 0), {'val_rev', project_id}, {0})
             ets_put(elem(tables, 0), {'pat_rev', project_id}, {0})
@@ -307,9 +264,9 @@ fun director(tables) {
             if (market_q == nil) { market_q = "Analyze the commercial opportunity and market landscape for: " ++ question }
             if (prior_art_q == nil) { prior_art_q = "Survey existing patents, academic literature, and prior art related to: " ++ question }
 
-            print("[director] Tech Q: " ++ trunc(to_string(tech_q), 80))
-            print("[director] Market Q: " ++ trunc(to_string(market_q), 80))
-            print("[director] Prior Art Q: " ++ trunc(to_string(prior_art_q), 80))
+            print("[director] Tech Q: " ++ string_truncate(to_string(tech_q), 80))
+            print("[director] Market Q: " ++ string_truncate(to_string(market_q), 80))
+            print("[director] Prior Art Q: " ++ string_truncate(to_string(prior_art_q), 80))
 
             ets_put(elem(tables, 0), project_id, {'researching'})
             ets_put(elem(tables, 1), {'finding_count', project_id}, {0})
@@ -457,10 +414,10 @@ fun director(tables) {
 fun researcher_tech(tables) {
     receive {
         {'research', project_id, sub_question, original_q} ->
-            print("[researcher_tech] Investigating: " ++ trunc(to_string(sub_question), 80))
-            system = "You are a deep technical research analyst. Use tools to find specific technical details, recent papers, material properties, and engineering data. Provide a thorough 400-600 word analysis with citations.\n\nCRITICAL: Your final output must be ONLY the analysis. No planning notes, no thinking, no word counts."
+            print("[researcher_tech] Investigating: " ++ string_truncate(to_string(sub_question), 80))
+            system = "You are a deep technical research analyst. Provide a thorough 400-600 word analysis citing specific data from the web research provided. Include technical details, mechanisms, materials, and feasibility."
             task = "Original question: " ++ to_string(original_q) ++ "\n\nSub-question: " ++ to_string(sub_question)
-            findings = tool_agent(system, task, 0, 3, 'swarm')
+            findings = research_agent(system, task, 'swarm')
             print("[researcher_tech] Findings ready (" ++ to_string(string_length(findings)) ++ " chars)")
             ets_put(elem(tables, 1), {'finding_tech', project_id}, findings)
             send(whereis("findings_collector"), {'finding_done', project_id, 'tech'})
@@ -471,10 +428,10 @@ fun researcher_tech(tables) {
 fun researcher_market(tables) {
     receive {
         {'research', project_id, sub_question, original_q} ->
-            print("[researcher_market] Investigating: " ++ trunc(to_string(sub_question), 80))
-            system = "You are a market research analyst. Use tools to find current market data, company valuations, industry reports, and competitive intelligence. Provide a thorough 400-600 word analysis with real market data.\n\nCRITICAL: Your final output must be ONLY the analysis. No planning notes, no thinking, no word counts."
+            print("[researcher_market] Investigating: " ++ string_truncate(to_string(sub_question), 80))
+            system = "You are a market research analyst. Provide a thorough 400-600 word analysis citing real market data from the web research provided. Include market size, key players, growth trends, competitive dynamics."
             task = "Original question: " ++ to_string(original_q) ++ "\n\nSub-question: " ++ to_string(sub_question)
-            findings = tool_agent(system, task, 0, 3, 'swarm')
+            findings = research_agent(system, task, 'swarm')
             print("[researcher_market] Findings ready (" ++ to_string(string_length(findings)) ++ " chars)")
             ets_put(elem(tables, 1), {'finding_market', project_id}, findings)
             send(whereis("findings_collector"), {'finding_done', project_id, 'market'})
@@ -485,10 +442,10 @@ fun researcher_market(tables) {
 fun researcher_prior_art(tables) {
     receive {
         {'research', project_id, sub_question, original_q} ->
-            print("[researcher_prior_art] Investigating: " ++ trunc(to_string(sub_question), 80))
-            system = "You are a patent research specialist. Use PATENTS: for patent databases, SCHOLAR: for academic papers, SEARCH: for general web. Find real patent numbers, assignees, filing dates, and academic citations. Identify gaps in existing IP.\n\nCRITICAL: Your final output must be ONLY the analysis. No planning notes, no thinking, no word counts."
+            print("[researcher_prior_art] Investigating: " ++ string_truncate(to_string(sub_question), 80))
+            system = "You are a patent research specialist. Provide a thorough 400-600 word analysis citing real patent numbers, assignees, and academic references from the web research provided. Identify gaps in existing IP landscape."
             task = "Original question: " ++ to_string(original_q) ++ "\n\nSub-question: " ++ to_string(sub_question)
-            findings = tool_agent(system, task, 0, 4, 'swarm')
+            findings = research_agent(system, task, 'swarm')
             print("[researcher_prior_art] Findings ready (" ++ to_string(string_length(findings)) ++ " chars)")
             ets_put(elem(tables, 1), {'finding_prior_art', project_id}, findings)
             send(whereis("findings_collector"), {'finding_done', project_id, 'prior_art'})
@@ -520,7 +477,7 @@ fun analyst(tables) {
             finding_tech = ets_get(elem(tables, 1), {'finding_tech', project_id})
             finding_market = ets_get(elem(tables, 1), {'finding_market', project_id})
             finding_prior_art = ets_get(elem(tables, 1), {'finding_prior_art', project_id})
-            prompt = "You are a senior research analyst. Synthesize these three findings into a unified 600-800 word analysis. Preserve specific numbers, patent references, and data points. Identify patterns across technical, market, and prior art dimensions.\n\nCRITICAL: Output ONLY the final synthesis. No planning notes, no thinking, no word counts. Start directly with the analysis.\n\nTechnical:\n" ++ trunc(to_string(finding_tech), 2000) ++ "\n\nMarket:\n" ++ trunc(to_string(finding_market), 2000) ++ "\n\nPrior art:\n" ++ trunc(to_string(finding_prior_art), 2000)
+            prompt = "You are a senior research analyst. Synthesize these three findings into a unified 600-800 word analysis. Preserve specific numbers, patent references, and data points. Identify patterns across technical, market, and prior art dimensions.\n\nCRITICAL: Output ONLY the final synthesis. No planning notes, no thinking, no word counts. Start directly with the analysis.\n\nTechnical:\n" ++ string_truncate(to_string(finding_tech), 2000) ++ "\n\nMarket:\n" ++ string_truncate(to_string(finding_market), 2000) ++ "\n\nPrior art:\n" ++ string_truncate(to_string(finding_prior_art), 2000)
             analysis = call_with_retry(prompt, 'orc', 1)
             print("[analyst] Synthesis complete (" ++ to_string(string_length(analysis)) ++ " chars)")
             ets_put(elem(tables, 2), project_id, analysis)
@@ -537,7 +494,7 @@ fun research_editor(tables) {
             finding_market = ets_get(elem(tables, 1), {'finding_market', project_id})
             finding_prior_art = ets_get(elem(tables, 1), {'finding_prior_art', project_id})
             analysis = ets_get(elem(tables, 2), project_id)
-            prompt = "You are a professional research report editor. Produce a polished report in markdown. Preserve all citations, patent numbers, market figures.\n\nSections:\n# Executive Summary\n(3-4 sentences)\n# Technical Landscape\n(200-300 words)\n# Market Opportunity\n(200-300 words)\n# Prior Art & Patent Landscape\n(200-300 words)\n# Synthesis & Key Insights\n(300-400 words)\n# Patentability Assessment\n(100-200 words)\n\nCRITICAL: Output ONLY the final markdown report. No planning notes, no word count checks, no revision drafts, no thinking. Start with '# Executive Summary'.\n\nSynthesis:\n" ++ trunc(to_string(analysis), 2500) ++ "\n\nTechnical:\n" ++ trunc(to_string(finding_tech), 1200) ++ "\n\nMarket:\n" ++ trunc(to_string(finding_market), 1200) ++ "\n\nPrior art:\n" ++ trunc(to_string(finding_prior_art), 1200)
+            prompt = "You are a professional research report editor. Produce a polished report in markdown. Preserve all citations, patent numbers, market figures.\n\nSections:\n# Executive Summary\n(3-4 sentences)\n# Technical Landscape\n(200-300 words)\n# Market Opportunity\n(200-300 words)\n# Prior Art & Patent Landscape\n(200-300 words)\n# Synthesis & Key Insights\n(300-400 words)\n# Patentability Assessment\n(100-200 words)\n\nCRITICAL: Output ONLY the final markdown report. No planning notes, no word count checks, no revision drafts, no thinking. Start with '# Executive Summary'.\n\nSynthesis:\n" ++ string_truncate(to_string(analysis), 2500) ++ "\n\nTechnical:\n" ++ string_truncate(to_string(finding_tech), 1200) ++ "\n\nMarket:\n" ++ string_truncate(to_string(finding_market), 1200) ++ "\n\nPrior art:\n" ++ string_truncate(to_string(finding_prior_art), 1200)
             report = call_with_retry(prompt, 'swarm', 1)
             print("[research_editor] Report polished (" ++ to_string(string_length(report)) ++ " chars)")
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
@@ -554,7 +511,7 @@ fun research_editor(tables) {
             peer_review = ets_get(elem(tables, 3), {'peer_review', project_id})
             novelty = ets_get(elem(tables, 3), {'novelty', project_id})
             val_decision = ets_get(elem(tables, 3), {'validator_decision', project_id})
-            prompt = "You are a research report editor performing a TARGETED REVISION. Address every concern from the peer review and novelty assessment. Strengthen weak areas. Fill gaps. Same markdown structure.\n\nSections: Executive Summary, Technical Landscape, Market Opportunity, Prior Art & Patent Landscape, Synthesis & Key Insights, Patentability Assessment.\n\nCRITICAL: Output ONLY the complete revised report. No planning, no thinking, no word counts. Start with '# Executive Summary'.\n\nPeer review:\n" ++ trunc(to_string(peer_review), 1500) ++ "\n\nNovelty assessment:\n" ++ trunc(to_string(novelty), 1000) ++ "\n\nValidator:\n" ++ trunc(to_string(val_decision), 500) ++ "\n\nPrevious report:\n" ++ trunc(to_string(old_report), 3000)
+            prompt = "You are a research report editor performing a TARGETED REVISION. Address every concern from the peer review and novelty assessment. Strengthen weak areas. Fill gaps. Same markdown structure.\n\nSections: Executive Summary, Technical Landscape, Market Opportunity, Prior Art & Patent Landscape, Synthesis & Key Insights, Patentability Assessment.\n\nCRITICAL: Output ONLY the complete revised report. No planning, no thinking, no word counts. Start with '# Executive Summary'.\n\nPeer review:\n" ++ string_truncate(to_string(peer_review), 1500) ++ "\n\nNovelty assessment:\n" ++ string_truncate(to_string(novelty), 1000) ++ "\n\nValidator:\n" ++ string_truncate(to_string(val_decision), 500) ++ "\n\nPrevious report:\n" ++ string_truncate(to_string(old_report), 3000)
             report = call_with_retry(prompt, 'orc', 1)
             print("[research_editor] Revision complete (" ++ to_string(string_length(report)) ++ " chars)")
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
@@ -574,7 +531,7 @@ fun peer_reviewer(tables) {
         {'review', project_id} ->
             print("[peer_reviewer] Reviewing research for project " ++ to_string(project_id))
             report = ets_get(elem(tables, 2), {'report', project_id})
-            prompt = "You are a rigorous peer reviewer. Evaluate:\n1. Methodological soundness\n2. Logical gaps\n3. Unsupported claims\n4. Completeness\n5. Technical accuracy\n6. Document quality — if it contains planning notes, word counts, or draft artifacts, rate confidence LOW immediately.\n\nRate confidence: HIGH, MEDIUM, or LOW. 300-400 words.\n\nCRITICAL: Output ONLY the review.\n\nReport:\n" ++ trunc(to_string(report), 3000)
+            prompt = "You are a rigorous peer reviewer. Evaluate:\n1. Methodological soundness\n2. Logical gaps\n3. Unsupported claims\n4. Completeness\n5. Technical accuracy\n6. Document quality — if it contains planning notes, word counts, or draft artifacts, rate confidence LOW immediately.\n\nRate confidence: HIGH, MEDIUM, or LOW. 300-400 words.\n\nCRITICAL: Output ONLY the review.\n\nReport:\n" ++ string_truncate(to_string(report), 3000)
             review = call_with_retry(prompt, 'swarm', 1)
             print("[peer_reviewer] Review complete (" ++ to_string(string_length(review)) ++ " chars)")
             ets_put(elem(tables, 3), {'peer_review', project_id}, review)
@@ -590,7 +547,7 @@ fun novelty_assessor(tables) {
             report = ets_get(elem(tables, 2), {'report', project_id})
             prior_art = ets_get(elem(tables, 1), {'finding_prior_art', project_id})
             system = "You are a patent novelty examiner. Verify innovations against prior art by searching online. For each: state innovation, SEARCH/PATENTS for closest prior art, rate NOVEL/INCREMENTAL/KNOWN, cite evidence. Overall: HIGH/MEDIUM/LOW. 300-400 words.\n\nCRITICAL: Final output must be ONLY the assessment."
-            task = "Report:\n" ++ trunc(to_string(report), 2000) ++ "\n\nPrior art:\n" ++ trunc(to_string(prior_art), 1500)
+            task = "Report:\n" ++ string_truncate(to_string(report), 2000) ++ "\n\nPrior art:\n" ++ string_truncate(to_string(prior_art), 1500)
             assessment = tool_agent(system, task, 0, 2, 'swarm')
             print("[novelty_assessor] Assessment complete (" ++ to_string(string_length(assessment)) ++ " chars)")
             ets_put(elem(tables, 3), {'novelty', project_id}, assessment)
@@ -623,13 +580,13 @@ fun validator(tables) {
             peer_review = ets_get(elem(tables, 3), {'peer_review', project_id})
             novelty = ets_get(elem(tables, 3), {'novelty', project_id})
             report = ets_get(elem(tables, 2), {'report', project_id})
-            prompt = "You are a STRICT patent pipeline gatekeeper.\n\nHARD RULES (automatic NO_GO if ANY true):\n- Peer review confidence is LOW\n- Report contains planning notes, word counts, or draft artifacts\n- ALL novelty elements rated KNOWN\n- Significant factual errors\n\nGO requires ALL:\n- Peer review MEDIUM or HIGH\n- At least one NOVEL element\n- No fatal flaws\n- Report is polished, finished\n\nOutput ONLY valid JSON, no fences:\n{\"decision\": \"go\" or \"no_go\", \"reasoning\": \"2-3 sentences\", \"key_concerns\": \"...\", \"strongest_claims\": \"...\"}\n\nPeer review:\n" ++ trunc(to_string(peer_review), 1500) ++ "\n\nNovelty:\n" ++ trunc(to_string(novelty), 1500) ++ "\n\nReport (first 500 chars):\n" ++ trunc(to_string(report), 500)
+            prompt = "You are a STRICT patent pipeline gatekeeper.\n\nHARD RULES (automatic NO_GO if ANY true):\n- Peer review confidence is LOW\n- Report contains planning notes, word counts, or draft artifacts\n- ALL novelty elements rated KNOWN\n- Significant factual errors\n\nGO requires ALL:\n- Peer review MEDIUM or HIGH\n- At least one NOVEL element\n- No fatal flaws\n- Report is polished, finished\n\nOutput ONLY valid JSON, no fences:\n{\"decision\": \"go\" or \"no_go\", \"reasoning\": \"2-3 sentences\", \"key_concerns\": \"...\", \"strongest_claims\": \"...\"}\n\nPeer review:\n" ++ string_truncate(to_string(peer_review), 1500) ++ "\n\nNovelty:\n" ++ string_truncate(to_string(novelty), 1500) ++ "\n\nReport (first 500 chars):\n" ++ string_truncate(to_string(report), 500)
             raw = clean_json(call_with_retry(prompt, 'orc', 1))
             decision_str = json_get(raw, "decision")
             reasoning = json_get(raw, "reasoning")
             if (reasoning == nil) { reasoning = to_string(raw) }
             print("[validator] Decision: " ++ to_string(decision_str))
-            print("[validator] Reasoning: " ++ trunc(to_string(reasoning), 120))
+            print("[validator] Reasoning: " ++ string_truncate(to_string(reasoning), 120))
             ets_put(elem(tables, 3), {'validator_decision', project_id}, raw)
             val_report = "# Validation Report\n\n## Peer Review\n" ++ to_string(peer_review) ++ "\n\n## Novelty Assessment\n" ++ to_string(novelty) ++ "\n\n## Decision: " ++ to_string(decision_str) ++ "\n\n" ++ to_string(reasoning)
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
@@ -657,7 +614,7 @@ fun patent_strategist(tables) {
             if (strongest == nil) { strongest = "See research report" }
             if (concerns == nil) { concerns = "None identified" }
             system = "You are a patent strategist. Search for comparable patents. Develop: TITLE, ABSTRACT (150 words), 2-3 INDEPENDENT CLAIMS, 4-6 DEPENDENT CLAIMS, CLAIM HIERARCHY, KEY DIFFERENTIATORS, PROSECUTION STRATEGY. 600-800 words.\n\nCRITICAL: Output ONLY the strategy. No planning."
-            task = "Strongest: " ++ trunc(to_string(strongest), 400) ++ "\nConcerns: " ++ trunc(to_string(concerns), 300) ++ "\n\nReport:\n" ++ trunc(to_string(report), 2500)
+            task = "Strongest: " ++ string_truncate(to_string(strongest), 400) ++ "\nConcerns: " ++ string_truncate(to_string(concerns), 300) ++ "\n\nReport:\n" ++ string_truncate(to_string(report), 2500)
             strategy = tool_agent(system, task, 0, 2, 'orc')
             print("[patent_strategist] Strategy complete (" ++ to_string(string_length(strategy)) ++ " chars)")
             ets_put(elem(tables, 4), {'strategy', project_id}, strategy)
@@ -672,7 +629,7 @@ fun patent_drafter(tables) {
             print("[patent_drafter] Drafting patent for project " ++ to_string(project_id))
             strategy = ets_get(elem(tables, 4), {'strategy', project_id})
             report = ets_get(elem(tables, 2), {'report', project_id})
-            prompt = "You are a patent attorney drafting a USPTO-style patent application. Write a COMPLETE application:\n\n# [PATENT TITLE]\n## Field of the Invention\n## Background of the Invention\n(200-300 words)\n## Summary of the Invention\n(150-200 words)\n## Detailed Description of Preferred Embodiments\n(400-600 words, 3+ working examples)\n## Claims\n(2-3 independent + 4-6 dependent, each complete single sentence)\n## Abstract\n(150 words max)\n\nEvery claim must be COMPLETE. No truncation.\n\nCRITICAL: Output ONLY the patent. No planning, no thinking. Start with title.\n\nStrategy:\n" ++ trunc(to_string(strategy), 3000) ++ "\n\nReport:\n" ++ trunc(to_string(report), 2000)
+            prompt = "You are a patent attorney drafting a USPTO-style patent application. Write a COMPLETE application:\n\n# [PATENT TITLE]\n## Field of the Invention\n## Background of the Invention\n(200-300 words)\n## Summary of the Invention\n(150-200 words)\n## Detailed Description of Preferred Embodiments\n(400-600 words, 3+ working examples)\n## Claims\n(2-3 independent + 4-6 dependent, each complete single sentence)\n## Abstract\n(150 words max)\n\nEvery claim must be COMPLETE. No truncation.\n\nCRITICAL: Output ONLY the patent. No planning, no thinking. Start with title.\n\nStrategy:\n" ++ string_truncate(to_string(strategy), 3000) ++ "\n\nReport:\n" ++ string_truncate(to_string(report), 2000)
             draft = call_with_retry(prompt, 'orc_long', 1)
             print("[patent_drafter] Draft complete (" ++ to_string(string_length(draft)) ++ " chars)")
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
@@ -691,7 +648,7 @@ fun patent_drafter(tables) {
             pat_rev_entry = ets_get(elem(tables, 0), {'pat_rev', project_id})
             version = 2
             if (pat_rev_entry != nil) { version = elem(pat_rev_entry, 0) + 1 }
-            prompt = "You are a patent attorney revising based on reviewer feedback. Address EVERY concern. Strengthen weak claims. Ensure ALL claims complete.\n\nCRITICAL: Output ONLY the revised patent. No planning. Start with title.\n\nFeedback:\n" ++ trunc(to_string(review_feedback), 2000) ++ "\n\nCurrent draft:\n" ++ trunc(to_string(old_draft), 3500)
+            prompt = "You are a patent attorney revising based on reviewer feedback. Address EVERY concern. Strengthen weak claims. Ensure ALL claims complete.\n\nCRITICAL: Output ONLY the revised patent. No planning. Start with title.\n\nFeedback:\n" ++ string_truncate(to_string(review_feedback), 2000) ++ "\n\nCurrent draft:\n" ++ string_truncate(to_string(old_draft), 3500)
             draft = call_with_retry(prompt, 'orc_long', 1)
             print("[patent_drafter] Revision complete (" ++ to_string(string_length(draft)) ++ " chars)")
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
@@ -710,7 +667,7 @@ fun patent_reviewer(tables) {
             print("[patent_reviewer] Reviewing patent for project " ++ to_string(project_id))
             draft = ets_get(elem(tables, 4), {'draft', project_id})
             strategy = ets_get(elem(tables, 4), {'strategy', project_id})
-            prompt = "Score this patent 1-10 each:\n1. NOVELTY\n2. BREADTH\n3. DEFENSIBILITY\n\nAlso check: claim clarity, specification support, completeness (any cut off?).\nPASSES if average >= 7.\n\nOutput ONLY valid JSON, no fences:\n{\"novelty\": N, \"breadth\": N, \"defensibility\": N, \"average\": N.N, \"passed\": true/false, \"strengths\": \"...\", \"weaknesses\": \"...\", \"feedback\": \"...\"}\n\nStrategy:\n" ++ trunc(to_string(strategy), 1500) ++ "\n\nDraft:\n" ++ trunc(to_string(draft), 3500)
+            prompt = "Score this patent 1-10 each:\n1. NOVELTY\n2. BREADTH\n3. DEFENSIBILITY\n\nAlso check: claim clarity, specification support, completeness (any cut off?).\nPASSES if average >= 7.\n\nOutput ONLY valid JSON, no fences:\n{\"novelty\": N, \"breadth\": N, \"defensibility\": N, \"average\": N.N, \"passed\": true/false, \"strengths\": \"...\", \"weaknesses\": \"...\", \"feedback\": \"...\"}\n\nStrategy:\n" ++ string_truncate(to_string(strategy), 1500) ++ "\n\nDraft:\n" ++ string_truncate(to_string(draft), 3500)
             raw = clean_json(call_with_retry(prompt, 'orc', 1))
             avg = json_get(raw, "average")
             passed = json_get(raw, "passed")
@@ -748,8 +705,8 @@ fun market_analyst(tables) {
             draft = ets_get(elem(tables, 4), {'draft', project_id})
             strategy = ets_get(elem(tables, 4), {'strategy', project_id})
             system = "You are a market analyst. Search for real market data. Produce markdown:\n## Target Buyers\n## Market Size (TAM/SAM/SOM)\n## Competitive Landscape\n## Licensing Strategy\n## Risk Factors\n## Revenue Projections (3-year)\n600-800 words.\n\nCRITICAL: Output ONLY the analysis. No planning."
-            task = "Strategy:\n" ++ trunc(to_string(strategy), 1500) ++ "\n\nDraft:\n" ++ trunc(to_string(draft), 1200) ++ "\n\nReport:\n" ++ trunc(to_string(report), 1200)
-            analysis = tool_agent(system, task, 0, 3, 'swarm')
+            task = "Strategy:\n" ++ string_truncate(to_string(strategy), 1500) ++ "\n\nDraft:\n" ++ string_truncate(to_string(draft), 1200) ++ "\n\nReport:\n" ++ string_truncate(to_string(report), 1200)
+            analysis = research_agent(system, task, 'swarm')
             print("[market_analyst] Analysis complete (" ++ to_string(string_length(analysis)) ++ " chars)")
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
             file_mkdir(out_dir)
@@ -768,7 +725,7 @@ fun pitch_writer(tables) {
             draft = ets_get(elem(tables, 4), {'draft', project_id})
             review = ets_get(elem(tables, 4), {'review', project_id})
             strategy = ets_get(elem(tables, 4), {'strategy', project_id})
-            prompt = "Write a compelling 1-page pitch (400-500 words) in markdown for a VP of R&D:\n\n# [Compelling headline]\n**The Opportunity** (2-3 sentences)\n**The Innovation** (3-4 sentences)\n**Market Impact** (key numbers)\n**Patent Strength** (scores, claims)\n**The Ask** (terms, next steps)\n---\n*Generated by Patent Research Lab — SwarmRT*\n\nCRITICAL: Output ONLY the pitch. No planning.\n\nMarket:\n" ++ trunc(to_string(market), 1500) ++ "\n\nStrategy:\n" ++ trunc(to_string(strategy), 1000) ++ "\n\nReview:\n" ++ trunc(to_string(review), 800) ++ "\n\nDraft:\n" ++ trunc(to_string(draft), 800)
+            prompt = "Write a compelling 1-page pitch (400-500 words) in markdown for a VP of R&D:\n\n# [Compelling headline]\n**The Opportunity** (2-3 sentences)\n**The Innovation** (3-4 sentences)\n**Market Impact** (key numbers)\n**Patent Strength** (scores, claims)\n**The Ask** (terms, next steps)\n---\n*Generated by Patent Research Lab — SwarmRT*\n\nCRITICAL: Output ONLY the pitch. No planning.\n\nMarket:\n" ++ string_truncate(to_string(market), 1500) ++ "\n\nStrategy:\n" ++ string_truncate(to_string(strategy), 1000) ++ "\n\nReview:\n" ++ string_truncate(to_string(review), 800) ++ "\n\nDraft:\n" ++ string_truncate(to_string(draft), 800)
             pitch = call_with_retry(prompt, 'swarm', 1)
             print("[pitch_writer] Pitch complete (" ++ to_string(string_length(pitch)) ++ " chars)")
             out_dir = "studio/output/patents/project_" ++ to_string(project_id)
