@@ -211,6 +211,7 @@ static sw_val_t *_builtin_typeof(sw_val_t **a, int n) {
         case SW_VAL_TUPLE: return sw_val_string("tuple");
         case SW_VAL_LIST: return sw_val_string("list");
         case SW_VAL_PID: return sw_val_string("pid");
+        case SW_VAL_MAP: return sw_val_string("map");
         default: return sw_val_string("unknown");
     }
 }
@@ -706,6 +707,80 @@ static sw_val_t *_builtin_node_send(sw_val_t **a, int n) {
     int ok = sw_node_send(a[0]->v.str, a[1]->v.str, 11 /* SW_TAG_CAST */,
                           data, sizeof(sw_val_t));
     return sw_val_atom(ok == 0 ? "ok" : "error");
+}
+
+/* === Map Builtins === */
+
+/* map_new() → empty map */
+static sw_val_t *_builtin_map_new(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    return sw_val_map_new(NULL, NULL, 0);
+}
+
+/* map_get(map, key) → value or nil */
+static sw_val_t *_builtin_map_get(sw_val_t **a, int n) {
+    if (n < 2) return sw_val_nil();
+    return sw_val_map_get(a[0], a[1]);
+}
+
+/* map_put(map, key, value) → new map with key set */
+static sw_val_t *_builtin_map_put(sw_val_t **a, int n) {
+    if (n < 3) return sw_val_nil();
+    return sw_val_map_put(a[0], a[1], a[2]);
+}
+
+/* map_keys(map) → list of keys */
+static sw_val_t *_builtin_map_keys(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_MAP) return sw_val_list(NULL, 0);
+    int cnt = a[0]->v.map.count;
+    if (cnt == 0) return sw_val_list(NULL, 0);
+    sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
+    for (int i = 0; i < cnt; i++) items[i] = a[0]->v.map.keys[i];
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+/* map_values(map) → list of values */
+static sw_val_t *_builtin_map_values(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_MAP) return sw_val_list(NULL, 0);
+    int cnt = a[0]->v.map.count;
+    if (cnt == 0) return sw_val_list(NULL, 0);
+    sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
+    for (int i = 0; i < cnt; i++) items[i] = a[0]->v.map.vals[i];
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+/* map_merge(map1, map2) → new map with all keys from both */
+static sw_val_t *_builtin_map_merge(sw_val_t **a, int n) {
+    if (n < 2) return sw_val_nil();
+    if (!a[0] || a[0]->type != SW_VAL_MAP) return (n >= 2 && a[1]) ? a[1] : sw_val_map_new(NULL, NULL, 0);
+    if (!a[1] || a[1]->type != SW_VAL_MAP) return a[0];
+    /* Start with a copy of map1 */
+    sw_val_t *result = sw_val_map_new(a[0]->v.map.keys, a[0]->v.map.vals, a[0]->v.map.count);
+    /* Add/overwrite with map2 entries */
+    for (int i = 0; i < a[1]->v.map.count; i++)
+        result = sw_val_map_put(result, a[1]->v.map.keys[i], a[1]->v.map.vals[i]);
+    return result;
+}
+
+/* map_has_key(map, key) → 'true' | 'false' */
+static sw_val_t *_builtin_map_has_key(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_MAP) return sw_val_atom("false");
+    for (int i = 0; i < a[0]->v.map.count; i++)
+        if (sw_val_equal(a[0]->v.map.keys[i], a[1])) return sw_val_atom("true");
+    return sw_val_atom("false");
+}
+
+/* === Error mechanism for try/catch === */
+
+/* error(reason) — sets thread-local error, caught by try/catch */
+static sw_val_t *_builtin_error(sw_val_t **a, int n) {
+    extern __thread sw_val_t *_sw_error;
+    _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
+    return sw_val_nil();
 }
 
 #endif /* SWARMRT_BUILTINS_STUDIO_H */

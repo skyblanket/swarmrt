@@ -116,6 +116,57 @@ int main(int argc, char **argv) {
         nasts++;
     }
 
+    /* Resolve imports: for each parsed AST, find import declarations and
+     * auto-load the corresponding .sw files from the same directory */
+    {
+        char input_dir[256];
+        char *tmp = strdup(inputs[0]);
+        char *dir = dirname(tmp);
+        strncpy(input_dir, dir, sizeof(input_dir) - 1);
+        free(tmp);
+
+        for (int a = 0; a < nasts; a++) {
+            node_t *mod = (node_t *)asts[a];
+            for (int im = 0; im < mod->v.mod.nimports; im++) {
+                const char *imp_name = mod->v.mod.imports[im];
+                /* Check if already loaded */
+                int found = 0;
+                for (int e = 0; e < nasts; e++) {
+                    if (strcmp(get_mod_name(asts[e]), imp_name) == 0) { found = 1; break; }
+                }
+                if (found) continue;
+
+                /* Try ModuleName.sw then modulename.sw */
+                char imp_path[512];
+                snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", input_dir, imp_name);
+                char *imp_source = read_file(imp_path);
+                if (!imp_source) {
+                    /* Try lowercase */
+                    char lower[128];
+                    strncpy(lower, imp_name, sizeof(lower) - 1);
+                    for (int c = 0; lower[c]; c++)
+                        if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
+                    snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", input_dir, lower);
+                    imp_source = read_file(imp_path);
+                }
+                if (!imp_source) {
+                    fprintf(stderr, "swc: cannot resolve import '%s'\n", imp_name);
+                    continue;
+                }
+                void *imp_ast = sw_lang_parse(imp_source);
+                free(imp_source);
+                if (!imp_ast) {
+                    fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
+                    continue;
+                }
+                if (nasts < 64) {
+                    asts[nasts++] = imp_ast;
+                    fprintf(stderr, "swc: auto-imported %s from %s\n", imp_name, imp_path);
+                }
+            }
+        }
+    }
+
     const char *mod_name = get_mod_name(asts[main_idx]);
 
     /* ---- emit command ---- */

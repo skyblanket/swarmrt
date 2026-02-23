@@ -5,7 +5,7 @@
  * evaluates expressions, and maps language primitives (spawn, send,
  * receive) to SwarmRT runtime calls.
  *
- * Value types: int, float, string, atom, pid, tuple, list, nil, fun.
+ * Value types: int, float, string, atom, pid, tuple, list, nil, fun, map.
  *
  * otonomy.ai
  */
@@ -27,6 +27,7 @@ typedef enum {
     SW_VAL_TUPLE,
     SW_VAL_LIST,
     SW_VAL_FUN,
+    SW_VAL_MAP,
 } sw_val_type_t;
 
 typedef struct sw_val sw_val_t;
@@ -53,6 +54,12 @@ struct sw_val {
             sw_val_t **captures;     /* captured variable values */
             int ncaptures;
         } fun;
+        struct {
+            sw_val_t **keys;
+            sw_val_t **vals;
+            int count;
+            int cap;
+        } map;
     } v;
 };
 
@@ -111,6 +118,11 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures);
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
 
+/* Map constructors */
+sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count);
+sw_val_t *sw_val_map_get(sw_val_t *map, sw_val_t *key);
+sw_val_t *sw_val_map_put(sw_val_t *map, sw_val_t *key, sw_val_t *val);
+
 /* Value inspection */
 int sw_val_is_truthy(sw_val_t *v);
 int sw_val_equal(sw_val_t *a, sw_val_t *b);
@@ -126,6 +138,8 @@ typedef enum {
     N_RECEIVE, N_CLAUSE, N_IF, N_BINOP, N_UNARY, N_PIPE,
     N_INT, N_FLOAT, N_STRING, N_ATOM, N_IDENT, N_TUPLE, N_LIST,
     N_SELF, N_AFTER,
+    /* Phase 12: Language polish */
+    N_MAP, N_FOR, N_RANGE, N_TRY, N_LIST_CONS,
 } node_type_t;
 
 typedef struct node {
@@ -133,9 +147,11 @@ typedef struct node {
     int line;
     union {
         /* N_MODULE */
-        struct { char name[128]; struct node **funs; int nfuns; } mod;
+        struct { char name[128]; struct node **funs; int nfuns;
+                 char imports[16][128]; int nimports; } mod;
         /* N_FUN */
-        struct { char name[128]; char params[16][128]; int nparams; struct node *body; } fun;
+        struct { char name[128]; char params[16][128]; int nparams;
+                 struct node *body; struct node *defaults[16]; } fun;
         /* N_BLOCK */
         struct { struct node **stmts; int nstmts; } block;
         /* N_ASSIGN */
@@ -149,7 +165,7 @@ typedef struct node {
         /* N_RECEIVE */
         struct { struct node **clauses; int nclauses; struct node *after_body; int after_ms; } recv;
         /* N_CLAUSE */
-        struct { struct node *pattern; struct node *body; } clause;
+        struct { struct node *pattern; struct node *body; struct node *guard; } clause;
         /* N_IF */
         struct { struct node *cond; struct node *then_b; struct node *else_b; } iff;
         /* N_BINOP */
@@ -166,6 +182,16 @@ typedef struct node {
         char sval[2048];
         /* N_TUPLE, N_LIST */
         struct { struct node **items; int count; } coll;
+        /* N_MAP */
+        struct { struct node **keys; struct node **vals; int count; } map;
+        /* N_FOR */
+        struct { char var[128]; struct node *iter; struct node *body; } forloop;
+        /* N_RANGE */
+        struct { struct node *from; struct node *to; } range;
+        /* N_TRY */
+        struct { struct node *body; char err_var[128]; struct node *catch_body; } trycatch;
+        /* N_LIST_CONS */
+        struct { struct node *head; struct node *tail; } cons;
     } v;
 } node_t;
 

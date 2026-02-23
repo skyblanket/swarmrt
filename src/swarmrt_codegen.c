@@ -134,6 +134,13 @@ static int is_builtin(const char *name) {
            strcmp(name, "node_name") == 0 || strcmp(name, "node_connect") == 0 ||
            strcmp(name, "node_disconnect") == 0 || strcmp(name, "node_send") == 0 ||
            strcmp(name, "node_peers") == 0 || strcmp(name, "node_is_connected") == 0 ||
+           /* Map builtins */
+           strcmp(name, "map_new") == 0 || strcmp(name, "map_get") == 0 ||
+           strcmp(name, "map_put") == 0 || strcmp(name, "map_keys") == 0 ||
+           strcmp(name, "map_values") == 0 || strcmp(name, "map_merge") == 0 ||
+           strcmp(name, "map_has_key") == 0 ||
+           /* Error */
+           strcmp(name, "error") == 0 ||
            strcmp(name, "typeof") == 0;
 }
 
@@ -207,6 +214,25 @@ static void scan_spawns(cg_ctx_t *ctx, node_t *n) {
     case N_TUPLE: case N_LIST:
         for (int i = 0; i < n->v.coll.count; i++) scan_spawns(ctx, n->v.coll.items[i]);
         break;
+    case N_FOR:
+        scan_spawns(ctx, n->v.forloop.iter);
+        scan_spawns(ctx, n->v.forloop.body);
+        break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { scan_spawns(ctx, n->v.map.keys[i]); scan_spawns(ctx, n->v.map.vals[i]); }
+        break;
+    case N_TRY:
+        scan_spawns(ctx, n->v.trycatch.body);
+        scan_spawns(ctx, n->v.trycatch.catch_body);
+        break;
+    case N_RANGE:
+        scan_spawns(ctx, n->v.range.from);
+        scan_spawns(ctx, n->v.range.to);
+        break;
+    case N_LIST_CONS:
+        scan_spawns(ctx, n->v.cons.head);
+        scan_spawns(ctx, n->v.cons.tail);
+        break;
     default: break;
     }
 }
@@ -261,6 +287,25 @@ static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
     case N_TUPLE: case N_LIST:
         for (int i = 0; i < n->v.coll.count; i++)
             collect_idents(n->v.coll.items[i], ids, nids, max);
+        break;
+    case N_FOR:
+        collect_idents(n->v.forloop.iter, ids, nids, max);
+        collect_idents(n->v.forloop.body, ids, nids, max);
+        break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { collect_idents(n->v.map.keys[i], ids, nids, max); collect_idents(n->v.map.vals[i], ids, nids, max); }
+        break;
+    case N_TRY:
+        collect_idents(n->v.trycatch.body, ids, nids, max);
+        collect_idents(n->v.trycatch.catch_body, ids, nids, max);
+        break;
+    case N_RANGE:
+        collect_idents(n->v.range.from, ids, nids, max);
+        collect_idents(n->v.range.to, ids, nids, max);
+        break;
+    case N_LIST_CONS:
+        collect_idents(n->v.cons.head, ids, nids, max);
+        collect_idents(n->v.cons.tail, ids, nids, max);
         break;
     default: break;
     }
@@ -333,6 +378,25 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     case N_TUPLE: case N_LIST:
         for (int i = 0; i < n->v.coll.count; i++) scan_lambdas(ctx, n->v.coll.items[i]);
         break;
+    case N_FOR:
+        scan_lambdas(ctx, n->v.forloop.iter);
+        scan_lambdas(ctx, n->v.forloop.body);
+        break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { scan_lambdas(ctx, n->v.map.keys[i]); scan_lambdas(ctx, n->v.map.vals[i]); }
+        break;
+    case N_TRY:
+        scan_lambdas(ctx, n->v.trycatch.body);
+        scan_lambdas(ctx, n->v.trycatch.catch_body);
+        break;
+    case N_RANGE:
+        scan_lambdas(ctx, n->v.range.from);
+        scan_lambdas(ctx, n->v.range.to);
+        break;
+    case N_LIST_CONS:
+        scan_lambdas(ctx, n->v.cons.head);
+        scan_lambdas(ctx, n->v.cons.tail);
+        break;
     case N_SPAWN: scan_lambdas(ctx, n->v.spawn.expr); break;
     default: break;
     }
@@ -390,6 +454,8 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <sys/stat.h>\n");
     fprintf(f, "#include <sys/time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
+
+    fprintf(f, "__thread sw_val_t *_sw_error = NULL;\n\n");
 
     /* Binary operation helpers */
     fprintf(f,
@@ -787,6 +853,18 @@ static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
         }
         fprintf(f, ")");
         break;
+    case N_LIST_CONS:
+        /* [h | t] pattern: list with at least 1 element */
+        fprintf(f, "(%s->type == SW_VAL_LIST && %s->v.tuple.count >= 1", val, val);
+        /* Check head pattern */
+        {
+            char head_item[128];
+            snprintf(head_item, sizeof(head_item), "%s->v.tuple.items[0]", val);
+            fprintf(f, " && ");
+            emit_pattern_cond(ctx, pat->v.cons.head, head_item);
+        }
+        fprintf(f, ")");
+        break;
     default:
         fprintf(f, "1");
         break;
@@ -809,6 +887,18 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
             emit_pattern_bind(ctx, pat->v.coll.items[i], item);
         }
         break;
+    case N_LIST_CONS: {
+        char head_item[128];
+        snprintf(head_item, sizeof(head_item), "%s->v.tuple.items[0]", val);
+        emit_pattern_bind(ctx, pat->v.cons.head, head_item);
+        /* Bind tail: rest of list */
+        if (pat->v.cons.tail->type == N_IDENT) {
+            fprintf(f, "        sw_val_t *%s = sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1);\n",
+                    pat->v.cons.tail->v.sval, val, val);
+            declare_var(ctx, pat->v.cons.tail->v.sval);
+        }
+        break;
+    }
     default: break;
     }
 }
@@ -937,6 +1027,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "node_name") == 0 || strcmp(fname, "node_connect") == 0 ||
              strcmp(fname, "node_disconnect") == 0 || strcmp(fname, "node_send") == 0 ||
              strcmp(fname, "node_peers") == 0 || strcmp(fname, "node_is_connected") == 0 ||
+             strcmp(fname, "map_new") == 0 || strcmp(fname, "map_get") == 0 ||
+             strcmp(fname, "map_put") == 0 || strcmp(fname, "map_keys") == 0 ||
+             strcmp(fname, "map_values") == 0 || strcmp(fname, "map_merge") == 0 ||
+             strcmp(fname, "map_has_key") == 0 || strcmp(fname, "error") == 0 ||
              strcmp(fname, "typeof") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
@@ -1024,25 +1118,30 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     for (int i = 0; i < n->v.recv.nclauses; i++) {
         node_t *cl = n->v.recv.clauses[i];
         if (i == 0)
-            fprintf(f, "    if (");
+            fprintf(f, "    if (%s && ", raw);
         else
-            fprintf(f, "    } else if (");
+            fprintf(f, "    } else if (%s && ", raw);
         emit_pattern_cond(ctx, cl->v.clause.pattern, msg);
         fprintf(f, ") {\n");
 
-        /* Save declared scope — pattern bindings are local to this clause */
         int saved_ndeclared = ctx->ndeclared;
-
-        /* Bind pattern variables */
         emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
 
-        /* Emit clause body */
+        /* Guard check */
+        if (cl->v.clause.guard) {
+            char guard_res[32];
+            emit_expr(ctx, cl->v.clause.guard, 0, guard_res, sizeof(guard_res));
+            fprintf(f, "      if (sw_val_is_truthy(%s)) {\n", guard_res);
+        }
+
         char body_res[32];
         emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
         if (body_res[0])
             fprintf(f, "        %s = %s;\n", res, body_res);
 
-        /* Restore scope */
+        if (cl->v.clause.guard)
+            fprintf(f, "      }\n");
+
         ctx->ndeclared = saved_ndeclared;
     }
 
@@ -1307,6 +1406,127 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         strncpy(out, v, osz - 1);
         break;
     }
+    case N_MAP: {
+        /* Map literal: %{k1: v1, k2: v2} -> sw_val_map_new(keys, vals, count) */
+        int count = n->v.map.count;
+        char key_vars[64][32], val_vars[64][32];
+        for (int i = 0; i < count && i < 64; i++) {
+            emit_expr(ctx, n->v.map.keys[i], 0, key_vars[i], sizeof(key_vars[i]));
+            emit_expr(ctx, n->v.map.vals[i], 0, val_vars[i], sizeof(val_vars[i]));
+        }
+        char karr[32], varr[32];
+        fresh_var(ctx, karr, sizeof(karr));
+        fresh_var(ctx, varr, sizeof(varr));
+        fprintf(f, "    sw_val_t *%s[] = {", karr);
+        for (int i = 0; i < count; i++) { if (i) fprintf(f, ", "); fprintf(f, "%s", key_vars[i]); }
+        fprintf(f, "};\n");
+        fprintf(f, "    sw_val_t *%s[] = {", varr);
+        for (int i = 0; i < count; i++) { if (i) fprintf(f, ", "); fprintf(f, "%s", val_vars[i]); }
+        fprintf(f, "};\n");
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    sw_val_t *%s = sw_val_map_new(%s, %s, %d);\n", v, karr, varr, count);
+        strncpy(out, v, osz - 1);
+        break;
+    }
+    case N_FOR: {
+        /* for x in iter { body } */
+        char iter_var[32];
+        emit_expr(ctx, n->v.forloop.iter, 0, iter_var, sizeof(iter_var));
+        char idx[32]; fresh_var(ctx, idx, sizeof(idx));
+        /* Check if iter is a range (N_RANGE produces a special struct) */
+        if (n->v.forloop.iter->type == N_RANGE) {
+            /* Range for: for i in start..end */
+            char start_v[32], end_v[32];
+            emit_expr(ctx, n->v.forloop.iter->v.range.from, 0, start_v, sizeof(start_v));
+            emit_expr(ctx, n->v.forloop.iter->v.range.to, 0, end_v, sizeof(end_v));
+            fprintf(f, "    for (int64_t %s = %s->v.i; %s <= %s->v.i; %s++) {\n",
+                    idx, start_v, idx, end_v, idx);
+            if (!is_declared(ctx, n->v.forloop.var)) {
+                fprintf(f, "    sw_val_t *%s = sw_val_int(%s);\n", n->v.forloop.var, idx);
+                declare_var(ctx, n->v.forloop.var);
+            } else {
+                fprintf(f, "    %s = sw_val_int(%s);\n", n->v.forloop.var, idx);
+            }
+        } else {
+            /* List for: for x in list */
+            fprintf(f, "    for (int %s = 0; %s < %s->v.tuple.count; %s++) {\n",
+                    idx, idx, iter_var, idx);
+            if (!is_declared(ctx, n->v.forloop.var)) {
+                fprintf(f, "    sw_val_t *%s = %s->v.tuple.items[%s];\n", n->v.forloop.var, iter_var, idx);
+                declare_var(ctx, n->v.forloop.var);
+            } else {
+                fprintf(f, "    %s = %s->v.tuple.items[%s];\n", n->v.forloop.var, iter_var, idx);
+            }
+        }
+        char body_res[32];
+        emit_expr(ctx, n->v.forloop.body, 0, body_res, sizeof(body_res));
+        fprintf(f, "    }\n");
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", v);
+        strncpy(out, v, osz - 1);
+        break;
+    }
+    case N_RANGE: {
+        /* Range expression 1..10 -- build a list */
+        char start_v[32], end_v[32];
+        emit_expr(ctx, n->v.range.from, 0, start_v, sizeof(start_v));
+        emit_expr(ctx, n->v.range.to, 0, end_v, sizeof(end_v));
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        char cnt[32]; fresh_var(ctx, cnt, sizeof(cnt));
+        char arr[32]; fresh_var(ctx, arr, sizeof(arr));
+        fprintf(f, "    int %s = (int)(%s->v.i - %s->v.i + 1);\n", cnt, end_v, start_v);
+        fprintf(f, "    if (%s < 0) %s = 0;\n", cnt, cnt);
+        fprintf(f, "    sw_val_t **%s = malloc(sizeof(sw_val_t*) * (%s > 0 ? %s : 1));\n", arr, cnt, cnt);
+        char ri[32]; fresh_var(ctx, ri, sizeof(ri));
+        fprintf(f, "    for (int %s = 0; %s < %s; %s++) %s[%s] = sw_val_int(%s->v.i + %s);\n",
+                ri, ri, cnt, ri, arr, ri, start_v, ri);
+        fprintf(f, "    sw_val_t *%s = sw_val_list(%s, %s);\n", v, arr, cnt);
+        fprintf(f, "    free(%s);\n", arr);
+        strncpy(out, v, osz - 1);
+        break;
+    }
+    case N_TRY: {
+        /* try { body } catch e { handler } */
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    _sw_error = NULL;\n");
+        char body_res[32];
+        emit_expr(ctx, n->v.trycatch.body, 0, body_res, sizeof(body_res));
+        fprintf(f, "    sw_val_t *%s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
+        fprintf(f, "    if (_sw_error) {\n");
+        if (!is_declared(ctx, n->v.trycatch.err_var)) {
+            fprintf(f, "        sw_val_t *%s = _sw_error;\n", n->v.trycatch.err_var);
+            declare_var(ctx, n->v.trycatch.err_var);
+        } else {
+            fprintf(f, "        %s = _sw_error;\n", n->v.trycatch.err_var);
+        }
+        fprintf(f, "        _sw_error = NULL;\n");
+        char catch_res[32];
+        emit_expr(ctx, n->v.trycatch.catch_body, 0, catch_res, sizeof(catch_res));
+        if (catch_res[0])
+            fprintf(f, "        %s = %s;\n", v, catch_res);
+        fprintf(f, "    }\n");
+        strncpy(out, v, osz - 1);
+        break;
+    }
+    case N_LIST_CONS: {
+        /* [h | t] as expression -- cons h onto list t */
+        char head_v[32], tail_v[32];
+        emit_expr(ctx, n->v.cons.head, 0, head_v, sizeof(head_v));
+        emit_expr(ctx, n->v.cons.tail, 0, tail_v, sizeof(tail_v));
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        char arr_name[32]; fresh_var(ctx, arr_name, sizeof(arr_name));
+        char cnt_name[32]; fresh_var(ctx, cnt_name, sizeof(cnt_name));
+        fprintf(f, "    int %s = %s->type == SW_VAL_LIST ? %s->v.tuple.count + 1 : 1;\n",
+                cnt_name, tail_v, tail_v);
+        fprintf(f, "    sw_val_t **%s = malloc(sizeof(sw_val_t*) * %s);\n", arr_name, cnt_name);
+        fprintf(f, "    %s[0] = %s;\n", arr_name, head_v);
+        fprintf(f, "    if (%s->type == SW_VAL_LIST) for (int _ci = 0; _ci < %s->v.tuple.count; _ci++) %s[_ci+1] = %s->v.tuple.items[_ci];\n",
+                tail_v, tail_v, arr_name, tail_v);
+        fprintf(f, "    sw_val_t *%s = sw_val_list(%s, %s);\n", v, arr_name, cnt_name);
+        fprintf(f, "    free(%s);\n", arr_name);
+        strncpy(out, v, osz - 1);
+        break;
+    }
     default:
         break;
     }
@@ -1333,8 +1553,15 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     /* Parameter extraction */
     if (fn->v.fun.nparams > 0) {
         for (int i = 0; i < fn->v.fun.nparams; i++) {
-            fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : sw_val_nil();\n",
-                    fn->v.fun.params[i], i, i);
+            if (fn->v.fun.defaults[i]) {
+                char def_val[32];
+                emit_expr(ctx, fn->v.fun.defaults[i], 0, def_val, sizeof(def_val));
+                fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : %s;\n",
+                        fn->v.fun.params[i], i, i, def_val);
+            } else {
+                fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : sw_val_nil();\n",
+                        fn->v.fun.params[i], i, i);
+            }
             declare_var(ctx, fn->v.fun.params[i]);
         }
     } else {

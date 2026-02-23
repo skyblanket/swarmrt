@@ -77,6 +77,17 @@ typedef enum {
     TOK_COLON,
     TOK_SEMI,
     TOK_NEWLINE,
+
+    /* Phase 12 tokens */
+    TOK_ELSIF,
+    TOK_FOR,
+    TOK_IN,
+    TOK_TRY,
+    TOK_CATCH,
+    TOK_IMPORT,
+    TOK_DOTDOT,    /* .. */
+    TOK_BAR,       /* | (single pipe, list cons) */
+    TOK_PERCENT,   /* % */
 } tok_type_t;
 
 typedef struct {
@@ -109,6 +120,12 @@ static struct { const char *w; tok_type_t t; } kw_table[] = {
     {"if",        TOK_IF},
     {"else",      TOK_ELSE},
     {"self",      TOK_SELF},
+    {"elsif",     TOK_ELSIF},
+    {"for",       TOK_FOR},
+    {"in",        TOK_IN},
+    {"try",       TOK_TRY},
+    {"catch",     TOK_CATCH},
+    {"import",    TOK_IMPORT},
     {"true",      TOK_ATOM},
     {"false",     TOK_ATOM},
     {"nil",       TOK_ATOM},
@@ -149,7 +166,8 @@ static tok_t lnext(lex_t *l) {
     /* Numbers */
     if (isdigit(c)) {
         int i = 0;
-        while (isdigit(lpeek(l)) || lpeek(l) == '.') t.text[i++] = ladv(l);
+        while (isdigit(lpeek(l)) || (lpeek(l) == '.' && lpeek2(l) != '.'))
+            t.text[i++] = ladv(l);
         t.text[i] = 0;
         t.type = TOK_NUMBER;
         t.num_val = atof(t.text);
@@ -160,7 +178,17 @@ static tok_t lnext(lex_t *l) {
     if (c == '"') {
         ladv(l); int i = 0;
         while (lpeek(l) && lpeek(l) != '"' && i < (int)sizeof(t.text) - 2) {
-            if (lpeek(l) == '\\') { ladv(l); t.text[i++] = ladv(l); }
+            if (lpeek(l) == '\\') {
+                ladv(l);
+                char esc = ladv(l);
+                switch (esc) {
+                    case 'n': t.text[i++] = '\n'; break;
+                    case 't': t.text[i++] = '\t'; break;
+                    case 'r': t.text[i++] = '\r'; break;
+                    case '#': t.text[i++] = '\x01'; break; /* sentinel: escaped # */
+                    default:  t.text[i++] = esc; break;
+                }
+            }
             else t.text[i++] = ladv(l);
         }
         t.text[i] = 0;
@@ -206,6 +234,8 @@ static tok_t lnext(lex_t *l) {
     if (c == '+' && lpeek2(l) == '+') { ladv(l); ladv(l); t.type = TOK_CONCAT; strcpy(t.text, "++"); return t; }
     if (c == '&' && lpeek2(l) == '&') { ladv(l); ladv(l); t.type = TOK_AND; strcpy(t.text, "&&"); return t; }
     if (c == '|' && lpeek2(l) == '|') { ladv(l); ladv(l); t.type = TOK_OR; strcpy(t.text, "||"); return t; }
+    if (c == '.' && lpeek2(l) == '.') { ladv(l); ladv(l); t.type = TOK_DOTDOT; strcpy(t.text, ".."); return t; }
+    if (c == '%' && lpeek2(l) == '{') { ladv(l); /* consume % only, { will be next */ t.type = TOK_PERCENT; strcpy(t.text, "%"); return t; }
 
     /* Single-char */
     ladv(l);
@@ -228,6 +258,8 @@ static tok_t lnext(lex_t *l) {
         case '.': t.type = TOK_DOT; break;
         case ':': t.type = TOK_COLON; break;
         case ';': t.type = TOK_SEMI; break;
+        case '|': t.type = TOK_BAR; break;
+        case '%': t.type = TOK_PERCENT; break;
         default:  t.type = TOK_EOF; break;
     }
     return t;
@@ -249,7 +281,10 @@ static void node_free(node_t *n) {
     case N_MODULE:
         for (int i = 0; i < n->v.mod.nfuns; i++) node_free(n->v.mod.funs[i]);
         free(n->v.mod.funs); break;
-    case N_FUN: node_free(n->v.fun.body); break;
+    case N_FUN:
+        node_free(n->v.fun.body);
+        for (int i = 0; i < n->v.fun.nparams; i++) node_free(n->v.fun.defaults[i]);
+        break;
     case N_BLOCK:
         for (int i = 0; i < n->v.block.nstmts; i++) node_free(n->v.block.stmts[i]);
         free(n->v.block.stmts); break;
@@ -264,7 +299,11 @@ static void node_free(node_t *n) {
         for (int i = 0; i < n->v.recv.nclauses; i++) node_free(n->v.recv.clauses[i]);
         free(n->v.recv.clauses);
         node_free(n->v.recv.after_body); break;
-    case N_CLAUSE: node_free(n->v.clause.pattern); node_free(n->v.clause.body); break;
+    case N_CLAUSE:
+        node_free(n->v.clause.pattern);
+        node_free(n->v.clause.guard);
+        node_free(n->v.clause.body);
+        break;
     case N_IF: node_free(n->v.iff.cond); node_free(n->v.iff.then_b); node_free(n->v.iff.else_b); break;
     case N_BINOP: node_free(n->v.binop.left); node_free(n->v.binop.right); break;
     case N_UNARY: node_free(n->v.unary.operand); break;
@@ -272,6 +311,13 @@ static void node_free(node_t *n) {
     case N_TUPLE: case N_LIST:
         for (int i = 0; i < n->v.coll.count; i++) node_free(n->v.coll.items[i]);
         free(n->v.coll.items); break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { node_free(n->v.map.keys[i]); node_free(n->v.map.vals[i]); }
+        free(n->v.map.keys); free(n->v.map.vals); break;
+    case N_FOR: node_free(n->v.forloop.iter); node_free(n->v.forloop.body); break;
+    case N_RANGE: node_free(n->v.range.from); node_free(n->v.range.to); break;
+    case N_TRY: node_free(n->v.trycatch.body); node_free(n->v.trycatch.catch_body); break;
+    case N_LIST_CONS: node_free(n->v.cons.head); node_free(n->v.cons.tail); break;
     default: break;
     }
     free(n);
@@ -317,6 +363,72 @@ static node_t *par_expr(par_t *p);
 static node_t *par_stmt(par_t *p);
 static node_t *par_block(par_t *p);
 
+/* Restore \x01 sentinels back to # */
+static void restore_hash_sentinels(char *s) {
+    for (; *s; s++) if (*s == '\x01') *s = '#';
+}
+
+/* String interpolation: "hello #{name}!" -> concat chain */
+static node_t *parse_interp_string(const char *text, int line) {
+    if (!strstr(text, "#{")) return NULL;
+    node_t *result = NULL;
+    const char *pos = text;
+    while (*pos) {
+        const char *interp = strstr(pos, "#{");
+        if (!interp) {
+            if (*pos) {
+                node_t *s = mknode(N_STRING, line);
+                strncpy(s->v.sval, pos, sizeof(s->v.sval)-1);
+                if (result) {
+                    node_t *cat = mknode(N_BINOP, line);
+                    cat->v.binop.left = result; cat->v.binop.right = s;
+                    strcpy(cat->v.binop.op, "++"); result = cat;
+                } else result = s;
+            }
+            break;
+        }
+        if (interp > pos) {
+            node_t *s = mknode(N_STRING, line);
+            int len = (int)(interp - pos);
+            if (len >= (int)sizeof(s->v.sval)) len = (int)sizeof(s->v.sval) - 1;
+            memcpy(s->v.sval, pos, len); s->v.sval[len] = 0;
+            restore_hash_sentinels(s->v.sval);
+            if (result) {
+                node_t *cat = mknode(N_BINOP, line);
+                cat->v.binop.left = result; cat->v.binop.right = s;
+                strcpy(cat->v.binop.op, "++"); result = cat;
+            } else result = s;
+        }
+        interp += 2;
+        const char *end = interp;
+        int depth = 1;
+        while (*end && depth > 0) {
+            if (*end == '{') depth++;
+            else if (*end == '}') depth--;
+            if (depth > 0) end++;
+        }
+        char expr_text[2048];
+        int elen = (int)(end - interp);
+        if (elen >= (int)sizeof(expr_text)) elen = (int)sizeof(expr_text) - 1;
+        memcpy(expr_text, interp, elen); expr_text[elen] = 0;
+        par_t ep; par_init(&ep, expr_text);
+        node_t *expr = par_expr(&ep);
+        node_t *call = mknode(N_CALL, line);
+        node_t *fn_node = mknode(N_IDENT, line);
+        strcpy(fn_node->v.sval, "to_string");
+        call->v.call.func = fn_node;
+        call->v.call.args = malloc(sizeof(node_t*));
+        call->v.call.args[0] = expr; call->v.call.nargs = 1;
+        if (result) {
+            node_t *cat = mknode(N_BINOP, line);
+            cat->v.binop.left = result; cat->v.binop.right = call;
+            strcpy(cat->v.binop.op, "++"); result = cat;
+        } else result = call;
+        pos = *end ? end + 1 : end;
+    }
+    return result ? result : mknode(N_STRING, line);
+}
+
 /* Primary expression */
 static node_t *par_primary(par_t *p) {
     tok_t t = p->cur;
@@ -336,8 +448,11 @@ static node_t *par_primary(par_t *p) {
 
     if (t.type == TOK_STRING) {
         par_adv(p);
+        node_t *interp = parse_interp_string(t.text, t.line);
+        if (interp) return interp;
         node_t *n = mknode(N_STRING, t.line);
         strncpy(n->v.sval, t.text, sizeof(n->v.sval)-1);
+        restore_hash_sentinels(n->v.sval);
         return n;
     }
 
@@ -357,39 +472,64 @@ static node_t *par_primary(par_t *p) {
 
     if (t.type == TOK_IDENT) {
         par_adv(p);
-
-        /* Module-qualified call: Module.function(args) */
-        char qualified[256];
-        strncpy(qualified, t.text, sizeof(qualified)-1);
         if (p->cur.type == TOK_DOT) {
-            par_adv(p); /* . */
-            tok_t fname = par_expect(p, TOK_IDENT, "function name");
-            snprintf(qualified, sizeof(qualified), "%s.%s", t.text, fname.text);
+            par_adv(p); /* consume . */
+            tok_t fname = par_expect(p, TOK_IDENT, "field/function name");
+            if (p->cur.type == TOK_LPAREN) {
+                /* Module-qualified call: Module.function(args) */
+                char qualified[256];
+                snprintf(qualified, sizeof(qualified), "%s.%s", t.text, fname.text);
+                par_adv(p); /* ( */
+                node_t *call = mknode(N_CALL, t.line);
+                node_t *fn_node = mknode(N_IDENT, t.line);
+                strncpy(fn_node->v.sval, qualified, sizeof(fn_node->v.sval)-1);
+                call->v.call.func = fn_node;
+                call->v.call.args = NULL; call->v.call.nargs = 0;
+                if (p->cur.type != TOK_RPAREN) {
+                    do {
+                        call->v.call.nargs++;
+                        call->v.call.args = realloc(call->v.call.args, sizeof(node_t*) * call->v.call.nargs);
+                        call->v.call.args[call->v.call.nargs-1] = par_expr(p);
+                    } while (par_match(p, TOK_COMMA));
+                }
+                par_expect(p, TOK_RPAREN, "')'");
+                return call;
+            } else {
+                /* Dot access: obj.field -> map_get(obj, 'field') */
+                node_t *obj = mknode(N_IDENT, t.line);
+                strncpy(obj->v.sval, t.text, sizeof(obj->v.sval)-1);
+                node_t *key = mknode(N_ATOM, fname.line);
+                strncpy(key->v.sval, fname.text, sizeof(key->v.sval)-1);
+                node_t *call = mknode(N_CALL, t.line);
+                node_t *fn_node = mknode(N_IDENT, t.line);
+                strcpy(fn_node->v.sval, "map_get");
+                call->v.call.func = fn_node;
+                call->v.call.args = malloc(sizeof(node_t*) * 2);
+                call->v.call.args[0] = obj; call->v.call.args[1] = key;
+                call->v.call.nargs = 2;
+                return call;
+            }
         }
-
         /* Function call: ident( args ) */
         if (p->cur.type == TOK_LPAREN) {
             par_adv(p); /* ( */
             node_t *call = mknode(N_CALL, t.line);
-            node_t *fn = mknode(N_IDENT, t.line);
-            strncpy(fn->v.sval, qualified, sizeof(fn->v.sval)-1);
-            call->v.call.func = fn;
-            call->v.call.args = NULL;
-            call->v.call.nargs = 0;
+            node_t *fn_node = mknode(N_IDENT, t.line);
+            strncpy(fn_node->v.sval, t.text, sizeof(fn_node->v.sval)-1);
+            call->v.call.func = fn_node;
+            call->v.call.args = NULL; call->v.call.nargs = 0;
             if (p->cur.type != TOK_RPAREN) {
                 do {
                     call->v.call.nargs++;
-                    call->v.call.args = realloc(call->v.call.args,
-                        sizeof(node_t*) * call->v.call.nargs);
+                    call->v.call.args = realloc(call->v.call.args, sizeof(node_t*) * call->v.call.nargs);
                     call->v.call.args[call->v.call.nargs-1] = par_expr(p);
                 } while (par_match(p, TOK_COMMA));
             }
             par_expect(p, TOK_RPAREN, "')'");
             return call;
         }
-
         node_t *n = mknode(N_IDENT, t.line);
-        strncpy(n->v.sval, qualified, sizeof(n->v.sval)-1);
+        strncpy(n->v.sval, t.text, sizeof(n->v.sval)-1);
         return n;
     }
 
@@ -419,6 +559,40 @@ static node_t *par_primary(par_t *p) {
         snprintf(p->errmsg, sizeof(p->errmsg),
                  "line %d: named functions not allowed in expressions", t.line);
         return mknode(N_INT, t.line);
+    }
+
+    /* For loop: for x in expr { body } */
+    if (t.type == TOK_FOR) {
+        par_adv(p);
+        tok_t var = par_expect(p, TOK_IDENT, "variable");
+        par_expect(p, TOK_IN, "'in'");
+        node_t *iter = par_expr(p);
+        par_expect(p, TOK_LBRACE, "'{'");
+        node_t *body = par_block(p);
+        par_expect(p, TOK_RBRACE, "'}'");
+        node_t *f = mknode(N_FOR, t.line);
+        strncpy(f->v.forloop.var, var.text, 127);
+        f->v.forloop.iter = iter;
+        f->v.forloop.body = body;
+        return f;
+    }
+
+    /* Try/catch: try { body } catch e { handler } */
+    if (t.type == TOK_TRY) {
+        par_adv(p);
+        par_expect(p, TOK_LBRACE, "'{'");
+        node_t *try_body = par_block(p);
+        par_expect(p, TOK_RBRACE, "'}'");
+        par_expect(p, TOK_CATCH, "'catch'");
+        tok_t err_var = par_expect(p, TOK_IDENT, "error variable");
+        par_expect(p, TOK_LBRACE, "'{'");
+        node_t *catch_body = par_block(p);
+        par_expect(p, TOK_RBRACE, "'}'");
+        node_t *tc = mknode(N_TRY, t.line);
+        tc->v.trycatch.body = try_body;
+        strncpy(tc->v.trycatch.err_var, err_var.text, 127);
+        tc->v.trycatch.catch_body = catch_body;
+        return tc;
     }
 
     /* Spawn expression */
@@ -456,6 +630,11 @@ static node_t *par_primary(par_t *p) {
         while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF) {
             node_t *cl = mknode(N_CLAUSE, p->cur.line);
             cl->v.clause.pattern = par_expr(p);
+            cl->v.clause.guard = NULL;
+            if (p->cur.type == TOK_WHEN) {
+                par_adv(p);
+                cl->v.clause.guard = par_expr(p);
+            }
             par_expect(p, TOK_ARROW, "'->'");
             /* Body: collect expressions until next clause pattern (expr ->) or } */
             node_t *body = mknode(N_BLOCK, p->cur.line);
@@ -518,11 +697,59 @@ static node_t *par_primary(par_t *p) {
         iff->v.iff.then_b = par_block(p);
         par_expect(p, TOK_RBRACE, "'}'");
         if (par_match(p, TOK_ELSE)) {
-            par_expect(p, TOK_LBRACE, "'{'");
-            iff->v.iff.else_b = par_block(p);
-            par_expect(p, TOK_RBRACE, "'}'");
+            if (p->cur.type == TOK_IF) {
+                iff->v.iff.else_b = par_primary(p);
+            } else {
+                par_expect(p, TOK_LBRACE, "'{'");
+                iff->v.iff.else_b = par_block(p);
+                par_expect(p, TOK_RBRACE, "'}'");
+            }
+        } else if (p->cur.type == TOK_ELSIF) {
+            p->cur.type = TOK_IF;
+            iff->v.iff.else_b = par_primary(p);
         }
         return iff;
+    }
+
+    /* Map literal: %{key: val, ...} */
+    if (t.type == TOK_PERCENT) {
+        par_adv(p);
+        par_expect(p, TOK_LBRACE, "'{'");
+        node_t *m = mknode(N_MAP, t.line);
+        m->v.map.keys = NULL; m->v.map.vals = NULL; m->v.map.count = 0;
+        if (p->cur.type != TOK_RBRACE) {
+            do {
+                node_t *key;
+                if (p->cur.type == TOK_IDENT) {
+                    /* Check for shorthand: name: val */
+                    lex_t sl = p->lex; tok_t sc = p->cur;
+                    tok_t k = par_adv(p);
+                    if (p->cur.type == TOK_COLON) {
+                        par_adv(p); /* consume : */
+                        key = mknode(N_ATOM, k.line);
+                        strncpy(key->v.sval, k.text, sizeof(key->v.sval)-1);
+                    } else {
+                        p->lex = sl; p->cur = sc;
+                        key = par_expr(p);
+                        par_expect(p, TOK_FARROW, "'=>'");
+                    }
+                } else if (p->cur.type == TOK_STRING || p->cur.type == TOK_ATOM) {
+                    key = par_primary(p);
+                    par_expect(p, TOK_FARROW, "'=>'");
+                } else {
+                    key = par_expr(p);
+                    par_expect(p, TOK_FARROW, "'=>'");
+                }
+                node_t *val = par_expr(p);
+                m->v.map.count++;
+                m->v.map.keys = realloc(m->v.map.keys, sizeof(node_t*) * m->v.map.count);
+                m->v.map.vals = realloc(m->v.map.vals, sizeof(node_t*) * m->v.map.count);
+                m->v.map.keys[m->v.map.count-1] = key;
+                m->v.map.vals[m->v.map.count-1] = val;
+            } while (par_match(p, TOK_COMMA));
+        }
+        par_expect(p, TOK_RBRACE, "'}'");
+        return m;
     }
 
     /* Tuple */
@@ -545,15 +772,31 @@ static node_t *par_primary(par_t *p) {
     /* List */
     if (t.type == TOK_LBRACKET) {
         par_adv(p);
+        if (p->cur.type == TOK_RBRACKET) {
+            par_adv(p);
+            node_t *lst = mknode(N_LIST, t.line);
+            lst->v.coll.items = NULL; lst->v.coll.count = 0;
+            return lst;
+        }
+        node_t *first = par_expr(p);
+        if (p->cur.type == TOK_BAR) {
+            /* List cons: [h | t] */
+            par_adv(p);
+            node_t *tail = par_expr(p);
+            par_expect(p, TOK_RBRACKET, "']'");
+            node_t *cons = mknode(N_LIST_CONS, t.line);
+            cons->v.cons.head = first;
+            cons->v.cons.tail = tail;
+            return cons;
+        }
         node_t *lst = mknode(N_LIST, t.line);
-        lst->v.coll.items = NULL; lst->v.coll.count = 0;
-        if (p->cur.type != TOK_RBRACKET) {
-            do {
-                lst->v.coll.count++;
-                lst->v.coll.items = realloc(lst->v.coll.items,
-                    sizeof(node_t*) * lst->v.coll.count);
-                lst->v.coll.items[lst->v.coll.count-1] = par_expr(p);
-            } while (par_match(p, TOK_COMMA));
+        lst->v.coll.items = malloc(sizeof(node_t*));
+        lst->v.coll.items[0] = first;
+        lst->v.coll.count = 1;
+        while (par_match(p, TOK_COMMA)) {
+            lst->v.coll.count++;
+            lst->v.coll.items = realloc(lst->v.coll.items, sizeof(node_t*) * lst->v.coll.count);
+            lst->v.coll.items[lst->v.coll.count-1] = par_expr(p);
         }
         par_expect(p, TOK_RBRACKET, "']'");
         return lst;
@@ -611,16 +854,29 @@ static node_t *par_add(par_t *p) {
     return left;
 }
 
+/* Range */
+static node_t *par_range(par_t *p) {
+    node_t *left = par_add(p);
+    if (p->cur.type == TOK_DOTDOT) {
+        par_adv(p);
+        node_t *r = mknode(N_RANGE, left->line);
+        r->v.range.from = left;
+        r->v.range.to = par_add(p);
+        return r;
+    }
+    return left;
+}
+
 /* Comparison */
 static node_t *par_cmp(par_t *p) {
-    node_t *left = par_add(p);
+    node_t *left = par_range(p);
     while (p->cur.type == TOK_EQ || p->cur.type == TOK_NEQ ||
            p->cur.type == TOK_LT || p->cur.type == TOK_GT ||
            p->cur.type == TOK_LE || p->cur.type == TOK_GE) {
         tok_t op = par_adv(p);
         node_t *n = mknode(N_BINOP, op.line);
         n->v.binop.left = left;
-        n->v.binop.right = par_add(p);
+        n->v.binop.right = par_range(p);
         strncpy(n->v.binop.op, op.text, 3);
         left = n;
     }
@@ -712,6 +968,10 @@ static node_t *par_fun(par_t *p) {
         do {
             tok_t param = par_expect(p, TOK_IDENT, "parameter");
             strncpy(fn->v.fun.params[fn->v.fun.nparams], param.text, 127);
+            fn->v.fun.defaults[fn->v.fun.nparams] = NULL;
+            if (par_match(p, TOK_ASSIGN)) {
+                fn->v.fun.defaults[fn->v.fun.nparams] = par_expr(p);
+            }
             fn->v.fun.nparams++;
         } while (par_match(p, TOK_COMMA));
     }
@@ -731,6 +991,15 @@ static node_t *par_module(par_t *p) {
     strncpy(mod->v.mod.name, name.text, sizeof(mod->v.mod.name)-1);
     mod->v.mod.funs = NULL;
     mod->v.mod.nfuns = 0;
+    mod->v.mod.nimports = 0;
+
+    /* Imports */
+    while (p->cur.type == TOK_IMPORT && !p->err) {
+        par_adv(p);
+        tok_t iname = par_expect(p, TOK_IDENT, "module name");
+        if (mod->v.mod.nimports < 16)
+            strncpy(mod->v.mod.imports[mod->v.mod.nimports++], iname.text, 127);
+    }
 
     /* Optional export */
     if (par_match(p, TOK_EXPORT)) {
@@ -851,6 +1120,48 @@ sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
     return fn(args, nargs);
 }
 
+sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {
+    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    v->type = SW_VAL_MAP;
+    v->v.map.count = count;
+    v->v.map.cap = count > 4 ? count : 4;
+    v->v.map.keys = malloc(sizeof(sw_val_t*) * v->v.map.cap);
+    v->v.map.vals = malloc(sizeof(sw_val_t*) * v->v.map.cap);
+    if (count > 0 && keys && vals) {
+        memcpy(v->v.map.keys, keys, sizeof(sw_val_t*) * count);
+        memcpy(v->v.map.vals, vals, sizeof(sw_val_t*) * count);
+    }
+    return v;
+}
+
+sw_val_t *sw_val_map_get(sw_val_t *map, sw_val_t *key) {
+    if (!map || map->type != SW_VAL_MAP) return sw_val_nil();
+    for (int i = 0; i < map->v.map.count; i++)
+        if (sw_val_equal(map->v.map.keys[i], key)) return map->v.map.vals[i];
+    return sw_val_nil();
+}
+
+sw_val_t *sw_val_map_put(sw_val_t *map, sw_val_t *key, sw_val_t *val) {
+    if (!map || map->type != SW_VAL_MAP) {
+        return sw_val_map_new(&key, &val, 1);
+    }
+    for (int i = 0; i < map->v.map.count; i++) {
+        if (sw_val_equal(map->v.map.keys[i], key)) {
+            sw_val_t *nm = sw_val_map_new(map->v.map.keys, map->v.map.vals, map->v.map.count);
+            nm->v.map.vals[i] = val;
+            return nm;
+        }
+    }
+    int n = map->v.map.count;
+    sw_val_t **ks = malloc(sizeof(sw_val_t*) * (n+1));
+    sw_val_t **vs = malloc(sizeof(sw_val_t*) * (n+1));
+    if (n > 0) { memcpy(ks, map->v.map.keys, sizeof(sw_val_t*)*n); memcpy(vs, map->v.map.vals, sizeof(sw_val_t*)*n); }
+    ks[n] = key; vs[n] = val;
+    sw_val_t *nm = sw_val_map_new(ks, vs, n+1);
+    free(ks); free(vs);
+    return nm;
+}
+
 void sw_val_free(sw_val_t *v) {
     if (!v) return;
     switch (v->type) {
@@ -858,7 +1169,9 @@ void sw_val_free(sw_val_t *v) {
     case SW_VAL_TUPLE: case SW_VAL_LIST:
         for (int i = 0; i < v->v.tuple.count; i++) sw_val_free(v->v.tuple.items[i]);
         free(v->v.tuple.items); break;
-    case SW_VAL_FUN: /* don't free closure env — owned by interpreter */ break;
+    case SW_VAL_FUN: /* don't free closure env -- owned by interpreter */ break;
+    case SW_VAL_MAP:
+        free(v->v.map.keys); free(v->v.map.vals); break;
     default: break;
     }
     free(v);
@@ -894,6 +1207,13 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
         for (int i = 0; i < a->v.tuple.count; i++)
             if (!sw_val_equal(a->v.tuple.items[i], b->v.tuple.items[i])) return 0;
         return 1;
+    case SW_VAL_MAP:
+        if (a->v.map.count != b->v.map.count) return 0;
+        for (int i = 0; i < a->v.map.count; i++) {
+            sw_val_t *bv = sw_val_map_get((sw_val_t*)b, a->v.map.keys[i]);
+            if (!sw_val_equal(a->v.map.vals[i], bv)) return 0;
+        }
+        return 1;
     default: return 0;
     }
 }
@@ -921,6 +1241,15 @@ void sw_val_print(sw_val_t *v) {
             sw_val_print(v->v.tuple.items[i]);
         }
         printf("]"); break;
+    case SW_VAL_MAP:
+        printf("%%{");
+        for (int i = 0; i < v->v.map.count; i++) {
+            if (i) printf(", ");
+            sw_val_print(v->v.map.keys[i]);
+            printf(": ");
+            sw_val_print(v->v.map.vals[i]);
+        }
+        printf("}"); break;
     default: printf("?"); break;
     }
 }
@@ -1034,6 +1363,31 @@ static int pattern_match(node_t *pattern, sw_val_t *val, sw_env_t *env) {
         for (int i = 0; i < pattern->v.coll.count; i++) {
             if (!pattern_match(pattern->v.coll.items[i], val->v.tuple.items[i], env))
                 return 0;
+        }
+        return 1;
+
+    case N_LIST_CONS:
+        if (val->type != SW_VAL_LIST || val->v.tuple.count < 1) return 0;
+        if (!pattern_match(pattern->v.cons.head, val->v.tuple.items[0], env)) return 0;
+        {
+            sw_val_t *tail = sw_val_list(val->v.tuple.items + 1, val->v.tuple.count - 1);
+            if (!pattern_match(pattern->v.cons.tail, tail, env)) return 0;
+        }
+        return 1;
+
+    case N_MAP:
+        if (val->type != SW_VAL_MAP) return 0;
+        for (int i = 0; i < pattern->v.map.count; i++) {
+            /* Keys in map patterns are literals: atoms (from name:) or strings */
+            node_t *kn = pattern->v.map.keys[i];
+            sw_val_t *pkey = NULL;
+            if (kn->type == N_ATOM) pkey = sw_val_atom(kn->v.sval);
+            else if (kn->type == N_STRING) pkey = sw_val_string(kn->v.sval);
+            else if (kn->type == N_INT) pkey = sw_val_int(kn->v.ival);
+            else return 0;
+            sw_val_t *pval_found = sw_val_map_get(val, pkey);
+            if (pval_found->type == SW_VAL_NIL) return 0;
+            if (!pattern_match(pattern->v.map.vals[i], pval_found, env)) return 0;
         }
         return 1;
 
@@ -1293,14 +1647,65 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (strcmp(fname, "elem") == 0) return builtin_elem(args, nargs);
         if (strcmp(fname, "abs") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT)
             return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
+        if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
+            char buf[256];
+            switch (args[0]->type) {
+            case SW_VAL_INT: snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf);
+            case SW_VAL_FLOAT: snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf);
+            case SW_VAL_STRING: return args[0];
+            case SW_VAL_ATOM: return sw_val_string(args[0]->v.str);
+            case SW_VAL_NIL: return sw_val_string("nil");
+            default: return sw_val_string("<val>");
+            }
+        }
+        if (strcmp(fname, "map_get") == 0 && nargs >= 2) return sw_val_map_get(args[0], args[1]);
+        if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);
+        if (strcmp(fname, "map_new") == 0) return sw_val_map_new(NULL, NULL, 0);
+        if (strcmp(fname, "map_keys") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
+            return sw_val_list(args[0]->v.map.keys, args[0]->v.map.count);
+        }
+        if (strcmp(fname, "map_values") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
+            return sw_val_list(args[0]->v.map.vals, args[0]->v.map.count);
+        }
+        if (strcmp(fname, "typeof") == 0 && nargs >= 1) {
+            const char *names[] = {"nil","int","float","string","atom","pid","tuple","list","fun","map"};
+            return sw_val_string(names[args[0]->type < 10 ? args[0]->type : 0]);
+        }
+        if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST) {
+            int cnt = args[0]->v.tuple.count;
+            sw_val_t **items = malloc(sizeof(sw_val_t*) * (cnt + 1));
+            memcpy(items, args[0]->v.tuple.items, sizeof(sw_val_t*) * cnt);
+            items[cnt] = args[1];
+            sw_val_t *r = sw_val_list(items, cnt + 1);
+            free(items);
+            return r;
+        }
 
         /* User-defined function in module */
         node_t *fn = find_fun(interp->module_ast, fname);
         if (fn) {
             sw_env_t *fenv = env_new(interp->global_env);
-            for (int i = 0; i < fn->v.fun.nparams && i < nargs; i++)
-                env_set(fenv, fn->v.fun.params[i], args[i]);
+            for (int i = 0; i < fn->v.fun.nparams; i++) {
+                if (i < nargs)
+                    env_set(fenv, fn->v.fun.params[i], args[i]);
+                else if (fn->v.fun.defaults[i])
+                    env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
+                else
+                    env_set(fenv, fn->v.fun.params[i], sw_val_nil());
+            }
             sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+            env_free(fenv);
+            return r;
+        }
+
+        /* Dynamic dispatch: variable holds a closure */
+        sw_val_t *fn_val = env_get(env, fname);
+        if (fn_val && fn_val->type == SW_VAL_FUN && fn_val->v.fun.body) {
+            node_t *fn_node = (node_t *)fn_val->v.fun.body;
+            sw_env_t *fenv = env_new(fn_val->v.fun.closure_env ? fn_val->v.fun.closure_env : interp->global_env);
+            for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
+                env_set(fenv, fn_node->v.fun.params[i], args[i]);
+            sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
             env_free(fenv);
             return r;
         }
@@ -1332,6 +1737,85 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         return msg;
     }
 
+    case N_MAP: {
+        sw_val_t *keys[64], *vals[64];
+        int count = n->v.map.count;
+        if (count > 64) count = 64;
+        for (int i = 0; i < count; i++) {
+            keys[i] = eval(interp, n->v.map.keys[i], env);
+            vals[i] = eval(interp, n->v.map.vals[i], env);
+        }
+        return sw_val_map_new(keys, vals, count);
+    }
+
+    case N_FOR: {
+        sw_val_t *iter = eval(interp, n->v.forloop.iter, env);
+        sw_val_t *result = sw_val_nil();
+        if (iter->type == SW_VAL_LIST) {
+            for (int i = 0; i < iter->v.tuple.count; i++) {
+                env_set(env, n->v.forloop.var, iter->v.tuple.items[i]);
+                result = eval(interp, n->v.forloop.body, env);
+            }
+        }
+        return result;
+    }
+
+    case N_RANGE: {
+        sw_val_t *from = eval(interp, n->v.range.from, env);
+        sw_val_t *to = eval(interp, n->v.range.to, env);
+        if (from->type != SW_VAL_INT || to->type != SW_VAL_INT)
+            return sw_val_list(NULL, 0);
+        int64_t lo = from->v.i, hi = to->v.i;
+        int cnt = (int)(hi - lo + 1);
+        if (cnt <= 0) return sw_val_list(NULL, 0);
+        if (cnt > 10000) cnt = 10000;
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
+        for (int i = 0; i < cnt; i++) items[i] = sw_val_int(lo + i);
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
+    }
+
+    case N_TRY: {
+        sw_val_t *result = eval(interp, n->v.trycatch.body, env);
+        if (interp->error) {
+            interp->error = 0;
+            sw_env_t *catch_env = env_new(env);
+            env_set(catch_env, n->v.trycatch.err_var, sw_val_string(interp->error_msg));
+            interp->error_msg[0] = 0;
+            result = eval(interp, n->v.trycatch.catch_body, catch_env);
+            env_free(catch_env);
+        }
+        return result;
+    }
+
+    case N_LIST_CONS: {
+        /* [h | t] — cons: prepend head to tail list */
+        sw_val_t *head = eval(interp, n->v.cons.head, env);
+        sw_val_t *tail = eval(interp, n->v.cons.tail, env);
+        if (tail->type == SW_VAL_LIST) {
+            int cnt = tail->v.tuple.count + 1;
+            sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
+            items[0] = head;
+            memcpy(items + 1, tail->v.tuple.items, sizeof(sw_val_t*) * tail->v.tuple.count);
+            sw_val_t *r = sw_val_list(items, cnt);
+            free(items);
+            return r;
+        }
+        return sw_val_list(&head, 1);
+    }
+
+    case N_FUN: {
+        /* Anonymous function: capture closure env */
+        sw_val_t *v = calloc(1, sizeof(sw_val_t));
+        v->type = SW_VAL_FUN;
+        v->v.fun.name = strdup(n->v.fun.name);
+        v->v.fun.num_params = n->v.fun.nparams;
+        v->v.fun.body = n;
+        v->v.fun.closure_env = env;
+        return v;
+    }
+
     case N_RECEIVE: {
         /* Simplified receive: wait for a message, try to match clauses */
         uint64_t timeout = n->v.recv.after_ms > 0 ? (uint64_t)n->v.recv.after_ms : 5000;
@@ -1353,6 +1837,11 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             node_t *cl = n->v.recv.clauses[i];
             sw_env_t *cl_env = env_new(env);
             if (pattern_match(cl->v.clause.pattern, msg, cl_env)) {
+                /* Check guard if present */
+                if (cl->v.clause.guard) {
+                    sw_val_t *gv = eval(interp, cl->v.clause.guard, cl_env);
+                    if (!sw_val_is_truthy(gv)) { env_free(cl_env); continue; }
+                }
                 sw_val_t *r = eval(interp, cl->v.clause.body, cl_env);
                 env_free(cl_env);
                 return r;
