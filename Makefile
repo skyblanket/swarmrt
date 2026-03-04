@@ -1,8 +1,15 @@
 # SwarmRT Makefile
 
 CC = cc
-CFLAGS = -Wall -Wextra -g -O2 -pthread -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wno-macro-redefined
+CFLAGS = -Wall -Wextra -Wno-unused-function -g -O2 -pthread -D_GNU_SOURCE -D_DARWIN_C_SOURCE
+CLANG_CHECK := $(shell $(CC) -Wno-macro-redefined -x c -c /dev/null -o /dev/null 2>/dev/null && echo yes)
+ifeq ($(CLANG_CHECK),yes)
+CFLAGS += -Wno-macro-redefined
+endif
 LDFLAGS = -pthread
+ifneq ($(shell uname),Darwin)
+LDFLAGS += -lssl -lcrypto
+endif
 
 SRC_DIR = src
 BUILD_DIR = build
@@ -12,7 +19,7 @@ EXAMPLES_DIR = examples
 # Core object files (needed by all native targets since process_exit hooks into all modules)
 CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
             swarmrt_phase4 swarmrt_phase5 swarmrt_hotload swarmrt_io swarmrt_gc swarmrt_node \
-            swarmrt_lang
+            swarmrt_lang swarmrt_http
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
@@ -26,6 +33,11 @@ all: v1 v2 proc native
 # Compile rules for core objects
 $(BUILD_DIR)/swarmrt_asm.o: $(SRC_DIR)/swarmrt_asm.S | dirs
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# swarmrt_native.c needs -fno-stack-protector: processes migrate between
+# scheduler threads via context_swap, invalidating the per-thread canary
+$(BUILD_DIR)/swarmrt_native.o: $(SRC_DIR)/swarmrt_native.c | dirs
+	$(CC) $(CFLAGS) -fno-stack-protector -c $< -o $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | dirs
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -161,6 +173,7 @@ libswarmrt: core-objs
 # SwarmRT compiler
 swc: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
+		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c \
 		-o $(BIN_DIR)/swc $(LDFLAGS)
 
 # Example: compile a .sw file
