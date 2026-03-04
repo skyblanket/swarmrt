@@ -85,6 +85,10 @@ typedef struct {
     void *module_ast;                /* ast_node_t* */
     int error;
     char error_msg[256];
+    /* Test assertion state (used by swarmrt_test) */
+    int assert_failed;
+    char assert_msg[512];
+    int assert_line;
 } sw_interp_t;
 
 /* === Public API === */
@@ -101,6 +105,9 @@ sw_val_t *sw_lang_call(sw_interp_t *interp, const char *func_name,
 
 /* Evaluate an expression string (for testing) */
 sw_val_t *sw_lang_eval(sw_interp_t *interp, const char *expr_source);
+
+/* Evaluate in REPL mode: assignments persist in global_env */
+sw_val_t *sw_lang_eval_repl(sw_interp_t *interp, const char *expr_source);
 
 /* Free interpreter */
 void sw_lang_free(sw_interp_t *interp);

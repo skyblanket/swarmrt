@@ -17,15 +17,20 @@
 #include <string.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <sys/stat.h>
 #include "swarmrt_lang.h"
 #include "swarmrt_codegen.h"
+#include "swarmrt_repl.h"
+#include "swarmrt_test.h"
 
 static void usage(void) {
     fprintf(stderr,
         "Usage: swc <command> [options] <file.sw>\n\n"
         "Commands:\n"
         "  build    Compile .sw to native binary\n"
-        "  emit     Output generated C to stdout\n\n"
+        "  emit     Output generated C to stdout\n"
+        "  repl     Start interactive REPL\n"
+        "  test     Run test_* functions in .sw files\n\n"
         "Options:\n"
         "  -o <name>     Output binary name (default: module name)\n"
         "  -O            Optimize (-O2)\n"
@@ -64,9 +69,33 @@ static int get_func_names(void *ast, const char **names, int max) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { usage(); return 1; }
+    if (argc < 2) { usage(); return 1; }
 
     const char *cmd = argv[1];
+
+    /* REPL — no input files needed */
+    if (strcmp(cmd, "repl") == 0)
+        return sw_repl_start();
+
+    /* Test runner */
+    if (strcmp(cmd, "test") == 0) {
+        if (argc < 3) {
+            /* Default: run tests in current directory */
+            return sw_test_run_dir(".") ? 1 : 0;
+        }
+        int total_failures = 0;
+        for (int i = 2; i < argc; i++) {
+            /* Check if argument is a directory */
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode))
+                total_failures += sw_test_run_dir(argv[i]);
+            else
+                total_failures += sw_test_run_file(argv[i]);
+        }
+        return total_failures ? 1 : 0;
+    }
+
+    if (argc < 3) { usage(); return 1; }
     const char *inputs[64];
     int ninputs = 0;
     const char *output_name = NULL;
@@ -289,12 +318,18 @@ int main(int argc, char **argv) {
 
     /* Compile with cc */
     char cmd_buf[2048];
+#ifdef __APPLE__
+    const char *extra_libs = "";
+#else
+    const char *extra_libs = "-lssl -lcrypto";
+#endif
     snprintf(cmd_buf, sizeof(cmd_buf),
-        "cc %s -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s",
+        "cc %s -fno-stack-protector -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s %s",
         optimize ? "-O2" : "-O0 -g",
         out_path, tmppath,
         swc_dir, swc_dir,
-        strip ? "-s" : "");
+        strip ? "-s" : "",
+        extra_libs);
 
     if (nasts > 1)
         fprintf(stderr, "swc: compiling %d modules → %s\n", nasts, out_path);

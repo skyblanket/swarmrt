@@ -1482,6 +1482,69 @@ static sw_val_t *builtin_elem(sw_val_t **args, int nargs) {
     return args[0]->v.tuple.items[idx];
 }
 
+/* Built-in: assert(condition) — fail test if falsy */
+static sw_val_t *builtin_assert(sw_interp_t *interp, sw_val_t **args, int nargs, int line) {
+    if (nargs < 1 || !sw_val_is_truthy(args[0])) {
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        if (nargs >= 2 && args[1]->type == SW_VAL_STRING)
+            snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                     "assertion failed: %s", args[1]->v.str);
+        else
+            snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                     "assertion failed");
+        return sw_val_atom("error");
+    }
+    return sw_val_atom("ok");
+}
+
+/* Format a value into a buffer (avoids stdout redirect) */
+static void val_to_str(sw_val_t *v, char *buf, size_t bufsz) {
+    if (!v || !buf || bufsz == 0) return;
+    switch (v->type) {
+    case SW_VAL_NIL:    snprintf(buf, bufsz, "nil"); break;
+    case SW_VAL_INT:    snprintf(buf, bufsz, "%lld", (long long)v->v.i); break;
+    case SW_VAL_FLOAT:  snprintf(buf, bufsz, "%g", v->v.f); break;
+    case SW_VAL_STRING: snprintf(buf, bufsz, "\"%s\"", v->v.str); break;
+    case SW_VAL_ATOM:   snprintf(buf, bufsz, ":%s", v->v.str); break;
+    case SW_VAL_PID:    snprintf(buf, bufsz, "#PID"); break;
+    case SW_VAL_FUN:    snprintf(buf, bufsz, "#Fun"); break;
+    default:            snprintf(buf, bufsz, "<val>"); break;
+    }
+}
+
+/* Built-in: assert_eq(actual, expected) */
+static sw_val_t *builtin_assert_eq(sw_interp_t *interp, sw_val_t **args, int nargs, int line) {
+    if (nargs < 2 || !sw_val_equal(args[0], args[1])) {
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        if (nargs >= 2) {
+            char abuf[128], ebuf[128];
+            val_to_str(args[0], abuf, sizeof(abuf));
+            val_to_str(args[1], ebuf, sizeof(ebuf));
+            snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                     "expected %s, got %s", ebuf, abuf);
+        } else {
+            snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                     "assert_eq requires 2 arguments");
+        }
+        return sw_val_atom("error");
+    }
+    return sw_val_atom("ok");
+}
+
+/* Built-in: assert_ne(a, b) — fail if equal */
+static sw_val_t *builtin_assert_ne(sw_interp_t *interp, sw_val_t **args, int nargs, int line) {
+    if (nargs < 2 || sw_val_equal(args[0], args[1])) {
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                 "expected values to differ, but both are equal");
+        return sw_val_atom("error");
+    }
+    return sw_val_atom("ok");
+}
+
 /* Evaluate node */
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     if (!n || interp->error) return sw_val_nil();
@@ -1633,6 +1696,9 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             /* Builtins */
             if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
             if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
+            if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
+            if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
+            if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
         }
         return val;
     }
@@ -1686,6 +1752,11 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             free(items);
             return r;
         }
+
+        /* Test assertion builtins */
+        if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
 
         /* User-defined function in module */
         node_t *fn = find_fun(interp->module_ast, fname);
@@ -1923,6 +1994,39 @@ sw_val_t *sw_lang_eval(sw_interp_t *interp, const char *expr_source) {
     interp->module_ast = mod;
     sw_val_t *result = sw_lang_call(interp, "_eval", NULL, 0);
     interp->module_ast = save_mod;
+    node_free(mod);
+    return result;
+}
+
+sw_val_t *sw_lang_eval_repl(sw_interp_t *interp, const char *expr_source) {
+    /* Parse expression wrapped in a function */
+    char wrapped[4096];
+    snprintf(wrapped, sizeof(wrapped),
+             "module _Eval\nfun _eval() {\n%s\n}\n", expr_source);
+
+    par_t p;
+    par_init(&p, wrapped);
+    node_t *mod = par_module(&p);
+    if (p.err) {
+        node_free(mod);
+        snprintf(interp->error_msg, sizeof(interp->error_msg), "parse error");
+        interp->error = 1;
+        return sw_val_nil();
+    }
+
+    /* Find the _eval function body */
+    node_t *fn = NULL;
+    for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        if (strcmp(mod->v.mod.funs[i]->v.fun.name, "_eval") == 0) {
+            fn = mod->v.mod.funs[i];
+            break;
+        }
+    }
+    if (!fn) { node_free(mod); return sw_val_nil(); }
+
+    /* Evaluate body directly in global_env so assignments persist.
+     * Keep original module_ast so loaded module functions are accessible. */
+    sw_val_t *result = eval(interp, fn->v.fun.body, interp->global_env);
     node_free(mod);
     return result;
 }
