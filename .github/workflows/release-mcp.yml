@@ -1,0 +1,123 @@
+name: Release MCP
+
+on:
+  push:
+    tags:
+      - 'mcp-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+            cc: cc
+            cflags: "-march=armv8-a"
+          - os: macos-13
+            target: darwin-x86_64
+            cc: cc
+            cflags: "-march=x86-64"
+          - os: ubuntu-latest
+            target: linux-x86_64
+            cc: gcc
+            cflags: "-march=x86-64"
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            cc: gcc
+            cflags: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Build
+        run: |
+          CFLAGS="-Wall -Wextra -Wno-unused-function -O2 -pthread -D_GNU_SOURCE ${{ matrix.cflags }}"
+          LDFLAGS="-pthread -lm -lz"
+
+          mkdir -p dist
+          ${{ matrix.cc }} $CFLAGS -c src/swarmrt_search.c -o dist/search.o
+          ${{ matrix.cc }} $CFLAGS dist/search.o mcp/swarmrt_mcp.c -o dist/swarmrt-mcp-${{ matrix.target }} $LDFLAGS
+          rm dist/search.o
+
+          # Strip on Linux
+          if [[ "${{ matrix.target }}" == linux-* ]]; then
+            strip dist/swarmrt-mcp-${{ matrix.target }}
+          fi
+
+          ls -lh dist/swarmrt-mcp-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarmrt-mcp-${{ matrix.target }}
+          path: dist/swarmrt-mcp-${{ matrix.target }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum swarmrt-mcp-* > checksums.txt
+          cat checksums.txt
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#mcp-v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "SwarmRT MCP v${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## SwarmRT MCP v${{ steps.version.outputs.VERSION }}
+
+            22 tools, single native binary, zero dependencies.
+
+            ### Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/skyblanket/swarmrt/main/mcp/get.sh | bash
+            ```
+
+            Or download the binary for your platform below, then:
+
+            ```bash
+            chmod +x swarmrt-mcp-*
+            claude mcp add -s user swarmrt-mcp -- /path/to/swarmrt-mcp-*
+            ```
+
+            ### Platforms
+            | File | Platform |
+            |------|----------|
+            | `swarmrt-mcp-darwin-arm64` | macOS Apple Silicon |
+            | `swarmrt-mcp-darwin-x86_64` | macOS Intel |
+            | `swarmrt-mcp-linux-x86_64` | Linux x86_64 |
+            | `swarmrt-mcp-linux-arm64` | Linux ARM64 |
+
+            See [mcp/README.md](mcp/README.md) for full documentation.
+          files: |
+            dist/swarmrt-mcp-*
+            dist/checksums.txt
+          draft: false
+          prerelease: false
