@@ -6,7 +6,7 @@ CLANG_CHECK := $(shell $(CC) -Wno-macro-redefined -x c -c /dev/null -o /dev/null
 ifeq ($(CLANG_CHECK),yes)
 CFLAGS += -Wno-macro-redefined
 endif
-LDFLAGS = -pthread
+LDFLAGS = -pthread -lz
 ifneq ($(shell uname),Darwin)
 LDFLAGS += -lssl -lcrypto
 endif
@@ -26,7 +26,7 @@ CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 .PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 \
         test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-all benchmark benchmark-native stats \
-        swc libswarmrt example-counter
+        swc libswarmrt example-counter search test-search bench-search sws mcp
 
 all: v1 v2 proc native
 
@@ -188,6 +188,30 @@ atelier: swc libswarmrt
 parse-test: v1
 	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/hello.sw
 	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/counter.sw
+
+# Search module (SIMD fuzzy + vector search)
+search: dirs
+	$(CC) $(CFLAGS) -march=native -c $(SRC_DIR)/swarmrt_search.c -o $(BUILD_DIR)/swarmrt_search.o
+
+test-search: search
+	$(CC) $(CFLAGS) -march=native $(BUILD_DIR)/swarmrt_search.o $(SRC_DIR)/test_search.c \
+		-o $(BIN_DIR)/test-search $(LDFLAGS) -lm
+	./$(BIN_DIR)/test-search
+
+bench-search: search
+	$(CC) $(CFLAGS) -march=native $(BUILD_DIR)/swarmrt_search.o $(SRC_DIR)/bench_search.c \
+		-o $(BIN_DIR)/bench-search $(LDFLAGS) -lm
+	./$(BIN_DIR)/bench-search
+
+# Filesystem search CLI
+sws: search dirs
+	$(CC) $(CFLAGS) -march=native $(BUILD_DIR)/swarmrt_search.o \
+		$(SRC_DIR)/swarmrt_fsindex.c -o $(BIN_DIR)/sws $(LDFLAGS) -lm
+
+# MCP server for Claude Code
+mcp: search dirs
+	$(CC) $(CFLAGS) -march=native $(BUILD_DIR)/swarmrt_search.o \
+		mcp/swarmrt_mcp.c -o $(BIN_DIR)/swarmrt-mcp $(LDFLAGS) -lm
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
