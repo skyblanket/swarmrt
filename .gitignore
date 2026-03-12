@@ -4,3 +4,4 @@ build/
 *.dSYM
 *.gen.c
 .DS_Store
+.swarmrt/
