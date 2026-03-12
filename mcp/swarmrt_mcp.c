@@ -846,6 +846,9 @@ static void tool_set_project(json_node_t *args, jbuf_t *out);
 static void tool_memory_update(json_node_t *args, jbuf_t *out);
 static void tool_autopilot_pause(json_node_t *args, jbuf_t *out);
 static void tool_codebase_grep(json_node_t *args, jbuf_t *out);
+static void tool_git_diff(json_node_t *args, jbuf_t *out);
+static void tool_git_log(json_node_t *args, jbuf_t *out);
+static void tool_codebase_overview(json_node_t *args, jbuf_t *out);
 
 static mcp_tool_t TOOLS[] = {
     {
@@ -961,6 +964,24 @@ static mcp_tool_t TOOLS[] = {
         "Switch the MCP to a different project directory. Resets search index, reloads memories from the new project's .swarmrt/ dir. Call this first when working in a specific repo.",
         "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute path to project root (e.g. /Users/sky/myrepo)\"}},\"required\":[\"path\"]}",
         tool_set_project
+    },
+    {
+        "git_diff",
+        "Show git changes in the project. Returns changed files with stats (insertions/deletions). Optionally diff against a specific ref (branch, commit, HEAD~N).",
+        "{\"type\":\"object\",\"properties\":{\"ref\":{\"type\":\"string\",\"description\":\"Git ref to diff against (default: staged + unstaged changes). Examples: HEAD~3, main, abc1234\"}},\"required\":[]}",
+        tool_git_diff
+    },
+    {
+        "git_log",
+        "Show recent git commits with hash, author, date, and message. Essential context for understanding what changed recently.",
+        "{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Number of commits (default 10)\"},\"path\":{\"type\":\"string\",\"description\":\"Filter to specific file/dir path\"}},\"required\":[]}",
+        tool_git_log
+    },
+    {
+        "codebase_overview",
+        "Get a structural overview of the codebase: languages detected, file counts by extension, directory structure (top 2 levels), total lines of code. Fast architectural context.",
+        "{\"type\":\"object\",\"properties\":{}}",
+        tool_codebase_overview
     },
     {NULL, NULL, NULL, NULL}
 };
@@ -1663,6 +1684,283 @@ static void tool_set_project(json_node_t *args, jbuf_t *out) {
     jb_append(out, "{\"project\":");
     jb_append_escaped(out, path);
     jb_append(out, ",\"memories\":%d,\"message\":\"Project switched. Search will index on first query.\"}", g_memory_count);
+}
+
+/* --- git tools (shell out to git) --- */
+
+static char *run_cmd(const char *cmd, size_t max_out) {
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return NULL;
+    size_t cap = max_out > 0 ? max_out : 65536;
+    char *buf = malloc(cap + 1);
+    size_t len = 0;
+    size_t nr;
+    while ((nr = fread(buf + len, 1, cap - len, fp)) > 0) {
+        len += nr;
+        if (len >= cap) break;
+    }
+    buf[len] = '\0';
+    pclose(fp);
+    return buf;
+}
+
+static void tool_git_diff(json_node_t *args, jbuf_t *out) {
+    const char *ref = json_get_str(args, "ref");
+    char cmd[4096];
+
+    if (ref && ref[0]) {
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git diff --stat '%s' 2>&1 && echo '---DIFF---' && git diff '%s' 2>&1 | head -200",
+                 g_project_root, ref, ref);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git diff --stat HEAD 2>&1 && echo '---DIFF---' && git diff HEAD 2>&1 | head -200",
+                 g_project_root);
+    }
+
+    char *result = run_cmd(cmd, 32768);
+    if (!result) { jb_append(out, "\"Error: failed to run git diff\""); return; }
+
+    session_add("git_diff", ref ? ref : "HEAD");
+
+    /* Split at ---DIFF--- */
+    char *sep = strstr(result, "---DIFF---\n");
+    if (sep) {
+        *sep = '\0';
+        const char *diff_content = sep + 11; /* skip "---DIFF---\n" */
+
+        jb_append(out, "{\"stats\":");
+        jb_append_escaped(out, result);
+        jb_append(out, ",\"diff\":");
+        jb_append_escaped(out, diff_content);
+        jb_append(out, "}");
+    } else {
+        jb_append(out, "{\"output\":");
+        jb_append_escaped(out, result);
+        jb_append(out, "}");
+    }
+    free(result);
+}
+
+static void tool_git_log(json_node_t *args, jbuf_t *out) {
+    int limit = (int)json_get_int(args, "limit", 10);
+    const char *path = json_get_str(args, "path");
+    if (limit > 50) limit = 50;
+
+    char cmd[4096];
+    if (path && path[0]) {
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d -- '%s' 2>&1",
+                 g_project_root, limit, path);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d 2>&1",
+                 g_project_root, limit);
+    }
+
+    char *result = run_cmd(cmd, 16384);
+    if (!result) { jb_append(out, "\"Error: failed to run git log\""); return; }
+
+    session_add("git_log", path ? path : "all");
+
+    /* Parse pipe-delimited lines into JSON */
+    jb_append(out, "[");
+    char *line = result;
+    int count = 0;
+    while (*line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strlen(line) < 3) { if (nl) { line = nl + 1; continue; } else break; }
+
+        /* Split by | */
+        char *hash = line;
+        char *author = strchr(hash, '|');
+        if (!author) { if (nl) { line = nl + 1; continue; } else break; }
+        *author++ = '\0';
+        char *date = strchr(author, '|');
+        if (!date) { if (nl) { line = nl + 1; continue; } else break; }
+        *date++ = '\0';
+        char *msg = strchr(date, '|');
+        if (!msg) { if (nl) { line = nl + 1; continue; } else break; }
+        *msg++ = '\0';
+
+        if (count > 0) jb_append(out, ",");
+        jb_append(out, "{\"hash\":");
+        jb_append_escaped(out, hash);
+        jb_append(out, ",\"author\":");
+        jb_append_escaped(out, author);
+        jb_append(out, ",\"date\":");
+        jb_append_escaped(out, date);
+        jb_append(out, ",\"message\":");
+        jb_append_escaped(out, msg);
+        jb_append(out, "}");
+        count++;
+
+        if (!nl) break;
+        line = nl + 1;
+    }
+    jb_append(out, "]");
+    free(result);
+}
+
+/* --- codebase_overview: language detection + structure --- */
+
+typedef struct { const char *ext; const char *lang; } ext_lang_t;
+static const ext_lang_t LANG_MAP[] = {
+    {".c", "C"}, {".h", "C/C++ Header"}, {".cpp", "C++"}, {".cc", "C++"},
+    {".rs", "Rust"}, {".go", "Go"}, {".py", "Python"}, {".js", "JavaScript"},
+    {".ts", "TypeScript"}, {".tsx", "TypeScript/React"}, {".jsx", "JavaScript/React"},
+    {".rb", "Ruby"}, {".java", "Java"}, {".kt", "Kotlin"}, {".swift", "Swift"},
+    {".ex", "Elixir"}, {".exs", "Elixir"}, {".erl", "Erlang"},
+    {".sh", "Shell"}, {".bash", "Shell"}, {".zsh", "Shell"},
+    {".html", "HTML"}, {".css", "CSS"}, {".scss", "SCSS"},
+    {".json", "JSON"}, {".yaml", "YAML"}, {".yml", "YAML"}, {".toml", "TOML"},
+    {".md", "Markdown"}, {".sql", "SQL"}, {".lua", "Lua"}, {".zig", "Zig"},
+    {".S", "Assembly"}, {".asm", "Assembly"}, {".sw", "SwarmLang"},
+    {".xml", "XML"}, {".proto", "Protobuf"}, {".r", "R"},
+    {".cs", "C#"}, {".fs", "F#"}, {".php", "PHP"}, {".pl", "Perl"},
+    {".scala", "Scala"}, {".clj", "Clojure"}, {".hs", "Haskell"},
+    {".vim", "Vim Script"}, {".el", "Emacs Lisp"}, {".dart", "Dart"},
+    {".m", "Objective-C"}, {".mm", "Objective-C++"},
+    {NULL, NULL}
+};
+
+typedef struct { char ext[16]; const char *lang; int files; int lines; } lang_stat_t;
+
+static void count_lines_walk(const char *dir, const char *root,
+                             lang_stat_t *stats, int *nstats, int max_stats,
+                             int *total_files, int *total_lines, int depth) {
+    if (depth > 6) return; /* don't go too deep */
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    char pathbuf[4096];
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        if (is_excluded(ent->d_name)) continue;
+        snprintf(pathbuf, sizeof(pathbuf), "%s/%s", dir, ent->d_name);
+        struct stat st;
+        if (lstat(pathbuf, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            count_lines_walk(pathbuf, root, stats, nstats, max_stats,
+                             total_files, total_lines, depth + 1);
+        } else if (S_ISREG(st.st_mode) && (size_t)st.st_size <= INDEX_MAX_FILE_SIZE) {
+            /* Get extension */
+            const char *dot = strrchr(ent->d_name, '.');
+            if (!dot) continue;
+
+            /* Find language */
+            const char *lang = NULL;
+            for (int i = 0; LANG_MAP[i].ext; i++) {
+                if (strcmp(dot, LANG_MAP[i].ext) == 0) { lang = LANG_MAP[i].lang; break; }
+            }
+            if (!lang) continue;
+
+            /* Count lines */
+            FILE *f = fopen(pathbuf, "r");
+            if (!f) continue;
+            int lines = 0;
+            int ch;
+            while ((ch = fgetc(f)) != EOF) {
+                if (ch == '\n') lines++;
+            }
+            fclose(f);
+
+            (*total_files)++;
+            (*total_lines) += lines;
+
+            /* Find or create stat entry */
+            int si = -1;
+            for (int i = 0; i < *nstats; i++) {
+                if (strcmp(stats[i].ext, dot) == 0) { si = i; break; }
+            }
+            if (si < 0 && *nstats < max_stats) {
+                si = (*nstats)++;
+                strncpy(stats[si].ext, dot, sizeof(stats[si].ext) - 1);
+                stats[si].lang = lang;
+                stats[si].files = 0;
+                stats[si].lines = 0;
+            }
+            if (si >= 0) {
+                stats[si].files++;
+                stats[si].lines += lines;
+            }
+        }
+    }
+    closedir(d);
+}
+
+static void tool_codebase_overview(json_node_t *args, jbuf_t *out) {
+    (void)args;
+
+    lang_stat_t stats[64];
+    int nstats = 0;
+    int total_files = 0, total_lines = 0;
+
+    count_lines_walk(g_project_root, g_project_root, stats, &nstats, 64,
+                     &total_files, &total_lines, 0);
+
+    /* Sort by lines descending */
+    for (int i = 0; i < nstats - 1; i++) {
+        for (int j = i + 1; j < nstats; j++) {
+            if (stats[j].lines > stats[i].lines) {
+                lang_stat_t tmp = stats[i];
+                stats[i] = stats[j];
+                stats[j] = tmp;
+            }
+        }
+    }
+
+    /* Get top-level dirs */
+    char top_dirs_cmd[4096];
+    snprintf(top_dirs_cmd, sizeof(top_dirs_cmd),
+             "cd '%s' && find . -maxdepth 2 -type d ! -path '*/.*' ! -path '*/node_modules/*' "
+             "! -path '*/build/*' ! -path '*/__pycache__/*' ! -path '*/target/*' 2>/dev/null | head -30",
+             g_project_root);
+    char *dirs = run_cmd(top_dirs_cmd, 4096);
+
+    /* Check if git repo */
+    char git_cmd[4096];
+    snprintf(git_cmd, sizeof(git_cmd), "cd '%s' && git rev-parse --short HEAD 2>/dev/null", g_project_root);
+    char *git_head = run_cmd(git_cmd, 64);
+    if (git_head) {
+        size_t gl = strlen(git_head);
+        while (gl > 0 && (git_head[gl-1] == '\n' || git_head[gl-1] == '\r')) git_head[--gl] = '\0';
+    }
+
+    session_add("overview", g_project_root);
+
+    jb_append(out, "{\"project\":");
+    jb_append_escaped(out, g_project_root);
+    jb_append(out, ",\"total_files\":%d,\"total_lines\":%d", total_files, total_lines);
+
+    if (git_head && git_head[0]) {
+        jb_append(out, ",\"git_head\":");
+        jb_append_escaped(out, git_head);
+    }
+
+    jb_append(out, ",\"languages\":[");
+    for (int i = 0; i < nstats && i < 15; i++) {
+        if (i > 0) jb_append(out, ",");
+        jb_append(out, "{\"lang\":");
+        jb_append_escaped(out, stats[i].lang);
+        jb_append(out, ",\"ext\":");
+        jb_append_escaped(out, stats[i].ext);
+        jb_append(out, ",\"files\":%d,\"lines\":%d}", stats[i].files, stats[i].lines);
+    }
+    jb_append(out, "]");
+
+    if (dirs && dirs[0]) {
+        jb_append(out, ",\"structure\":");
+        jb_append_escaped(out, dirs);
+    }
+
+    jb_append(out, "}");
+
+    free(dirs);
+    free(git_head);
 }
 
 /* ================================================================
