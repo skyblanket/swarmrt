@@ -41,10 +41,10 @@
  * Section 1: Configuration
  * ================================================================ */
 
-#define MCP_VERSION         "0.2.0"
+#define MCP_VERSION         "0.4.0"
 #define MCP_NAME            "swarmrt-mcp"
 #define MAX_LINE            (4 * 1024 * 1024)  /* 4MB max JSON-RPC message */
-#define MAX_TOOLS           32
+#define MAX_TOOLS           48
 #define MAX_RESULTS         20
 #define MAX_MEMORIES        8192
 #define MAX_SESSION_EVENTS  4096
@@ -70,6 +70,55 @@ static const char *DEFAULT_EXCLUDES[] = {
     ".DS_Store", "Thumbs.db", "*.lock",
     NULL
 };
+
+/* Forward declaration */
+static void mcp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* .gitignore support — merged into exclude list at startup */
+#define MAX_GITIGNORE_PATTERNS 256
+static char *g_gitignore_patterns[MAX_GITIGNORE_PATTERNS];
+static int g_gitignore_count = 0;
+
+static void load_gitignore(const char *project_root) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/.gitignore", project_root);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f) && g_gitignore_count < MAX_GITIGNORE_PATTERNS) {
+        /* Strip trailing newline/whitespace */
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' ||
+                           line[len-1] == ' '  || line[len-1] == '\t'))
+            line[--len] = '\0';
+
+        /* Skip empty lines, comments, negation patterns */
+        if (len == 0 || line[0] == '#' || line[0] == '!') continue;
+
+        /* Strip trailing slash (directory marker) */
+        if (len > 0 && line[len-1] == '/') line[--len] = '\0';
+        if (len == 0) continue;
+
+        /* Store pattern — if it has no slash, it matches basename (fnmatch)
+         * If it has a leading slash, strip it (relative to root) */
+        char *pat = line;
+        if (pat[0] == '/') pat++;
+
+        g_gitignore_patterns[g_gitignore_count++] = strdup(pat);
+    }
+    fclose(f);
+
+    if (g_gitignore_count > 0)
+        mcp_log("loaded %d patterns from .gitignore", g_gitignore_count);
+}
+
+static void free_gitignore(void) {
+    for (int i = 0; i < g_gitignore_count; i++)
+        free(g_gitignore_patterns[i]);
+    g_gitignore_count = 0;
+}
 
 /* ================================================================
  * Section 2: Minimal JSON Parser
@@ -387,6 +436,31 @@ static int is_excluded(const char *name) {
     for (int i = 0; DEFAULT_EXCLUDES[i]; i++) {
         if (fnmatch(DEFAULT_EXCLUDES[i], name, 0) == 0) return 1;
     }
+    /* Check .gitignore patterns against basename */
+    for (int i = 0; i < g_gitignore_count; i++) {
+        if (fnmatch(g_gitignore_patterns[i], name, 0) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Path-based exclude: checks gitignore patterns against relative path too */
+static int is_path_excluded(const char *relpath) {
+    /* Check basename against default + gitignore */
+    const char *basename = strrchr(relpath, '/');
+    basename = basename ? basename + 1 : relpath;
+    if (is_excluded(basename)) return 1;
+
+    /* Check full relative path against gitignore glob patterns */
+    for (int i = 0; i < g_gitignore_count; i++) {
+        /* Pattern with wildcard or path separator → match full path */
+        if (strchr(g_gitignore_patterns[i], '/') ||
+            strchr(g_gitignore_patterns[i], '*')) {
+            if (fnmatch(g_gitignore_patterns[i], relpath,
+                        FNM_PATHNAME) == 0) return 1;
+        }
+        /* Also check if any path component matches the pattern */
+        if (fnmatch(g_gitignore_patterns[i], relpath, 0) == 0) return 1;
+    }
     return 0;
 }
 
@@ -416,12 +490,23 @@ static void index_directory(sws_index_t *idx, const char *root) {
             struct stat st;
             if (lstat(pathbuf, &st) != 0) continue;
 
+            /* Compute relative path for gitignore matching */
+            const char *rel = pathbuf;
+            size_t rootlen_dir = strlen(root);
+            if (strncmp(pathbuf, root, rootlen_dir) == 0 && pathbuf[rootlen_dir] == '/')
+                rel = pathbuf + rootlen_dir + 1;
+
             if (S_ISDIR(st.st_mode)) {
+                /* Check gitignore for directories too */
+                if (is_path_excluded(rel)) continue;
                 dir_entry_t *e = calloc(1, sizeof(dir_entry_t));
                 e->path = strdup(pathbuf);
                 e->next = stack;
                 stack = e;
             } else if (S_ISREG(st.st_mode) && (size_t)st.st_size <= INDEX_MAX_FILE_SIZE) {
+                /* Check gitignore for full relative path */
+                if (is_path_excluded(rel)) continue;
+
                 FILE *f = fopen(pathbuf, "r");
                 if (!f) continue;
                 char *buf = malloc(INDEX_PREVIEW_SIZE + 1);
@@ -431,11 +516,8 @@ static void index_directory(sws_index_t *idx, const char *root) {
 
                 if (is_binary_data(buf, nr)) { free(buf); continue; }
 
-                /* Make path relative to project root */
-                const char *relpath = pathbuf;
-                size_t rootlen = strlen(root);
-                if (strncmp(pathbuf, root, rootlen) == 0 && pathbuf[rootlen] == '/')
-                    relpath = pathbuf + rootlen + 1;
+                /* Use pre-computed relative path */
+                const char *relpath = rel;
 
                 /* Document = "relpath\ncontent" */
                 size_t rlen = strlen(relpath);
@@ -563,6 +645,73 @@ static int extract_snippet(const char *text, const char *query, char *buf, size_
     buf[avail] = '\0';
 
     return line_num;
+}
+
+/* Path-boost: re-rank search results when query matches filename/path.
+ * This fixes the #1 fuzzy search issue: content-only matches ranking
+ * above exact filename matches. */
+static void rerank_with_path_boost(sws_result_t *results, int n,
+                                    const char *query) {
+    if (n <= 1 || !query || !query[0]) return;
+
+    /* Lowercase query for comparison */
+    char q_lower[256];
+    int qlen = 0;
+    for (int i = 0; query[i] && i < 255; i++)
+        q_lower[qlen++] = (query[i] >= 'A' && query[i] <= 'Z')
+                          ? query[i] + 32 : query[i];
+    q_lower[qlen] = '\0';
+
+    /* Boost scores for path matches */
+    for (int i = 0; i < n; i++) {
+        char pathbuf[4096];
+        extract_path(results[i].text, pathbuf, sizeof(pathbuf));
+
+        /* Lowercase path for comparison */
+        char p_lower[4096];
+        int plen = 0;
+        for (int j = 0; pathbuf[j] && j < 4095; j++)
+            p_lower[plen++] = (pathbuf[j] >= 'A' && pathbuf[j] <= 'Z')
+                              ? pathbuf[j] + 32 : pathbuf[j];
+        p_lower[plen] = '\0';
+
+        /* Extract basename */
+        const char *basename = strrchr(p_lower, '/');
+        basename = basename ? basename + 1 : p_lower;
+
+        /* Exact basename match → huge boost */
+        if (strstr(basename, q_lower)) {
+            results[i].score += 10.0f;
+        }
+        /* Path component match → medium boost */
+        else if (strstr(p_lower, q_lower)) {
+            results[i].score += 5.0f;
+        }
+        /* Check individual query words against path */
+        else {
+            char words[256];
+            memcpy(words, q_lower, qlen + 1);
+            char *tok = strtok(words, " _-./");
+            while (tok) {
+                if (strlen(tok) >= 3 && strstr(p_lower, tok)) {
+                    results[i].score += 2.0f;
+                    break;
+                }
+                tok = strtok(NULL, " _-./");
+            }
+        }
+    }
+
+    /* Re-sort by boosted score (insertion sort, small n) */
+    for (int i = 1; i < n; i++) {
+        sws_result_t tmp = results[i];
+        int j = i - 1;
+        while (j >= 0 && results[j].score < tmp.score) {
+            results[j + 1] = results[j];
+            j--;
+        }
+        results[j + 1] = tmp;
+    }
 }
 
 /* ================================================================
@@ -849,6 +998,12 @@ static void tool_codebase_grep(json_node_t *args, jbuf_t *out);
 static void tool_git_diff(json_node_t *args, jbuf_t *out);
 static void tool_git_log(json_node_t *args, jbuf_t *out);
 static void tool_codebase_overview(json_node_t *args, jbuf_t *out);
+static void tool_workspace_create(json_node_t *args, jbuf_t *out);
+static void tool_workspace_list(json_node_t *args, jbuf_t *out);
+static void tool_workspace_archive(json_node_t *args, jbuf_t *out);
+static void tool_checkpoint_save(json_node_t *args, jbuf_t *out);
+static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out);
+static void tool_workspace_diff(json_node_t *args, jbuf_t *out);
 
 static mcp_tool_t TOOLS[] = {
     {
@@ -983,6 +1138,43 @@ static mcp_tool_t TOOLS[] = {
         "{\"type\":\"object\",\"properties\":{}}",
         tool_codebase_overview
     },
+    /* --- Conductor-inspired workspace tools --- */
+    {
+        "workspace_create",
+        "Create an isolated workspace (git worktree) for parallel development. Each workspace gets its own branch and directory. Auto-assigns a city name if none provided. Use for running multiple agents on different tasks simultaneously.",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Workspace name (auto-assigned city name if omitted)\"},\"task\":{\"type\":\"string\",\"description\":\"Description of what this workspace is for\"}},\"required\":[]}",
+        tool_workspace_create
+    },
+    {
+        "workspace_list",
+        "List all active workspaces with their branches, paths, and change status (files changed, insertions, deletions).",
+        "{\"type\":\"object\",\"properties\":{}}",
+        tool_workspace_list
+    },
+    {
+        "workspace_archive",
+        "Archive (delete) a workspace. Removes the git worktree and branch.",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Name of workspace to archive\"}},\"required\":[\"name\"]}",
+        tool_workspace_archive
+    },
+    {
+        "checkpoint_save",
+        "Save a checkpoint (snapshot) of a workspace's current state. Commits all changes and creates a restorable reference. Like a save point you can revert to.",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Workspace name\"},\"label\":{\"type\":\"string\",\"description\":\"Label for this checkpoint (default: auto)\"}},\"required\":[\"name\"]}",
+        tool_checkpoint_save
+    },
+    {
+        "checkpoint_restore",
+        "Restore a workspace to a previous checkpoint. Without a ref, lists available checkpoints. With a ref (commit hash), hard-resets to that state.",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Workspace name\"},\"ref\":{\"type\":\"string\",\"description\":\"Commit hash to restore to (omit to list available checkpoints)\"}},\"required\":[\"name\"]}",
+        tool_checkpoint_restore
+    },
+    {
+        "workspace_diff",
+        "Show all changes in a workspace compared to the base branch (main). Returns file stats, commit count, and diff content. Use before creating a PR to review changes.",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Workspace name\"}},\"required\":[\"name\"]}",
+        tool_workspace_diff
+    },
     {NULL, NULL, NULL, NULL}
 };
 
@@ -1002,6 +1194,7 @@ static void tool_codebase_search(json_node_t *args, jbuf_t *out) {
 
     sws_result_t results[MAX_RESULTS];
     int n = sws_bm25_search(g_code_index, query, results, limit);
+    rerank_with_path_boost(results, n, query);
 
     jb_append(out, "[");
     char pathbuf[4096], snippet[512];
@@ -1030,6 +1223,7 @@ static void tool_codebase_fuzzy(json_node_t *args, jbuf_t *out) {
 
     sws_result_t results[MAX_RESULTS];
     int n = sws_fuzzy_search(g_code_index, query, results, limit);
+    rerank_with_path_boost(results, n, query);
 
     jb_append(out, "[");
     char pathbuf[4096], snippet[512];
@@ -1337,6 +1531,7 @@ static void tool_session_context(json_node_t *args, jbuf_t *out) {
 
 static void tool_process_stats(json_node_t *args, jbuf_t *out) {
     (void)args;
+    ensure_search_ready();
     sws_info_t code_info = {0}, mem_info = {0};
     if (g_code_index) sws_info(g_code_index, &code_info);
     if (g_memory_index) sws_info(g_memory_index, &mem_info);
@@ -1443,7 +1638,34 @@ static void tool_autopilot_status(json_node_t *args, jbuf_t *out) {
         jb_append_escaped(out, g_autopilot.steps[i].text);
         jb_append(out, ",\"done\":%s}", g_autopilot.steps[i].done ? "true" : "false");
     }
-    jb_append(out, "]}");
+    jb_append(out, "]");
+
+    /* Git-aware: show modified + untracked files */
+    {
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && (git diff --name-only; git diff --name-only --cached; git ls-files --others --exclude-standard) 2>/dev/null | sort -u | head -30",
+                 g_project_root);
+        FILE *proc = popen(cmd, "r");
+        if (proc) {
+            jb_append(out, ",\"dirty_files\":[");
+            char fbuf[1024];
+            int fc = 0;
+            while (fgets(fbuf, sizeof(fbuf), proc)) {
+                int flen = (int)strlen(fbuf);
+                while (flen > 0 && (fbuf[flen-1] == '\n' || fbuf[flen-1] == '\r'))
+                    fbuf[--flen] = '\0';
+                if (flen == 0) continue;
+                if (fc > 0) jb_append(out, ",");
+                jb_append_escaped(out, fbuf);
+                fc++;
+            }
+            pclose(proc);
+            jb_append(out, "]");
+        }
+    }
+
+    jb_append(out, "}");
 
     pthread_mutex_unlock(&g_autopilot_lock);
 }
@@ -1481,6 +1703,30 @@ static void tool_autopilot_step(json_node_t *args, jbuf_t *out) {
 
     jb_append(out, "{\"completed_step\":%d,\"summary\":", completed);
     jb_append_escaped(out, summary);
+
+    /* Capture files changed since autopilot started (git awareness) */
+    {
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "cd '%s' && git diff --name-only HEAD 2>/dev/null | head -30",
+                 g_project_root);
+        FILE *proc = popen(cmd, "r");
+        if (proc) {
+            jb_append(out, ",\"files_changed\":[");
+            char fbuf[1024];
+            int fc = 0;
+            while (fgets(fbuf, sizeof(fbuf), proc)) {
+                int flen = (int)strlen(fbuf);
+                while (flen > 0 && (fbuf[flen-1] == '\n' || fbuf[flen-1] == '\r'))
+                    fbuf[--flen] = '\0';
+                if (flen == 0) continue;
+                if (fc > 0) jb_append(out, ",");
+                jb_append_escaped(out, fbuf);
+                fc++;
+            }
+            pclose(proc);
+            jb_append(out, "]");
+        }
+    }
 
     if (all_done) {
         jb_append(out, ",\"all_done\":true,\"message\":\"All steps complete! Call autopilot_stop with reason 'completed'.\"}");
@@ -1964,6 +2210,507 @@ static void tool_codebase_overview(json_node_t *args, jbuf_t *out) {
 }
 
 /* ================================================================
+ * Section 9b: Conductor-Inspired Workspace Tools
+ *
+ * Git worktree orchestration, checkpoints, scripts, todos, PR workflow.
+ * Inspired by Conductor (conductor.build) — YC-backed multi-agent orchestrator.
+ * ================================================================ */
+
+/* City names for auto-naming workspaces (Conductor-style) */
+static const char *CITY_NAMES[] = {
+    "tokyo", "paris", "berlin", "london", "cairo", "oslo", "lima",
+    "rome", "seoul", "dubai", "prague", "vienna", "lisbon", "zurich",
+    "kyoto", "nairobi", "bogota", "hanoi", "athens", "havana",
+    "taipei", "lagos", "mumbai", "jakarta", "santiago", "montreal",
+    "reykjavik", "marrakech", "bruges", "tallinn", "tbilisi", "baku",
+    NULL
+};
+
+#define MAX_WORKSPACES 32
+
+typedef struct {
+    char name[64];
+    char branch[128];
+    char path[4096];
+    char task[256];    /* what this workspace is for */
+    bool active;
+} workspace_t;
+
+static workspace_t g_workspaces[MAX_WORKSPACES];
+static int g_workspace_count = 0;
+static pthread_mutex_t g_workspace_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* --- Workspace persistence --- */
+
+static void workspaces_save(void) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/workspaces.json", g_data_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "{\"workspaces\":[");
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (i > 0) fprintf(f, ",");
+        fprintf(f, "{\"name\":\"%s\",\"branch\":\"%s\",\"path\":\"%s\",\"task\":\"",
+                g_workspaces[i].name, g_workspaces[i].branch, g_workspaces[i].path);
+        for (const char *c = g_workspaces[i].task; *c; c++) {
+            if (*c == '"') fprintf(f, "\\\"");
+            else if (*c == '\\') fprintf(f, "\\\\");
+            else fputc(*c, f);
+        }
+        fprintf(f, "\",\"active\":%s}", g_workspaces[i].active ? "true" : "false");
+    }
+    fprintf(f, "]}");
+    fclose(f);
+}
+
+static void workspaces_load(void) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/workspaces.json", g_data_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 1024 * 1024) { fclose(f); return; }
+    char *buf = malloc(sz + 1);
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+
+    const char *p = buf;
+    json_node_t *root = json_parse(&p);
+    if (!root) { free(buf); return; }
+
+    json_node_t *ws = json_get(root, "workspaces");
+    if (ws && ws->type == JSON_ARRAY) {
+        for (int i = 0; i < ws->children.count && g_workspace_count < MAX_WORKSPACES; i++) {
+            json_node_t *w = ws->children.items[i];
+            const char *name = json_get_str(w, "name");
+            const char *branch = json_get_str(w, "branch");
+            const char *wpath = json_get_str(w, "path");
+            const char *wtask = json_get_str(w, "task");
+            json_node_t *act = json_get(w, "active");
+            if (name && branch && wpath) {
+                workspace_t *ws_entry = &g_workspaces[g_workspace_count++];
+                strncpy(ws_entry->name, name, sizeof(ws_entry->name) - 1);
+                strncpy(ws_entry->branch, branch, sizeof(ws_entry->branch) - 1);
+                strncpy(ws_entry->path, wpath, sizeof(ws_entry->path) - 1);
+                if (wtask) strncpy(ws_entry->task, wtask, sizeof(ws_entry->task) - 1);
+                ws_entry->active = act && act->type == JSON_BOOL ? act->bval : true;
+            }
+        }
+    }
+
+    json_free(root);
+    free(buf);
+}
+
+/* --- Pick a city name not already used --- */
+static const char *pick_workspace_name(void) {
+    for (int c = 0; CITY_NAMES[c]; c++) {
+        bool used = false;
+        for (int w = 0; w < g_workspace_count; w++) {
+            if (g_workspaces[w].active && strcmp(g_workspaces[w].name, CITY_NAMES[c]) == 0) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) return CITY_NAMES[c];
+    }
+    return "workspace";
+}
+
+/* --- workspace_create: git worktree add with isolated branch --- */
+
+static void tool_workspace_create(json_node_t *args, jbuf_t *out) {
+    const char *name = json_get_str(args, "name");
+    const char *task = json_get_str(args, "task");
+    char cmd[4096];
+
+    pthread_mutex_lock(&g_workspace_lock);
+
+    /* Auto-name if not provided */
+    char auto_name[64];
+    if (!name || !name[0]) {
+        strncpy(auto_name, pick_workspace_name(), sizeof(auto_name) - 1);
+        auto_name[sizeof(auto_name) - 1] = '\0';
+        name = auto_name;
+    }
+
+    /* Check not duplicate */
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (g_workspaces[i].active && strcmp(g_workspaces[i].name, name) == 0) {
+            pthread_mutex_unlock(&g_workspace_lock);
+            jb_append(out, "{\"error\":\"Workspace '%s' already exists\"}", name);
+            return;
+        }
+    }
+
+    if (g_workspace_count >= MAX_WORKSPACES) {
+        pthread_mutex_unlock(&g_workspace_lock);
+        jb_append(out, "{\"error\":\"Maximum workspaces reached (%d)\"}", MAX_WORKSPACES);
+        return;
+    }
+
+    /* Create branch name */
+    char branch[128];
+    snprintf(branch, sizeof(branch), "conductor/%s", name);
+
+    /* Workspace path */
+    char ws_path[4096];
+    snprintf(ws_path, sizeof(ws_path), "%s/.conductor/%s", g_project_root, name);
+
+    /* Create git worktree */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git worktree add -b '%s' '%s' HEAD 2>&1",
+             g_project_root, branch, ws_path);
+    char *result = run_cmd(cmd, 4096);
+
+    if (!result || strstr(result, "fatal") || strstr(result, "error")) {
+        pthread_mutex_unlock(&g_workspace_lock);
+        jb_append(out, "{\"error\":\"Failed to create worktree: ");
+        if (result) {
+            /* Inline escape without quotes */
+            for (const char *c = result; *c; c++) {
+                if (*c == '"') jb_append(out, "\\\"");
+                else if (*c == '\n') jb_append(out, " ");
+                else jb_append(out, "%c", *c);
+            }
+        }
+        jb_append(out, "\"}");
+        free(result);
+        return;
+    }
+    free(result);
+
+    /* Register workspace */
+    workspace_t *ws = &g_workspaces[g_workspace_count++];
+    strncpy(ws->name, name, sizeof(ws->name) - 1);
+    strncpy(ws->branch, branch, sizeof(ws->branch) - 1);
+    strncpy(ws->path, ws_path, sizeof(ws->path) - 1);
+    if (task) strncpy(ws->task, task, sizeof(ws->task) - 1);
+    ws->active = true;
+
+    workspaces_save();
+    pthread_mutex_unlock(&g_workspace_lock);
+
+    session_add("workspace_create", name);
+    mcp_log("workspace created: %s → %s", name, ws_path);
+
+    jb_append(out, "{\"name\":");
+    jb_append_escaped(out, name);
+    jb_append(out, ",\"branch\":");
+    jb_append_escaped(out, branch);
+    jb_append(out, ",\"path\":");
+    jb_append_escaped(out, ws_path);
+    if (task && task[0]) {
+        jb_append(out, ",\"task\":");
+        jb_append_escaped(out, task);
+    }
+    jb_append(out, ",\"message\":\"Workspace ready. Agent can work in this isolated worktree.\"}");
+}
+
+/* --- workspace_list: show all active workspaces --- */
+
+static void tool_workspace_list(json_node_t *args, jbuf_t *out) {
+    (void)args;
+    pthread_mutex_lock(&g_workspace_lock);
+
+    jb_append(out, "{\"workspaces\":[");
+    int count = 0;
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (!g_workspaces[i].active) continue;
+        if (count > 0) jb_append(out, ",");
+
+        /* Get git status for this workspace */
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git diff --stat HEAD 2>/dev/null | tail -1",
+                 g_workspaces[i].path);
+        char *status = run_cmd(cmd, 512);
+        if (status) {
+            size_t sl = strlen(status);
+            while (sl > 0 && (status[sl-1] == '\n' || status[sl-1] == '\r')) status[--sl] = '\0';
+        }
+
+        jb_append(out, "{\"name\":");
+        jb_append_escaped(out, g_workspaces[i].name);
+        jb_append(out, ",\"branch\":");
+        jb_append_escaped(out, g_workspaces[i].branch);
+        jb_append(out, ",\"path\":");
+        jb_append_escaped(out, g_workspaces[i].path);
+        if (g_workspaces[i].task[0]) {
+            jb_append(out, ",\"task\":");
+            jb_append_escaped(out, g_workspaces[i].task);
+        }
+        if (status && status[0]) {
+            jb_append(out, ",\"changes\":");
+            jb_append_escaped(out, status);
+        }
+        jb_append(out, "}");
+        free(status);
+        count++;
+    }
+    jb_append(out, "],\"count\":%d}", count);
+
+    pthread_mutex_unlock(&g_workspace_lock);
+}
+
+/* --- workspace_archive: remove worktree and mark inactive --- */
+
+static void tool_workspace_archive(json_node_t *args, jbuf_t *out) {
+    const char *name = json_get_str(args, "name");
+    if (!name) { jb_append(out, "\"Error: name is required\""); return; }
+
+    pthread_mutex_lock(&g_workspace_lock);
+
+    workspace_t *ws = NULL;
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (g_workspaces[i].active && strcmp(g_workspaces[i].name, name) == 0) {
+            ws = &g_workspaces[i];
+            break;
+        }
+    }
+
+    if (!ws) {
+        pthread_mutex_unlock(&g_workspace_lock);
+        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        return;
+    }
+
+    /* Remove worktree */
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "cd '%s' && git worktree remove '%s' --force 2>&1",
+             g_project_root, ws->path);
+    char *result = run_cmd(cmd, 4096);
+
+    /* Delete branch */
+    snprintf(cmd, sizeof(cmd), "cd '%s' && git branch -D '%s' 2>&1",
+             g_project_root, ws->branch);
+    char *br_result = run_cmd(cmd, 1024);
+
+    ws->active = false;
+    workspaces_save();
+    pthread_mutex_unlock(&g_workspace_lock);
+
+    session_add("workspace_archive", name);
+    mcp_log("workspace archived: %s", name);
+
+    jb_append(out, "{\"archived\":");
+    jb_append_escaped(out, name);
+    jb_append(out, ",\"message\":\"Workspace and branch removed.\"}");
+
+    free(result);
+    free(br_result);
+}
+
+/* --- checkpoint_save: save workspace state as git ref --- */
+
+static void tool_checkpoint_save(json_node_t *args, jbuf_t *out) {
+    const char *name = json_get_str(args, "name");
+    const char *label = json_get_str(args, "label");
+    if (!name) { jb_append(out, "\"Error: workspace name is required\""); return; }
+    if (!label) label = "auto";
+
+    pthread_mutex_lock(&g_workspace_lock);
+
+    workspace_t *ws = NULL;
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (g_workspaces[i].active && strcmp(g_workspaces[i].name, name) == 0) {
+            ws = &g_workspaces[i];
+            break;
+        }
+    }
+
+    if (!ws) {
+        pthread_mutex_unlock(&g_workspace_lock);
+        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        return;
+    }
+
+    /* Commit all changes in workspace */
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git add -A && git commit -m 'checkpoint: %s' --allow-empty 2>&1",
+             ws->path, label);
+    char *commit_result = run_cmd(cmd, 4096);
+
+    /* Get commit hash */
+    snprintf(cmd, sizeof(cmd), "cd '%s' && git rev-parse HEAD 2>&1", ws->path);
+    char *hash = run_cmd(cmd, 64);
+    if (hash) {
+        size_t hl = strlen(hash);
+        while (hl > 0 && (hash[hl-1] == '\n' || hash[hl-1] == '\r')) hash[--hl] = '\0';
+    }
+
+    /* Create ref for this checkpoint */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git update-ref refs/conductor/%s/%lld HEAD 2>&1",
+             ws->path, name, (long long)ts.tv_sec);
+    run_cmd(cmd, 256);
+
+    pthread_mutex_unlock(&g_workspace_lock);
+
+    session_add("checkpoint_save", name);
+    mcp_log("checkpoint saved: %s/%s → %s", name, label, hash ? hash : "?");
+
+    jb_append(out, "{\"workspace\":");
+    jb_append_escaped(out, name);
+    jb_append(out, ",\"label\":");
+    jb_append_escaped(out, label);
+    if (hash && hash[0]) {
+        jb_append(out, ",\"commit\":");
+        jb_append_escaped(out, hash);
+    }
+    jb_append(out, ",\"message\":\"Checkpoint saved. Use checkpoint_restore to revert.\"}");
+
+    free(commit_result);
+    free(hash);
+}
+
+/* --- checkpoint_restore: revert workspace to a previous checkpoint --- */
+
+static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out) {
+    const char *name = json_get_str(args, "name");
+    const char *ref = json_get_str(args, "ref");
+    if (!name) { jb_append(out, "\"Error: workspace name is required\""); return; }
+
+    pthread_mutex_lock(&g_workspace_lock);
+
+    workspace_t *ws = NULL;
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (g_workspaces[i].active && strcmp(g_workspaces[i].name, name) == 0) {
+            ws = &g_workspaces[i];
+            break;
+        }
+    }
+
+    if (!ws) {
+        pthread_mutex_unlock(&g_workspace_lock);
+        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        return;
+    }
+
+    char cmd[4096];
+
+    if (ref && ref[0]) {
+        /* Restore to specific ref */
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git reset --hard '%s' 2>&1", ws->path, ref);
+    } else {
+        /* List available checkpoints */
+        snprintf(cmd, sizeof(cmd),
+                 "cd '%s' && git log --oneline -10 2>&1", ws->path);
+        char *log = run_cmd(cmd, 4096);
+        pthread_mutex_unlock(&g_workspace_lock);
+
+        jb_append(out, "{\"workspace\":");
+        jb_append_escaped(out, name);
+        jb_append(out, ",\"checkpoints\":");
+        jb_append_escaped(out, log ? log : "(none)");
+        jb_append(out, ",\"message\":\"Pass a commit hash as 'ref' to restore.\"}");
+        free(log);
+        return;
+    }
+
+    char *result = run_cmd(cmd, 4096);
+    pthread_mutex_unlock(&g_workspace_lock);
+
+    session_add("checkpoint_restore", name);
+    mcp_log("checkpoint restored: %s → %s", name, ref);
+
+    jb_append(out, "{\"workspace\":");
+    jb_append_escaped(out, name);
+    jb_append(out, ",\"restored_to\":");
+    jb_append_escaped(out, ref);
+    jb_append(out, ",\"result\":");
+    jb_append_escaped(out, result ? result : "ok");
+    jb_append(out, "}");
+    free(result);
+}
+
+/* --- workspace_diff: show changes in workspace vs base branch --- */
+
+static void tool_workspace_diff(json_node_t *args, jbuf_t *out) {
+    const char *name = json_get_str(args, "name");
+    if (!name) { jb_append(out, "\"Error: workspace name is required\""); return; }
+
+    pthread_mutex_lock(&g_workspace_lock);
+    workspace_t *ws = NULL;
+    for (int i = 0; i < g_workspace_count; i++) {
+        if (g_workspaces[i].active && strcmp(g_workspaces[i].name, name) == 0) {
+            ws = &g_workspaces[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_workspace_lock);
+
+    if (!ws) {
+        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        return;
+    }
+
+    /* Get default branch */
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo main",
+             g_project_root);
+    char *default_branch = run_cmd(cmd, 128);
+    if (default_branch) {
+        size_t dl = strlen(default_branch);
+        while (dl > 0 && (default_branch[dl-1] == '\n' || default_branch[dl-1] == '\r'))
+            default_branch[--dl] = '\0';
+    }
+
+    /* Diff stat */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git diff --stat '%s' 2>&1",
+             ws->path, default_branch ? default_branch : "main");
+    char *stat_result = run_cmd(cmd, 8192);
+
+    /* Diff content (limited) */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git diff '%s' 2>&1 | head -300",
+             ws->path, default_branch ? default_branch : "main");
+    char *diff_result = run_cmd(cmd, 32768);
+
+    /* Commit count */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git rev-list --count '%s'..HEAD 2>&1",
+             ws->path, default_branch ? default_branch : "main");
+    char *commit_count = run_cmd(cmd, 32);
+    if (commit_count) {
+        size_t cl = strlen(commit_count);
+        while (cl > 0 && (commit_count[cl-1] == '\n' || commit_count[cl-1] == '\r'))
+            commit_count[--cl] = '\0';
+    }
+
+    session_add("workspace_diff", name);
+
+    jb_append(out, "{\"workspace\":");
+    jb_append_escaped(out, name);
+    jb_append(out, ",\"base\":");
+    jb_append_escaped(out, default_branch ? default_branch : "main");
+    if (commit_count && commit_count[0]) {
+        jb_append(out, ",\"commits\":");
+        jb_append_escaped(out, commit_count);
+    }
+    jb_append(out, ",\"stats\":");
+    jb_append_escaped(out, stat_result ? stat_result : "(no changes)");
+    jb_append(out, ",\"diff\":");
+    jb_append_escaped(out, diff_result ? diff_result : "(no changes)");
+    jb_append(out, "}");
+
+    free(default_branch);
+    free(stat_result);
+    free(diff_result);
+    free(commit_count);
+}
+
+
+/* ================================================================
  * Section 10: MCP Protocol Handler
  * ================================================================ */
 
@@ -2117,11 +2864,15 @@ int main(int argc, char **argv) {
     /* Init data dir */
     init_data_dir(root);
 
+    /* Load .gitignore patterns before indexing */
+    load_gitignore(root);
+
     /* Init subsystems */
     init_search(root);
     init_memory();
     init_session();
     autopilot_load();
+    workspaces_load();
 
     mcp_log("ready — %u files indexed, %d memories loaded", g_files_indexed, g_memory_count);
 
