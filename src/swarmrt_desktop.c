@@ -1743,6 +1743,13 @@ int sw_desktop_tile_app(const char *app_name, int position) {
 
 #include <windows.h>
 
+/* Fallback for headers that don't define this (e.g. zig cc's bundled headers).
+ * MOUSEEVENTF_VIRTUALDESKTOP maps absolute coords to the entire virtual desktop
+ * rather than just the primary monitor. Value: 0x4000 */
+#ifndef MOUSEEVENTF_VIRTUALDESKTOP
+#define MOUSEEVENTF_VIRTUALDESKTOP 0x4000
+#endif
+
 static CRITICAL_SECTION g_init_cs;
 static CRITICAL_SECTION g_op_cs;
 static int g_cs_initialized = 0;
