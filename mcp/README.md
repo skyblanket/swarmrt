@@ -182,7 +182,7 @@ make mcp
 | Tool | Description |
 |------|-------------|
 | `wake_create` | Schedule a prompt to be injected into the current Claude Code session on a 5-field cron schedule (local timezone). Persists to `.swarmrt/wakes.json` — survives session restarts and `--resume`. Examples: `*/15 * * * *`, `0 */3 * * *`, `0 9,13,17 * * 1-5`. Minimum granularity is 1 minute. Requires `swarmrt-wrap` to be the process wrapping Claude Code for prompts to actually fire. |
-| `wake_list` | List all scheduled wakes with their next fire time, last fire time, fire count, and enabled state. |
+| `wake_list` | List all scheduled wakes with their cron, prompt, enabled state, next fire time, last scheduled fire time, scheduled fire count, last manual fire time, and manual fire count. Scheduled and manual counters are tracked separately — `fire_count` / `last_fired_at` reflect cron deliveries only, while `manual_fire_count` / `last_manual_fire_at` reflect `wake_fire_now` deliveries. This keeps the scheduled cadence observable without being polluted by debug pokes. |
 | `wake_delete` | Delete a scheduled wake by id or name. |
 | `wake_enable` | Enable or disable a wake without deleting it. |
 | `wake_fire_now` | Manually queue a wake to fire on the wrapper's next 5-second tick — useful for testing a scheduled prompt without waiting for its cron slot. |

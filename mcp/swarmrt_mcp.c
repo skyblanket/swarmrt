@@ -1128,8 +1128,10 @@ typedef struct {
     cron_t    cron;
     bool      enabled;
     int64_t   created_at;
-    int64_t   last_fired_at;
-    int       fire_count;
+    int64_t   last_fired_at;        /* scheduled (cron) fires only */
+    int       fire_count;            /* scheduled (cron) fires only */
+    int64_t   last_manual_fire_at;   /* wake_fire_now deliveries */
+    int       manual_fire_count;     /* wake_fire_now deliveries */
 } wake_t;
 
 static wake_t g_wakes[MAX_WAKES];
@@ -1189,11 +1191,13 @@ static void wakes_save(void) {
         json_fwrite_escaped(f, w->cron_expr);
         fprintf(f, ",\"prompt\":");
         json_fwrite_escaped(f, w->prompt);
-        fprintf(f, ",\"enabled\":%s,\"created_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d}",
+        fprintf(f, ",\"enabled\":%s,\"created_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d,\"last_manual_fire_at\":%lld,\"manual_fire_count\":%d}",
                 w->enabled ? "true" : "false",
                 (long long)w->created_at,
                 (long long)w->last_fired_at,
-                w->fire_count);
+                w->fire_count,
+                (long long)w->last_manual_fire_at,
+                w->manual_fire_count);
     }
     fprintf(f, "]}");
     fclose(f);
@@ -1236,9 +1240,11 @@ static void wakes_load(void) {
             w->prompt        = strdup(prompt);
             json_node_t *en  = json_get(w_n, "enabled");
             w->enabled       = (en && en->type == JSON_BOOL) ? en->bval : true;
-            w->created_at    = json_get_int(w_n, "created_at", 0);
-            w->last_fired_at = json_get_int(w_n, "last_fired_at", 0);
-            w->fire_count    = (int)json_get_int(w_n, "fire_count", 0);
+            w->created_at         = json_get_int(w_n, "created_at", 0);
+            w->last_fired_at      = json_get_int(w_n, "last_fired_at", 0);
+            w->fire_count         = (int)json_get_int(w_n, "fire_count", 0);
+            w->last_manual_fire_at= json_get_int(w_n, "last_manual_fire_at", 0);
+            w->manual_fire_count  = (int)json_get_int(w_n, "manual_fire_count", 0);
             if (!cron_parse(w->cron_expr, &w->cron)) {
                 mcp_log("wakes_load: bad cron \"%s\", skipping", w->cron_expr);
                 wake_free(w);
@@ -1359,11 +1365,13 @@ static void tool_wake_list(json_node_t *args, jbuf_t *out) {
         jb_append(out, ",\"prompt\":");
         jb_append_escaped(out, w->prompt);
         time_t next = w->enabled ? cron_next_fire(&w->cron, ts.tv_sec) : 0;
-        jb_append(out, ",\"enabled\":%s,\"next_fire_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d}",
+        jb_append(out, ",\"enabled\":%s,\"next_fire_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d,\"last_manual_fire_at\":%lld,\"manual_fire_count\":%d}",
                   w->enabled ? "true" : "false",
                   (long long)next,
                   (long long)w->last_fired_at,
-                  w->fire_count);
+                  w->fire_count,
+                  (long long)w->last_manual_fire_at,
+                  w->manual_fire_count);
     }
     jb_append(out, "],\"count\":%d,\"now\":%lld}",
               g_wake_count, (long long)ts.tv_sec);
