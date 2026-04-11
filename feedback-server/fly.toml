@@ -1,0 +1,37 @@
+# fly.toml — swarmrt-feedback
+# Shared feedback aggregator for SwarmRT MCP (wake + autopilot + feedback).
+# Public write-only endpoint with per-IP rate limit, public read endpoint,
+# SQLite on a persistent volume. ~0 cost at idle thanks to auto-stop.
+
+app             = "swarmrt-feedback"
+primary_region  = "bom"
+
+[build]
+
+[env]
+  PORT            = "8080"
+  SWARMRT_DB_PATH = "/data/swarmrt.db"
+
+[[mounts]]
+  source      = "swarmrt_data"
+  destination = "/data"
+
+[http_service]
+  internal_port        = 8080
+  force_https          = true
+  auto_stop_machines   = "stop"
+  auto_start_machines  = true
+  min_machines_running = 0
+  processes            = ["app"]
+
+  [[http_service.checks]]
+    interval      = "30s"
+    timeout       = "5s"
+    grace_period  = "10s"
+    method        = "get"
+    path          = "/v1/healthz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus     = 1
+  memory   = "256mb"

@@ -1137,6 +1137,7 @@ typedef struct {
 static wake_t g_wakes[MAX_WAKES];
 static int    g_wake_count   = 0;
 static int    g_wake_next_id = 1;
+static int64_t g_wakes_mtime  = 0; /* mtime of wakes.json at last load */
 static pthread_mutex_t g_wakes_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void wake_free(wake_t *w) {
@@ -1201,11 +1202,19 @@ static void wakes_save(void) {
     }
     fprintf(f, "]}");
     fclose(f);
+
+    /* Track our own write so wakes_reload_if_changed() doesn't bounce-load
+     * the file we just saved. */
+    struct stat st;
+    if (stat(path, &st) == 0) g_wakes_mtime = (int64_t)st.st_mtime;
 }
 
 static void wakes_load(void) {
     char path[4096];
     snprintf(path, sizeof(path), "%s/%s", g_data_dir, WAKES_FILE);
+
+    struct stat st;
+    if (stat(path, &st) == 0) g_wakes_mtime = (int64_t)st.st_mtime;
 
     FILE *f = fopen(path, "r");
     if (!f) return;
@@ -1261,6 +1270,21 @@ static void wakes_load(void) {
         mcp_log("loaded %d wake(s)", g_wake_count);
 }
 
+/* Reload wakes.json from disk if mtime changed since last read. The
+ * swarmrt-wrap PTY daemon writes to wakes.json on every fire (to bump
+ * counters), so the MCP's in-memory g_wakes[] otherwise goes stale
+ * between calls. Invoke at the top of each wake_* handler while
+ * holding g_wakes_lock. Cheap (stat + fopen) when nothing changed. */
+static void wakes_reload_if_changed(void) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", g_data_dir, WAKES_FILE);
+    struct stat st;
+    if (stat(path, &st) != 0) return;               /* no file yet */
+    if ((int64_t)st.st_mtime == g_wakes_mtime) return; /* unchanged */
+    wakes_clear();
+    wakes_load();
+}
+
 static wake_t *wake_find(json_node_t *args) {
     int id = (int)json_get_int(args, "id", -1);
     const char *name = json_get_str(args, "name");
@@ -1298,6 +1322,7 @@ static void tool_wake_create(json_node_t *args, jbuf_t *out) {
     }
 
     pthread_mutex_lock(&g_wakes_lock);
+    wakes_reload_if_changed();
 
     if (g_wake_count >= MAX_WAKES) {
         pthread_mutex_unlock(&g_wakes_lock);
@@ -1349,6 +1374,7 @@ static void tool_wake_create(json_node_t *args, jbuf_t *out) {
 static void tool_wake_list(json_node_t *args, jbuf_t *out) {
     (void)args;
     pthread_mutex_lock(&g_wakes_lock);
+    wakes_reload_if_changed();
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -1381,6 +1407,7 @@ static void tool_wake_list(json_node_t *args, jbuf_t *out) {
 
 static void tool_wake_delete(json_node_t *args, jbuf_t *out) {
     pthread_mutex_lock(&g_wakes_lock);
+    wakes_reload_if_changed();
     wake_t *w = wake_find(args);
     if (!w) {
         pthread_mutex_unlock(&g_wakes_lock);
@@ -1407,6 +1434,7 @@ static void tool_wake_enable(json_node_t *args, jbuf_t *out) {
         return;
     }
     pthread_mutex_lock(&g_wakes_lock);
+    wakes_reload_if_changed();
     wake_t *w = wake_find(args);
     if (!w) {
         pthread_mutex_unlock(&g_wakes_lock);
@@ -1424,6 +1452,7 @@ static void tool_wake_enable(json_node_t *args, jbuf_t *out) {
 
 static void tool_wake_fire_now(json_node_t *args, jbuf_t *out) {
     pthread_mutex_lock(&g_wakes_lock);
+    wakes_reload_if_changed();
     wake_t *w = wake_find(args);
     if (!w) {
         pthread_mutex_unlock(&g_wakes_lock);
@@ -1452,6 +1481,312 @@ static void tool_wake_fire_now(json_node_t *args, jbuf_t *out) {
 
     mcp_log("wake queued for immediate fire: id=%d", id);
     jb_append(out, "{\"queued\":true,\"id\":%d,\"message\":\"Queued for swarmrt-wrap's next 5s tick.\"}", id);
+}
+
+/* ================================================================
+ * Section 7.7: Agent Feedback (shared server, opt-in)
+ *
+ * Ships structured feedback from an agent using swarmrt-mcp to a
+ * shared HTTPS endpoint (default https://swarmrt-feedback.fly.dev).
+ * Opt-in via SWARMRT_FEEDBACK_ENABLED=1. Public read endpoints for
+ * accumulated reports — anyone can see what other agents submitted.
+ *
+ * Privacy model:
+ *   - Anonymous writes (machine_id is a hash of hostname, not a user)
+ *   - SWARMRT_FEEDBACK_ENABLED defaults to off (no surprise telemetry)
+ *   - Server rejects free-text fields containing filesystem paths
+ *   - SWARMRT_FEEDBACK_URL env var overrides endpoint (for self-hosting)
+ *
+ * Transport: shells out to curl with a temp-file POST body. No native
+ * HTTPS client dependency on the MCP side (libcurl would pull in SSL).
+ * ================================================================ */
+
+#define FEEDBACK_DEFAULT_URL "https://swarmrt-feedback.fly.dev"
+
+/* Forward decl — defined later (Section 9). */
+static int shell_arg_safe(const char *s);
+
+static char g_machine_id[33] = {0};
+static char g_session_id[33] = {0};
+
+/* Deterministic-but-anonymous id from hostname (fnv1a 64-bit, hex).
+ * The point is dedup, not identification — a user running the MCP
+ * on the same machine twice produces the same id. */
+static void init_identity(void) {
+    const char *menv = getenv("SWARMRT_MACHINE_ID");
+    if (menv && menv[0]) {
+        strncpy(g_machine_id, menv, sizeof(g_machine_id) - 1);
+    } else {
+        char host[256] = {0};
+        if (gethostname(host, sizeof(host) - 1) == 0 && host[0]) {
+            uint64_t h = 0xcbf29ce484222325ULL;
+            for (const char *p = host; *p; p++) {
+                h ^= (unsigned char)*p;
+                h *= 0x100000001b3ULL;
+            }
+            snprintf(g_machine_id, sizeof(g_machine_id), "%016llx",
+                     (unsigned long long)h);
+        }
+    }
+
+    const char *senv = getenv("SWARMRT_SESSION_ID");
+    if (senv && senv[0]) {
+        strncpy(g_session_id, senv, sizeof(g_session_id) - 1);
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t r1 = (uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32);
+        uint64_t r2 = ((uint64_t)getpid() * 0x9e3779b97f4a7c15ULL) ^
+                      (uint64_t)ts.tv_nsec;
+        snprintf(g_session_id, sizeof(g_session_id), "%016llx%016llx",
+                 (unsigned long long)r1, (unsigned long long)r2);
+    }
+}
+
+static bool feedback_enabled(void) {
+    const char *e = getenv("SWARMRT_FEEDBACK_ENABLED");
+    return e && (strcmp(e, "1") == 0 || strcmp(e, "true") == 0 ||
+                 strcmp(e, "yes") == 0);
+}
+
+/* Restrict the URL to a small, shell-safe character set so we can
+ * embed it in a popen() command line without quoting woes. */
+static int is_safe_url(const char *s) {
+    if (!s || !s[0]) return 0;
+    if (strncmp(s, "http://", 7) != 0 && strncmp(s, "https://", 8) != 0) return 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = *p;
+        if (!(isalnum(c) || c == '-' || c == '.' || c == '_' || c == ':' ||
+              c == '/' || c == '?' || c == '&' || c == '=' || c == '%'))
+            return 0;
+    }
+    return 1;
+}
+
+static const char *feedback_url(void) {
+    const char *url = getenv("SWARMRT_FEEDBACK_URL");
+    if (!url || !url[0]) return FEEDBACK_DEFAULT_URL;
+    if (!is_safe_url(url)) return NULL;
+    return url;
+}
+
+/* Common HTTP GET helper — shells out to curl, appends the raw response
+ * body (assumed JSON) straight into `out`. Used by feedback_read and
+ * feedback_stats. Caller is responsible for URL path + query string. */
+static void feedback_http_get(const char *url, const char *path_query,
+                              jbuf_t *out) {
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+             "curl -sS -m 10 '%s%s' 2>&1", url, path_query);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        jb_append(out, "{\"error\":\"curl exec failed\"}");
+        return;
+    }
+    char resp[65536] = {0};
+    size_t total = 0;
+    while (total < sizeof(resp) - 1) {
+        size_t n = fread(resp + total, 1, sizeof(resp) - 1 - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    pclose(fp);
+    if (total == 0) {
+        jb_append(out, "{\"error\":\"empty response from feedback server\"}");
+        return;
+    }
+    /* Strip trailing whitespace — Go's json.Encoder always appends '\n'. */
+    while (total > 0 && (resp[total-1] == '\n' || resp[total-1] == '\r' ||
+                         resp[total-1] == ' '  || resp[total-1] == '\t'))
+        resp[--total] = '\0';
+    /* Response is JSON from the server — pass through verbatim. */
+    jb_append(out, "%s", resp);
+}
+
+static void tool_feedback_report(json_node_t *args, jbuf_t *out) {
+    if (!feedback_enabled()) {
+        jb_append(out, "{\"sent\":false,\"reason\":\"SWARMRT_FEEDBACK_ENABLED not set. "
+                  "This is opt-in to prevent surprise telemetry. Set SWARMRT_FEEDBACK_ENABLED=1 "
+                  "in your shell env to ship feedback to the shared server "
+                  "(default: %s). The report was not sent.\"}", FEEDBACK_DEFAULT_URL);
+        return;
+    }
+
+    const char *url = feedback_url();
+    if (!url) {
+        jb_append(out, "{\"error\":\"SWARMRT_FEEDBACK_URL contains unsafe characters; "
+                  "must be http(s):// with only [a-zA-Z0-9-._:/?&=%%]\"}");
+        return;
+    }
+
+    const char *category      = json_get_str(args, "category");
+    const char *severity      = json_get_str(args, "severity");
+    const char *message       = json_get_str(args, "message");
+    const char *tool_name     = json_get_str(args, "tool");
+    const char *suggested_fix = json_get_str(args, "suggested_fix");
+    const char *context       = json_get_str(args, "context");
+
+    if (!category) { jb_append(out, "{\"error\":\"category required: bug|confusion|wish|works-well\"}"); return; }
+    if (!severity) { jb_append(out, "{\"error\":\"severity required: low|med|high\"}"); return; }
+    if (!message)  { jb_append(out, "{\"error\":\"message required\"}"); return; }
+
+    /* Build JSON request body via jbuf. */
+    jbuf_t body;
+    jb_init(&body);
+    jb_append(&body, "{\"swarmrt_ver\":\"%s\"", MCP_VERSION);
+    if (g_machine_id[0]) {
+        jb_append(&body, ",\"machine_id\":");
+        jb_append_escaped(&body, g_machine_id);
+    }
+    if (g_session_id[0]) {
+        jb_append(&body, ",\"session_id\":");
+        jb_append_escaped(&body, g_session_id);
+    }
+    const char *model_env = getenv("SWARMRT_MODEL");
+    if (model_env && model_env[0]) {
+        jb_append(&body, ",\"model\":");
+        jb_append_escaped(&body, model_env);
+    }
+    jb_append(&body, ",\"category\":");
+    jb_append_escaped(&body, category);
+    jb_append(&body, ",\"severity\":");
+    jb_append_escaped(&body, severity);
+    jb_append(&body, ",\"message\":");
+    jb_append_escaped(&body, message);
+    if (tool_name) {
+        jb_append(&body, ",\"tool\":");
+        jb_append_escaped(&body, tool_name);
+    }
+    if (suggested_fix) {
+        jb_append(&body, ",\"suggested_fix\":");
+        jb_append_escaped(&body, suggested_fix);
+    }
+    if (context) {
+        jb_append(&body, ",\"context\":");
+        jb_append_escaped(&body, context);
+    }
+    jb_append(&body, "}");
+
+    /* Write body + receive response via temp files — safer than inline quoting. */
+    char tmpbody[256], tmpresp[256];
+    struct timespec tsn;
+    clock_gettime(CLOCK_REALTIME, &tsn);
+    snprintf(tmpbody, sizeof(tmpbody), "/tmp/swarmrt_fb_req_%d_%ld.json",
+             (int)getpid(), (long)tsn.tv_nsec);
+    snprintf(tmpresp, sizeof(tmpresp), "/tmp/swarmrt_fb_resp_%d_%ld.json",
+             (int)getpid(), (long)tsn.tv_nsec);
+
+    FILE *bf = fopen(tmpbody, "w");
+    if (!bf) {
+        jb_free(&body);
+        jb_append(out, "{\"error\":\"temp file create failed\"}");
+        return;
+    }
+    fwrite(body.buf, 1, body.len, bf);
+    fclose(bf);
+    jb_free(&body);
+
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+             "curl -sS -m 10 -X POST -H 'Content-Type: application/json' "
+             "--data-binary @%s -o %s -w '%%{http_code}' '%s/v1/report' 2>&1",
+             tmpbody, tmpresp, url);
+
+    char http_code[32] = {0};
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        fread(http_code, 1, sizeof(http_code) - 1, fp);
+        pclose(fp);
+    }
+    /* Trim whitespace */
+    int n = (int)strlen(http_code);
+    while (n > 0 && (http_code[n-1] == ' ' || http_code[n-1] == '\n' ||
+                     http_code[n-1] == '\r' || http_code[n-1] == '\t'))
+        http_code[--n] = 0;
+
+    char respbuf[8192] = {0};
+    FILE *rf = fopen(tmpresp, "r");
+    if (rf) {
+        size_t nr = fread(respbuf, 1, sizeof(respbuf) - 1, rf);
+        respbuf[nr] = 0;
+        /* Strip trailing whitespace — Go json.Encoder always appends '\n'. */
+        while (nr > 0 && (respbuf[nr-1] == '\n' || respbuf[nr-1] == '\r' ||
+                          respbuf[nr-1] == ' '  || respbuf[nr-1] == '\t'))
+            respbuf[--nr] = 0;
+        fclose(rf);
+    }
+    unlink(tmpbody);
+    unlink(tmpresp);
+
+    bool ok = (n == 3 && http_code[0] == '2');
+    mcp_log("feedback_report: http=%s ok=%d", http_code, (int)ok);
+
+    jb_append(out, "{\"sent\":%s,\"http_code\":\"%s\",\"url\":",
+              ok ? "true" : "false", http_code);
+    jb_append_escaped(out, url);
+    if (respbuf[0]) {
+        jb_append(out, ",\"server_response\":%s", respbuf);
+    }
+    jb_append(out, "}");
+}
+
+static void tool_feedback_read(json_node_t *args, jbuf_t *out) {
+    const char *url = feedback_url();
+    if (!url) {
+        jb_append(out, "{\"error\":\"SWARMRT_FEEDBACK_URL contains unsafe characters\"}");
+        return;
+    }
+
+    int64_t since = json_get_int(args, "since", 0);
+    int64_t limit = json_get_int(args, "limit", 20);
+    const char *category     = json_get_str(args, "category");
+    const char *tool_name    = json_get_str(args, "tool");
+    const char *severity_min = json_get_str(args, "severity_min");
+
+    if (limit <= 0) limit = 20;
+    if (limit > 500) limit = 500;
+
+    /* Text query params must be alphanumeric/hyphen/underscore only. */
+    if (category && !shell_arg_safe(category)) {
+        jb_append(out, "{\"error\":\"category contains unsafe chars\"}");
+        return;
+    }
+    if (tool_name && !shell_arg_safe(tool_name)) {
+        jb_append(out, "{\"error\":\"tool contains unsafe chars\"}");
+        return;
+    }
+    if (severity_min && !shell_arg_safe(severity_min)) {
+        jb_append(out, "{\"error\":\"severity_min contains unsafe chars\"}");
+        return;
+    }
+
+    char query[512];
+    int qlen = snprintf(query, sizeof(query),
+                        "/v1/feedback?since=%lld&limit=%lld",
+                        (long long)since, (long long)limit);
+    if (category && qlen < (int)sizeof(query))
+        qlen += snprintf(query + qlen, sizeof(query) - qlen,
+                         "&category=%s", category);
+    if (tool_name && qlen < (int)sizeof(query))
+        qlen += snprintf(query + qlen, sizeof(query) - qlen,
+                         "&tool=%s", tool_name);
+    if (severity_min && qlen < (int)sizeof(query))
+        qlen += snprintf(query + qlen, sizeof(query) - qlen,
+                         "&severity_min=%s", severity_min);
+
+    feedback_http_get(url, query, out);
+}
+
+static void tool_feedback_stats(json_node_t *args, jbuf_t *out) {
+    const char *url = feedback_url();
+    if (!url) {
+        jb_append(out, "{\"error\":\"SWARMRT_FEEDBACK_URL contains unsafe characters\"}");
+        return;
+    }
+    int64_t since = json_get_int(args, "since", 0);
+    char query[128];
+    snprintf(query, sizeof(query), "/v1/stats?since=%lld", (long long)since);
+    feedback_http_get(url, query, out);
 }
 
 /* ================================================================
@@ -1500,6 +1835,9 @@ static void tool_wake_list(json_node_t *args, jbuf_t *out);
 static void tool_wake_delete(json_node_t *args, jbuf_t *out);
 static void tool_wake_enable(json_node_t *args, jbuf_t *out);
 static void tool_wake_fire_now(json_node_t *args, jbuf_t *out);
+static void tool_feedback_report(json_node_t *args, jbuf_t *out);
+static void tool_feedback_read(json_node_t *args, jbuf_t *out);
+static void tool_feedback_stats(json_node_t *args, jbuf_t *out);
 
 static mcp_tool_t TOOLS[] = {
     {
@@ -1701,6 +2039,25 @@ static mcp_tool_t TOOLS[] = {
         "Manually queue a wake to fire on swarmrt-wrap's next 5-second tick, bypassing its cron schedule. Appends to .swarmrt/wake_queue.jsonl. Use for testing or for on-demand triggering of a prepared prompt.",
         "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"}}}",
         tool_wake_fire_now
+    },
+    /* --- Agent feedback: shared server, opt-in --- */
+    {
+        "feedback_report",
+        "Ship a structured feedback report to the shared swarmrt feedback server (default https://swarmrt-feedback.fly.dev). Opt-in: does nothing unless SWARMRT_FEEDBACK_ENABLED=1 is set. Use this when you notice a bug, a confusing tool interface, a missing capability, or something working unexpectedly well — the point is to accumulate ground-truth agent observations across many users so the tool can be improved by evidence rather than guesswork. Anonymous (machine_id is a hash of hostname). Server rejects free-text fields containing filesystem paths for privacy. Returns {sent, http_code, server_response}.",
+        "{\"type\":\"object\",\"properties\":{\"category\":{\"type\":\"string\",\"enum\":[\"bug\",\"confusion\",\"wish\",\"works-well\"],\"description\":\"bug = something is broken; confusion = tool is unclear or mis-documented; wish = missing feature; works-well = positive signal that keeps ground-truth calibrated\"},\"severity\":{\"type\":\"string\",\"enum\":[\"low\",\"med\",\"high\"]},\"message\":{\"type\":\"string\",\"description\":\"Plain-English description. Do NOT include filesystem paths, code blocks, or user data. Summarize in prose.\"},\"tool\":{\"type\":\"string\",\"description\":\"Optional name of the specific tool this is about (e.g. wake_list)\"},\"suggested_fix\":{\"type\":\"string\",\"description\":\"Optional — what you would change\"},\"context\":{\"type\":\"string\",\"description\":\"Optional — how you encountered it\"}},\"required\":[\"category\",\"severity\",\"message\"]}",
+        tool_feedback_report
+    },
+    {
+        "feedback_read",
+        "Read accumulated feedback from the shared server (public endpoint, no auth). Use for triage: see what other agents reported in the last N hours, filter by category or severity, cross-reference with recent commits. Returns the server's JSON response verbatim: {items: [...], count}.",
+        "{\"type\":\"object\",\"properties\":{\"since\":{\"type\":\"integer\",\"description\":\"Unix timestamp — only show reports received after this\"},\"limit\":{\"type\":\"integer\",\"description\":\"Max results (default 20, max 500)\"},\"category\":{\"type\":\"string\",\"enum\":[\"bug\",\"confusion\",\"wish\",\"works-well\"]},\"tool\":{\"type\":\"string\",\"description\":\"Filter to a specific tool name\"},\"severity_min\":{\"type\":\"string\",\"enum\":[\"low\",\"med\",\"high\"],\"description\":\"Filter to reports at this severity or higher\"}}}",
+        tool_feedback_read
+    },
+    {
+        "feedback_stats",
+        "Aggregate counts from the shared feedback server: total reports, counts per category, top-10 most-reported tools. Public endpoint, no auth. Use for dashboards and summaries.",
+        "{\"type\":\"object\",\"properties\":{\"since\":{\"type\":\"integer\",\"description\":\"Unix timestamp — only count reports received after this (default: all time)\"}}}",
+        tool_feedback_stats
     },
     {NULL, NULL, NULL, NULL}
 };
@@ -3469,6 +3826,7 @@ int main(int argc, char **argv) {
     autopilot_load();
     workspaces_load();
     wakes_load();
+    init_identity();
 
     mcp_log("ready — %u files indexed, %d memories loaded", g_files_indexed, g_memory_count);
 
