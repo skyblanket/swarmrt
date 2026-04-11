@@ -31,6 +31,9 @@ int sw_ets_delete(sw_ets_tid_t tid, void *key);
 int sw_ets_drop(sw_ets_tid_t tid);
 int sw_ets_info_count(sw_ets_tid_t tid);
 
+/* List all active table IDs, returns count written to out[] */
+int sw_ets_list_tids(uint32_t *out, int max);
+
 /* Called by process_exit to clean up owned tables */
 void sw_ets_cleanup_owner(sw_process_t *proc);
 

@@ -6,76 +6,21 @@ module Atelier
 
 export [main, directeur, concepteur, ingenieur_front, ingenieur_back, typographe, mouvement, critique, specs_collector, keeper]
 
-# ── LLM Helpers (Otonomy Inference Proxy — OpenAI-compatible) ──
-
-fun otonomy_url() {
-    "https://otonomy-inference-production.up.railway.app/v1/chat/completions"
-}
-
-fun otonomy_headers() {
-    key = getenv("OTONOMY_API_KEY")
-    [{'Authorization', "Bearer " ++ key}, {'Content-Type', 'application/json'}]
-}
-
-fun extract_reply(resp) {
-    result = "error: unknown"
-    if (resp == nil) {
-        print("[llm] ERROR: http_post returned nil")
-        result = "error: no response"
-    }
-    if (resp != nil) {
-        err = json_get(resp, "error")
-        if (err != nil) {
-            print("[llm] API ERROR: " ++ to_string(err))
-        }
-        choices = json_get(resp, "choices")
-        if (choices == nil) {
-            print("[llm] ERROR: no choices in response")
-            print("[llm] raw resp: " ++ to_string(string_sub(resp, 0, 200)))
-            result = "error: no choices"
-        }
-        if (choices != nil) {
-            message = json_get(choices, "message")
-            content = json_get(message, "content")
-            if (content == nil) {
-                content = json_get(message, "reasoning")
-            }
-            if (content == "") {
-                content = json_get(message, "reasoning")
-            }
-            if (content == nil) {
-                print("[llm] WARNING: content and reasoning both nil")
-                result = "error: empty response"
-            }
-            if (content != nil) {
-                result = content
-            }
-        }
-    }
-    result
-}
-
-# string_truncate() is now a runtime builtin — removed string_truncate() helper.
+# ── LLM Helpers ──
+# Uses llm_complete() builtin. Backend configured via env:
+#   LLM_URL=http://100.76.144.33:11434/v1/chat/completions  (Ollama on sushi)
+#   LLM_URL=https://otonomy-inference-production.up.railway.app/v1/chat/completions  (Otonomy proxy)
 
 fun call_opus(sys, msg) {
-    body = "{\"model\":\"otonomy-orc\",\"max_tokens\":4096,\"messages\":[{\"role\":\"system\",\"content\":" ++ json_escape(sys) ++ "},{\"role\":\"user\",\"content\":" ++ json_escape(msg) ++ "}]}"
-    print("[llm] body size: " ++ to_string(string_length(body)))
-    resp = http_post(otonomy_url(), otonomy_headers(), body)
-    extract_reply(resp)
+    llm_complete(sys ++ "\n\n" ++ msg, %{model: "otonomy-orc", max_tokens: 4096, temperature: 0.7})
 }
 
 fun call_sonnet(sys, msg) {
-    body = "{\"model\":\"otonomy-swarm\",\"max_tokens\":4096,\"messages\":[{\"role\":\"system\",\"content\":" ++ json_escape(sys) ++ "},{\"role\":\"user\",\"content\":" ++ json_escape(msg) ++ "}]}"
-    print("[llm] body size: " ++ to_string(string_length(body)))
-    resp = http_post(otonomy_url(), otonomy_headers(), body)
-    extract_reply(resp)
+    llm_complete(sys ++ "\n\n" ++ msg, %{model: "otonomy-swarm", max_tokens: 4096, temperature: 0.7})
 }
 
 fun call_sonnet_long(sys, msg) {
-    body = "{\"model\":\"otonomy-swarm\",\"max_tokens\":65536,\"messages\":[{\"role\":\"system\",\"content\":" ++ json_escape(sys) ++ "},{\"role\":\"user\",\"content\":" ++ json_escape(msg) ++ "}]}"
-    print("[llm] body size: " ++ to_string(string_length(body)))
-    resp = http_post(otonomy_url(), otonomy_headers(), body)
-    extract_reply(resp)
+    llm_complete(sys ++ "\n\n" ++ msg, %{model: "otonomy-swarm", max_tokens: 65536, temperature: 0.7})
 }
 
 # ── System Prompts (kept short to stay under proxy payload limits) ──

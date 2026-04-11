@@ -26,7 +26,14 @@ CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 .PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 \
         test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-all benchmark benchmark-native stats \
-        swc libswarmrt example-counter search test-search bench-search sws mcp
+        swc libswarmrt example-counter search test-search bench-search sws mcp mcp-wrap coder coder-clean
+
+# coder — mally-like coding CLI powered by Gemma 4 via vLLM/transformers serve
+coder:
+	$(MAKE) -C coder
+
+coder-clean:
+	$(MAKE) -C coder clean
 
 all: v1 v2 proc native
 
@@ -212,6 +219,15 @@ sws: search dirs
 mcp: search dirs
 	$(CC) $(CFLAGS) -march=native $(BUILD_DIR)/swarmrt_search.o \
 		mcp/swarmrt_mcp.c -o $(BIN_DIR)/swarmrt-mcp $(LDFLAGS) -lm
+
+# PTY wrapper that injects scheduled wakes into a Claude Code session.
+# On Linux, forkpty() requires -lutil; on macOS it's in libc (libutil is a stub).
+WRAP_LDFLAGS = -pthread
+ifneq ($(shell uname),Darwin)
+WRAP_LDFLAGS += -lutil
+endif
+mcp-wrap: dirs
+	$(CC) $(CFLAGS) mcp/swarmrt_wrap.c -o $(BIN_DIR)/swarmrt-wrap $(WRAP_LDFLAGS)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)

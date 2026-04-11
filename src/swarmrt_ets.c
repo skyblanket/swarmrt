@@ -359,6 +359,18 @@ int sw_ets_info_count(sw_ets_tid_t tid) {
     return count;
 }
 
+int sw_ets_list_tids(uint32_t *out, int max) {
+    int n = 0;
+    pthread_mutex_lock(&g_ets_meta_lock);
+    sw_ets_table_t *t = g_ets_tables;
+    while (t && n < max) {
+        out[n++] = t->tid;
+        t = t->global_next;
+    }
+    pthread_mutex_unlock(&g_ets_meta_lock);
+    return n;
+}
+
 void sw_ets_cleanup_owner(sw_process_t *proc) {
     /* Snapshot owned TIDs under meta lock */
     sw_ets_tid_t tids[256];

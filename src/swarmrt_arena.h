@@ -46,8 +46,7 @@ typedef struct {
     uint32_t block_top;         /* Top of free block stack */
     uint32_t block_capacity;    /* Max blocks in this partition */
     sw_spinlock_t lock;
-    char _pad[64 - 28 - sizeof(sw_spinlock_t)]; /* Pad to ~cache line */
-} __attribute__((aligned(64))) sw_arena_partition_t;
+} __attribute__((aligned(128))) sw_arena_partition_t;
 
 typedef struct {
     uint8_t *base;              /* Arena base address (mmap'd) */

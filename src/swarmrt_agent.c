@@ -5,9 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <pthread.h>
-#include <ucontext.h>
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#else
+  #include <unistd.h>
+  #include <ucontext.h>
+#endif
 #include "swarmrt_v2.h"
 #include "swarmrt_agent.h"
 
@@ -47,7 +52,12 @@ int sw_await(sw_process_t *proc, void (*async_fn)(void*), void *arg, sw_term_t *
     
     /* SUSPEND - swap to scheduler context */
     proc->state = 1; /* waiting */
+#ifdef _WIN32
+    /* Windows: use SwitchToFiber if available, or busy-wait fallback */
+    SwitchToFiber(proc->scheduler->fiber);
+#else
     swapcontext(&proc->ctx, &proc->scheduler->ctx);
+#endif
     
     /* RESUMED here when async completes */
     proc->state = 0; /* running */

@@ -15,16 +15,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <signal.h>
-#include <time.h>
-#include <errno.h>
-#include <sys/mman.h>
-#include <sys/time.h>
 #include <stdint.h>
 #include <stdatomic.h>
-#include <dispatch/dispatch.h>
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+  #include <process.h>
+#else
+  #include <unistd.h>
+  #include <pthread.h>
+  #include <signal.h>
+  #include <time.h>
+  #include <errno.h>
+  #include <sys/mman.h>
+  #include <sys/time.h>
+  #ifdef __APPLE__
+    #include <dispatch/dispatch.h>
+  #endif
+#endif
 #include "swarmrt_native.h"
 #include "swarmrt_ets.h"
 #include "swarmrt_phase5.h"
@@ -85,13 +94,18 @@ static inline void timer_free(sw_timer_t *t) {
     free(t);
 }
 
-/* === Timer for preemption (macOS uses dispatch) === */
+/* === Timer for preemption (macOS uses dispatch, Linux POSIX timer, Windows timer queue) === */
 #ifdef __APPLE__
 static dispatch_source_t g_preempt_timer;
+#elif defined(_WIN32)
+static HANDLE g_preempt_timer_queue = NULL;
+static HANDLE g_preempt_timer = NULL;
 #else
 static timer_t g_preempt_timer;
 #endif
+#ifndef _WIN32
 static struct sigaction g_old_sigaction;
+#endif
 
 /* === Forward Declarations === */
 static void *scheduler_main(void *arg);
@@ -100,7 +114,11 @@ static void process_exit(sw_process_t *proc, int reason);
 static void process_destroy(sw_process_t *proc);
 static void fire_timers(void);
 static void registry_remove_proc(sw_process_t *proc);
+#ifdef _WIN32
+static VOID CALLBACK preempt_handler(PVOID param, BOOLEAN fired);
+#else
 static void preempt_handler(int sig, siginfo_t *info, void *context);
+#endif
 static void mailbox_drain(sw_mailbox_t *mb);
 static inline void mailbox_wake(sw_process_t *to);
 
@@ -138,13 +156,22 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
     size_t total = proc_slab_size + block_pool_size + free_pid_size + free_block_size;
     total = (total + 4095) & ~(size_t)4095;  /* Page-align */
 
-    /* Single mmap — one syscall to rule them all */
+    /* Single allocation — one syscall to rule them all */
+#ifdef _WIN32
+    uint8_t *mem = (uint8_t *)VirtualAlloc(NULL, total,
+                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem) {
+        fprintf(stderr, "[SwarmRT] arena VirtualAlloc failed (%lu)\n", GetLastError());
+        return -1;
+    }
+#else
     uint8_t *mem = mmap(NULL, total, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
         perror("[SwarmRT] arena mmap failed");
         return -1;
     }
+#endif
 
     arena->base = mem;
     arena->size = total;
@@ -262,8 +289,18 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     /* Allocate process stack with guard page (lazy — reuse across lifetimes).
      * Layout: [GUARD PAGE | usable stack ... ]
      * Stack grows downward; guard page at bottom catches overflow via SIGSEGV. */
-#define SW_PROC_STACK_SIZE  (8 * 1024)  /* 8KB usable per process stack */
+#define SW_PROC_STACK_SIZE  (64 * 1024)  /* 64KB usable per process stack */
     if (!proc->stack_mem) {
+#ifdef _WIN32
+        long page_size = 4096;
+        size_t total = (size_t)page_size + SW_PROC_STACK_SIZE;
+        total = (total + page_size - 1) & ~(page_size - 1);
+        void *mem = VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!mem) { return -1; }
+        /* Bottom page is guard — no access */
+        DWORD old_prot;
+        VirtualProtect(mem, page_size, PAGE_NOACCESS, &old_prot);
+#else
         long page_size = sysconf(_SC_PAGESIZE);
         size_t total = (size_t)page_size + SW_PROC_STACK_SIZE;
         /* Round up to page alignment */
@@ -273,6 +310,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         if (mem == MAP_FAILED) { return -1; }
         /* Bottom page is guard — no access */
         mprotect(mem, page_size, PROT_NONE);
+#endif
         proc->stack_mem = (uint8_t *)mem + page_size;  /* usable region */
         proc->stack_size = total - page_size;
     }
@@ -286,8 +324,11 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->ctx.pc = (uint64_t)sw_process_trampoline;
     proc->ctx.x19 = (uint64_t)proc;  /* Trampoline reads proc from x19 */
 #else
+    /* Pre-push trampoline address onto the stack so `ret` in context_swap
+     * jumps to the trampoline on first switch (same mechanism as resuming). */
+    stack_top -= 8;
+    *(uint64_t *)stack_top = (uint64_t)sw_process_trampoline;
     proc->ctx.rsp = (uint64_t)stack_top;
-    proc->ctx.rip = (uint64_t)sw_process_trampoline;
     proc->ctx.r12 = (uint64_t)proc;  /* Trampoline reads proc from r12 */
 #endif
     proc->ctx.stack_base = (uint64_t)stack_top;
@@ -373,10 +414,16 @@ static void process_destroy(sw_process_t *proc) {
  * PREEMPTION (Reduction-based Scheduling)
  * ============================================================================ */
 
+#ifdef _WIN32
+static VOID CALLBACK preempt_handler(PVOID param, BOOLEAN fired) {
+    (void)param;
+    (void)fired;
+#else
 static void preempt_handler(int sig, siginfo_t *info, void *context) {
     (void)sig;
     (void)info;
     (void)context;
+#endif
 
     sw_scheduler_t *sched = tls_scheduler;
     sw_process_t *current = tls_current;
@@ -397,6 +444,14 @@ static void setup_preemption(void) {
         /* Preemption signal */
     });
     dispatch_resume(g_preempt_timer);
+#elif defined(_WIN32)
+    /* Windows: timer queue fires callback every 1ms */
+    g_preempt_timer_queue = CreateTimerQueue();
+    if (g_preempt_timer_queue) {
+        CreateTimerQueueTimer(&g_preempt_timer, g_preempt_timer_queue,
+            (WAITORTIMERCALLBACK)preempt_handler, NULL,
+            0, 1, WT_EXECUTEDEFAULT);
+    }
 #else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -671,6 +726,36 @@ static void *scheduler_main(void *arg) {
 }
 
 /* ============================================================================
+ * CRASH HANDLER — print backtrace on SIGSEGV/SIGBUS/SIGABRT
+ * ============================================================================ */
+#include <execinfo.h>
+
+static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    const char *signame = (sig == SIGSEGV) ? "SIGSEGV" :
+                          (sig == SIGBUS)  ? "SIGBUS"  :
+                          (sig == SIGABRT) ? "SIGABRT" : "SIGNAL";
+
+    /* Use write() not printf() — async-signal-safe */
+    char msg[512];
+    int len = snprintf(msg, sizeof(msg),
+        "\n\033[31m[SwarmRT] CRASH: %s at address %p\033[0m\n"
+        "Backtrace:\n",
+        signame, info->si_addr);
+    write(STDERR_FILENO, msg, len);
+
+    void *frames[32];
+    int nframes = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
+
+    write(STDERR_FILENO, "\n", 1);
+
+    /* Re-raise to get the default core dump */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ============================================================================
  * PUBLIC API
  * ============================================================================ */
 
@@ -758,6 +843,20 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     printf("[SwarmRT] Swarm '%s' initialized with %d scheduler(s)\n",
            name, num_schedulers);
     fflush(stdout);
+
+    /* Install crash handler so segfaults produce a backtrace instead of
+     * a bare "segmentation fault" message.  macOS provides backtrace()
+     * in <execinfo.h> which gives us symbol names + offsets. */
+    {
+        struct sigaction crash_sa;
+        memset(&crash_sa, 0, sizeof(crash_sa));
+        crash_sa.sa_sigaction = _sw_crash_handler;
+        crash_sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        sigaction(SIGSEGV, &crash_sa, NULL);
+        sigaction(SIGBUS,  &crash_sa, NULL);
+        sigaction(SIGABRT, &crash_sa, NULL);
+    }
+
     return 0;
 }
 
@@ -813,7 +912,11 @@ void sw_shutdown(int swarm_id) {
 
     /* Free process stacks (mmap'd with guard page) */
     if (g_swarm->arena.proc_slab) {
+#ifdef _WIN32
+        long page_size = 4096;
+#else
         long page_size = sysconf(_SC_PAGESIZE);
+#endif
         sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
         for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
             if (slab[i].stack_mem) {
@@ -821,15 +924,23 @@ void sw_shutdown(int swarm_id) {
                 void *base = (uint8_t *)slab[i].stack_mem - page_size;
                 size_t total = slab[i].stack_size + page_size;
                 total = (total + page_size - 1) & ~(page_size - 1);
+#ifdef _WIN32
+                VirtualFree(base, 0, MEM_RELEASE);
+#else
                 munmap(base, total);
+#endif
                 slab[i].stack_mem = NULL;
             }
         }
     }
 
-    /* Clean up arena (os_unfair_lock has no destroy) */
+    /* Clean up arena */
     if (g_swarm->arena.base) {
+#ifdef _WIN32
+        VirtualFree(g_swarm->arena.base, 0, MEM_RELEASE);
+#else
         munmap(g_swarm->arena.base, g_swarm->arena.size);
+#endif
     }
 
     free(g_swarm->schedulers);
@@ -859,16 +970,15 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
 
     sw_arena_t *arena = &g_swarm->arena;
 
-    /* 1. Pick the target scheduler.
-     * If called from within a scheduler, default to the CURRENT scheduler —
-     * zero cross-thread overhead. Only use round-robin from external threads. */
-    uint32_t sched_id;
-    if (tls_scheduler) {
-        sched_id = tls_scheduler->id;  /* Local spawn — same scheduler */
-    } else {
-        sched_id = __sync_fetch_and_add(&g_swarm->next_sched, 1)
-                   % g_swarm->num_schedulers;
-    }
+    /* 1. Pick the target scheduler via round-robin.
+     * Originally this preferred the current scheduler for zero cross-thread
+     * overhead, but that starves background processes when the parent
+     * blocks on a C syscall (popen fread, fgetc) — the child would be
+     * queued on the same pinned thread and never run. Round-robin
+     * distributes across all schedulers so heartbeats and watchers keep
+     * ticking while main is busy with an HTTP call. */
+    uint32_t sched_id = __sync_fetch_and_add(&g_swarm->next_sched, 1)
+                        % g_swarm->num_schedulers;
     uint32_t part_id = sched_id;
     if (part_id >= arena->num_partitions) part_id = 0;
     sw_arena_partition_t *part = &arena->partitions[part_id];

@@ -13,9 +13,9 @@
 #define CNAME(name) name
 #endif
 
-#ifdef __x86_64__
+#if defined(__x86_64__) && !defined(_WIN32)
 /* ============================================================================
- * x86_64 Context Switch
+ * x86_64 Context Switch (System V ABI — macOS + Linux)
  *
  * Callee-saved registers (must preserve):
  *   rbx, rbp, r12-r15
@@ -78,6 +78,58 @@ CNAME(sw_proc_context_swap_asm):
 
 CNAME(sw_proc_rdtsc):
     rdtsc                      /* Returns TSC in edx:eax */
+    shlq $32, %rdx
+    orq %rdx, %rax
+    ret
+
+#elif defined(__x86_64__) && defined(_WIN32)
+/* ============================================================================
+ * x86_64 Context Switch (Windows x64 ABI)
+ *
+ * Callee-saved: rbx, rbp, rdi, rsi, r12-r15
+ * Arguments: rcx = from, rdx = to
+ * ============================================================================ */
+
+.text
+.globl sw_proc_context_swap_asm
+.align 16
+
+sw_proc_context_swap_asm:
+    /* rcx = from, rdx = to */
+    leaq 256(%rcx), %r8
+
+    movq %rbx, 0(%r8)
+    movq %rbp, 8(%r8)
+    movq %rdi, 16(%r8)
+    movq %rsi, 24(%r8)
+    movq %r12, 32(%r8)
+    movq %r13, 40(%r8)
+    movq %r14, 48(%r8)
+    movq %r15, 56(%r8)
+    movq %rsp, 64(%r8)
+    movq (%rsp), %rax
+    movq %rax, 72(%r8)
+
+    leaq 256(%rdx), %r8
+
+    movq 0(%r8), %rbx
+    movq 8(%r8), %rbp
+    movq 16(%r8), %rdi
+    movq 24(%r8), %rsi
+    movq 32(%r8), %r12
+    movq 40(%r8), %r13
+    movq 48(%r8), %r14
+    movq 56(%r8), %r15
+    movq 64(%r8), %rsp
+    movq 72(%r8), %rax
+    pushq %rax
+    ret
+
+.globl sw_proc_rdtsc
+.align 16
+
+sw_proc_rdtsc:
+    rdtsc
     shlq $32, %rdx
     orq %rdx, %rax
     ret

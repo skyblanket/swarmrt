@@ -1,8 +1,13 @@
 bin/
 build/
+build-cmake/
+build_ios/
 *.o
 *.dSYM
 *.gen.c
 .DS_Store
 .swarmrt/
+.conductor/
 dist/
+CMakeCache.txt
+CMakeFiles/
