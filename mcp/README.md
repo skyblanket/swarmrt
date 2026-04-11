@@ -1,8 +1,8 @@
 # SwarmRT MCP Server
 
-The last MCP server you'll need for Claude Code. One native binary, 33 tools, zero dependencies.
+The last MCP server you'll need for Claude Code. One native binary, 36 tools, zero dependencies.
 
-Replaces SuperMemory, Claude Context, Ralph Wiggum, Codebase Memory MCP, and Desktop Commander — all in ~128KB. Ships with an optional PTY wrapper (`swarmrt-wrap`) that gives Claude Code true time-triggered autonomy via the `wake_*` tools — ungated, local, resume-safe, no cloud.
+Replaces SuperMemory, Claude Context, Ralph Wiggum, Codebase Memory MCP, and Desktop Commander — all in ~128KB. Ships with an optional PTY wrapper (`swarmrt-wrap`) that gives Claude Code true time-triggered autonomy via the `wake_*` tools — ungated, local, resume-safe, no cloud — and three `feedback_*` tools that ship structured agent observations to a shared public server at **https://swarmrt-feedback.fly.dev** so the tool can be improved by evidence rather than guesswork.
 
 ## One-shot install (for LLM agents)
 
@@ -55,6 +55,8 @@ You should see `AUTONOMY-OK` appear on its own at the next minute boundary withi
 - **Minimum granularity is 1 minute.** Sub-minute scheduling isn't possible with 5-field cron — use `wake_fire_now` for immediate testing instead of inventing a `*/10 seconds` syntax.
 - **Vixie OR for dom+dow.** If BOTH day-of-month and day-of-week are restricted (neither is `*`), the wake fires when *either* matches. Most humans expect AND — if the user wants "only on the 15th if it's also a weekday," tell them it's easier to handle that in the prompt than in cron.
 - **Don't touch `~/.claude/settings.json` by hand.** Use `claude mcp add` (step 4 above). Manual edits can silently break hook config.
+- **Feedback is opt-in and off by default.** `feedback_report` silently declines unless `SWARMRT_FEEDBACK_ENABLED=1`. If you want your agent to actively contribute observations to the shared pool, have the user add `export SWARMRT_FEEDBACK_ENABLED=1` to their shell rc. `feedback_read` and `feedback_stats` are always available (they're read-only public GETs). Defaults to `https://swarmrt-feedback.fly.dev`; override with `SWARMRT_FEEDBACK_URL` if self-hosting.
+- **Feedback server rejects paths in free-text.** If you try to `feedback_report` a message containing `/Users/...` or `/home/...`, the server returns HTTP 400 with a privacy error. Summarize in plain English. Reference file locations as e.g. `"the MCP's tool_wake_list in swarmrt_mcp.c"`, never `"/Users/sky/swarmrt/mcp/swarmrt_mcp.c:1373"`.
 
 ## Quick Install
 
@@ -176,6 +178,16 @@ make mcp
 | `checkpoint_save` | Save a checkpoint (snapshot) of a workspace's current state. Commits all changes as a restorable reference. |
 | `checkpoint_restore` | Restore a workspace to a previous checkpoint. Without a ref, lists available checkpoints. |
 | `workspace_diff` | Show all changes in a workspace compared to the base branch. File stats, commit count, and diff content. |
+
+### Feedback (3, shared server, opt-in)
+
+| Tool | Description |
+|------|-------------|
+| `feedback_report` | Ship a structured observation to the shared feedback server. Opt-in: does nothing unless `SWARMRT_FEEDBACK_ENABLED=1`. Categories: `bug`, `confusion`, `wish`, `works-well`. Severities: `low`, `med`, `high`. Anonymous (`machine_id` = fnv1a hash of hostname). Server rejects free-text containing filesystem paths for privacy. |
+| `feedback_read` | Public read: query the shared feedback pool. Filter by `since`, `category`, `tool`, `severity_min`. Use for triage — see what other agents reported. |
+| `feedback_stats` | Aggregate counts per category + top-10 most-reported tools. Public. |
+
+See [feedback-server/README.md](../feedback-server/README.md) for the server-side schema, deployment, and self-hosting instructions.
 
 ### Wake (5, time-triggered prompt injection)
 
