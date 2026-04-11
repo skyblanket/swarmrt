@@ -399,8 +399,10 @@ typedef struct {
     cron_t   cron;
     bool     enabled;
     int64_t  created_at;
-    int64_t  last_fired_at;
-    int      fire_count;
+    int64_t  last_fired_at;         /* scheduled (cron) fires only */
+    int      fire_count;             /* scheduled (cron) fires only */
+    int64_t  last_manual_fire_at;    /* wake_fire_now deliveries */
+    int      manual_fire_count;      /* wake_fire_now deliveries */
 } wake_t;
 
 static wake_t  g_wakes[MAX_WAKES];
@@ -470,9 +472,11 @@ static bool wakes_load_if_changed(void) {
             w->cron_expr     = strdup(cron_s);
             w->prompt        = strdup(prompt);
             w->enabled       = json_get_bool(w_n, "enabled", true);
-            w->created_at    = json_get_int(w_n, "created_at", 0);
-            w->last_fired_at = json_get_int(w_n, "last_fired_at", 0);
-            w->fire_count    = (int)json_get_int(w_n, "fire_count", 0);
+            w->created_at          = json_get_int(w_n, "created_at", 0);
+            w->last_fired_at       = json_get_int(w_n, "last_fired_at", 0);
+            w->fire_count          = (int)json_get_int(w_n, "fire_count", 0);
+            w->last_manual_fire_at = json_get_int(w_n, "last_manual_fire_at", 0);
+            w->manual_fire_count   = (int)json_get_int(w_n, "manual_fire_count", 0);
             if (!cron_parse(w->cron_expr, &w->cron)) { wake_free(w); continue; }
             g_wake_count++;
         }
@@ -521,11 +525,13 @@ static void wakes_save(void) {
         if (w->name) jesc(f, w->name); else fputs("null", f);
         fprintf(f, ",\"cron\":"); jesc(f, w->cron_expr);
         fprintf(f, ",\"prompt\":"); jesc(f, w->prompt);
-        fprintf(f, ",\"enabled\":%s,\"created_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d}",
+        fprintf(f, ",\"enabled\":%s,\"created_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d,\"last_manual_fire_at\":%lld,\"manual_fire_count\":%d}",
                 w->enabled ? "true" : "false",
                 (long long)w->created_at,
                 (long long)w->last_fired_at,
-                w->fire_count);
+                w->fire_count,
+                (long long)w->last_manual_fire_at,
+                w->manual_fire_count);
     }
     fprintf(f, "]}");
     fclose(f);
@@ -597,33 +603,56 @@ static void inject(int fd, const char *prompt) {
     logmsg("injected: %.60s%s", prompt, n > 60 ? "..." : "");
 }
 
-static void drain_queue(int master_fd) {
+/* Returns the number of manual fires that landed on a tracked wake
+ * (so process_tick knows whether to save updated counters). */
+static int drain_queue(int master_fd, time_t now) {
     FILE *f = fopen(g_queue_path, "r");
-    if (!f) return;
+    if (!f) return 0;
 
     char line[16384];
     int injected = 0;
+    int tracked  = 0;
     while (fgets(line, sizeof(line), f)) {
         const char *p = line;
         json_node_t *n = json_parse(&p);
         if (!n) continue;
         const char *prompt = json_get_str(n, "prompt");
-        if (prompt) { inject(master_fd, prompt); injected++; }
+        int id = (int)json_get_int(n, "id", -1);
+        if (prompt) {
+            inject(master_fd, prompt);
+            injected++;
+            /* If this queue entry references a known wake, bump its
+             * manual counters. Not found is fine — the wake may have
+             * been deleted between wake_fire_now and this tick. */
+            if (id > 0) {
+                for (int i = 0; i < g_wake_count; i++) {
+                    if (g_wakes[i].id == id) {
+                        g_wakes[i].manual_fire_count++;
+                        g_wakes[i].last_manual_fire_at = now;
+                        tracked++;
+                        break;
+                    }
+                }
+            }
+        }
         json_free(n);
     }
     fclose(f);
     if (injected > 0) {
         unlink(g_queue_path);
-        logmsg("drained queue: %d injection(s)", injected);
+        logmsg("drained queue: %d injection(s), %d tracked", injected, tracked);
     }
+    return tracked;
 }
 
 static void process_tick(int master_fd, time_t now) {
-    /* 1. Drain manual queue unconditionally (user-initiated). */
-    drain_queue(master_fd);
-
-    /* 2. Pick up any config changes from disk. */
+    /* 1. Pick up config changes BEFORE draining the queue, so manual
+     *    fires bump counters on the current view of g_wakes. */
     wakes_load_if_changed();
+
+    /* 2. Drain manual queue unconditionally (user-initiated). */
+    int manual_tracked = drain_queue(master_fd, now);
+    if (manual_tracked > 0) wakes_save();
 
     /* 3. Fire at most one due cron wake per tick. */
     for (int i = 0; i < g_wake_count; i++) {
