@@ -7,6 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$ROOT_DIR/bin/swarmrt-mcp"
+WRAP_BINARY="$ROOT_DIR/bin/swarmrt-wrap"
 HOOK="$SCRIPT_DIR/autopilot_hook.sh"
 SETTINGS_FILE="$HOME/.claude/settings.json"
 
@@ -19,14 +20,22 @@ if [ ! -f "$BINARY" ]; then
     cd "$ROOT_DIR"
     make mcp
 fi
+if [ ! -f "$WRAP_BINARY" ]; then
+    echo "Building swarmrt-wrap (PTY daemon for wake_* tools)..."
+    cd "$ROOT_DIR"
+    make mcp-wrap
+fi
 
-# Verify binary
+# Verify binaries
 if [ ! -x "$BINARY" ]; then
     echo "Error: $BINARY not found or not executable"
     exit 1
 fi
 
-echo "Binary: $BINARY ($(wc -c < "$BINARY" | tr -d ' ') bytes)"
+echo "MCP binary:  $BINARY ($(wc -c < "$BINARY" | tr -d ' ') bytes)"
+if [ -x "$WRAP_BINARY" ]; then
+    echo "Wrap binary: $WRAP_BINARY ($(wc -c < "$WRAP_BINARY" | tr -d ' ') bytes)"
+fi
 
 # Ensure .claude dir exists
 mkdir -p "$(dirname "$SETTINGS_FILE")"
@@ -79,9 +88,20 @@ PYEOF
 echo ""
 echo "Installed. Restart Claude Code to activate."
 echo ""
-echo "Tools (15):"
-echo "  Search:    codebase_search, codebase_fuzzy, codebase_status, codebase_reindex"
-echo "  Memory:    memory_store, memory_recall, memory_list, memory_forget"
-echo "  Session:   session_log, session_context"
-echo "  Autopilot: autopilot_start, autopilot_status, autopilot_step, autopilot_stop"
-echo "  Stats:     process_stats"
+echo "Tools (33):"
+echo "  Search:     codebase_search, codebase_fuzzy, codebase_grep, codebase_status, codebase_reindex"
+echo "  Git:        git_diff, git_log"
+echo "  Arch:       codebase_overview"
+echo "  Memory:     memory_store, memory_update, memory_recall, memory_list, memory_forget"
+echo "  Session:    session_log, session_context"
+echo "  Autopilot:  autopilot_start, autopilot_status, autopilot_step, autopilot_pause, autopilot_stop"
+echo "  Workspace:  workspace_create, workspace_list, workspace_archive, checkpoint_save, checkpoint_restore, workspace_diff"
+echo "  Wake:       wake_create, wake_list, wake_delete, wake_enable, wake_fire_now"
+echo "  System:     set_project, process_stats"
+echo ""
+echo "For wake_* tools to actually fire, launch Claude Code via the PTY wrapper:"
+echo "  alias claude='$WRAP_BINARY claude'"
+echo ""
+echo "Without the wrapper, wake_create still saves to .swarmrt/wakes.json but nothing"
+echo "injects prompts into the session. The wrapper polls wakes.json every 5s and"
+echo "writes due prompts to the PTY as if you had typed them."

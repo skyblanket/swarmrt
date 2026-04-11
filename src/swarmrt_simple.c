@@ -168,11 +168,7 @@ sw_term_t *sw_receive(uint64_t timeout_ms) {
 
 /* Scheduling - NO-OP in simple version */
 void sw_yield(void) {
-    #ifdef __APPLE__
-        pthread_yield_np();
-    #else
-        pthread_yield();
-    #endif
+    sched_yield();
 }
 
 void sw_schedule(sw_process_t *proc) {

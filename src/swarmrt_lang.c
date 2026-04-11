@@ -191,6 +191,8 @@ static tok_t lnext(lex_t *l) {
                     case 'n': t.text[i++] = '\n'; break;
                     case 't': t.text[i++] = '\t'; break;
                     case 'r': t.text[i++] = '\r'; break;
+                    case 'e': t.text[i++] = '\x1b'; break; /* ANSI escape */
+                    case '0': t.text[i++] = '\0'; break;
                     case '#': t.text[i++] = '\x01'; break; /* sentinel: escaped # */
                     default:  t.text[i++] = esc; break;
                 }
@@ -1582,13 +1584,26 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         sw_val_t *right = eval(interp, n->v.binop.right, env);
         const char *op = n->v.binop.op;
 
-        /* String concatenation */
+        /* String concatenation (bounded — no unbounded strcat) */
         if (strcmp(op, "++") == 0) {
-            char buf[1024] = "";
-            if (left->type == SW_VAL_STRING) strcat(buf, left->v.str);
-            else if (left->type == SW_VAL_INT) { char tmp[64]; snprintf(tmp, 64, "%lld", (long long)left->v.i); strcat(buf, tmp); }
-            if (right->type == SW_VAL_STRING) strcat(buf, right->v.str);
-            else if (right->type == SW_VAL_INT) { char tmp[64]; snprintf(tmp, 64, "%lld", (long long)right->v.i); strcat(buf, tmp); }
+            char buf[4096];
+            size_t pos = 0;
+            buf[0] = '\0';
+            if (left->type == SW_VAL_STRING && left->v.str) {
+                size_t n = strlen(left->v.str);
+                if (n > sizeof(buf) - pos - 1) n = sizeof(buf) - pos - 1;
+                memcpy(buf + pos, left->v.str, n); pos += n;
+            } else if (left->type == SW_VAL_INT) {
+                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%lld", (long long)left->v.i);
+            }
+            if (right->type == SW_VAL_STRING && right->v.str) {
+                size_t n = strlen(right->v.str);
+                if (n > sizeof(buf) - pos - 1) n = sizeof(buf) - pos - 1;
+                memcpy(buf + pos, right->v.str, n); pos += n;
+            } else if (right->type == SW_VAL_INT) {
+                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%lld", (long long)right->v.i);
+            }
+            buf[pos] = '\0';
             return sw_val_string(buf);
         }
 

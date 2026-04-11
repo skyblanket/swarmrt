@@ -15,9 +15,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <libgen.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+  #include <io.h>
+  #include <direct.h>
+  #define swc_unlink(p) _unlink(p)
+#else
+  #include <unistd.h>
+  #include <libgen.h>
+  #define swc_unlink(p) unlink(p)
+#endif
+#include "swarmrt_platform.h"
 #include "swarmrt_lang.h"
 #include "swarmrt_codegen.h"
 #include "swarmrt_repl.h"
@@ -150,8 +160,17 @@ int main(int argc, char **argv) {
     {
         char input_dir[256];
         char *tmp = strdup(inputs[0]);
+#ifdef _WIN32
+        /* Manual dirname: find last separator */
+        char *sep = strrchr(tmp, '/');
+        char *bsep = strrchr(tmp, '\\');
+        if (bsep > sep) sep = bsep;
+        if (sep) *sep = '\0'; else tmp[0] = '.', tmp[1] = '\0';
+        strncpy(input_dir, tmp, sizeof(input_dir) - 1);
+#else
         char *dir = dirname(tmp);
         strncpy(input_dir, dir, sizeof(input_dir) - 1);
+#endif
         free(tmp);
 
         for (int a = 0; a < nasts; a++) {
@@ -258,12 +277,15 @@ int main(int argc, char **argv) {
 
     /* Write to temp file */
     char tmppath[256];
-    snprintf(tmppath, sizeof(tmppath), "/tmp/swc_%s_XXXXXX.c", mod_name);
-    /* mkstemps needs suffix length */
+    snprintf(tmppath, sizeof(tmppath), "%s/swc_%s_XXXXXX.c", sw_tmpdir(), mod_name);
+#ifdef _WIN32
+    int fd = -1;  /* No mkstemps on Windows, use fallback */
+#else
     int fd = mkstemps(tmppath, 2);
+#endif
     if (fd < 0) {
         /* Fallback: use fixed name */
-        snprintf(tmppath, sizeof(tmppath), "/tmp/swc_%s.c", mod_name);
+        snprintf(tmppath, sizeof(tmppath), "%s/swc_%s.c", sw_tmpdir(), mod_name);
         FILE *tf = fopen(tmppath, "w");
         if (!tf) { fprintf(stderr, "swc: cannot create temp file\n"); free(code); return 1; }
         fputs(code, tf);
@@ -310,9 +332,16 @@ int main(int argc, char **argv) {
     char swc_dir[256] = ".";
     char *swc_path = strdup(argv[0]);
     if (swc_path) {
+#ifdef _WIN32
+        char *sep = strrchr(swc_path, '/');
+        char *bsep = strrchr(swc_path, '\\');
+        if (bsep > sep) sep = bsep;
+        if (sep) *sep = '\0'; else swc_path[0] = '.', swc_path[1] = '\0';
+        snprintf(swc_dir, sizeof(swc_dir), "%s/..", swc_path);
+#else
         char *dir = dirname(swc_path);
-        /* Go up from bin/ to project root */
         snprintf(swc_dir, sizeof(swc_dir), "%s/..", dir);
+#endif
         free(swc_path);
     }
 
@@ -338,7 +367,7 @@ int main(int argc, char **argv) {
     int rc = system(cmd_buf);
 
     /* Cleanup temp file */
-    if (!emit_c) unlink(tmppath);
+    if (!emit_c) swc_unlink(tmppath);
 
     if (rc != 0) {
         fprintf(stderr, "swc: compilation failed (cc returned %d)\n", rc);

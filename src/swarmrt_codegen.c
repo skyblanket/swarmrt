@@ -155,6 +155,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "string_ends_with") == 0 ||
            strcmp(name, "string_truncate") == 0 ||
            /* Agent utilities */
+           strcmp(name, "parse_gemma_calls") == 0 ||
            strcmp(name, "clean_json") == 0 ||
            strcmp(name, "strip_html") == 0 ||
            /* Process introspection */
@@ -182,7 +183,21 @@ static int is_builtin(const char *name) {
            strcmp(name, "breaker_state") == 0 ||
            strcmp(name, "llm_stream") == 0 ||
            strcmp(name, "ets_list") == 0 ||
-           strcmp(name, "ets_count") == 0;
+           strcmp(name, "ets_count") == 0 ||
+           /* PDF builtins */
+           strcmp(name, "pdf_text") == 0 ||
+           strcmp(name, "pdf_pages") == 0 ||
+           strcmp(name, "pdf_meta") == 0 ||
+           /* Phase 16: Interactive CLI primitives */
+           strcmp(name, "read_line") == 0 ||
+           strcmp(name, "print_inline") == 0 ||
+           strcmp(name, "sys_exit") == 0 ||
+           /* Phase 17: LLM streaming */
+           strcmp(name, "http_post_stream") == 0 ||
+           /* Phase 18: terminal introspection */
+           strcmp(name, "term_cols") == 0 ||
+           /* Phase 19: interactive picker */
+           strcmp(name, "read_choice") == 0;
 }
 
 static int is_self_call(cg_ctx_t *ctx, node_t *n) {
@@ -743,15 +758,17 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
     fprintf(f, "/* === Spawn trampolines === */\n");
     for (int i = 0; i < ctx->nspawns; i++) {
         spawn_info_t *sp = &ctx->spawns[i];
-        /* Struct for captured args */
+        /* Struct for captured args. Names are module-prefixed so multiple
+         * modules in a multi-module build don't collide on _sp0_t etc. */
         fprintf(f, "typedef struct {");
         for (int a = 0; a < sp->nargs; a++)
             fprintf(f, " sw_val_t *a%d;", a);
-        fprintf(f, " } _sp%d_t;\n", sp->id);
+        fprintf(f, " } _%s_sp%d_t;\n", ctx->mod_name, sp->id);
 
         /* Entry function */
-        fprintf(f, "static void _sp%d_entry(void *_raw) {\n", sp->id);
-        fprintf(f, "    _sp%d_t *_s = (_sp%d_t *)_raw;\n", sp->id, sp->id);
+        fprintf(f, "static void _%s_sp%d_entry(void *_raw) {\n", ctx->mod_name, sp->id);
+        fprintf(f, "    _%s_sp%d_t *_s = (_%s_sp%d_t *)_raw;\n",
+                ctx->mod_name, sp->id, ctx->mod_name, sp->id);
         if (sp->nargs > 0) {
             fprintf(f, "    sw_val_t *_a[] = {");
             for (int a = 0; a < sp->nargs; a++) {
@@ -1086,6 +1103,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "string_ends_with") == 0 ||
              strcmp(fname, "string_truncate") == 0 ||
              /* Agent utilities */
+             strcmp(fname, "parse_gemma_calls") == 0 ||
              strcmp(fname, "clean_json") == 0 ||
              strcmp(fname, "strip_html") == 0 ||
              /* Process introspection */
@@ -1113,7 +1131,21 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "breaker_state") == 0 ||
              strcmp(fname, "llm_stream") == 0 ||
              strcmp(fname, "ets_list") == 0 ||
-             strcmp(fname, "ets_count") == 0)
+             strcmp(fname, "ets_count") == 0 ||
+             /* PDF builtins */
+             strcmp(fname, "pdf_text") == 0 ||
+             strcmp(fname, "pdf_pages") == 0 ||
+             strcmp(fname, "pdf_meta") == 0 ||
+             /* Phase 16: Interactive CLI primitives */
+             strcmp(fname, "read_line") == 0 ||
+             strcmp(fname, "print_inline") == 0 ||
+             strcmp(fname, "sys_exit") == 0 ||
+             /* Phase 17: LLM streaming */
+             strcmp(fname, "http_post_stream") == 0 ||
+             /* Phase 18: terminal introspection */
+             strcmp(fname, "term_cols") == 0 ||
+             /* Phase 19: interactive picker */
+             strcmp(fname, "read_choice") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)
@@ -1162,7 +1194,8 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     spawn_info_t *sp = &ctx->spawns[sp_id];
     char sa[32];
     fresh_var(ctx, sa, sizeof(sa));
-    fprintf(f, "    _sp%d_t *%s = malloc(sizeof(_sp%d_t));\n", sp_id, sa, sp_id);
+    fprintf(f, "    _%s_sp%d_t *%s = malloc(sizeof(_%s_sp%d_t));\n",
+            ctx->mod_name, sp_id, sa, ctx->mod_name, sp_id);
 
     /* Evaluate and assign spawn arguments */
     for (int i = 0; i < sp->nargs; i++) {
@@ -1173,8 +1206,8 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
 
     char res[32];
     fresh_var(ctx, res, sizeof(res));
-    fprintf(f, "    sw_val_t *%s = sw_val_pid(sw_spawn(_sp%d_entry, %s));\n",
-            res, sp_id, sa);
+    fprintf(f, "    sw_val_t *%s = sw_val_pid(sw_spawn(_%s_sp%d_entry, %s));\n",
+            res, ctx->mod_name, sp_id, sa);
     strncpy(out, res, osz - 1);
 }
 
@@ -1701,7 +1734,7 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
     fprintf(f, "int main(int argc, char **argv) {\n");
     fprintf(f, "    (void)argc; (void)argv;\n");
     fprintf(f, "    setvbuf(stdout, NULL, _IONBF, 0);\n");
-    fprintf(f, "    sw_init(\"%s\", 4);\n", ctx->mod_name);
+    fprintf(f, "    sw_init(\"%s\", 2);\n", ctx->mod_name);
     fprintf(f, "    sw_io_init();\n");
     fprintf(f, "    sw_spawn(_main_entry, NULL);\n");
     fprintf(f, "    while(1) usleep(60000000); /* run forever */\n");

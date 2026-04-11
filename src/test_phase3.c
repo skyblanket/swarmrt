@@ -15,6 +15,7 @@
 #include "swarmrt_otp.h"
 #include "swarmrt_task.h"
 #include "swarmrt_ets.h"
+#include "swarmrt_lang.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -349,24 +350,32 @@ static void test_task_shutdown(void) {
 
 static volatile int e1_passed = 0;
 
+static sw_val_t e1_k1, e1_k2, e1_k3, e1_miss;
+static sw_val_t e1_v1, e1_v2, e1_v3;
+
 static void e1_runner(void *arg) {
     (void)arg;
     sw_ets_tid_t tid = sw_ets_new(SW_ETS_DEFAULT);
 
-    int k1 = 1, k2 = 2, k3 = 3;
-    int v1 = 10, v2 = 20, v3 = 30;
-    int miss_key = 99;
+    e1_k1 = (sw_val_t){.type = SW_VAL_INT, .v.i = 1};
+    e1_k2 = (sw_val_t){.type = SW_VAL_INT, .v.i = 2};
+    e1_k3 = (sw_val_t){.type = SW_VAL_INT, .v.i = 3};
+    e1_miss = (sw_val_t){.type = SW_VAL_INT, .v.i = 99};
+    e1_v1 = (sw_val_t){.type = SW_VAL_INT, .v.i = 10};
+    e1_v2 = (sw_val_t){.type = SW_VAL_INT, .v.i = 20};
+    e1_v3 = (sw_val_t){.type = SW_VAL_INT, .v.i = 30};
 
-    sw_ets_insert(tid, &k1, &v1);
-    sw_ets_insert(tid, &k2, &v2);
-    sw_ets_insert(tid, &k3, &v3);
+    sw_ets_insert(tid, &e1_k1, &e1_v1);
+    sw_ets_insert(tid, &e1_k2, &e1_v2);
+    sw_ets_insert(tid, &e1_k3, &e1_v3);
 
-    void *r1 = sw_ets_lookup(tid, &k1);
-    void *r2 = sw_ets_lookup(tid, &k2);
-    void *r3 = sw_ets_lookup(tid, &k3);
-    void *r4 = sw_ets_lookup(tid, &miss_key);
+    void *r1 = sw_ets_lookup(tid, &e1_k1);
+    void *r2 = sw_ets_lookup(tid, &e1_k2);
+    void *r3 = sw_ets_lookup(tid, &e1_k3);
+    void *r4 = sw_ets_lookup(tid, &e1_miss);
 
-    e1_passed = (r1 == &v1 && r2 == &v2 && r3 == &v3 && r4 == NULL);
+    sw_val_t *rv1 = (sw_val_t *)r1, *rv2 = (sw_val_t *)r2, *rv3 = (sw_val_t *)r3;
+    e1_passed = (rv1 && rv1->v.i == 10 && rv2 && rv2->v.i == 20 && rv3 && rv3->v.i == 30 && r4 == NULL);
 
     sw_ets_drop(tid);
 }
@@ -389,20 +398,24 @@ static void test_ets_insert_lookup(void) {
 
 static volatile int e2_passed = 0;
 
+static sw_val_t e2_key, e2_v1, e2_v2;
+
 static void e2_runner(void *arg) {
     (void)arg;
     sw_ets_tid_t tid = sw_ets_new(SW_ETS_DEFAULT);
 
-    int key = 42;
-    int v1 = 100, v2 = 200;
+    e2_key = (sw_val_t){.type = SW_VAL_INT, .v.i = 42};
+    e2_v1 = (sw_val_t){.type = SW_VAL_INT, .v.i = 100};
+    e2_v2 = (sw_val_t){.type = SW_VAL_INT, .v.i = 200};
 
-    sw_ets_insert(tid, &key, &v1);
-    sw_ets_insert(tid, &key, &v2);
+    sw_ets_insert(tid, &e2_key, &e2_v1);
+    sw_ets_insert(tid, &e2_key, &e2_v2);
 
-    void *result = sw_ets_lookup(tid, &key);
+    void *result = sw_ets_lookup(tid, &e2_key);
     int count = sw_ets_info_count(tid);
 
-    e2_passed = (result == &v2 && count == 1);
+    sw_val_t *rv = (sw_val_t *)result;
+    e2_passed = (rv && rv->v.i == 200 && count == 1);
 
     sw_ets_drop(tid);
 }
@@ -425,25 +438,32 @@ static void test_ets_set_replace(void) {
 
 static volatile int e3_passed = 0;
 
+static sw_val_t e3_k1, e3_k2, e3_k3, e3_v1, e3_v2, e3_v3;
+
 static void e3_runner(void *arg) {
     (void)arg;
     sw_ets_tid_t tid = sw_ets_new(SW_ETS_DEFAULT);
 
-    int k1 = 1, k2 = 2, k3 = 3;
-    int v1 = 10, v2 = 20, v3 = 30;
+    e3_k1 = (sw_val_t){.type = SW_VAL_INT, .v.i = 1};
+    e3_k2 = (sw_val_t){.type = SW_VAL_INT, .v.i = 2};
+    e3_k3 = (sw_val_t){.type = SW_VAL_INT, .v.i = 3};
+    e3_v1 = (sw_val_t){.type = SW_VAL_INT, .v.i = 10};
+    e3_v2 = (sw_val_t){.type = SW_VAL_INT, .v.i = 20};
+    e3_v3 = (sw_val_t){.type = SW_VAL_INT, .v.i = 30};
 
-    sw_ets_insert(tid, &k1, &v1);
-    sw_ets_insert(tid, &k2, &v2);
-    sw_ets_insert(tid, &k3, &v3);
+    sw_ets_insert(tid, &e3_k1, &e3_v1);
+    sw_ets_insert(tid, &e3_k2, &e3_v2);
+    sw_ets_insert(tid, &e3_k3, &e3_v3);
 
-    int del_result = sw_ets_delete(tid, &k2);
+    int del_result = sw_ets_delete(tid, &e3_k2);
 
-    void *r1 = sw_ets_lookup(tid, &k1);
-    void *r2 = sw_ets_lookup(tid, &k2);
-    void *r3 = sw_ets_lookup(tid, &k3);
+    void *r1 = sw_ets_lookup(tid, &e3_k1);
+    void *r2 = sw_ets_lookup(tid, &e3_k2);
+    void *r3 = sw_ets_lookup(tid, &e3_k3);
     int count = sw_ets_info_count(tid);
 
-    e3_passed = (del_result == 0 && r1 == &v1 && r2 == NULL && r3 == &v3 && count == 2);
+    sw_val_t *rv1 = (sw_val_t *)r1, *rv3 = (sw_val_t *)r3;
+    e3_passed = (del_result == 0 && rv1 && rv1->v.i == 10 && r2 == NULL && rv3 && rv3->v.i == 30 && count == 2);
 
     sw_ets_drop(tid);
 }
@@ -465,8 +485,8 @@ static void test_ets_delete(void) {
  * ========================================================================= */
 
 static sw_ets_tid_t e4_tid = 0;
-static int e4_keys[100];
-static int e4_vals[100];
+static sw_val_t e4_keys[100];
+static sw_val_t e4_vals[100];
 static _Atomic int e4_readers_ok = 0;
 
 static void e4_reader(void *arg) {
@@ -475,7 +495,8 @@ static void e4_reader(void *arg) {
 
     for (int i = 0; i < 100; i++) {
         void *v = sw_ets_lookup(e4_tid, &e4_keys[i]);
-        if (v != &e4_vals[i]) {
+        sw_val_t *rv = (sw_val_t *)v;
+        if (!rv || rv->v.i != i * 7) {
             ok = 0;
             break;
         }
@@ -491,8 +512,8 @@ static void test_ets_concurrent_reads(void) {
     /* Create PUBLIC table from main thread — no owner process needed,
      * avoids cooperative scheduling deadlock */
     for (int i = 0; i < 100; i++) {
-        e4_keys[i] = i;
-        e4_vals[i] = i * 7;
+        e4_keys[i] = (sw_val_t){.type = SW_VAL_INT, .v.i = i};
+        e4_vals[i] = (sw_val_t){.type = SW_VAL_INT, .v.i = i * 7};
     }
     e4_tid = sw_ets_new(SW_ETS_DEFAULT);
     for (int i = 0; i < 100; i++) {
@@ -520,15 +541,16 @@ static void test_ets_concurrent_reads(void) {
  * ========================================================================= */
 
 static sw_ets_tid_t e5_tid = 0;
-static int e5_key = 42;
-static int e5_val = 100;
+static sw_val_t e5_key = {.type = SW_VAL_INT, .v.i = 42};
+static sw_val_t e5_val = {.type = SW_VAL_INT, .v.i = 100};
 static volatile int e5_reader_val = -1;   /* sentinel */
 static volatile int e5_writer_result = 99; /* sentinel */
 
 static void e5_reader_proc(void *arg) {
     sw_process_t *owner = (sw_process_t *)arg;
     void *v = sw_ets_lookup(e5_tid, &e5_key);
-    e5_reader_val = v ? *(int *)v : 0;
+    sw_val_t *rv = (sw_val_t *)v;
+    e5_reader_val = rv ? (int)rv->v.i : 0;
 
     /* Signal owner we're done */
     int *done = (int *)malloc(sizeof(int));
@@ -536,10 +558,11 @@ static void e5_reader_proc(void *arg) {
     sw_send(owner, done);
 }
 
+static sw_val_t e5_other_val = {.type = SW_VAL_INT, .v.i = 999};
+
 static void e5_writer_proc(void *arg) {
     sw_process_t *owner = (sw_process_t *)arg;
-    int other_val = 999;
-    e5_writer_result = sw_ets_insert(e5_tid, &e5_key, &other_val);
+    e5_writer_result = sw_ets_insert(e5_tid, &e5_key, &e5_other_val);
 
     /* Signal owner we're done */
     int *done = (int *)malloc(sizeof(int));
@@ -590,10 +613,11 @@ static void test_ets_protected(void) {
  * ========================================================================= */
 
 static sw_ets_tid_t e6_tid = 0;
-static int e6_key = 42;
-static int e6_val = 100;
+static sw_val_t e6_key = {.type = SW_VAL_INT, .v.i = 42};
+static sw_val_t e6_val = {.type = SW_VAL_INT, .v.i = 100};
 static volatile int e6_read_result_is_null = -1; /* sentinel: -1=never ran */
 static volatile int e6_write_result = 99;        /* sentinel: 99=never ran */
+static sw_val_t e6_other_val = {.type = SW_VAL_INT, .v.i = 999};
 
 static void e6_intruder(void *arg) {
     sw_process_t *owner = (sw_process_t *)arg;
@@ -601,8 +625,7 @@ static void e6_intruder(void *arg) {
     void *v = sw_ets_lookup(e6_tid, &e6_key);
     e6_read_result_is_null = (v == NULL) ? 1 : 0;
 
-    int other_val = 999;
-    e6_write_result = sw_ets_insert(e6_tid, &e6_key, &other_val);
+    e6_write_result = sw_ets_insert(e6_tid, &e6_key, &e6_other_val);
 
     /* Signal owner we're done */
     int *done = (int *)malloc(sizeof(int));
@@ -652,12 +675,14 @@ static void test_ets_private(void) {
 
 static volatile sw_ets_tid_t e7_tid = 0;
 
+static sw_val_t e7_key = {.type = SW_VAL_INT, .v.i = 1};
+static sw_val_t e7_val = {.type = SW_VAL_INT, .v.i = 42};
+
 static void e7_owner(void *arg) {
     (void)arg;
     e7_tid = sw_ets_new(SW_ETS_DEFAULT);
 
-    int key = 1, val = 42;
-    sw_ets_insert(e7_tid, &key, &val);
+    sw_ets_insert(e7_tid, &e7_key, &e7_val);
     /* Process exits here — ETS table should be cleaned up */
 }
 
@@ -683,19 +708,21 @@ static void test_ets_owner_exit(void) {
 
 static volatile int e8_passed = 0;
 
+static sw_val_t e8_key = {.type = SW_VAL_INT, .v.i = 1};
+static sw_val_t e8_val = {.type = SW_VAL_INT, .v.i = 42};
+
 static void e8_runner(void *arg) {
     (void)arg;
     sw_ets_tid_t tid = sw_ets_new(SW_ETS_DEFAULT);
 
-    int key = 1, val = 42;
-    sw_ets_insert(tid, &key, &val);
+    sw_ets_insert(tid, &e8_key, &e8_val);
 
     int drop_result = sw_ets_drop(tid);
 
     /* All subsequent ops should fail */
-    void *lookup = sw_ets_lookup(tid, &key);
-    int insert = sw_ets_insert(tid, &key, &val);
-    int delete = sw_ets_delete(tid, &key);
+    void *lookup = sw_ets_lookup(tid, &e8_key);
+    int insert = sw_ets_insert(tid, &e8_key, &e8_val);
+    int delete = sw_ets_delete(tid, &e8_key);
     int count = sw_ets_info_count(tid);
 
     e8_passed = (drop_result == 0 &&

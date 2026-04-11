@@ -34,6 +34,7 @@
 #include <math.h>
 #include <pwd.h>
 #include <regex.h>
+#include <ctype.h>
 
 #include "../src/swarmrt_search.h"
 
@@ -53,6 +54,9 @@
 #define INDEX_FILE          "index.sws"
 #define DATA_DIR_NAME       ".swarmrt"
 #define AUTOPILOT_FILE      "autopilot.json"
+#define WAKES_FILE          "wakes.json"
+#define WAKE_QUEUE_FILE     "wake_queue.jsonl"
+#define MAX_WAKES           64
 
 /* Auto-indexer config */
 #define INDEX_MAX_FILE_SIZE (256 * 1024)
@@ -965,6 +969,484 @@ static void autopilot_clear(void) {
 }
 
 /* ================================================================
+ * Section 7.6: Wake Engine (time-triggered prompts)
+ *
+ * Durable cron schedule for injecting prompts into the active
+ * Claude Code session. State in .swarmrt/wakes.json — source of
+ * truth, re-read live by the swarmrt-wrap PTY daemon, which polls
+ * the file on a 5-second tick and writes due prompts to the pty
+ * master as if the user had typed them.
+ *
+ * Why this exists: Claude Code's built-in CronCreate only fires
+ * while the REPL is idle and mid-turn, and /schedule requires a
+ * cloud environment + claude.ai OAuth + 1-hour minimum. This
+ * subsystem has no such constraints. Wakes persist across session
+ * restarts and --resume because the state lives in the project's
+ * .swarmrt/ directory, not in any Claude session.
+ * ================================================================ */
+
+typedef struct {
+    uint64_t minute;   /* bits 0..59 */
+    uint64_t hour;     /* bits 0..23 */
+    uint32_t dom;      /* bits 1..31 */
+    uint32_t month;    /* bits 1..12 */
+    uint8_t  dow;      /* bits 0..6, 0=Sun */
+    bool     dom_star; /* original field was "*" */
+    bool     dow_star; /* original field was "*" */
+} cron_t;
+
+static bool cron_parse_field(const char *s, int lo_min, int hi_max, uint64_t *mask) {
+    *mask = 0;
+    char buf[256];
+    size_t len = strlen(s);
+    if (len == 0 || len >= sizeof(buf)) return false;
+    memcpy(buf, s, len + 1);
+
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        int step = 1;
+        char *slash = strchr(tok, '/');
+        if (slash) {
+            *slash = 0;
+            step = atoi(slash + 1);
+            if (step < 1) return false;
+        }
+        int lo, hi;
+        if (strcmp(tok, "*") == 0) {
+            lo = lo_min; hi = hi_max;
+        } else {
+            char *dash = strchr(tok, '-');
+            if (dash) {
+                *dash = 0;
+                lo = atoi(tok);
+                hi = atoi(dash + 1);
+            } else {
+                lo = atoi(tok);
+                hi = lo;
+            }
+        }
+        if (lo < lo_min || hi > hi_max || lo > hi) return false;
+        for (int i = lo; i <= hi; i += step) {
+            *mask |= (1ULL << i);
+        }
+    }
+    return *mask != 0;
+}
+
+static bool cron_parse(const char *expr, cron_t *c) {
+    memset(c, 0, sizeof(*c));
+    char buf[512];
+    size_t len = strlen(expr);
+    if (len == 0 || len >= sizeof(buf)) return false;
+    memcpy(buf, expr, len + 1);
+
+    char *fields[5] = {0};
+    int fcount = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t", &save); tok && fcount < 5;
+         tok = strtok_r(NULL, " \t", &save)) {
+        fields[fcount++] = tok;
+    }
+    if (fcount != 5) return false;
+
+    /* Capture star-ness BEFORE parsing (the parser mutates tokens). */
+    c->dom_star = (strcmp(fields[2], "*") == 0);
+    c->dow_star = (strcmp(fields[4], "*") == 0);
+
+    uint64_t mask;
+    if (!cron_parse_field(fields[0], 0, 59, &mask)) return false;
+    c->minute = mask;
+    if (!cron_parse_field(fields[1], 0, 23, &mask)) return false;
+    c->hour = mask;
+    if (!cron_parse_field(fields[2], 1, 31, &mask)) return false;
+    c->dom = (uint32_t)mask;
+    if (!cron_parse_field(fields[3], 1, 12, &mask)) return false;
+    c->month = (uint32_t)mask;
+    if (!cron_parse_field(fields[4], 0, 6, &mask)) return false;
+    c->dow = (uint8_t)mask;
+    return true;
+}
+
+/* Compute next fire strictly after `from`. 0 on failure. */
+static time_t cron_next_fire(const cron_t *c, time_t from) {
+    time_t t = from + 60 - (from % 60);
+    if (t <= from) t = from + 60;
+
+    struct tm tm;
+    for (int guard = 0; guard < 4 * 366 * 1440; guard++) {
+        localtime_r(&t, &tm);
+
+        if (!(c->month & (1U << (tm.tm_mon + 1)))) {
+            tm.tm_mday = 1; tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
+            tm.tm_mon++;
+            if (tm.tm_mon > 11) { tm.tm_mon = 0; tm.tm_year++; }
+            t = mktime(&tm);
+            if (t == -1) return 0;
+            continue;
+        }
+
+        bool dom_match = (c->dom & (1U << tm.tm_mday)) != 0;
+        bool dow_match = (c->dow & (1U << tm.tm_wday)) != 0;
+        bool day_ok;
+        if (c->dom_star && c->dow_star)      day_ok = true;
+        else if (c->dom_star)                day_ok = dow_match;
+        else if (c->dow_star)                day_ok = dom_match;
+        else                                  day_ok = dom_match || dow_match; /* Vixie OR */
+        if (!day_ok) {
+            tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
+            tm.tm_mday++;
+            t = mktime(&tm);
+            if (t == -1) return 0;
+            continue;
+        }
+
+        if (!(c->hour & (1ULL << tm.tm_hour))) {
+            tm.tm_min = 0; tm.tm_sec = 0;
+            tm.tm_hour++;
+            t = mktime(&tm);
+            if (t == -1) return 0;
+            continue;
+        }
+
+        if (!(c->minute & (1ULL << tm.tm_min))) {
+            tm.tm_sec = 0;
+            tm.tm_min++;
+            t = mktime(&tm);
+            if (t == -1) return 0;
+            continue;
+        }
+        return t;
+    }
+    return 0;
+}
+
+typedef struct {
+    int       id;
+    char     *name;        /* optional */
+    char     *cron_expr;
+    char     *prompt;
+    cron_t    cron;
+    bool      enabled;
+    int64_t   created_at;
+    int64_t   last_fired_at;
+    int       fire_count;
+} wake_t;
+
+static wake_t g_wakes[MAX_WAKES];
+static int    g_wake_count   = 0;
+static int    g_wake_next_id = 1;
+static pthread_mutex_t g_wakes_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void wake_free(wake_t *w) {
+    free(w->name); w->name = NULL;
+    free(w->cron_expr); w->cron_expr = NULL;
+    free(w->prompt); w->prompt = NULL;
+}
+
+static void wakes_clear(void) {
+    for (int i = 0; i < g_wake_count; i++) wake_free(&g_wakes[i]);
+    g_wake_count = 0;
+    g_wake_next_id = 1;
+}
+
+/* Write a JSON-escaped string directly to a FILE*. Mirrors jb_append_escaped. */
+static void json_fwrite_escaped(FILE *f, const char *s) {
+    fputc('"', f);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            switch (*p) {
+                case '"':  fputs("\\\"", f); break;
+                case '\\': fputs("\\\\", f); break;
+                case '\n': fputs("\\n", f);  break;
+                case '\r': fputs("\\r", f);  break;
+                case '\t': fputs("\\t", f);  break;
+                case '\b': fputs("\\b", f);  break;
+                case '\f': fputs("\\f", f);  break;
+                default:
+                    if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+                    else fputc(*p, f);
+            }
+        }
+    }
+    fputc('"', f);
+}
+
+static void wakes_save(void) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", g_data_dir, WAKES_FILE);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "{\"next_id\":%d,\"wakes\":[", g_wake_next_id);
+    for (int i = 0; i < g_wake_count; i++) {
+        wake_t *w = &g_wakes[i];
+        if (i > 0) fputc(',', f);
+        fprintf(f, "{\"id\":%d,\"name\":", w->id);
+        if (w->name) json_fwrite_escaped(f, w->name);
+        else         fputs("null", f);
+        fprintf(f, ",\"cron\":");
+        json_fwrite_escaped(f, w->cron_expr);
+        fprintf(f, ",\"prompt\":");
+        json_fwrite_escaped(f, w->prompt);
+        fprintf(f, ",\"enabled\":%s,\"created_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d}",
+                w->enabled ? "true" : "false",
+                (long long)w->created_at,
+                (long long)w->last_fired_at,
+                w->fire_count);
+    }
+    fprintf(f, "]}");
+    fclose(f);
+}
+
+static void wakes_load(void) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", g_data_dir, WAKES_FILE);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > 4 * 1024 * 1024) { fclose(f); return; }
+
+    char *buf = malloc(size + 1);
+    fread(buf, 1, size, f);
+    buf[size] = '\0';
+    fclose(f);
+
+    const char *p = buf;
+    json_node_t *root = json_parse(&p);
+    if (!root) { free(buf); return; }
+
+    int next_id = (int)json_get_int(root, "next_id", 1);
+    json_node_t *arr = json_get(root, "wakes");
+    if (arr && arr->type == JSON_ARRAY) {
+        for (int i = 0; i < arr->children.count && g_wake_count < MAX_WAKES; i++) {
+            json_node_t *w_n = arr->children.items[i];
+            const char *cron_s = json_get_str(w_n, "cron");
+            const char *prompt = json_get_str(w_n, "prompt");
+            if (!cron_s || !prompt) continue;
+            wake_t *w = &g_wakes[g_wake_count];
+            memset(w, 0, sizeof(*w));
+            w->id            = (int)json_get_int(w_n, "id", g_wake_count + 1);
+            const char *name = json_get_str(w_n, "name");
+            w->name          = (name && name[0]) ? strdup(name) : NULL;
+            w->cron_expr     = strdup(cron_s);
+            w->prompt        = strdup(prompt);
+            json_node_t *en  = json_get(w_n, "enabled");
+            w->enabled       = (en && en->type == JSON_BOOL) ? en->bval : true;
+            w->created_at    = json_get_int(w_n, "created_at", 0);
+            w->last_fired_at = json_get_int(w_n, "last_fired_at", 0);
+            w->fire_count    = (int)json_get_int(w_n, "fire_count", 0);
+            if (!cron_parse(w->cron_expr, &w->cron)) {
+                mcp_log("wakes_load: bad cron \"%s\", skipping", w->cron_expr);
+                wake_free(w);
+                continue;
+            }
+            g_wake_count++;
+        }
+    }
+    if (next_id > g_wake_next_id) g_wake_next_id = next_id;
+
+    json_free(root);
+    free(buf);
+    if (g_wake_count > 0)
+        mcp_log("loaded %d wake(s)", g_wake_count);
+}
+
+static wake_t *wake_find(json_node_t *args) {
+    int id = (int)json_get_int(args, "id", -1);
+    const char *name = json_get_str(args, "name");
+    for (int i = 0; i < g_wake_count; i++) {
+        if (id > 0 && g_wakes[i].id == id) return &g_wakes[i];
+        if (name && g_wakes[i].name && strcmp(g_wakes[i].name, name) == 0)
+            return &g_wakes[i];
+    }
+    return NULL;
+}
+
+static int wake_index_of(wake_t *w) {
+    for (int i = 0; i < g_wake_count; i++)
+        if (&g_wakes[i] == w) return i;
+    return -1;
+}
+
+/* --- wake_* tool handlers --- */
+
+static void tool_wake_create(json_node_t *args, jbuf_t *out) {
+    const char *expr   = json_get_str(args, "cron_expression");
+    const char *prompt = json_get_str(args, "prompt");
+    const char *name   = json_get_str(args, "name");
+
+    if (!expr) {
+        jb_append(out, "{\"error\":\"cron_expression required (e.g. \\\"*/15 * * * *\\\")\"}");
+        return;
+    }
+    if (!prompt) { jb_append(out, "{\"error\":\"prompt required\"}"); return; }
+
+    cron_t parsed;
+    if (!cron_parse(expr, &parsed)) {
+        jb_append(out, "{\"error\":\"invalid cron expression\",\"hint\":\"5 fields: minute hour dom month dow. Examples: '*/15 * * * *', '0 */3 * * *', '0 9,13,17 * * 1-5'\"}");
+        return;
+    }
+
+    pthread_mutex_lock(&g_wakes_lock);
+
+    if (g_wake_count >= MAX_WAKES) {
+        pthread_mutex_unlock(&g_wakes_lock);
+        jb_append(out, "{\"error\":\"max wakes reached\",\"max\":%d}", MAX_WAKES);
+        return;
+    }
+
+    if (name) {
+        for (int i = 0; i < g_wake_count; i++) {
+            if (g_wakes[i].name && strcmp(g_wakes[i].name, name) == 0) {
+                pthread_mutex_unlock(&g_wakes_lock);
+                jb_append(out, "{\"error\":\"wake with that name already exists\"}");
+                return;
+            }
+        }
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    wake_t *w = &g_wakes[g_wake_count++];
+    memset(w, 0, sizeof(*w));
+    w->id            = g_wake_next_id++;
+    w->name          = name ? strdup(name) : NULL;
+    w->cron_expr     = strdup(expr);
+    w->prompt        = strdup(prompt);
+    w->cron          = parsed;
+    w->enabled       = true;
+    w->created_at    = ts.tv_sec;
+    w->last_fired_at = 0;
+    w->fire_count    = 0;
+
+    wakes_save();
+    int id = w->id;
+    time_t next = cron_next_fire(&w->cron, ts.tv_sec);
+    pthread_mutex_unlock(&g_wakes_lock);
+
+    mcp_log("wake created: id=%d cron=\"%s\"", id, expr);
+    session_add("wake_create", expr);
+
+    jb_append(out, "{\"id\":%d,\"cron\":", id);
+    jb_append_escaped(out, expr);
+    jb_append(out, ",\"prompt\":");
+    jb_append_escaped(out, prompt);
+    jb_append(out, ",\"enabled\":true,\"next_fire_at\":%lld,\"message\":\"Wake created. The swarmrt-wrap PTY daemon will inject the prompt on schedule. Make sure Claude Code was launched via 'swarmrt-wrap claude'.\"}",
+              (long long)next);
+}
+
+static void tool_wake_list(json_node_t *args, jbuf_t *out) {
+    (void)args;
+    pthread_mutex_lock(&g_wakes_lock);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    jb_append(out, "{\"wakes\":[");
+    for (int i = 0; i < g_wake_count; i++) {
+        wake_t *w = &g_wakes[i];
+        if (i > 0) jb_append(out, ",");
+        jb_append(out, "{\"id\":%d,\"name\":", w->id);
+        if (w->name) jb_append_escaped(out, w->name);
+        else         jb_append(out, "null");
+        jb_append(out, ",\"cron\":");
+        jb_append_escaped(out, w->cron_expr);
+        jb_append(out, ",\"prompt\":");
+        jb_append_escaped(out, w->prompt);
+        time_t next = w->enabled ? cron_next_fire(&w->cron, ts.tv_sec) : 0;
+        jb_append(out, ",\"enabled\":%s,\"next_fire_at\":%lld,\"last_fired_at\":%lld,\"fire_count\":%d}",
+                  w->enabled ? "true" : "false",
+                  (long long)next,
+                  (long long)w->last_fired_at,
+                  w->fire_count);
+    }
+    jb_append(out, "],\"count\":%d,\"now\":%lld}",
+              g_wake_count, (long long)ts.tv_sec);
+
+    pthread_mutex_unlock(&g_wakes_lock);
+}
+
+static void tool_wake_delete(json_node_t *args, jbuf_t *out) {
+    pthread_mutex_lock(&g_wakes_lock);
+    wake_t *w = wake_find(args);
+    if (!w) {
+        pthread_mutex_unlock(&g_wakes_lock);
+        jb_append(out, "{\"error\":\"wake not found\"}");
+        return;
+    }
+    int id = w->id;
+    int idx = wake_index_of(w);
+    wake_free(w);
+    for (int i = idx; i < g_wake_count - 1; i++)
+        g_wakes[i] = g_wakes[i + 1];
+    g_wake_count--;
+    wakes_save();
+    pthread_mutex_unlock(&g_wakes_lock);
+
+    mcp_log("wake deleted: id=%d", id);
+    jb_append(out, "{\"deleted\":true,\"id\":%d}", id);
+}
+
+static void tool_wake_enable(json_node_t *args, jbuf_t *out) {
+    json_node_t *en = json_get(args, "enabled");
+    if (!en || en->type != JSON_BOOL) {
+        jb_append(out, "{\"error\":\"'enabled' boolean required\"}");
+        return;
+    }
+    pthread_mutex_lock(&g_wakes_lock);
+    wake_t *w = wake_find(args);
+    if (!w) {
+        pthread_mutex_unlock(&g_wakes_lock);
+        jb_append(out, "{\"error\":\"wake not found\"}");
+        return;
+    }
+    w->enabled = en->bval;
+    int id = w->id;
+    bool val = w->enabled;
+    wakes_save();
+    pthread_mutex_unlock(&g_wakes_lock);
+
+    jb_append(out, "{\"id\":%d,\"enabled\":%s}", id, val ? "true" : "false");
+}
+
+static void tool_wake_fire_now(json_node_t *args, jbuf_t *out) {
+    pthread_mutex_lock(&g_wakes_lock);
+    wake_t *w = wake_find(args);
+    if (!w) {
+        pthread_mutex_unlock(&g_wakes_lock);
+        jb_append(out, "{\"error\":\"wake not found\"}");
+        return;
+    }
+
+    /* Append to wake_queue.jsonl — swarmrt-wrap drains this on its next tick. */
+    char qpath[4096];
+    snprintf(qpath, sizeof(qpath), "%s/%s", g_data_dir, WAKE_QUEUE_FILE);
+    FILE *f = fopen(qpath, "a");
+    if (!f) {
+        pthread_mutex_unlock(&g_wakes_lock);
+        jb_append(out, "{\"error\":\"could not open wake queue\"}");
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"id\":%d,\"queued_at\":%lld,\"prompt\":",
+            w->id, (long long)ts.tv_sec);
+    json_fwrite_escaped(f, w->prompt);
+    fprintf(f, "}\n");
+    fclose(f);
+    int id = w->id;
+    pthread_mutex_unlock(&g_wakes_lock);
+
+    mcp_log("wake queued for immediate fire: id=%d", id);
+    jb_append(out, "{\"queued\":true,\"id\":%d,\"message\":\"Queued for swarmrt-wrap's next 5s tick.\"}", id);
+}
+
+/* ================================================================
  * Section 8: Tool Definitions
  * ================================================================ */
 
@@ -986,6 +1468,7 @@ static void tool_memory_list(json_node_t *args, jbuf_t *out);
 static void tool_memory_forget(json_node_t *args, jbuf_t *out);
 static void tool_session_log(json_node_t *args, jbuf_t *out);
 static void tool_session_context(json_node_t *args, jbuf_t *out);
+static int shell_arg_safe(const char *s);
 static void tool_process_stats(json_node_t *args, jbuf_t *out);
 static void tool_autopilot_start(json_node_t *args, jbuf_t *out);
 static void tool_autopilot_status(json_node_t *args, jbuf_t *out);
@@ -1004,6 +1487,11 @@ static void tool_workspace_archive(json_node_t *args, jbuf_t *out);
 static void tool_checkpoint_save(json_node_t *args, jbuf_t *out);
 static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out);
 static void tool_workspace_diff(json_node_t *args, jbuf_t *out);
+static void tool_wake_create(json_node_t *args, jbuf_t *out);
+static void tool_wake_list(json_node_t *args, jbuf_t *out);
+static void tool_wake_delete(json_node_t *args, jbuf_t *out);
+static void tool_wake_enable(json_node_t *args, jbuf_t *out);
+static void tool_wake_fire_now(json_node_t *args, jbuf_t *out);
 
 static mcp_tool_t TOOLS[] = {
     {
@@ -1175,6 +1663,37 @@ static mcp_tool_t TOOLS[] = {
         "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Workspace name\"}},\"required\":[\"name\"]}",
         tool_workspace_diff
     },
+    /* --- Wake engine: time-triggered prompt injection --- */
+    {
+        "wake_create",
+        "Schedule a prompt to be injected into the current Claude Code session on a cron schedule. Persists across session restarts and --resume (stored in .swarmrt/wakes.json at project root). Requires Claude Code to be running under 'swarmrt-wrap claude' for prompts to actually fire. Cron is 5-field local-timezone: minute hour dom month dow. Examples: '*/15 * * * *' (every 15 min), '0 */3 * * *' (every 3 hours), '0 9,13,17 * * 1-5' (9am/1pm/5pm weekdays), '0 */2 9-17 * 1-5' (every 2h during work hours weekdays). Minimum granularity is 1 minute. No feature gates, no 1-hour floor, no cloud required.",
+        "{\"type\":\"object\",\"properties\":{\"cron_expression\":{\"type\":\"string\",\"description\":\"5-field cron expression in local time (e.g. '0 */3 * * *')\"},\"prompt\":{\"type\":\"string\",\"description\":\"The text to inject as if the user typed it. Can be a slash command ('/babysit-prs') or plain instructions ('check deploy status and summarize').\"},\"name\":{\"type\":\"string\",\"description\":\"Optional short name for the wake (for easy reference in wake_delete / wake_enable)\"}},\"required\":[\"cron_expression\",\"prompt\"]}",
+        tool_wake_create
+    },
+    {
+        "wake_list",
+        "List all scheduled wakes in this project. Returns id, name, cron, prompt, enabled, next_fire_at (unix ts), last_fired_at, and fire_count for each.",
+        "{\"type\":\"object\",\"properties\":{}}",
+        tool_wake_list
+    },
+    {
+        "wake_delete",
+        "Delete a scheduled wake by id or name.",
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"description\":\"Wake id\"},\"name\":{\"type\":\"string\",\"description\":\"Wake name\"}}}",
+        tool_wake_delete
+    },
+    {
+        "wake_enable",
+        "Enable or disable a wake without deleting it. Disabled wakes keep their state but are skipped by the PTY daemon.",
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"enabled\"]}",
+        tool_wake_enable
+    },
+    {
+        "wake_fire_now",
+        "Manually queue a wake to fire on swarmrt-wrap's next 5-second tick, bypassing its cron schedule. Appends to .swarmrt/wake_queue.jsonl. Use for testing or for on-demand triggering of a prepared prompt.",
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"}}}",
+        tool_wake_fire_now
+    },
     {NULL, NULL, NULL, NULL}
 };
 
@@ -1185,10 +1704,10 @@ static mcp_tool_t TOOLS[] = {
 static void tool_codebase_search(json_node_t *args, jbuf_t *out) {
     const char *query = json_get_str(args, "query");
     int limit = (int)json_get_int(args, "limit", 10);
-    if (!query) { jb_append(out, "\"Error: query is required\""); return; }
+    if (!query) { jb_append(out, "{\"error\":\"query is required\"}"); return; }
     if (limit > MAX_RESULTS) limit = MAX_RESULTS;
     ensure_search_ready();
-    if (!g_code_index) { jb_append(out, "\"Error: index not initialized\""); return; }
+    if (!g_code_index) { jb_append(out, "{\"error\":\"index not initialized\"}"); return; }
 
     session_add("search", query);
 
@@ -1214,10 +1733,10 @@ static void tool_codebase_search(json_node_t *args, jbuf_t *out) {
 static void tool_codebase_fuzzy(json_node_t *args, jbuf_t *out) {
     const char *query = json_get_str(args, "query");
     int limit = (int)json_get_int(args, "limit", 10);
-    if (!query) { jb_append(out, "\"Error: query is required\""); return; }
+    if (!query) { jb_append(out, "{\"error\":\"query is required\"}"); return; }
     if (limit > MAX_RESULTS) limit = MAX_RESULTS;
     ensure_search_ready();
-    if (!g_code_index) { jb_append(out, "\"Error: index not initialized\""); return; }
+    if (!g_code_index) { jb_append(out, "{\"error\":\"index not initialized\"}"); return; }
 
     session_add("fuzzy_search", query);
 
@@ -1280,7 +1799,7 @@ static void tool_memory_store(json_node_t *args, jbuf_t *out) {
     const char *key = json_get_str(args, "key");
     const char *value = json_get_str(args, "value");
     const char *tags = json_get_str(args, "tags");
-    if (!key || !value) { jb_append(out, "\"Error: key and value required\""); return; }
+    if (!key || !value) { jb_append(out, "{\"error\":\"key and value required\"}"); return; }
 
     pthread_mutex_lock(&g_memory_lock);
 
@@ -1331,7 +1850,7 @@ static void tool_memory_store(json_node_t *args, jbuf_t *out) {
 static void tool_memory_recall(json_node_t *args, jbuf_t *out) {
     const char *query = json_get_str(args, "query");
     int limit = (int)json_get_int(args, "limit", 5);
-    if (!query) { jb_append(out, "\"Error: query required\""); return; }
+    if (!query) { jb_append(out, "{\"error\":\"query required\"}"); return; }
     if (limit > 20) limit = 20;
 
     sws_result_t results[20];
@@ -1393,7 +1912,7 @@ static void tool_memory_list(json_node_t *args, jbuf_t *out) {
 
 static void tool_memory_forget(json_node_t *args, jbuf_t *out) {
     const char *key = json_get_str(args, "key");
-    if (!key) { jb_append(out, "\"Error: key required\""); return; }
+    if (!key) { jb_append(out, "{\"error\":\"key required\"}"); return; }
 
     pthread_mutex_lock(&g_memory_lock);
     int found = -1;
@@ -1421,7 +1940,7 @@ static void tool_memory_update(json_node_t *args, jbuf_t *out) {
     const char *key = json_get_str(args, "key");
     const char *append = json_get_str(args, "append");
     const char *tags = json_get_str(args, "tags");
-    if (!key || !append) { jb_append(out, "\"Error: key and append required\""); return; }
+    if (!key || !append) { jb_append(out, "{\"error\":\"key and append required\"}"); return; }
 
     pthread_mutex_lock(&g_memory_lock);
 
@@ -1494,14 +2013,14 @@ static void tool_memory_update(json_node_t *args, jbuf_t *out) {
         jb_append(out, ",\"action\":\"created\",\"total_length\":%zu}", strlen(append));
     } else {
         pthread_mutex_unlock(&g_memory_lock);
-        jb_append(out, "\"Error: memory limit reached\"");
+        jb_append(out, "{\"error\":\"memory limit reached\"}");
     }
 }
 
 static void tool_session_log(json_node_t *args, jbuf_t *out) {
     const char *type = json_get_str(args, "type");
     const char *content = json_get_str(args, "content");
-    if (!type || !content) { jb_append(out, "\"Error: type and content required\""); return; }
+    if (!type || !content) { jb_append(out, "{\"error\":\"type and content required\"}"); return; }
     session_add(type, content);
     jb_append(out, "{\"logged\":true,\"events\":%d}", g_session_count);
 }
@@ -1509,7 +2028,7 @@ static void tool_session_log(json_node_t *args, jbuf_t *out) {
 static void tool_session_context(json_node_t *args, jbuf_t *out) {
     const char *query = json_get_str(args, "query");
     int limit = (int)json_get_int(args, "limit", 10);
-    if (!query) { jb_append(out, "\"Error: query required\""); return; }
+    if (!query) { jb_append(out, "{\"error\":\"query required\"}"); return; }
     if (limit > MAX_RESULTS) limit = MAX_RESULTS;
 
     sws_result_t results[MAX_RESULTS];
@@ -1551,9 +2070,9 @@ static void tool_autopilot_start(json_node_t *args, jbuf_t *out) {
     const char *goal = json_get_str(args, "goal");
     json_node_t *steps = json_get(args, "steps");
 
-    if (!goal) { jb_append(out, "\"Error: goal is required\""); return; }
+    if (!goal) { jb_append(out, "{\"error\":\"goal is required\"}"); return; }
     if (!steps || steps->type != JSON_ARRAY || steps->children.count == 0) {
-        jb_append(out, "\"Error: steps array is required and must not be empty\"");
+        jb_append(out, "{\"error\":\"steps array is required and must not be empty\"}");
         return;
     }
 
@@ -1672,13 +2191,13 @@ static void tool_autopilot_status(json_node_t *args, jbuf_t *out) {
 
 static void tool_autopilot_step(json_node_t *args, jbuf_t *out) {
     const char *summary = json_get_str(args, "summary");
-    if (!summary) { jb_append(out, "\"Error: summary required\""); return; }
+    if (!summary) { jb_append(out, "{\"error\":\"summary required\"}"); return; }
 
     pthread_mutex_lock(&g_autopilot_lock);
 
     if (!g_autopilot.active) {
         pthread_mutex_unlock(&g_autopilot_lock);
-        jb_append(out, "\"Error: autopilot not active\"");
+        jb_append(out, "{\"error\":\"autopilot not active\"}");
         return;
     }
 
@@ -1827,7 +2346,7 @@ static void grep_directory(const char *dir, const char *root, regex_t *re,
 static void tool_codebase_grep(json_node_t *args, jbuf_t *out) {
     const char *pattern = json_get_str(args, "pattern");
     int limit = (int)json_get_int(args, "limit", 20);
-    if (!pattern) { jb_append(out, "\"Error: pattern required\""); return; }
+    if (!pattern) { jb_append(out, "{\"error\":\"pattern required\"}"); return; }
     if (limit > 100) limit = 100;
 
     regex_t re;
@@ -1835,8 +2354,9 @@ static void tool_codebase_grep(json_node_t *args, jbuf_t *out) {
     if (rc != 0) {
         char errbuf[256];
         regerror(rc, &re, errbuf, sizeof(errbuf));
-        jb_append(out, "{\"error\":\"Invalid regex: ");
-        jb_append(out, "%s\"}", errbuf);
+        jb_append(out, "{\"error\":");
+        jb_append_escaped(out, errbuf);
+        jb_append(out, "}");
         return;
     }
 
@@ -1858,7 +2378,7 @@ static void tool_autopilot_pause(json_node_t *args, jbuf_t *out) {
 
     if (!g_autopilot.active) {
         pthread_mutex_unlock(&g_autopilot_lock);
-        jb_append(out, "\"Error: autopilot not active\"");
+        jb_append(out, "{\"error\":\"autopilot not active\"}");
         return;
     }
 
@@ -1880,15 +2400,18 @@ static void tool_autopilot_pause(json_node_t *args, jbuf_t *out) {
 static void tool_set_project(json_node_t *args, jbuf_t *out) {
     const char *path = json_get_str(args, "path");
     if (!path || path[0] != '/') {
-        jb_append(out, "\"Error: absolute path required (e.g. /Users/sky/myrepo)\"");
+        jb_append(out, "{\"error\":\"absolute path required (e.g. /Users/sky/myrepo)\"}");
+        return;
+    }
+    if (!shell_arg_safe(path)) {
+        jb_append(out, "{\"error\":\"path contains unsafe characters\"}");
         return;
     }
 
     /* Verify directory exists */
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        jb_append(out, "\"Error: directory not found: ");
-        jb_append(out, "%s\"", path);
+        jb_append(out, "{\"error\":\"directory not found\"}");
         return;
     }
 
@@ -1923,6 +2446,12 @@ static void tool_set_project(json_node_t *args, jbuf_t *out) {
     autopilot_load();
     pthread_mutex_unlock(&g_autopilot_lock);
 
+    /* Reload wake schedule */
+    pthread_mutex_lock(&g_wakes_lock);
+    wakes_clear();
+    wakes_load();
+    pthread_mutex_unlock(&g_wakes_lock);
+
     session_add("set_project", path);
     mcp_log("switched project: %s -> %s", old_root, path);
     free((void *)old_root);
@@ -1930,6 +2459,29 @@ static void tool_set_project(json_node_t *args, jbuf_t *out) {
     jb_append(out, "{\"project\":");
     jb_append_escaped(out, path);
     jb_append(out, ",\"memories\":%d,\"message\":\"Project switched. Search will index on first query.\"}", g_memory_count);
+}
+
+/* --- Shell safety --- */
+
+/*
+ * Sanitize a string for safe use inside single-quoted shell arguments.
+ * Returns 1 if safe, 0 if dangerous characters detected.
+ * Allowed: alphanumeric, dot, dash, underscore, slash, colon, at, tilde, space, plus, equals
+ * Rejected: quotes, semicolons, pipes, backticks, dollar, ampersand, parens, newlines, etc.
+ */
+static int shell_arg_safe(const char *s) {
+    if (!s || !s[0]) return 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c)) continue;
+        if (c == '.' || c == '-' || c == '_' || c == '/' || c == ':' ||
+            c == '@' || c == '~' || c == ' ' || c == '+' || c == '=' ||
+            c == '^') continue;
+        return 0; /* Dangerous character */
+    }
+    /* Reject path traversal */
+    if (strstr(s, "..")) return 0;
+    return 1;
 }
 
 /* --- git tools (shell out to git) --- */
@@ -1955,6 +2507,10 @@ static void tool_git_diff(json_node_t *args, jbuf_t *out) {
     char cmd[4096];
 
     if (ref && ref[0]) {
+        if (!shell_arg_safe(ref)) {
+            jb_append(out, "{\"error\":\"Invalid ref — contains unsafe characters\"}");
+            return;
+        }
         snprintf(cmd, sizeof(cmd),
                  "cd '%s' && git diff --stat '%s' 2>&1 && echo '---DIFF---' && git diff '%s' 2>&1 | head -200",
                  g_project_root, ref, ref);
@@ -1965,7 +2521,7 @@ static void tool_git_diff(json_node_t *args, jbuf_t *out) {
     }
 
     char *result = run_cmd(cmd, 32768);
-    if (!result) { jb_append(out, "\"Error: failed to run git diff\""); return; }
+    if (!result) { jb_append(out, "{\"error\":\"failed to run git diff\"}"); return; }
 
     session_add("git_diff", ref ? ref : "HEAD");
 
@@ -1995,6 +2551,10 @@ static void tool_git_log(json_node_t *args, jbuf_t *out) {
 
     char cmd[4096];
     if (path && path[0]) {
+        if (!shell_arg_safe(path)) {
+            jb_append(out, "{\"error\":\"Invalid path — contains unsafe characters\"}");
+            return;
+        }
         snprintf(cmd, sizeof(cmd),
                  "cd '%s' && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d -- '%s' 2>&1",
                  g_project_root, limit, path);
@@ -2005,7 +2565,7 @@ static void tool_git_log(json_node_t *args, jbuf_t *out) {
     }
 
     char *result = run_cmd(cmd, 16384);
-    if (!result) { jb_append(out, "\"Error: failed to run git log\""); return; }
+    if (!result) { jb_append(out, "{\"error\":\"failed to run git log\"}"); return; }
 
     session_add("git_log", path ? path : "all");
 
@@ -2337,18 +2897,25 @@ static void tool_workspace_create(json_node_t *args, jbuf_t *out) {
         name = auto_name;
     }
 
+    /* Validate name — alphanumeric, hyphens, underscores only */
+    if (!shell_arg_safe(name)) {
+        pthread_mutex_unlock(&g_workspace_lock);
+        jb_append(out, "{\"error\":\"Invalid workspace name — use alphanumeric, hyphens, underscores only\"}");
+        return;
+    }
+
     /* Check not duplicate */
     for (int i = 0; i < g_workspace_count; i++) {
         if (g_workspaces[i].active && strcmp(g_workspaces[i].name, name) == 0) {
             pthread_mutex_unlock(&g_workspace_lock);
-            jb_append(out, "{\"error\":\"Workspace '%s' already exists\"}", name);
+            jb_append(out, "{\"error\":\"Workspace already exists\"}");  /* name already validated */
             return;
         }
     }
 
     if (g_workspace_count >= MAX_WORKSPACES) {
         pthread_mutex_unlock(&g_workspace_lock);
-        jb_append(out, "{\"error\":\"Maximum workspaces reached (%d)\"}", MAX_WORKSPACES);
+        jb_append(out, "{\"error\":\"Maximum workspaces reached\"}");  /* MAX_WORKSPACES limit */
         return;
     }
 
@@ -2460,7 +3027,11 @@ static void tool_workspace_list(json_node_t *args, jbuf_t *out) {
 
 static void tool_workspace_archive(json_node_t *args, jbuf_t *out) {
     const char *name = json_get_str(args, "name");
-    if (!name) { jb_append(out, "\"Error: name is required\""); return; }
+    if (!name) { jb_append(out, "{\"error\":\"name is required\"}"); return; }
+    if (!shell_arg_safe(name)) {
+        jb_append(out, "{\"error\":\"Invalid name — contains unsafe characters\"}");
+        return;
+    }
 
     pthread_mutex_lock(&g_workspace_lock);
 
@@ -2474,7 +3045,7 @@ static void tool_workspace_archive(json_node_t *args, jbuf_t *out) {
 
     if (!ws) {
         pthread_mutex_unlock(&g_workspace_lock);
-        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        jb_append(out, "{\"error\":\"Workspace not found\"}");
         return;
     }
 
@@ -2509,8 +3080,12 @@ static void tool_workspace_archive(json_node_t *args, jbuf_t *out) {
 static void tool_checkpoint_save(json_node_t *args, jbuf_t *out) {
     const char *name = json_get_str(args, "name");
     const char *label = json_get_str(args, "label");
-    if (!name) { jb_append(out, "\"Error: workspace name is required\""); return; }
+    if (!name) { jb_append(out, "{\"error\":\"workspace name is required\"}"); return; }
     if (!label) label = "auto";
+    if (!shell_arg_safe(name) || !shell_arg_safe(label)) {
+        jb_append(out, "{\"error\":\"Invalid name or label — contains unsafe characters\"}");
+        return;
+    }
 
     pthread_mutex_lock(&g_workspace_lock);
 
@@ -2524,14 +3099,14 @@ static void tool_checkpoint_save(json_node_t *args, jbuf_t *out) {
 
     if (!ws) {
         pthread_mutex_unlock(&g_workspace_lock);
-        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        jb_append(out, "{\"error\":\"Workspace not found\"}");
         return;
     }
 
-    /* Commit all changes in workspace */
+    /* Commit tracked changes in workspace (exclude secrets) */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git add -A && git commit -m 'checkpoint: %s' --allow-empty 2>&1",
+             "cd '%s' && git add -u && git commit -m 'checkpoint: %s' --allow-empty 2>&1",
              ws->path, label);
     char *commit_result = run_cmd(cmd, 4096);
 
@@ -2575,7 +3150,15 @@ static void tool_checkpoint_save(json_node_t *args, jbuf_t *out) {
 static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out) {
     const char *name = json_get_str(args, "name");
     const char *ref = json_get_str(args, "ref");
-    if (!name) { jb_append(out, "\"Error: workspace name is required\""); return; }
+    if (!name) { jb_append(out, "{\"error\":\"workspace name is required\"}"); return; }
+    if (!shell_arg_safe(name)) {
+        jb_append(out, "{\"error\":\"Invalid workspace name\"}");
+        return;
+    }
+    if (ref && ref[0] && !shell_arg_safe(ref)) {
+        jb_append(out, "{\"error\":\"Invalid ref — contains unsafe characters\"}");
+        return;
+    }
 
     pthread_mutex_lock(&g_workspace_lock);
 
@@ -2589,7 +3172,7 @@ static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out) {
 
     if (!ws) {
         pthread_mutex_unlock(&g_workspace_lock);
-        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        jb_append(out, "{\"error\":\"Workspace not found\"}");
         return;
     }
 
@@ -2635,7 +3218,11 @@ static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out) {
 
 static void tool_workspace_diff(json_node_t *args, jbuf_t *out) {
     const char *name = json_get_str(args, "name");
-    if (!name) { jb_append(out, "\"Error: workspace name is required\""); return; }
+    if (!name) { jb_append(out, "{\"error\":\"workspace name is required\"}"); return; }
+    if (!shell_arg_safe(name)) {
+        jb_append(out, "{\"error\":\"Invalid name — contains unsafe characters\"}");
+        return;
+    }
 
     pthread_mutex_lock(&g_workspace_lock);
     workspace_t *ws = NULL;
@@ -2648,7 +3235,7 @@ static void tool_workspace_diff(json_node_t *args, jbuf_t *out) {
     pthread_mutex_unlock(&g_workspace_lock);
 
     if (!ws) {
-        jb_append(out, "{\"error\":\"Workspace '%s' not found\"}", name);
+        jb_append(out, "{\"error\":\"Workspace not found\"}");
         return;
     }
 
@@ -2873,6 +3460,7 @@ int main(int argc, char **argv) {
     init_session();
     autopilot_load();
     workspaces_load();
+    wakes_load();
 
     mcp_log("ready — %u files indexed, %d memories loaded", g_files_indexed, g_memory_count);
 

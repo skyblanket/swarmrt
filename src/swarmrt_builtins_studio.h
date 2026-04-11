@@ -18,10 +18,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <errno.h>
+#include <stdint.h>
+#ifndef _WIN32
+  #include <sys/select.h>
+  #include <sys/ioctl.h>
+#endif
+#include "swarmrt_platform.h"
+#ifdef _WIN32
+  #include <io.h>
+  #include <direct.h>
+  #include <sys/time.h>  /* MinGW-w64 provides gettimeofday */
+  #define sw_mkdir(p, m) _mkdir(p)
+  #define swbs_unlink(p) _unlink(p)
+  #define sw_sleep(s) Sleep((s) * 1000)
+#else
+  #include <unistd.h>
+  #include <sys/time.h>
+  #include <sys/wait.h>
+  #define sw_mkdir(p, m) mkdir(p, m)
+  #define swbs_unlink(p) unlink(p)
+  #define sw_sleep(s) sleep(s)
+#endif
 
 /* === Registry === */
 
@@ -242,7 +261,7 @@ static sw_val_t *_builtin_random_int(sw_val_t **a, int n) {
     if (n < 2 || a[0]->type != SW_VAL_INT || a[1]->type != SW_VAL_INT)
         return sw_val_int(0);
     int64_t lo = a[0]->v.i, hi = a[1]->v.i;
-    return sw_val_int(lo + (int64_t)(arc4random_uniform((uint32_t)(hi - lo + 1))));
+    return sw_val_int(lo + (int64_t)(sw_random_uniform((uint32_t)(hi - lo + 1))));
 }
 
 /* === String ops === */
@@ -330,12 +349,15 @@ static sw_val_t *_builtin_list_append(sw_val_t **a, int n) {
 /* === File I/O === */
 
 static int _mkdirp(const char *path) {
-    char tmp[2048];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(path);
+    char *tmp = (char *)malloc(len + 1);
+    memcpy(tmp, path, len + 1);
     for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
+        if (*p == '/') { *p = 0; sw_mkdir(tmp, 0755); *p = '/'; }
     }
-    return mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1;
+    int rc = sw_mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1;
+    free(tmp);
+    return rc;
 }
 
 static sw_val_t *_builtin_file_mkdir(sw_val_t **a, int n) {
@@ -490,7 +512,7 @@ static sw_val_t *_http_post_once(const char *url, sw_val_t *headers, const char 
     size_t cmdcap = strlen(body) + strlen(url) + 4096;
     char *cmd = (char *)malloc(cmdcap);
     int off = 0;
-    off += snprintf(cmd + off, cmdcap - off, "curl -sS -X POST --connect-timeout 30 --max-time 120");
+    off += snprintf(cmd + off, cmdcap - off, "curl -sS -X POST --connect-timeout 30 --max-time 300");
 
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
@@ -503,15 +525,15 @@ static sw_val_t *_http_post_once(const char *url, sw_val_t *headers, const char 
     }
 
     char tmpf[256], outf[256];
-    snprintf(tmpf, sizeof(tmpf), "/tmp/sw_http_%d_%u.json", getpid(), arc4random());
-    snprintf(outf, sizeof(outf), "/tmp/sw_http_out_%d_%u.json", getpid(), arc4random());
+    snprintf(tmpf, sizeof(tmpf), "%s/sw_http_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
     FILE *tf = fopen(tmpf, "w");
     if (tf) { fputs(body, tf); fclose(tf); }
     off += snprintf(cmd + off, cmdcap - off, " -d @%s '%s' -o %s 2>/dev/null", tmpf, url, outf);
 
     int status = system(cmd);
     free(cmd);
-    unlink(tmpf);
+    swbs_unlink(tmpf);
 
     size_t rlen = 0;
     resp_out[0] = 0;
@@ -521,7 +543,7 @@ static sw_val_t *_http_post_once(const char *url, sw_val_t *headers, const char 
         resp_out[rlen] = 0;
         fclose(fp);
     }
-    unlink(outf);
+    swbs_unlink(outf);
 
     return NULL; /* just use rlen via resp_out */
 }
@@ -537,7 +559,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     int delays[] = {0, 5, 15};
     for (int attempt = 0; attempt < 3; attempt++) {
         if (delays[attempt] > 0)
-            sleep(delays[attempt]);
+            sw_sleep(delays[attempt]);
         _http_post_once(url, a[1], body, resp, rcap);
         size_t rlen = strlen(resp);
         /* Check for server error or empty response */
@@ -553,6 +575,795 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_string(resp);
     free(resp);
     return r;
+}
+
+/* ============================================================
+ * Line editor state — forward declared here so http_post_stream
+ * can check whether the terminal is in raw mode before watching
+ * stdin for interrupt keystrokes. The actual implementation lives
+ * further down alongside read_line.
+ * ============================================================ */
+
+#include <termios.h>
+
+#define SW_RL_HIST_MAX 64
+
+typedef struct {
+    struct termios saved;
+    int saved_ok;
+    char *entries[SW_RL_HIST_MAX];
+    int count;
+} _sw_rl_state_t;
+
+static _sw_rl_state_t _sw_rl = {0};
+
+/* ============================================================
+ * popen with pid tracking — so we can kill on interrupt
+ * ============================================================
+ *
+ * Standard popen() hides the child pid. We need it to deliver
+ * SIGTERM when the user hits ESC during an LLM stream. This is a
+ * minimal fork+exec+pipe that gives us back both the read FILE*
+ * and the child pid. Uses /bin/sh -c like popen() does, so the
+ * command string format is identical. */
+
+typedef struct {
+    FILE *fp;
+    pid_t pid;
+} _sw_popen_pid_t;
+
+static _sw_popen_pid_t _sw_popen_pid(const char *cmd) {
+    _sw_popen_pid_t r;
+    r.fp = NULL;
+    r.pid = -1;
+#ifndef _WIN32
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return r;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return r;
+    }
+    if (pid == 0) {
+        /* child */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        /* Put child in its own process group so killpg() later can
+         * take down the whole subshell + curl without signaling us. */
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    /* parent */
+    close(pipefd[1]);
+    r.fp = fdopen(pipefd[0], "r");
+    r.pid = pid;
+#else
+    (void)cmd;
+#endif
+    return r;
+}
+
+/* Kill the child's process group with SIGTERM so curl and any shell
+ * middleman both die. Then reap via waitpid so we don't leave zombies. */
+static int _sw_pkill_close(_sw_popen_pid_t p) {
+#ifndef _WIN32
+    if (p.pid > 0) {
+        killpg(p.pid, SIGTERM);
+        /* Give it 200ms to exit gracefully, then SIGKILL. */
+        for (int i = 0; i < 20; i++) {
+            int status;
+            pid_t r = waitpid(p.pid, &status, WNOHANG);
+            if (r == p.pid) break;
+            usleep(10000);
+        }
+        killpg(p.pid, SIGKILL);
+        int status;
+        waitpid(p.pid, &status, 0);
+    }
+#endif
+    if (p.fp) fclose(p.fp);
+    return 0;
+}
+
+static int _sw_popen_pid_close(_sw_popen_pid_t p) {
+#ifndef _WIN32
+    if (p.fp) fclose(p.fp);
+    int status = 0;
+    if (p.pid > 0) waitpid(p.pid, &status, 0);
+    return status;
+#else
+    if (p.fp) fclose(p.fp);
+    return 0;
+#endif
+}
+
+/* ============================================================
+ * Stream emitter — column-aware output for streamed LLM content
+ * ============================================================
+ *
+ * Enforces a 2-column left margin (so assistant text aligns with
+ * the bordered input box) and wraps lines at (term_width - 2) so
+ * long lines don't overrun the right edge.
+ *
+ * Correctness details:
+ *   - UTF-8 continuation bytes (10xxxxxx) don't advance the column;
+ *     only the first byte of a sequence does. Roughly correct for
+ *     most text (wide chars like emoji count as 1 col, but that's
+ *     a rare case and the wrap just happens one col late).
+ *   - ANSI CSI sequences (\x1b [ ... final-byte) are passed through
+ *     without advancing the column counter.
+ *   - Newlines reset column to 0 and defer the 2-space indent until
+ *     the next non-newline byte, so blank lines stay blank.
+ *   - Wrapping is mid-column for v1 — no word-boundary detection.
+ */
+
+typedef struct {
+    int term_w;
+    int right_margin;
+    int col;
+    int in_ansi;
+    int line_started;
+} _sw_stream_state_t;
+
+static int _sw_term_cols(void) {
+#ifndef _WIN32
+    struct winsize ws;
+    /* Try stdout first, then stderr, then /dev/tty — one of them will be
+     * a real TTY even when the others are piped. `tput cols` via shell()
+     * fails because its stdout is a pipe; ioctl on /dev/tty doesn't have
+     * that problem. */
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (int)ws.ws_col;
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (int)ws.ws_col;
+    int tty_fd = open("/dev/tty", O_RDONLY);
+    if (tty_fd >= 0) {
+        int col = 0;
+        if (ioctl(tty_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+            col = (int)ws.ws_col;
+        close(tty_fd);
+        if (col > 0) return col;
+    }
+#endif
+    return 80;
+}
+
+/* sw builtin: term_cols() → int  (number of columns in the current tty) */
+static sw_val_t *_builtin_term_cols(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    return sw_val_int((int64_t)_sw_term_cols());
+}
+
+static void _sw_stream_init(_sw_stream_state_t *s) {
+    int w = _sw_term_cols();
+    s->term_w = w;
+    s->right_margin = (w > 10) ? (w - 2) : w;
+    s->col = 0;
+    s->in_ansi = 0;
+    s->line_started = 0;
+}
+
+static void _sw_stream_reset_line(_sw_stream_state_t *s) {
+    /* Called after \r\e[K clears the spinner line: cursor is at col 0
+     * and we need to re-emit the 2-space indent before the next byte. */
+    s->col = 0;
+    s->line_started = 0;
+    s->in_ansi = 0;
+}
+
+static void _sw_stream_emit(_sw_stream_state_t *s, char c) {
+    /* Lazy leading indent: emit 2 spaces at the start of each line,
+     * but only when about to write a non-newline byte. */
+    if (!s->line_started && !s->in_ansi && c != '\n' && c != '\r' && c != '\x1b') {
+        fputs("  ", stdout);
+        s->col = 2;
+        s->line_started = 1;
+    }
+    if (s->in_ansi) {
+        fputc(c, stdout);
+        if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7E) s->in_ansi = 0;
+        return;
+    }
+    if (c == '\x1b') {
+        s->in_ansi = 1;
+        fputc(c, stdout);
+        return;
+    }
+    if (c == '\n') {
+        fputc(c, stdout);
+        s->col = 0;
+        s->line_started = 0;
+        return;
+    }
+    if (c == '\r') {
+        fputc(c, stdout);
+        s->col = 0;
+        return;
+    }
+    int is_cont = ((unsigned char)c & 0xC0) == 0x80;
+    if (!is_cont && s->col >= s->right_margin) {
+        fputs("\n  ", stdout);
+        s->col = 2;
+        s->line_started = 1;
+    }
+    fputc(c, stdout);
+    if (!is_cont) s->col++;
+}
+
+/* ============================================================
+ * Spinner — Claude-Code-style rotating verb + elapsed time
+ * ============================================================
+ *
+ * Shown during the dead-air phase between sending an LLM request and
+ * receiving the first streamed token. Cleared the moment real content
+ * is about to be printed.
+ *
+ * The verb list is inspired by Claude Code's spinnerVerbs.ts — a
+ * curated subset trimmed for binary size. One verb is picked per
+ * http_post_stream call and stays stable for the whole call, matching
+ * CC's behavior (verb is constant, elapsed time + tokens tick).
+ */
+
+static const char *_sw_spinner_verbs[] = {
+    "Accomplishing", "Architecting", "Baking", "Beaming", "Brewing",
+    "Calculating", "Cerebrating", "Churning", "Cogitating", "Concocting",
+    "Contemplating", "Cooking", "Crafting", "Creating", "Crunching",
+    "Crystallizing", "Deliberating", "Deciphering", "Divining", "Doodling",
+    "Enchanting", "Envisioning", "Fermenting", "Finagling", "Forging",
+    "Forming", "Gallivanting", "Generating", "Germinating", "Hashing",
+    "Hatching", "Ideating", "Imagining", "Incubating", "Inferring",
+    "Infusing", "Kneading", "Manifesting", "Marinating", "Meandering",
+    "Mulling", "Musing", "Noodling", "Orchestrating", "Percolating",
+    "Pondering", "Processing", "Puzzling", "Ruminating", "Scheming",
+    "Simmering", "Sketching", "Spelunking", "Spinning", "Stewing",
+    "Swirling", "Synthesizing", "Thinking", "Tinkering", "Transfiguring",
+    "Unfurling", "Vibing", "Wandering", "Whisking", "Working",
+    "Wrangling", "Zesting"
+};
+static const int _sw_spinner_verb_count =
+    (int)(sizeof(_sw_spinner_verbs) / sizeof(_sw_spinner_verbs[0]));
+
+static uint64_t _sw_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000);
+}
+
+static const char *_sw_pick_spinner_verb(void) {
+    static int seeded = 0;
+    if (!seeded) {
+        /* sw_random_u32 is already entropy-seeded; use it. */
+        seeded = 1;
+    }
+    unsigned r = sw_random_u32();
+    return _sw_spinner_verbs[r % (unsigned)_sw_spinner_verb_count];
+}
+
+/* Format elapsed ms as a compact human duration: "0.3s", "12s", "1m 23s". */
+static void _sw_format_elapsed(uint64_t ms, char *out, size_t outcap) {
+    if (ms < 1000) {
+        snprintf(out, outcap, "%llums", (unsigned long long)ms);
+    } else if (ms < 10000) {
+        snprintf(out, outcap, "%.1fs", (double)ms / 1000.0);
+    } else if (ms < 60000) {
+        snprintf(out, outcap, "%llus", (unsigned long long)(ms / 1000));
+    } else if (ms < 3600000) {
+        unsigned long long mins = ms / 60000;
+        unsigned long long secs = (ms % 60000) / 1000;
+        snprintf(out, outcap, "%llum %llus", mins, secs);
+    } else {
+        unsigned long long hrs = ms / 3600000;
+        unsigned long long mins = (ms % 3600000) / 60000;
+        snprintf(out, outcap, "%lluh %llum", hrs, mins);
+    }
+}
+
+/* Draw/refresh the spinner line in-place using \r and clear-to-EOL. */
+static void _sw_spinner_draw(const char *verb, uint64_t elapsed_ms, int tokens) {
+    /* Frame glyphs: 6 forward + 6 reverse for a gentle bloom. */
+    static const char *frames[] = {
+        "·", "✢", "✳", "✶", "✻", "✽",
+        "✻", "✶", "✳", "✢", "·", "·"
+    };
+    static const int frame_count = 12;
+    int frame = (int)((elapsed_ms / 120) % (uint64_t)frame_count);
+
+    char elapsed_s[32];
+    _sw_format_elapsed(elapsed_ms, elapsed_s, sizeof(elapsed_s));
+
+    /* Colors: deep-red glyph (brand), dim verb, dim parenthetical. */
+    const char *c_brand = "\x1b[38;5;124m";
+    const char *c_dim   = "\x1b[38;5;240m";
+    const char *c_reset = "\x1b[0m";
+
+    /* Only show token counter once we've accumulated something worth showing. */
+    if (tokens >= 25) {
+        printf("\r\x1b[K %s%s%s %s%s… (%s · ↑ %d tokens · esc to interrupt)%s",
+               c_brand, frames[frame], c_reset,
+               c_dim, verb, elapsed_s, tokens, c_reset);
+    } else {
+        printf("\r\x1b[K %s%s%s %s%s… (%s · esc to interrupt)%s",
+               c_brand, frames[frame], c_reset,
+               c_dim, verb, elapsed_s, c_reset);
+    }
+    fflush(stdout);
+}
+
+/*
+ * http_post_stream(url, headers_list, body) → string (full content)
+ *
+ * POSTs a JSON body with "stream": true to an OpenAI-compatible endpoint,
+ * parses the Server-Sent-Events stream token-by-token, prints each
+ * delta.content to stdout as it arrives (for visual streaming), and
+ * returns the complete accumulated assistant content as a string wrapped
+ * in a minimal OpenAI response shape so the existing extract_content
+ * path keeps working:
+ *    {"choices":[{"message":{"role":"assistant","content":"..."}}]}
+ *
+ * While waiting for the first byte from upstream, a Claude-Code-style
+ * spinner shows on stdout (verb + elapsed + token estimate). It is
+ * cleared the instant real content is about to be printed or a tool
+ * call marker is detected.
+ *
+ * Detects <tool_call> in the stream and stops printing to stdout once
+ * it's seen, so tool-call JSON doesn't leak into the user's view.
+ */
+static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
+    if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *url = a[0]->v.str;
+    sw_val_t *headers = a[1];
+    const char *body = a[2]->v.str;
+
+    /* Write body to temp file to avoid shell-escaping the JSON. */
+    char body_file[256];
+    snprintf(body_file, sizeof(body_file), "%s/sw_stream_%d_%u.json",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    FILE *bf = fopen(body_file, "w");
+    if (!bf) return sw_val_nil();
+    fputs(body, bf);
+    fclose(bf);
+
+    /* Redirect curl's stderr to a temp file so we can surface real errors
+     * (ECONNREFUSED, NXDOMAIN, TLS failures, etc) instead of silently
+     * returning empty content and leaving the user to guess. Previously
+     * we piped stderr to /dev/null which hid every transport failure. */
+    char err_file[256];
+    snprintf(err_file, sizeof(err_file), "%s/sw_stream_err_%d_%u.txt",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+
+    /* Build the curl command with headers + -N for unbuffered streaming. */
+    size_t cmdcap = 8192;
+    char *cmd = (char *)malloc(cmdcap);
+    int off = 0;
+    off += snprintf(cmd + off, cmdcap - off,
+        "curl -sS -N -X POST --connect-timeout 30 --max-time 1800");
+    if (headers && headers->type == SW_VAL_LIST) {
+        for (int i = 0; i < headers->v.tuple.count; i++) {
+            sw_val_t *h = headers->v.tuple.items[i];
+            if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
+                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
+                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
+                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
+        }
+    }
+    off += snprintf(cmd + off, cmdcap - off,
+        " --data-binary @%s '%s' 2>%s", body_file, url, err_file);
+
+    _sw_popen_pid_t ch = _sw_popen_pid(cmd);
+    FILE *pp = ch.fp;
+    free(cmd);
+    if (!pp) { swbs_unlink(body_file); swbs_unlink(err_file); return sw_val_nil(); }
+
+    /* Put the pipe in non-blocking mode so we can tick the spinner while
+     * waiting for the first byte from the upstream LLM. */
+    int pipe_fd = fileno(pp);
+    int _fl = fcntl(pipe_fd, F_GETFL, 0);
+    if (_fl >= 0) fcntl(pipe_fd, F_SETFL, _fl | O_NONBLOCK);
+
+    /* If stdin is a TTY and already in raw mode (the line editor set it
+     * up at startup), we can watch it for ESC / Ctrl+C to interrupt the
+     * streaming generation. Not fatal if it isn't a TTY — we just skip
+     * the interrupt path. */
+    int stdin_fd = -1;
+    if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) {
+        stdin_fd = STDIN_FILENO;
+    }
+    int interrupted = 0;
+
+    /* Pick one random verb for this call. Spinner only on a TTY —
+     * piped output stays clean for tests/scripts. */
+    int is_tty = isatty(fileno(stdout));
+    const char *verb = _sw_pick_spinner_verb();
+    int spinner_drawn = 0;
+    uint64_t t_start = _sw_now_ms();
+    uint64_t t_next_tick = t_start;
+
+    /* Column-aware stream emitter: 2-col left indent + wrap at term_w-2. */
+    _sw_stream_state_t stream;
+    _sw_stream_init(&stream);
+
+    /* Accumulate all token deltas here. We keep a lookahead window so
+     * tool-call markers can be fully detected before any of their bytes
+     * leak to the user's terminal.  We detect TWO formats:
+     *   1. <tool_call>{...}</tool_call>  — prompted XML wrapper
+     *   2. \ncall:name{...}              — Gemma 4 native format
+     * The lookahead must cover the longer marker ("<tool_call>" = 11). */
+    size_t buf_cap = 65536, buf_len = 0;
+    char *buffer = (char *)malloc(buf_cap);
+    buffer[0] = '\0';
+    int seen_tool_call = 0;
+    size_t print_pos = 0; /* next byte in buffer to be considered for stdout */
+    const size_t LOOKAHEAD = 11; /* max(strlen("<tool_call>"), strlen("\ncall:X")) */
+
+    /* Draw the spinner immediately so the user sees *something* at t=0. */
+    if (is_tty) {
+        _sw_spinner_draw(verb, 0, 0);
+        spinner_drawn = 1;
+    }
+
+    /* Line buffer for SSE parsing. We read non-blocking into a scratch
+     * buffer and split lines ourselves — fgets() would block and prevent
+     * spinner ticking during dead air. */
+    char line[16384];
+    size_t line_len = 0;
+    char readbuf[4096];
+    int done = 0;
+    const int spinner_tick_ms = 80;
+
+    /* Scrape `usage.prompt_tokens` / `completion_tokens` from whichever
+     * SSE chunk carries it (transformers-serve emits usage in the final
+     * chunk after `finish_reason`). Using server-provided token counts
+     * instead of char estimates lets us budget compaction against the
+     * model's actual context window. */
+    long long prompt_tokens = -1;
+    long long completion_tokens = -1;
+    long long total_tokens = -1;
+    /* Track the server's finish_reason so we can distinguish a normal
+     * "stop" from a truncation ("length") or a content filter. */
+    char finish_reason[32] = {0};
+
+    while (!done) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pipe_fd, &rfds);
+        if (stdin_fd >= 0) FD_SET(stdin_fd, &rfds);
+        int max_fd = pipe_fd;
+        if (stdin_fd > max_fd) max_fd = stdin_fd;
+        uint64_t now = _sw_now_ms();
+        uint64_t remaining = (t_next_tick > now) ? (t_next_tick - now) : 0;
+        struct timeval tv;
+        tv.tv_sec = (time_t)(remaining / 1000);
+        tv.tv_usec = (suseconds_t)((remaining % 1000) * 1000);
+        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* Check stdin for an interrupt keystroke. ESC (0x1b) or
+         * Ctrl+C (0x03) aborts the stream, kills the child, and
+         * returns the partial buffer with an [Interrupted] marker
+         * the model will see on the next turn. */
+        if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
+            unsigned char ib;
+            ssize_t nb = read(stdin_fd, &ib, 1);
+            if (nb == 1 && (ib == 0x1b || ib == 0x03)) {
+                interrupted = 1;
+                if (spinner_drawn) {
+                    fputs("\r\x1b[K", stdout);
+                    spinner_drawn = 0;
+                    _sw_stream_reset_line(&stream);
+                }
+                fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
+                fflush(stdout);
+                _sw_pkill_close(ch);
+                pp = NULL;
+                ch.fp = NULL;
+                ch.pid = -1;
+                done = 1;
+                break;
+            }
+            /* Any other keystroke while streaming: ignore and loop. */
+        }
+        if (ret == 0) {
+            /* Timeout — tick the spinner whenever it's supposed to be
+             * showing. Three cases need it:
+             *   1. Dead air before the first content byte (TTFT wait)
+             *   2. After we've detected <tool_call> and are still
+             *      receiving the rest of the JSON (avoids the silent
+             *      multi-second gap between rationale text and the
+             *      tool header)
+             *   3. After a blank/whitespace-only start where the model
+             *      skipped rationale and went straight to the tool_call
+             * The `spinner_drawn` flag is set exactly when the spinner
+             * should be visible on screen right now, so we just refresh
+             * it. */
+            if (is_tty && spinner_drawn) {
+                uint64_t elapsed = _sw_now_ms() - t_start;
+                int est_tokens = (int)(buf_len / 4);
+                _sw_spinner_draw(verb, elapsed, est_tokens);
+            }
+            t_next_tick = _sw_now_ms() + (uint64_t)spinner_tick_ms;
+            continue;
+        }
+
+        ssize_t rn = read(pipe_fd, readbuf, sizeof(readbuf));
+        if (rn < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            break;
+        }
+        if (rn == 0) { done = 1; break; }
+
+        for (ssize_t ri = 0; ri < rn && !done; ri++) {
+            char ch = readbuf[ri];
+            if (line_len < sizeof(line) - 1) line[line_len++] = ch;
+            if (ch != '\n') continue;
+            line[line_len] = '\0';
+            size_t this_line_len = line_len;
+            line_len = 0;
+
+            if (this_line_len < 6 || strncmp(line, "data: ", 6) != 0) continue;
+            const char *json = line + 6;
+            if (strncmp(json, "[DONE]", 6) == 0) { done = 1; break; }
+
+            /* Opportunistically scrape token counts from any chunk
+             * that includes a `usage` object. Final chunk usually
+             * does; intermediate chunks usually don't. */
+            {
+                const char *u = strstr(json, "\"prompt_tokens\":");
+                if (u) { prompt_tokens = strtoll(u + 16, NULL, 10); }
+                u = strstr(json, "\"completion_tokens\":");
+                if (u) { completion_tokens = strtoll(u + 20, NULL, 10); }
+                u = strstr(json, "\"total_tokens\":");
+                if (u) { total_tokens = strtoll(u + 15, NULL, 10); }
+                /* finish_reason — capture on the last chunk that has one */
+                const char *fr = strstr(json, "\"finish_reason\":\"");
+                if (fr) {
+                    fr += 17;
+                    size_t k = 0;
+                    while (*fr && *fr != '"' && k < sizeof(finish_reason) - 1) {
+                        finish_reason[k++] = *fr++;
+                    }
+                    finish_reason[k] = '\0';
+                }
+            }
+
+            const char *p = strstr(json, "\"content\":\"");
+            if (!p) continue;
+            p += 11;
+
+            char tok[8192];
+            size_t tok_len = 0;
+            while (*p && *p != '"' && tok_len < sizeof(tok) - 1) {
+                if (*p == '\\' && *(p + 1)) {
+                    char esc = *(p + 1);
+                    switch (esc) {
+                        case 'n': tok[tok_len++] = '\n'; p += 2; break;
+                        case 't': tok[tok_len++] = '\t'; p += 2; break;
+                        case 'r': tok[tok_len++] = '\r'; p += 2; break;
+                        case '"': tok[tok_len++] = '"'; p += 2; break;
+                        case '\\': tok[tok_len++] = '\\'; p += 2; break;
+                        case '/': tok[tok_len++] = '/'; p += 2; break;
+                        default: tok[tok_len++] = esc; p += 2; break;
+                    }
+                } else {
+                    tok[tok_len++] = *p++;
+                }
+            }
+            tok[tok_len] = '\0';
+
+            if (buf_len + tok_len + 1 > buf_cap) {
+                while (buf_len + tok_len + 1 > buf_cap) buf_cap *= 2;
+                buffer = (char *)realloc(buffer, buf_cap);
+            }
+            memcpy(buffer + buf_len, tok, tok_len);
+            buf_len += tok_len;
+            buffer[buf_len] = '\0';
+
+            if (!seen_tool_call) {
+                /* Detect tool call: either <tool_call> or \ncall: */
+                const char *marker = strstr(buffer, "<tool_call>");
+                if (!marker) {
+                    /* Gemma 4 native: look for \ncall: (newline + call:) */
+                    const char *nc = strstr(buffer + print_pos, "\ncall:");
+                    if (!nc && print_pos == 0) nc = (strncmp(buffer, "call:", 5) == 0) ? buffer : NULL;
+                    if (nc) marker = nc;
+                }
+                if (marker) {
+                    seen_tool_call = 1;
+                    if (spinner_drawn) {
+                        fputs("\r\x1b[K", stdout);
+                        spinner_drawn = 0;
+                        _sw_stream_reset_line(&stream);
+                    }
+                    size_t marker_idx = (size_t)(marker - buffer);
+                    /* Emit text before the tool marker, but strip Gemma 4's
+                     * bare "thought" rationale prefix — it's a model artifact
+                     * that adds noise.  Only strip if the pre-marker text is
+                     * JUST whitespace + "thought" + whitespace. */
+                    {
+                        size_t tmp = print_pos;
+                        while (tmp < marker_idx && (buffer[tmp]==' '||buffer[tmp]=='\n'||buffer[tmp]=='\t'||buffer[tmp]=='\r')) tmp++;
+                        int is_bare_thought = (marker_idx - tmp >= 7 && strncmp(buffer + tmp, "thought", 7) == 0);
+                        if (is_bare_thought) {
+                            size_t after_t = tmp + 7;
+                            while (after_t < marker_idx && (buffer[after_t]==' '||buffer[after_t]=='\n'||buffer[after_t]=='\t'||buffer[after_t]=='\r')) after_t++;
+                            if (after_t >= marker_idx) print_pos = marker_idx; /* skip it */
+                        }
+                    }
+                    while (print_pos < marker_idx) {
+                        _sw_stream_emit(&stream, buffer[print_pos++]);
+                    }
+                    _sw_stream_emit(&stream, '\n');
+                    fflush(stdout);
+                    /* Re-raise the spinner so the user sees continuous
+                     * progress while the rest of the tool_call JSON
+                     * streams in, instead of a silent multi-second gap
+                     * before the tool header lands. */
+                    if (is_tty) {
+                        uint64_t elapsed = _sw_now_ms() - t_start;
+                        _sw_spinner_draw(verb, elapsed, (int)(buf_len / 4));
+                        spinner_drawn = 1;
+                    }
+                } else {
+                    /* About to emit real bytes — clear spinner first. */
+                    if (print_pos + LOOKAHEAD < buf_len && spinner_drawn) {
+                        fputs("\r\x1b[K", stdout);
+                        spinner_drawn = 0;
+                        _sw_stream_reset_line(&stream);
+                    }
+                    while (print_pos + LOOKAHEAD < buf_len) {
+                        _sw_stream_emit(&stream, buffer[print_pos++]);
+                    }
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+
+    /* EOF — flush whatever is still in the lookahead window. */
+    if (spinner_drawn) {
+        fputs("\r\x1b[K", stdout);
+        spinner_drawn = 0;
+        _sw_stream_reset_line(&stream);
+    }
+    if (!seen_tool_call) {
+        while (print_pos < buf_len) {
+            _sw_stream_emit(&stream, buffer[print_pos++]);
+        }
+    }
+    fputs("\n", stdout);
+    fflush(stdout);
+    /* If the user interrupted, we already killed + waited for the
+     * child inside _sw_pkill_close — don't re-close. Otherwise close
+     * the FILE* and wait for the child normally. */
+    int curl_status = 0;
+    int curl_exit = 0;
+    if (!interrupted && pp) {
+        curl_status = _sw_popen_pid_close(ch);
+#ifdef _WIN32
+        curl_exit = curl_status;
+#else
+        curl_exit = WIFEXITED(curl_status) ? WEXITSTATUS(curl_status) : -1;
+#endif
+    }
+    swbs_unlink(body_file);
+
+    /* If curl failed, read its stderr and surface a real error to the
+     * user. This is the difference between "server returned empty"
+     * (confusing) and "curl: (7) Failed to connect to sushi port 8000:
+     * Connection refused" (actionable). */
+    if (curl_exit != 0 && buf_len == 0) {
+        FILE *ef = fopen(err_file, "r");
+        char errbuf[1024];
+        size_t erlen = 0;
+        if (ef) {
+            erlen = fread(errbuf, 1, sizeof(errbuf) - 1, ef);
+            fclose(ef);
+        }
+        errbuf[erlen] = '\0';
+        /* Strip trailing newline for cleaner display. */
+        while (erlen > 0 && (errbuf[erlen - 1] == '\n' || errbuf[erlen - 1] == '\r')) {
+            errbuf[--erlen] = '\0';
+        }
+        fprintf(stdout, "\n  \x1b[38;5;208m⚠ curl exited %d\x1b[0m\n", curl_exit);
+        if (erlen > 0) {
+            fprintf(stdout, "  \x1b[38;5;240m%s\x1b[0m\n", errbuf);
+        } else {
+            fprintf(stdout, "  \x1b[38;5;240m(no stderr captured — check the URL/endpoint)\x1b[0m\n");
+        }
+        fflush(stdout);
+    }
+    swbs_unlink(err_file);
+
+    /* Append a marker the model will see in history if the turn was
+     * cut short. Three cases:
+     *   1. User hit ESC/Ctrl+C  → "[Request interrupted by user]"
+     *   2. curl timed out (28)  → "[Response cut off by transport timeout]"
+     *   3. finish_reason="length" → "[Response truncated at max_tokens limit — increase max_tokens and retry]"
+     * Claude Code uses similar markers so the model knows the
+     * previous response was incomplete. */
+    const char *trunc_marker = NULL;
+    if (interrupted) {
+        trunc_marker = "\n\n[Request interrupted by user]";
+    } else if (curl_exit == 28) {
+        trunc_marker = "\n\n[Response cut off by transport timeout after 30 minutes — "
+                       "the generation was still in progress. Retry with a more targeted "
+                       "request or split the work across turns.]";
+    } else if (strcmp(finish_reason, "length") == 0) {
+        trunc_marker = "\n\n[Response truncated at max_tokens output limit. "
+                       "Retry with SWARM_CODE_MAX_OUTPUT_TOKENS set higher, or break "
+                       "the work into smaller pieces.]";
+    }
+    if (trunc_marker) {
+        size_t ml = strlen(trunc_marker);
+        if (buf_len + ml + 1 > buf_cap) {
+            while (buf_len + ml + 1 > buf_cap) buf_cap *= 2;
+            buffer = (char *)realloc(buffer, buf_cap);
+        }
+        memcpy(buffer + buf_len, trunc_marker, ml);
+        buf_len += ml;
+        buffer[buf_len] = '\0';
+        /* Also show it on screen so the user can see it happened. */
+        if (is_tty && !interrupted) {
+            fprintf(stdout, "\n  \x1b[38;5;208m⚠%s\x1b[0m\n", trunc_marker + 2);
+            fflush(stdout);
+        }
+    }
+
+    /* Wrap the accumulated content in a minimal OpenAI-shaped response so
+     * the existing extract_content path just works. Need to JSON-encode
+     * the content string (escape quotes, backslashes, newlines). */
+    size_t enc_cap = buf_len * 2 + 256;
+    char *enc = (char *)malloc(enc_cap);
+    size_t ep = 0;
+    for (size_t i = 0; i < buf_len && ep < enc_cap - 8; i++) {
+        char c = buffer[i];
+        switch (c) {
+            case '"':  enc[ep++] = '\\'; enc[ep++] = '"'; break;
+            case '\\': enc[ep++] = '\\'; enc[ep++] = '\\'; break;
+            case '\n': enc[ep++] = '\\'; enc[ep++] = 'n'; break;
+            case '\r': enc[ep++] = '\\'; enc[ep++] = 'r'; break;
+            case '\t': enc[ep++] = '\\'; enc[ep++] = 't'; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    ep += snprintf(enc + ep, enc_cap - ep, "\\u%04x", (unsigned char)c);
+                } else {
+                    enc[ep++] = c;
+                }
+        }
+    }
+    enc[ep] = '\0';
+
+    size_t out_cap = ep + 512;
+    char *out = (char *)malloc(out_cap);
+    /* Include the usage block so sw callers can read real token counts
+     * from the server. Missing values (no usage chunk seen) are omitted
+     * rather than sent as 0 to distinguish "unknown" from "zero". */
+    if (prompt_tokens >= 0) {
+        snprintf(out, out_cap,
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\"}}],"
+            "\"usage\":{\"prompt_tokens\":%lld,\"completion_tokens\":%lld,\"total_tokens\":%lld}}",
+            enc,
+            prompt_tokens,
+            completion_tokens >= 0 ? completion_tokens : 0,
+            total_tokens >= 0 ? total_tokens : prompt_tokens + (completion_tokens >= 0 ? completion_tokens : 0));
+    } else {
+        snprintf(out, out_cap,
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\"}}]}",
+            enc);
+    }
+
+    sw_val_t *result = sw_val_string(out);
+    free(enc);
+    free(out);
+    free(buffer);
+    return result;
 }
 
 /* === Supervisor === */
@@ -885,7 +1696,7 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     char *cmd = (char *)malloc(cmdcap);
 
     char outf[256];
-    snprintf(outf, sizeof(outf), "/tmp/sw_http_out_%d_%u.json", getpid(), arc4random());
+    snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
 
     int off = 0;
     off += snprintf(cmd + off, cmdcap - off,
@@ -905,7 +1716,7 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
 
     int delays[] = {0, 3, 10};
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (delays[attempt] > 0) sleep(delays[attempt]);
+        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
         system(cmd);
         resp[0] = 0;
         FILE *fp = fopen(outf, "r");
@@ -913,10 +1724,10 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
             size_t rlen = fread(resp, 1, rcap - 1, fp);
             resp[rlen] = 0;
             fclose(fp);
-            if (rlen > 0) { unlink(outf); break; }
+            if (rlen > 0) { swbs_unlink(outf); break; }
         }
     }
-    unlink(outf);
+    swbs_unlink(outf);
     free(cmd);
     sw_val_t *r = sw_val_string(resp);
     free(resp);
@@ -924,27 +1735,156 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
 }
 
 /* === Shell: run command, capture stdout === */
+/* Uses system() + file redirect instead of popen() to avoid fork() in a
+ * multi-threaded process.  popen() calls fork() which duplicates only the
+ * calling thread — any mutex held by a scheduler thread at that instant
+ * is permanently locked in the child, corrupting the malloc allocator and
+ * causing segfaults in the parent on macOS.  system() uses posix_spawn on
+ * modern macOS, sidestepping the issue entirely. */
 
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
     const char *cmd = a[0]->v.str;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return sw_val_nil();
 
-    size_t cap = 65536, len = 0;
-    char *buf = (char *)malloc(cap);
-    while (len < cap - 1) {
-        size_t rd = fread(buf + len, 1, cap - len - 1, fp);
-        if (rd == 0) break;
-        len += rd;
+    /* Temp files for captured output and exit status */
+    char outf[256], exitf[256];
+    snprintf(outf, sizeof(outf), "%s/sw_shell_%d_%u.out",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    snprintf(exitf, sizeof(exitf), "%s/sw_shell_%d_%u.exit",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+
+    /* Launch command in background, writing exit code to a file when done.
+     * This lets us poll the output file while the command runs. */
+    size_t cmdlen = strlen(cmd);
+    size_t wrapcap = cmdlen + 1024;
+    char *wrapped = (char *)malloc(wrapcap);
+    if (!wrapped) return sw_val_nil();
+    snprintf(wrapped, wrapcap,
+        "{ %s ; echo $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
+    system(wrapped);
+    free(wrapped);
+
+    /* Poll the output file, showing a live tail while the command runs.
+     * Check for the exit file every second — its presence means done.
+     * Show last 2 lines of output as a progress indicator. */
+    int is_tty = isatty(fileno(stdout));
+    int done = 0;
+    int polls = 0;
+    const int max_poll_seconds = 600;  /* hard cap: 10 minutes */
+    off_t last_size = 0;
+
+    while (!done && polls < max_poll_seconds) {
+        usleep(1000000);  /* 1 second */
+        polls++;
+
+        /* Check if command finished */
+        FILE *ef = fopen(exitf, "r");
+        if (ef) { fclose(ef); done = 1; break; }
+
+        /* Show live tail if terminal */
+        if (is_tty) {
+            struct stat st;
+            if (stat(outf, &st) == 0 && st.st_size > last_size) {
+                last_size = st.st_size;
+                /* Read last 512 bytes to extract last 2 lines */
+                FILE *tf = fopen(outf, "r");
+                if (tf) {
+                    off_t tail_start = (st.st_size > 512) ? st.st_size - 512 : 0;
+                    fseek(tf, tail_start, SEEK_SET);
+                    char tail[513];
+                    size_t tread = fread(tail, 1, 512, tf);
+                    tail[tread] = '\0';
+                    fclose(tf);
+
+                    /* Find last 2 newlines */
+                    char *last_nl = NULL, *prev_nl = NULL;
+                    for (char *p = tail + tread - 1; p >= tail; p--) {
+                        if (*p == '\n') {
+                            if (!last_nl) { last_nl = p; }
+                            else if (!prev_nl) { prev_nl = p; break; }
+                        }
+                    }
+                    const char *display = prev_nl ? prev_nl + 1 :
+                                          last_nl ? last_nl + 1 : tail;
+                    /* Truncate display line to ~120 chars */
+                    char line_buf[128];
+                    size_t dlen = strlen(display);
+                    if (dlen > 120) dlen = 120;
+                    memcpy(line_buf, display, dlen);
+                    line_buf[dlen] = '\0';
+                    /* Strip trailing newline */
+                    while (dlen > 0 && (line_buf[dlen-1]=='\n'||line_buf[dlen-1]=='\r'))
+                        line_buf[--dlen] = '\0';
+
+                    fprintf(stdout, "\r\033[K    \033[38;5;240m⎿ %s\033[0m",
+                            line_buf);
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+    /* Clear the progress line */
+    if (is_tty) { fputs("\r\033[K", stdout); fflush(stdout); }
+
+    /* Read exit code */
+    int status = -1;
+    {
+        FILE *ef = fopen(exitf, "r");
+        if (ef) {
+            char ebuf[16] = {0};
+            size_t er = fread(ebuf, 1, 15, ef);
+            ebuf[er] = 0;
+            fclose(ef);
+            status = atoi(ebuf);
+        }
+    }
+    swbs_unlink(exitf);
+
+    /* Read full output, sanitizing non-printable bytes.
+     * Binary output (gzipped pages, encrypted files, images) poisons
+     * the model's context and causes empty responses.  We keep only
+     * printable ASCII (0x20-0x7E) plus \t \n \r.  If the result is
+     * entirely binary (sanitized length is 0), return a placeholder. */
+    size_t cap = 65536, raw_len = 0;
+    char *raw = (char *)malloc(cap);
+    if (!raw) { swbs_unlink(outf); return sw_val_nil(); }
+    raw[0] = 0;
+
+    FILE *fp = fopen(outf, "r");
+    if (fp) {
+        while (raw_len < cap - 1) {
+            size_t rd = fread(raw + raw_len, 1, cap - raw_len - 1, fp);
+            if (rd == 0) break;
+            raw_len += rd;
+        }
+        raw[raw_len] = 0;
+        fclose(fp);
+    }
+    swbs_unlink(outf);
+
+    /* Sanitize: strip non-printable bytes in-place */
+    size_t len = 0;
+    char *buf = (char *)malloc(raw_len + 64);
+    if (!buf) { free(raw); return sw_val_nil(); }
+    for (size_t i = 0; i < raw_len; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E))
+            buf[len++] = (char)c;
     }
     buf[len] = 0;
-    int status = pclose(fp);
+    free(raw);
+
+    /* If all content was binary, say so */
+    if (len == 0 && raw_len > 0) {
+        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
+        len = strlen(buf);
+    }
 
     /* Return {status, output} tuple */
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
-    items[0] = sw_val_int(WEXITSTATUS(status));
+    if (!items) { free(buf); return sw_val_nil(); }
+    items[0] = sw_val_int(status);
     items[1] = sw_val_string(buf);
     sw_val_t *r = sw_val_tuple(items, 2);
     free(buf);
@@ -1259,10 +2199,15 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *prompt = a[0]->v.str;
 
-    /* Defaults */
+    /* Defaults — resolve URL from env: LLM_URL > OLLAMA_HOST > hardcoded */
     const char *model = "otonomy-orc";
     const char *api_key = NULL;
-    const char *url = "https://otonomy-inference-production.up.railway.app/v1/chat/completions";
+    const char *env_url = getenv("LLM_URL");
+    const char *ollama_host = getenv("OLLAMA_HOST");
+    /* Only use OLLAMA_HOST if it looks like a URL (has http), not a bind addr like 0.0.0.0 */
+    const char *url = env_url ? env_url
+                    : (ollama_host && strstr(ollama_host, "http")) ? ollama_host
+                    : "https://otonomy-inference-production.up.railway.app/v1/chat/completions";
     int max_tokens = 4096;
     double temperature = 0.7;
     int retries = 0;
@@ -1290,7 +2235,7 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     /* Resolve API key from env if not provided */
     if (!api_key) api_key = getenv("OTONOMY_API_KEY");
     if (!api_key) api_key = getenv("OPENAI_API_KEY");
-    if (!api_key) return sw_val_string("error: no API key (set OTONOMY_API_KEY or pass api_key in opts)");
+    if (!api_key) api_key = "ollama";  /* Ollama doesn't need a real key */
 
     /* Escape prompt for JSON */
     size_t plen = strlen(prompt);
@@ -1336,7 +2281,7 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     sw_val_t *last_result = sw_val_string("error: no response");
 
     for (int attempt = 0; attempt < attempts; attempt++) {
-        if (attempt > 0) sleep(2); /* 2s backoff between retries */
+        if (attempt > 0) sw_sleep(2); /* 2s backoff between retries */
 
         sw_val_t *post_args[3] = { sw_val_string(url), hdr_list, sw_val_string(body) };
         sw_val_t *resp = _builtin_http_post(post_args, 3);
@@ -1378,6 +2323,84 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
 }
 
 /* === Extra String Utilities === */
+
+/* parse_gemma_calls(content) → list of {name_atom, args_map} tuples
+ *
+ * Extracts Gemma 4's native tool-call format: call:name{json_object}
+ * Returns a list so the caller can iterate. Each entry is a 2-tuple:
+ *   {atom("tool_name"), decoded_json_map}
+ *
+ * Example: "I'll read the file.\ncall:read{\"path\":\"/etc/hosts\"}"
+ *  → [{read, %{path: "/etc/hosts"}}]
+ */
+static sw_val_t *_builtin_parse_gemma_calls(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return sw_val_list(NULL, 0);
+    const char *s = a[0]->v.str;
+
+    int cap = 8, cnt = 0;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+
+    const char *p = s;
+    while ((p = strstr(p, "call:")) != NULL) {
+        /* Ensure call: is at start of string or preceded by newline/space */
+        if (p != s && *(p - 1) != '\n' && *(p - 1) != ' ' && *(p - 1) != '\t') {
+            p += 5;
+            continue;
+        }
+        p += 5; /* skip "call:" */
+
+        /* Extract tool name: everything up to '{' */
+        const char *brace = strchr(p, '{');
+        if (!brace) break;
+        size_t name_len = brace - p;
+        if (name_len == 0 || name_len > 64) { p = brace; continue; }
+        char name_buf[65];
+        memcpy(name_buf, p, name_len);
+        name_buf[name_len] = '\0';
+        /* Trim whitespace from name */
+        while (name_len > 0 && (name_buf[name_len-1] == ' ' || name_buf[name_len-1] == '\t'))
+            name_buf[--name_len] = '\0';
+
+        /* Find matching closing brace (handle nested braces) */
+        int depth = 0;
+        const char *q = brace;
+        int in_str = 0;
+        while (*q) {
+            if (*q == '"' && (q == brace || *(q-1) != '\\')) in_str = !in_str;
+            if (!in_str) {
+                if (*q == '{') depth++;
+                else if (*q == '}') { depth--; if (depth == 0) { q++; break; } }
+            }
+            q++;
+        }
+        if (depth != 0) break; /* unbalanced */
+
+        /* Extract and parse the JSON */
+        size_t json_len = q - brace;
+        char *json_buf = (char *)malloc(json_len + 1);
+        memcpy(json_buf, brace, json_len);
+        json_buf[json_len] = '\0';
+
+        const char *jp = json_buf;
+        sw_val_t *decoded = _json_parse(&jp);
+        free(json_buf);
+
+        if (decoded && decoded->type == SW_VAL_MAP) {
+            /* Build {name_atom, args_map} tuple */
+            sw_val_t *tc[2];
+            tc[0] = sw_val_atom(name_buf);
+            tc[1] = decoded;
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+            items[cnt++] = sw_val_tuple(tc, 2);
+        }
+        p = q;
+    }
+
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
 
 /* string_split(str, delim) → list of strings */
 static sw_val_t *_builtin_string_split(sw_val_t **a, int n) {
@@ -2081,7 +3104,7 @@ static void _llm_stream_entry(void *raw) {
     char *cmd = (char *)malloc(cmd_cap);
     /* Write body to temp file for safety */
     char tmpf[256];
-    snprintf(tmpf, sizeof(tmpf), "/tmp/sw_llm_stream_%d_%u.json", getpid(), arc4random());
+    snprintf(tmpf, sizeof(tmpf), "%s/sw_llm_stream_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
     FILE *tf = fopen(tmpf, "w");
     if (tf) { fputs(body, tf); fclose(tf); }
     free(body);
@@ -2093,9 +3116,9 @@ static void _llm_stream_entry(void *raw) {
         "-d @%s '%s' 2>/dev/null",
         ctx->api_key, tmpf, ctx->url);
 
-    FILE *fp = popen(cmd, "r");
+    FILE *fp = sw_popen(cmd, "r");
     free(cmd);
-    unlink(tmpf);
+    swbs_unlink(tmpf);
 
     if (!fp) {
         sw_val_t *items[2];
@@ -2167,7 +3190,7 @@ static void _llm_stream_entry(void *raw) {
         }
     }
 
-    pclose(fp);
+    sw_pclose(fp);
 
     /* Send completion message */
     {
@@ -2253,6 +3276,656 @@ static sw_val_t *_builtin_ets_count(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_int(-1);
     int count = sw_ets_info_count((sw_ets_tid_t)a[0]->v.i);
     return sw_val_int((int64_t)count);
+}
+
+/* === PDF builtins === */
+#include "swarmrt_pdf.h"
+
+/* pdf_text(path) → string | nil
+ * pdf_text(path, %{pages: [0,1]}) → string | nil */
+static sw_val_t *_builtin_pdf_text(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str)
+        return sw_val_nil();
+
+    /* Read file */
+    FILE *fp = fopen(a[0]->v.str, "rb");
+    if (!fp) return sw_val_nil();
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return sw_val_nil(); } /* 100MB limit */
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) { fclose(fp); return sw_val_nil(); }
+    fread(buf, 1, sz, fp);
+    fclose(fp);
+
+    char *text = NULL;
+    size_t text_len = 0;
+    int rc;
+
+    /* Check for page selection (second arg is map with "pages" key) */
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_MAP) {
+        /* Look for pages key — simplified: extract pages from map */
+        /* For now, extract all text */
+        rc = sw_pdf_extract_text(buf, sz, &text, &text_len);
+    } else {
+        rc = sw_pdf_extract_text(buf, sz, &text, &text_len);
+    }
+
+    free(buf);
+    if (rc != SW_PDF_OK || !text) { free(text); return sw_val_nil(); }
+    sw_val_t *r = sw_val_string(text);
+    free(text);
+    return r;
+}
+
+/* pdf_pages(path) → int | nil */
+static sw_val_t *_builtin_pdf_pages(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str)
+        return sw_val_nil();
+
+    FILE *fp = fopen(a[0]->v.str, "rb");
+    if (!fp) return sw_val_nil();
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) { fclose(fp); return sw_val_nil(); }
+    fread(buf, 1, sz, fp);
+    fclose(fp);
+
+    int count = 0;
+    int rc = sw_pdf_page_count(buf, sz, &count);
+    free(buf);
+    if (rc != SW_PDF_OK) return sw_val_nil();
+    return sw_val_int(count);
+}
+
+/* pdf_meta(path) → %{title, author, ...} | nil */
+static sw_val_t *_builtin_pdf_meta(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str)
+        return sw_val_nil();
+
+    FILE *fp = fopen(a[0]->v.str, "rb");
+    if (!fp) return sw_val_nil();
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) { fclose(fp); return sw_val_nil(); }
+    fread(buf, 1, sz, fp);
+    fclose(fp);
+
+    sw_pdf_meta_t meta;
+    int rc = sw_pdf_metadata(buf, sz, &meta);
+    free(buf);
+    if (rc != SW_PDF_OK) return sw_val_nil();
+
+    /* Build a map with title, author, subject, creator, creation_date */
+    sw_val_t *keys[5], *vals[5];
+    int mc = 0;
+    if (meta.title) { keys[mc] = sw_val_string("title"); vals[mc] = sw_val_string(meta.title); mc++; }
+    if (meta.author) { keys[mc] = sw_val_string("author"); vals[mc] = sw_val_string(meta.author); mc++; }
+    if (meta.subject) { keys[mc] = sw_val_string("subject"); vals[mc] = sw_val_string(meta.subject); mc++; }
+    if (meta.creator) { keys[mc] = sw_val_string("creator"); vals[mc] = sw_val_string(meta.creator); mc++; }
+    if (meta.creation_date) { keys[mc] = sw_val_string("creation_date"); vals[mc] = sw_val_string(meta.creation_date); mc++; }
+    sw_pdf_meta_free(&meta);
+    if (mc == 0) return sw_val_map_new(NULL, NULL, 0);
+    return sw_val_map_new(keys, vals, mc);
+}
+
+/* ============================================================
+ * Phase 16: Interactive CLI primitives (swarm-code)
+ * ============================================================ */
+
+/* read_line(prompt?) → string | nil
+ *
+ * Proper line editor that handles bracketed paste (multiline paste as a
+ * single input), backspace, Ctrl+D for EOF, and up-arrow history.
+ *
+ * Under the hood this puts stdin into non-canonical (raw) mode via
+ * termios so we can read one keystroke at a time. The terminal is
+ * restored via atexit() when the process exits. Bracketed paste is
+ * enabled via the \e[?2004h escape sequence — modern terminals
+ * (Terminal.app, iTerm2, Alacritty, kitty, WezTerm) all support it.
+ *
+ * In raw mode we handle echo ourselves:
+ *   - printable chars → append + echo
+ *   - backspace (0x7f/0x08) → pop + "\b \b"
+ *   - Enter (0x0a/0x0d) → emit newline, return buffer
+ *   - Ctrl+D on empty line (0x04) → return nil (EOF)
+ *   - Ctrl+C (0x03) → kernel-handled (ISIG still set)
+ *   - ESC[200~...ESC[201~ → bracketed paste; collect verbatim
+ *   - ESC[A / ESC[B → up/down for simple history recall
+ *
+ * Works for non-terminal stdin too (piped input): if tcgetattr fails,
+ * we fall back to the old fgetc-until-newline loop so piped scripts
+ * still work for tests.
+ */
+
+/* termios / _sw_rl_state_t already declared near the top of this
+ * file so http_post_stream's interrupt path can see them. */
+#include <unistd.h>
+
+static void _sw_rl_restore(void) {
+    if (_sw_rl.saved_ok) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &_sw_rl.saved);
+        fputs("\x1b[?2004l", stdout);
+        fflush(stdout);
+        _sw_rl.saved_ok = 0;
+    }
+}
+
+static int _sw_rl_setup(void) {
+    if (_sw_rl.saved_ok) return 1;
+    if (!isatty(STDIN_FILENO)) return 0;
+    if (tcgetattr(STDIN_FILENO, &_sw_rl.saved) != 0) return 0;
+    struct termios raw = _sw_rl.saved;
+    /* Non-canonical, no echo. Keep ISIG so Ctrl+C stays. */
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_iflag &= ~(ICRNL); /* don't translate CR to NL — we handle both */
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return 0;
+    _sw_rl.saved_ok = 1;
+    atexit(_sw_rl_restore);
+    fputs("\x1b[?2004h", stdout);
+    fflush(stdout);
+    return 1;
+}
+
+static void _sw_rl_history_push(const char *line) {
+    if (!line || !*line) return;
+    /* Skip duplicates of the last entry */
+    if (_sw_rl.count > 0 && strcmp(_sw_rl.entries[_sw_rl.count - 1], line) == 0) return;
+    if (_sw_rl.count == SW_RL_HIST_MAX) {
+        free(_sw_rl.entries[0]);
+        memmove(_sw_rl.entries, _sw_rl.entries + 1, sizeof(char*) * (SW_RL_HIST_MAX - 1));
+        _sw_rl.count--;
+    }
+    _sw_rl.entries[_sw_rl.count++] = strdup(line);
+}
+
+/* Redraw the current buffer: clear line, reprint prompt + buf, position cursor.
+ * `cursor` is the byte offset within buf where the caret should end up. */
+static void _sw_rl_redraw(const char *prompt, const char *buf, size_t len, size_t cursor) {
+    fputs("\r\x1b[K", stdout);
+    if (prompt) fputs(prompt, stdout);
+    fwrite(buf, 1, len, stdout);
+    if (cursor < len) {
+        size_t back = len - cursor;
+        printf("\x1b[%zuD", (size_t)back);
+    }
+    fflush(stdout);
+}
+
+static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
+    const char *prompt = (n >= 1 && a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : NULL;
+    if (prompt) {
+        fputs(prompt, stdout);
+        fflush(stdout);
+    }
+
+    /* Fall back to canonical line read if not a TTY (piped input, tests). */
+    if (!_sw_rl_setup()) {
+        size_t cap = 256, len = 0;
+        char *buf = (char *)malloc(cap);
+        int c;
+        while ((c = fgetc(stdin)) != EOF && c != '\n') {
+            if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+            buf[len++] = (char)c;
+        }
+        if (c == EOF && len == 0) { free(buf); return sw_val_nil(); }
+        buf[len] = '\0';
+        sw_val_t *r = sw_val_string(buf);
+        free(buf);
+        return r;
+    }
+
+    /* Raw-mode line editor. */
+    size_t cap = 512, len = 0, cursor = 0;
+    char *buf = (char *)malloc(cap);
+    buf[0] = '\0';
+    int hist_idx = _sw_rl.count; /* one past the end = "new line" */
+    /* When a multi-line paste lands in the buffer, we can't do simple
+     * cursor-position redraws (they'd clobber earlier lines). Once this
+     * flag is set, fall back to append-only behavior. */
+    int has_newline = 0;
+
+    for (;;) {
+        int c = fgetc(stdin);
+        if (c == EOF) {
+            if (len == 0) { free(buf); return sw_val_nil(); }
+            break;
+        }
+        /* Ctrl+D (EOT) on empty line = EOF; otherwise forward-delete. */
+        if (c == 4) {
+            if (len == 0) { free(buf); fputc('\n', stdout); fflush(stdout); return sw_val_nil(); }
+            if (!has_newline && cursor < len) {
+                memmove(buf + cursor, buf + cursor + 1, len - cursor - 1);
+                len--;
+                buf[len] = '\0';
+                _sw_rl_redraw(prompt, buf, len, cursor);
+            }
+            continue;
+        }
+        /* Enter (LF or CR) = submit. */
+        if (c == '\n' || c == '\r') {
+            fputc('\n', stdout);
+            fflush(stdout);
+            break;
+        }
+        /* Backspace (DEL or BS). */
+        if (c == 127 || c == 8) {
+            if (len > 0 && cursor > 0) {
+                if (has_newline || cursor == len) {
+                    /* Simple append-mode backspace: just pop the last char. */
+                    len--;
+                    cursor = len;
+                    buf[len] = '\0';
+                    fputs("\b \b", stdout);
+                    fflush(stdout);
+                } else {
+                    /* Delete char before cursor, shift tail left. */
+                    memmove(buf + cursor - 1, buf + cursor, len - cursor);
+                    len--;
+                    cursor--;
+                    buf[len] = '\0';
+                    _sw_rl_redraw(prompt, buf, len, cursor);
+                }
+            }
+            continue;
+        }
+        /* Ctrl+A: jump to start of line. */
+        if (c == 1) {
+            if (!has_newline && cursor > 0) {
+                cursor = 0;
+                _sw_rl_redraw(prompt, buf, len, cursor);
+            }
+            continue;
+        }
+        /* Ctrl+E: jump to end of line. */
+        if (c == 5) {
+            if (!has_newline && cursor < len) {
+                cursor = len;
+                _sw_rl_redraw(prompt, buf, len, cursor);
+            }
+            continue;
+        }
+        /* Ctrl+K: kill from cursor to end of line. */
+        if (c == 11) {
+            if (!has_newline && cursor < len) {
+                len = cursor;
+                buf[len] = '\0';
+                _sw_rl_redraw(prompt, buf, len, cursor);
+            }
+            continue;
+        }
+        /* Ctrl+U: clear line. */
+        if (c == 21) {
+            len = 0;
+            cursor = 0;
+            buf[0] = '\0';
+            has_newline = 0;
+            _sw_rl_redraw(prompt, buf, len, cursor);
+            continue;
+        }
+        /* Ctrl+W: kill word before cursor. */
+        if (c == 23) {
+            if (!has_newline && cursor > 0) {
+                size_t end = cursor;
+                /* Skip trailing spaces */
+                while (end > 0 && buf[end - 1] == ' ') end--;
+                /* Skip the word */
+                while (end > 0 && buf[end - 1] != ' ') end--;
+                size_t removed = cursor - end;
+                if (removed > 0) {
+                    memmove(buf + end, buf + cursor, len - cursor);
+                    len -= removed;
+                    cursor = end;
+                    buf[len] = '\0';
+                    _sw_rl_redraw(prompt, buf, len, cursor);
+                }
+            }
+            continue;
+        }
+        /* ESC: distinguish bare Esc (clear line) from escape sequences
+         * (arrows, bracketed paste). Bare Esc has no follow-up byte;
+         * sequences send the next byte within a couple of ms. */
+        if (c == 27) {
+            fd_set _erfds;
+            FD_ZERO(&_erfds);
+            FD_SET(STDIN_FILENO, &_erfds);
+            struct timeval _etv = {0, 50000};  /* 50 ms */
+            int _hasmore = select(STDIN_FILENO + 1, &_erfds, NULL, NULL, &_etv);
+            if (_hasmore <= 0) {
+                /* Bare Esc: clear current buffer without submitting.
+                 * Matches Claude Code's "Esc clears input" behavior. */
+                len = 0;
+                cursor = 0;
+                has_newline = 0;
+                if (len + 1 > cap) { /* no-op, just for clarity */ }
+                buf[0] = '\0';
+                _sw_rl_redraw(prompt, buf, len, cursor);
+                continue;
+            }
+            int c1 = fgetc(stdin);
+            if (c1 != '[') continue;
+            int c2 = fgetc(stdin);
+            /* Arrow keys: ESC [ A (up) / B (down) / C (right) / D (left) */
+            if (c2 == 'A') {
+                if (_sw_rl.count > 0 && hist_idx > 0) {
+                    hist_idx--;
+                    const char *h = _sw_rl.entries[hist_idx];
+                    size_t hlen = strlen(h);
+                    if (hlen + 1 > cap) { while (hlen + 1 > cap) cap *= 2; buf = (char*)realloc(buf, cap); }
+                    memcpy(buf, h, hlen);
+                    buf[hlen] = '\0';
+                    len = hlen;
+                    cursor = hlen;
+                    has_newline = (memchr(buf, '\n', len) != NULL);
+                    _sw_rl_redraw(prompt, buf, len, cursor);
+                }
+                continue;
+            }
+            if (c2 == 'B') {
+                if (hist_idx < _sw_rl.count) {
+                    hist_idx++;
+                    if (hist_idx == _sw_rl.count) {
+                        /* Back to new empty line */
+                        len = 0;
+                        cursor = 0;
+                        buf[0] = '\0';
+                        has_newline = 0;
+                    } else {
+                        const char *h = _sw_rl.entries[hist_idx];
+                        size_t hlen = strlen(h);
+                        if (hlen + 1 > cap) { while (hlen + 1 > cap) cap *= 2; buf = (char*)realloc(buf, cap); }
+                        memcpy(buf, h, hlen);
+                        buf[hlen] = '\0';
+                        len = hlen;
+                        cursor = hlen;
+                        has_newline = (memchr(buf, '\n', len) != NULL);
+                    }
+                    _sw_rl_redraw(prompt, buf, len, cursor);
+                }
+                continue;
+            }
+            /* Right arrow */
+            if (c2 == 'C') {
+                if (!has_newline && cursor < len) {
+                    cursor++;
+                    fputs("\x1b[C", stdout);
+                    fflush(stdout);
+                }
+                continue;
+            }
+            /* Left arrow */
+            if (c2 == 'D') {
+                if (!has_newline && cursor > 0) {
+                    cursor--;
+                    fputs("\x1b[D", stdout);
+                    fflush(stdout);
+                }
+                continue;
+            }
+            /* Home: ESC [ H */
+            if (c2 == 'H') {
+                if (!has_newline && cursor > 0) {
+                    cursor = 0;
+                    _sw_rl_redraw(prompt, buf, len, cursor);
+                }
+                continue;
+            }
+            /* End: ESC [ F */
+            if (c2 == 'F') {
+                if (!has_newline && cursor < len) {
+                    cursor = len;
+                    _sw_rl_redraw(prompt, buf, len, cursor);
+                }
+                continue;
+            }
+            /* ESC [ 1 ~ (Home alt), ESC [ 3 ~ (Delete), ESC [ 4 ~ (End alt) */
+            if (c2 == '1' || c2 == '3' || c2 == '4' || c2 == '7' || c2 == '8') {
+                int c3 = fgetc(stdin);
+                if (c3 == '~') {
+                    if (c2 == '3') {
+                        /* Forward delete */
+                        if (!has_newline && cursor < len) {
+                            memmove(buf + cursor, buf + cursor + 1, len - cursor - 1);
+                            len--;
+                            buf[len] = '\0';
+                            _sw_rl_redraw(prompt, buf, len, cursor);
+                        }
+                    } else if (c2 == '1' || c2 == '7') {
+                        /* Home */
+                        if (!has_newline && cursor > 0) {
+                            cursor = 0;
+                            _sw_rl_redraw(prompt, buf, len, cursor);
+                        }
+                    } else if (c2 == '4' || c2 == '8') {
+                        /* End */
+                        if (!has_newline && cursor < len) {
+                            cursor = len;
+                            _sw_rl_redraw(prompt, buf, len, cursor);
+                        }
+                    }
+                    continue;
+                }
+                /* Bracketed paste start: ESC [ 2 0 0 ~ is handled below */
+                if (c2 == '2' && c3 == '0') {
+                    /* unreachable here — handled in dedicated branch */
+                }
+                continue;
+            }
+            /* Bracketed paste start: ESC [ 2 0 0 ~ */
+            if (c2 == '2') {
+                int c3 = fgetc(stdin);
+                int c4 = fgetc(stdin);
+                int c5 = fgetc(stdin);
+                if (c3 == '0' && c4 == '0' && c5 == '~') {
+                    /* Collect paste content verbatim until ESC [ 2 0 1 ~ */
+                    /* Note: paste always goes to end of buffer — we don't
+                     * try to insert at cursor for multi-line pastes. */
+                    cursor = len;
+                    for (;;) {
+                        int pc = fgetc(stdin);
+                        if (pc == EOF) break;
+                        if (pc == 27) {
+                            int p1 = fgetc(stdin);
+                            if (p1 == '[') {
+                                int p2 = fgetc(stdin);
+                                if (p2 == '2') {
+                                    int p3 = fgetc(stdin);
+                                    int p4 = fgetc(stdin);
+                                    int p5 = fgetc(stdin);
+                                    if (p3 == '0' && p4 == '1' && p5 == '~') goto paste_done;
+                                }
+                            }
+                            continue;
+                        }
+                        /* Append to buffer; echo so user sees what was pasted. */
+                        if (len + 1 >= cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+                        buf[len++] = (char)pc;
+                        buf[len] = '\0';
+                        if (pc == '\n' || pc == '\r') {
+                            has_newline = 1;
+                            /* Echo newline and an indent for visual clarity */
+                            fputc('\n', stdout);
+                            if (prompt) {
+                                /* Align continuation lines with the prompt width — 2 spaces is a reasonable default */
+                                fputs("  ", stdout);
+                            }
+                        } else {
+                            fputc(pc, stdout);
+                        }
+                    }
+                    paste_done:
+                    cursor = len;
+                    fflush(stdout);
+                    continue;
+                }
+                /* Not a paste marker; discard the sequence. */
+                continue;
+            }
+            /* Other escape sequences — ignore. */
+            continue;
+        }
+        /* Printable character */
+        if (c >= 0x20 && c != 0x7f) {
+            if (len + 2 >= cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+            if (has_newline || cursor == len) {
+                /* Append at end — cheap path, no redraw. */
+                buf[len++] = (char)c;
+                cursor = len;
+                buf[len] = '\0';
+                fputc(c, stdout);
+                fflush(stdout);
+            } else {
+                /* Insert at cursor position, shift tail right. */
+                memmove(buf + cursor + 1, buf + cursor, len - cursor);
+                buf[cursor] = (char)c;
+                len++;
+                cursor++;
+                buf[len] = '\0';
+                _sw_rl_redraw(prompt, buf, len, cursor);
+            }
+        }
+        /* All other control chars: ignore */
+    }
+
+    buf[len] = '\0';
+    if (len > 0) _sw_rl_history_push(buf);
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+/* read_choice(header, options) → int index (or -1 on Esc/cancel)
+ *
+ * Interactive arrow-key picker. Prints the header, then renders the
+ * option list with ❯ marking the current selection, accepts up/down
+ * arrow keys + Enter to confirm + Esc to cancel + 1-9 numeric
+ * shortcuts. Inspired by Claude Code's CustomSelect component.
+ *
+ * The rendered lines are repainted in place using cursor-up +
+ * clear-to-EOL, so moving between options doesn't scroll the
+ * terminal. Expected to be called only from the Reader process to
+ * avoid racing with the main input loop on stdin.
+ */
+static sw_val_t *_builtin_read_choice(sw_val_t **a, int n) {
+    if (n < 2) return sw_val_int(-1);
+    const char *header = (a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : "";
+    sw_val_t *opts = a[1];
+    if (!opts || opts->type != SW_VAL_LIST || opts->v.tuple.count == 0)
+        return sw_val_int(-1);
+
+    int count = opts->v.tuple.count;
+    const char **labels = (const char **)malloc(sizeof(char *) * count);
+    for (int i = 0; i < count; i++) {
+        sw_val_t *v = opts->v.tuple.items[i];
+        labels[i] = (v && v->type == SW_VAL_STRING) ? v->v.str : "";
+    }
+
+    /* Non-TTY fallback: can't do interactive picker, return first option. */
+    if (!_sw_rl_setup() || !isatty(STDIN_FILENO)) {
+        free(labels);
+        return sw_val_int(0);
+    }
+
+    /* Print header once, then reserve `count` lines for the picker. */
+    if (*header) {
+        fputs(header, stdout);
+        fputc('\n', stdout);
+    }
+    /* Pre-print blank lines so we're guaranteed to have space below us
+     * before we start moving the cursor back up. */
+    for (int i = 0; i < count; i++) fputc('\n', stdout);
+    fflush(stdout);
+
+    int cur = 0;
+    int result = -1;
+
+    for (;;) {
+        /* Move cursor back up `count` lines to the first option line. */
+        fprintf(stdout, "\x1b[%dA", count);
+        for (int i = 0; i < count; i++) {
+            fputs("\r\x1b[K", stdout);  /* clear line */
+            if (i == cur) {
+                fprintf(stdout,
+                    "  \x1b[38;5;124m\x1b[1m❯\x1b[0m \x1b[1m%d. %s\x1b[0m\n",
+                    i + 1, labels[i]);
+            } else {
+                fprintf(stdout,
+                    "    \x1b[38;5;244m%d. %s\x1b[0m\n",
+                    i + 1, labels[i]);
+            }
+        }
+        fflush(stdout);
+
+        int c = fgetc(stdin);
+        if (c == EOF) { result = -1; break; }
+        /* Ctrl+C, Ctrl+D = cancel */
+        if (c == 3 || c == 4) { result = -1; break; }
+        /* Enter = confirm current selection */
+        if (c == '\n' || c == '\r') { result = cur; break; }
+        /* Numeric shortcut 1..9 */
+        if (c >= '1' && c <= '9') {
+            int idx = c - '1';
+            if (idx < count) { result = idx; break; }
+            continue;
+        }
+        /* ESC — could be bare escape (cancel) or arrow sequence */
+        if (c == 27) {
+            /* Peek for more bytes via select with a short timeout. Bare
+             * Esc has no follow-up; arrow keys send ESC [ A immediately. */
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(STDIN_FILENO, &rfds);
+            struct timeval tv = {0, 50000};  /* 50 ms */
+            int has_more = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+            if (has_more <= 0) { result = -1; break; }  /* bare Esc */
+            int c1 = fgetc(stdin);
+            if (c1 != '[') continue;
+            int c2 = fgetc(stdin);
+            if (c2 == 'A') { if (cur > 0) cur--; }         /* up */
+            else if (c2 == 'B') { if (cur < count - 1) cur++; } /* down */
+            /* other escapes (home/end/etc) ignored */
+            continue;
+        }
+        /* j/k vim-style */
+        if (c == 'j') { if (cur < count - 1) cur++; continue; }
+        if (c == 'k') { if (cur > 0) cur--; continue; }
+        /* anything else: ignore */
+    }
+
+    free(labels);
+    return sw_val_int(result);
+}
+
+/* print_inline(args...) → 'ok'
+ * Like print, but without a trailing newline. */
+static sw_val_t *_builtin_print_inline(sw_val_t **a, int n) {
+    for (int i = 0; i < n; i++) {
+        if (i) printf(" ");
+        sw_val_print(a[i]);
+    }
+    fflush(stdout);
+    return sw_val_atom("ok");
+}
+
+/* sys_exit(code?) → never returns
+ * Cleanly terminate the process. Essential for CLIs because the
+ * runtime's main loop otherwise spins forever waiting for processes. */
+static sw_val_t *_builtin_sys_exit(sw_val_t **a, int n) {
+    int code = 0;
+    if (n >= 1 && a[0] && a[0]->type == SW_VAL_INT) code = (int)a[0]->v.i;
+    fflush(stdout);
+    fflush(stderr);
+    exit(code);
+    return sw_val_nil(); /* unreachable */
 }
 
 #endif /* SWARMRT_BUILTINS_STUDIO_H */
