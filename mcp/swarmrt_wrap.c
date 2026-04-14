@@ -593,14 +593,47 @@ static int enter_raw_mode(void) {
  * Injection + tick
  * ================================================================ */
 
+/* Loop on partial writes so long prompts don't get truncated.
+ *
+ * The PTY master's kernel buffer can return a short count when
+ * back-pressured by the child's reader (Claude Code's Ink loop
+ * during a busy render). Before v0.5.3 inject() ignored the return
+ * value of write(), so a 1062-byte feedback-triage prompt could
+ * land as ~512 bytes + \r, submitting a truncated message to the
+ * REPL. Reported externally as bug #4. */
+static int write_all(int fd, const char *buf, size_t n) {
+    size_t w = 0;
+    while (w < n) {
+        ssize_t r = write(fd, buf + w, n - w);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Brief pause so the reader can drain. */
+                struct timespec ts = {0, 10 * 1000 * 1000}; /* 10ms */
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            return -1;
+        }
+        if (r == 0) return -1; /* defensive — should not happen on a pty */
+        w += (size_t)r;
+    }
+    return 0;
+}
+
 static void inject(int fd, const char *prompt) {
     if (!prompt) return;
     size_t n = strlen(prompt);
-    ssize_t w = write(fd, prompt, n);
-    (void)w;
-    w = write(fd, "\r", 1);
-    (void)w;
-    logmsg("injected: %.60s%s", prompt, n > 60 ? "..." : "");
+    if (write_all(fd, prompt, n) < 0) {
+        logmsg("inject prompt failed (%zu bytes): %s", n, strerror(errno));
+        return;
+    }
+    if (write_all(fd, "\r", 1) < 0) {
+        logmsg("inject \\r failed: %s", strerror(errno));
+        return;
+    }
+    logmsg("injected: %zu bytes, preview: %.60s%s",
+           n, prompt, n > 60 ? "..." : "");
 }
 
 /* Returns the number of manual fires that landed on a tracked wake
