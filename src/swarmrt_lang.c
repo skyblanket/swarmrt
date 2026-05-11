@@ -2061,21 +2061,90 @@ static void _jd_skip_ws(const char **pp) {
     while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
 }
 
+/* Parse 4 hex digits at *pp into 16-bit codepoint, advancing *pp.
+ * Returns -1 on malformed input. Caller positions past leading 'u'. */
+static int _jd_hex4(const char **pp) {
+    int cp = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = **pp;
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = 10 + c - 'a';
+        else if (c >= 'A' && c <= 'F') d = 10 + c - 'A';
+        else return -1;
+        cp = (cp << 4) | d;
+        (*pp)++;
+    }
+    return cp;
+}
+
+/* UTF-8 encode codepoint cp into buf. Returns bytes written (1-4). */
+static int _jd_utf8(unsigned int cp, char *buf) {
+    if (cp < 0x80) { buf[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    buf[0] = (char)(0xF0 | (cp >> 18));
+    buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
 static sw_val_t *_jd_parse_string(const char **pp) {
     (*pp)++;
     char buf[8192];
     int len = 0;
-    while (**pp && **pp != '"' && len < (int)sizeof(buf) - 2) {
+    while (**pp && **pp != '"' && len < (int)sizeof(buf) - 5) {
         if (**pp == '\\') {
             (*pp)++;
             switch (**pp) {
-                case 'n': buf[len++] = '\n'; break;
-                case 't': buf[len++] = '\t'; break;
-                case 'r': buf[len++] = '\r'; break;
-                default:  buf[len++] = **pp; break;
+                case 'n': buf[len++] = '\n'; (*pp)++; break;
+                case 't': buf[len++] = '\t'; (*pp)++; break;
+                case 'r': buf[len++] = '\r'; (*pp)++; break;
+                case 'b': buf[len++] = '\b'; (*pp)++; break;
+                case 'f': buf[len++] = '\f'; (*pp)++; break;
+                case '"': case '\\': case '/':
+                    buf[len++] = **pp; (*pp)++; break;
+                case 'u': {
+                    /* \uXXXX — UTF-8 encode the codepoint. Combines
+                     * surrogate pairs (\uD800..\uDBFF + \uDC00..\uDFFF)
+                     * into 4-byte UTF-8 for emoji / SMP characters.
+                     * Without this, model-emitted JSON containing
+                     * special chars (& as &, > as >) was
+                     * being decoded to literal "u0026" / "u003e",
+                     * breaking shell composition in tool calls. */
+                    (*pp)++;
+                    int cp = _jd_hex4(pp);
+                    if (cp < 0) { buf[len++] = 'u'; break; }
+                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                        (*pp)[0] == '\\' && (*pp)[1] == 'u') {
+                        const char *save = *pp;
+                        (*pp) += 2;
+                        int low = _jd_hex4(pp);
+                        if (low >= 0xDC00 && low <= 0xDFFF) {
+                            unsigned int full = 0x10000 +
+                                (((unsigned int)(cp - 0xD800)) << 10) +
+                                (unsigned int)(low - 0xDC00);
+                            len += _jd_utf8(full, buf + len);
+                            break;
+                        }
+                        *pp = save;
+                    }
+                    len += _jd_utf8((unsigned int)cp, buf + len);
+                    break;
+                }
+                default: buf[len++] = **pp; (*pp)++; break;
             }
-        } else buf[len++] = **pp;
-        (*pp)++;
+        } else { buf[len++] = **pp; (*pp)++; }
     }
     if (**pp == '"') (*pp)++;
     buf[len] = 0;

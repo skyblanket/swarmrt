@@ -35,6 +35,8 @@
 #include <pwd.h>
 #include <regex.h>
 #include <ctype.h>
+#include <sys/file.h>     /* flock — used by wake_queue.jsonl readers/writers */
+#include <fcntl.h>
 
 #include "../src/swarmrt_search.h"
 
@@ -398,7 +400,12 @@ static void jb_free(jbuf_t *jb) { free(jb->buf); }
  * Section 4: Logging
  * ================================================================ */
 
+/* Suppress mcp_log output. Set by stop-hook mode so Claude Code doesn't
+ * echo [swarmrt-mcp] chatter to the user on every turn-end. */
+static bool g_silent_log = false;
+
 static void mcp_log(const char *fmt, ...) {
+    if (g_silent_log) return;
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "[swarmrt-mcp] ");
@@ -1460,7 +1467,9 @@ static void tool_wake_fire_now(json_node_t *args, jbuf_t *out) {
         return;
     }
 
-    /* Append to wake_queue.jsonl — swarmrt-wrap drains this on its next tick. */
+    /* Append to wake_queue.jsonl — drained by the Stop-hook mode (or the
+     * legacy swarmrt-wrap PTY tick). Use flock so a concurrent hook
+     * process can't pop-and-rewrite mid-append and drop this entry. */
     char qpath[4096];
     snprintf(qpath, sizeof(qpath), "%s/%s", g_data_dir, WAKE_QUEUE_FILE);
     FILE *f = fopen(qpath, "a");
@@ -1469,18 +1478,251 @@ static void tool_wake_fire_now(json_node_t *args, jbuf_t *out) {
         jb_append(out, "{\"error\":\"could not open wake queue\"}");
         return;
     }
+    int qfd = fileno(f);
+    if (qfd >= 0) flock(qfd, LOCK_EX);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     fprintf(f, "{\"id\":%d,\"queued_at\":%lld,\"prompt\":",
             w->id, (long long)ts.tv_sec);
     json_fwrite_escaped(f, w->prompt);
     fprintf(f, "}\n");
+    fflush(f);
+    if (qfd >= 0) flock(qfd, LOCK_UN);
     fclose(f);
     int id = w->id;
     pthread_mutex_unlock(&g_wakes_lock);
 
     mcp_log("wake queued for immediate fire: id=%d", id);
-    jb_append(out, "{\"queued\":true,\"id\":%d,\"message\":\"Queued for swarmrt-wrap's next 5s tick.\"}", id);
+    jb_append(out, "{\"queued\":true,\"id\":%d,\"message\":\"Queued for next Stop hook or swarmrt-wrap tick.\"}", id);
+}
+
+/* ================================================================
+ * Section 7.8: Stop-Hook Mode
+ *
+ * Ralph-Wiggum-style autonomous loop for Claude Code. Invoked as:
+ *     swarmrt-mcp --stop-hook [project_dir]
+ *
+ * Claude Code fires this on every turn-end and pipes its hook JSON on
+ * stdin. We drain at most one prompt per invocation (first queued entry
+ * wins, else first due cron wake) and emit
+ *     {"decision":"block","reason":"<prompt>"}
+ * on stdout to feed that prompt back as the next user turn. When nothing
+ * is queued or due, we exit 0 with empty stdout and Claude stops normally.
+ *
+ * Why this replaces swarmrt-wrap's PTY injection: the Stop hook runs
+ * inside Claude Code's own state machine, so prompts land as real user
+ * messages — no racing with modals, paste-bracketing, or idle-grace
+ * timing. The legacy PTY wrapper still works; don't run both or every
+ * wake fires twice.
+ * ================================================================ */
+
+/* Slurp stdin into a malloc'd, NUL-terminated buffer. Caps at 1 MiB —
+ * Claude Code hook payloads are tiny (<2 KiB in practice). */
+static char *read_all_stdin(size_t *out_len) {
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    while (len < 1024 * 1024) {
+        if (cap - len < 1024) {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        ssize_t n = read(STDIN_FILENO, buf + len, cap - len - 1);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        if (n == 0) break;
+        len += (size_t)n;
+    }
+    buf[len] = '\0';
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+/* Atomically pop the first line from wake_queue.jsonl, leaving the
+ * remainder in place. Returns strdup'd first line (minus trailing \n)
+ * or NULL if file is missing/empty. Holds LOCK_EX across read and
+ * rewrite so a concurrent tool_wake_fire_now append can't be lost. */
+static char *queue_pop_first_line(const char *qpath) {
+    int fd = open(qpath, O_RDWR);
+    if (fd < 0) return NULL;
+    if (flock(fd, LOCK_EX) != 0) { close(fd); return NULL; }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        unlink(qpath);
+        return NULL;
+    }
+
+    char *buf = malloc((size_t)st.st_size + 1);
+    if (!buf) { flock(fd, LOCK_UN); close(fd); return NULL; }
+    ssize_t n = read(fd, buf, (size_t)st.st_size);
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+
+    /* Take first line (up to first \n). */
+    char *nl = memchr(buf, '\n', (size_t)n);
+    size_t first_len = nl ? (size_t)(nl - buf) : (size_t)n;
+    const char *rest = nl ? nl + 1 : buf + n;
+    size_t rest_len = (size_t)n - (size_t)(rest - buf);
+
+    char *first = malloc(first_len + 1);
+    if (!first) { free(buf); flock(fd, LOCK_UN); close(fd); return NULL; }
+    memcpy(first, buf, first_len);
+    first[first_len] = '\0';
+
+    /* Rewrite the file with rest_len bytes, truncating the old tail. */
+    if (lseek(fd, 0, SEEK_SET) == 0) {
+        if (rest_len > 0) {
+            ssize_t w = write(fd, rest, rest_len);
+            (void)w;
+        }
+        if (ftruncate(fd, (off_t)rest_len) != 0) { /* best-effort */ }
+        fsync(fd);
+    }
+
+    if (rest_len == 0) unlink(qpath);  /* tidy up empty file */
+
+    flock(fd, LOCK_UN);
+    close(fd);
+    free(buf);
+    return first;
+}
+
+/* Scan g_wakes for the first enabled wake whose cron is due at `now`.
+ * Returns the wake and its due time, or NULL if nothing is ready.
+ * Must be called on the calling process's view of g_wakes (we're a
+ * one-shot hook process; no mutex needed). */
+static wake_t *find_due_cron_wake(time_t now, time_t *out_fire_t) {
+    for (int i = 0; i < g_wake_count; i++) {
+        wake_t *w = &g_wakes[i];
+        if (!w->enabled) continue;
+        time_t base = (w->last_fired_at > w->created_at)
+                          ? w->last_fired_at : w->created_at;
+        if (base == 0) base = now - 60;  /* fresh wake: compute from ~now */
+        time_t next = cron_next_fire(&w->cron, base);
+        if (next > 0 && next <= now) {
+            if (out_fire_t) *out_fire_t = next;
+            return w;
+        }
+    }
+    return NULL;
+}
+
+/* Emit {"decision":"block","reason":"<escaped>"} on stdout. */
+static void emit_block_decision(const char *reason) {
+    fputs("{\"decision\":\"block\",\"reason\":", stdout);
+    json_fwrite_escaped(stdout, reason ? reason : "");
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+/* Orchestrator: dispatched from main() when argv includes --stop-hook.
+ * Returns a process exit code. */
+static int run_stop_hook(int argc, char **argv) {
+    g_silent_log = true;
+
+    /* Read the hook input. It's fine if stdin is empty — we just fall
+     * back to cwd/getcwd and treat stop_hook_active as false. */
+    size_t slen = 0;
+    char *sbuf = read_all_stdin(&slen);
+
+    char *hook_cwd = NULL;
+    bool stop_hook_active = false;
+    if (sbuf && slen > 0) {
+        const char *p = sbuf;
+        json_node_t *root = json_parse(&p);
+        if (root) {
+            const char *c = json_get_str(root, "cwd");
+            if (c && c[0]) hook_cwd = strdup(c);
+            json_node_t *sa = json_get(root, "stop_hook_active");
+            if (sa && sa->type == JSON_BOOL) stop_hook_active = sa->bval;
+            json_free(root);
+        }
+    }
+    free(sbuf);
+
+    /* If Claude Code is already reentering because of a prior block,
+     * short-circuit silently so we can never infinite-loop. The next
+     * genuine Stop (after Claude processes the injected prompt) will
+     * fire the next wake. */
+    if (stop_hook_active) {
+        free(hook_cwd);
+        return 0;
+    }
+
+    /* Resolve project root: explicit CLI arg wins, else hook cwd, else
+     * this process's cwd. Skip any leading --stop-hook token. */
+    const char *project_root = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--stop-hook") == 0) continue;
+        project_root = argv[i];
+        break;
+    }
+    char cwdbuf[4096];
+    if (!project_root) project_root = hook_cwd;
+    if (!project_root) {
+        if (getcwd(cwdbuf, sizeof(cwdbuf))) project_root = cwdbuf;
+        else project_root = ".";
+    }
+
+    init_data_dir(project_root);
+    wakes_load();
+
+    time_t now = time(NULL);
+    char qpath[4096];
+    snprintf(qpath, sizeof(qpath), "%s/%s", g_data_dir, WAKE_QUEUE_FILE);
+
+    /* Step 1: drain one queued entry if present. */
+    char *line = queue_pop_first_line(qpath);
+    if (line && line[0]) {
+        const char *p = line;
+        json_node_t *entry = json_parse(&p);
+        const char *prompt = entry ? json_get_str(entry, "prompt") : NULL;
+        int id = entry ? (int)json_get_int(entry, "id", -1) : -1;
+        if (prompt && prompt[0]) {
+            /* Bump manual counters if the wake still exists. */
+            if (id > 0) {
+                for (int i = 0; i < g_wake_count; i++) {
+                    if (g_wakes[i].id == id) {
+                        g_wakes[i].manual_fire_count++;
+                        g_wakes[i].last_manual_fire_at = now;
+                        wakes_save();
+                        break;
+                    }
+                }
+            }
+            char *reason = strdup(prompt);
+            if (entry) json_free(entry);
+            free(line);
+            free(hook_cwd);
+            emit_block_decision(reason);
+            free(reason);
+            return 0;
+        }
+        if (entry) json_free(entry);
+    }
+    free(line);
+
+    /* Step 2: fire the first due cron wake, if any. */
+    time_t fire_t = 0;
+    wake_t *due = find_due_cron_wake(now, &fire_t);
+    if (due) {
+        char *reason = strdup(due->prompt);
+        due->last_fired_at = now;
+        due->fire_count++;
+        wakes_save();
+        free(hook_cwd);
+        emit_block_decision(reason);
+        free(reason);
+        return 0;
+    }
+
+    /* Step 3: nothing due — let Claude stop. */
+    free(hook_cwd);
+    return 0;
 }
 
 /* ================================================================
@@ -3798,7 +4040,16 @@ static void init_data_dir(const char *project_root) {
 }
 
 int main(int argc, char **argv) {
-    /* Determine project root: arg1, or CWD */
+    /* Stop-hook mode: one-shot dispatcher for Claude Code's Stop event.
+     * Reads hook JSON from stdin, maybe emits {"decision":"block",...}
+     * on stdout, exits. Skips MCP server setup entirely. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--stop-hook") == 0) {
+            return run_stop_hook(argc, argv);
+        }
+    }
+
+    /* Determine project root: first non-flag arg, or CWD */
     char cwd[4096];
     const char *root = NULL;
     if (argc > 1) {

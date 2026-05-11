@@ -939,8 +939,19 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     size_t cmdcap = 8192;
     char *cmd = (char *)malloc(cmdcap);
     int off = 0;
+    /* --keepalive-time 30: send TCP keepalives so flaky long-distance
+     *   routes (api.z.ai, sushi, anything overseas) don't silently drop
+     *   an idle stream during long reasoning chains.
+     * --retry 2 --retry-delay 1 --retry-connrefused --retry-all-errors:
+     *   curl auto-retries connection failures BEFORE any data arrives;
+     *   does NOT restart an already-streaming response (so safe for
+     *   streaming). Catches transient SSL/connect timeouts (curl 28/35).
+     * --max-time 1800: hard ceiling at 30 min — long reasoning is fine
+     *   but eventually we want to surface a failure rather than hang. */
     off += snprintf(cmd + off, cmdcap - off,
-        "curl -sS -N -X POST --connect-timeout 30 --max-time 1800");
+        "curl -sS -N -X POST --connect-timeout 30 --max-time 1800 "
+        "--keepalive-time 30 "
+        "--retry 2 --retry-delay 1 --retry-connrefused --retry-all-errors");
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
             sw_val_t *h = headers->v.tuple.items[i];
@@ -998,6 +1009,19 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     int seen_tool_call = 0;
     size_t print_pos = 0; /* next byte in buffer to be considered for stdout */
     const size_t LOOKAHEAD = 11; /* max(strlen("<tool_call>"), strlen("\ncall:X")) */
+
+    /* Reasoning channel — GLM-5.1, DeepSeek-R1, and o1-style models
+     * stream `delta.reasoning_content` separately from `delta.content`.
+     * We display reasoning dimmed+italic inline so the user sees the
+     * model think, but never add it to `buffer` — only `content` is
+     * scanned for tool-call markers. Also exposed in the response JSON
+     * so the agent layer can detect "thought but said nothing" and
+     * decide to retry instead of giving up. */
+    size_t reason_cap = 16384, reason_len = 0;
+    char *reasoning = (char *)malloc(reason_cap);
+    reasoning[0] = '\0';
+    int reason_started = 0;  /* have we opened the dim italic block? */
+    int content_started = 0; /* have we transitioned reasoning → content? */
 
     /* Draw the spinner immediately so the user sees *something* at t=0. */
     if (is_tty) {
@@ -1133,6 +1157,56 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                 }
             }
 
+            /* Reasoning channel: parse first since it usually streams
+             * before content. A chunk can have reasoning, content, both,
+             * or neither. The `"reasoning_content":"` prefix can't false-
+             * match `"content":"` because of the underscore boundary. */
+            {
+                const char *rp = strstr(json, "\"reasoning_content\":\"");
+                if (rp) {
+                    rp += 21;
+                    char rtok[8192];
+                    size_t rtok_len = 0;
+                    while (*rp && *rp != '"' && rtok_len < sizeof(rtok) - 1) {
+                        if (*rp == '\\' && *(rp + 1)) {
+                            char esc = *(rp + 1);
+                            switch (esc) {
+                                case 'n': rtok[rtok_len++] = '\n'; rp += 2; break;
+                                case 't': rtok[rtok_len++] = '\t'; rp += 2; break;
+                                case 'r': rtok[rtok_len++] = '\r'; rp += 2; break;
+                                case '"': rtok[rtok_len++] = '"'; rp += 2; break;
+                                case '\\': rtok[rtok_len++] = '\\'; rp += 2; break;
+                                case '/': rtok[rtok_len++] = '/'; rp += 2; break;
+                                default: rtok[rtok_len++] = esc; rp += 2; break;
+                            }
+                        } else {
+                            rtok[rtok_len++] = *rp++;
+                        }
+                    }
+                    if (rtok_len > 0) {
+                        if (reason_len + rtok_len + 1 > reason_cap) {
+                            while (reason_len + rtok_len + 1 > reason_cap) reason_cap *= 2;
+                            reasoning = (char *)realloc(reasoning, reason_cap);
+                        }
+                        memcpy(reasoning + reason_len, rtok, rtok_len);
+                        reason_len += rtok_len;
+                        reasoning[reason_len] = '\0';
+
+                        if (spinner_drawn) {
+                            fputs("\r\x1b[K", stdout);
+                            spinner_drawn = 0;
+                            _sw_stream_reset_line(&stream);
+                        }
+                        if (!reason_started) {
+                            fputs("  \x1b[38;5;240m\x1b[3m", stdout);
+                            reason_started = 1;
+                        }
+                        fwrite(rtok, 1, rtok_len, stdout);
+                        fflush(stdout);
+                    }
+                }
+            }
+
             const char *p = strstr(json, "\"content\":\"");
             if (!p) continue;
             p += 11;
@@ -1157,6 +1231,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             }
             tok[tok_len] = '\0';
 
+            /* Reasoning → content transition: close the dim italic block
+             * with a separator so user sees the model's thinking end and
+             * its actual response begin. Only fires once per turn. */
+            if (tok_len > 0 && reason_started && !content_started) {
+                fputs("\x1b[0m\n\n", stdout);
+                fflush(stdout);
+                content_started = 1;
+            }
+
             if (buf_len + tok_len + 1 > buf_cap) {
                 while (buf_len + tok_len + 1 > buf_cap) buf_cap *= 2;
                 buffer = (char *)realloc(buffer, buf_cap);
@@ -1166,12 +1249,25 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             buffer[buf_len] = '\0';
 
             if (!seen_tool_call) {
-                /* Detect tool call: either <tool_call> or \ncall: */
+                /* Detect tool call: either <tool_call> or [punct/ws]call: */
                 const char *marker = strstr(buffer, "<tool_call>");
                 if (!marker) {
-                    /* Gemma 4 native: look for \ncall: (newline + call:) */
-                    const char *nc = strstr(buffer + print_pos, "\ncall:");
-                    if (!nc && print_pos == 0) nc = (strncmp(buffer, "call:", 5) == 0) ? buffer : NULL;
+                    /* Native call:NAME{...} — scan from print_pos for
+                     * `call:` not preceded by an identifier char. Accepts
+                     * "\ncall:" (Gemma) and ".call:" / ",call:" (GLM-5.1)
+                     * but rejects "http_call:" (false positive). */
+                    const char *nc = NULL;
+                    size_t scan_start = print_pos;
+                    for (size_t i = scan_start; i + 5 <= buf_len; i++) {
+                        if (buffer[i] != 'c') continue;
+                        if (memcmp(buffer + i, "call:", 5) != 0) continue;
+                        char prev = (i == 0) ? '\n' : buffer[i - 1];
+                        int is_word = (prev >= 'a' && prev <= 'z') ||
+                                      (prev >= 'A' && prev <= 'Z') ||
+                                      (prev >= '0' && prev <= '9') ||
+                                      prev == '_';
+                        if (!is_word) { nc = buffer + i; break; }
+                    }
                     if (nc) marker = nc;
                 }
                 if (marker) {
@@ -1231,6 +1327,12 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         fputs("\r\x1b[K", stdout);
         spinner_drawn = 0;
         _sw_stream_reset_line(&stream);
+    }
+    /* If the model emitted reasoning but never started speaking content,
+     * close the dim/italic block cleanly so the terminal styling resets. */
+    if (reason_started && !content_started) {
+        fputs("\x1b[0m\n", stdout);
+        fflush(stdout);
     }
     if (!seen_tool_call) {
         while (print_pos < buf_len) {
@@ -1340,27 +1442,53 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     }
     enc[ep] = '\0';
 
-    size_t out_cap = ep + 512;
+    /* JSON-encode reasoning so the agent layer can read it back. Same
+     * escape rules as content. We keep them in separate fields so the
+     * agent's tool-call extractor never scans reasoning text. */
+    size_t renc_cap = reason_len * 2 + 256;
+    char *renc = (char *)malloc(renc_cap);
+    size_t rep = 0;
+    for (size_t i = 0; i < reason_len && rep < renc_cap - 8; i++) {
+        char c = reasoning[i];
+        switch (c) {
+            case '"':  renc[rep++] = '\\'; renc[rep++] = '"'; break;
+            case '\\': renc[rep++] = '\\'; renc[rep++] = '\\'; break;
+            case '\n': renc[rep++] = '\\'; renc[rep++] = 'n'; break;
+            case '\r': renc[rep++] = '\\'; renc[rep++] = 'r'; break;
+            case '\t': renc[rep++] = '\\'; renc[rep++] = 't'; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    rep += snprintf(renc + rep, renc_cap - rep, "\\u%04x", (unsigned char)c);
+                } else {
+                    renc[rep++] = c;
+                }
+        }
+    }
+    renc[rep] = '\0';
+
+    size_t out_cap = ep + rep + 512;
     char *out = (char *)malloc(out_cap);
     /* Include the usage block so sw callers can read real token counts
      * from the server. Missing values (no usage chunk seen) are omitted
      * rather than sent as 0 to distinguish "unknown" from "zero". */
     if (prompt_tokens >= 0) {
         snprintf(out, out_cap,
-            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\"}}],"
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"}}],"
             "\"usage\":{\"prompt_tokens\":%lld,\"completion_tokens\":%lld,\"total_tokens\":%lld}}",
-            enc,
+            enc, renc,
             prompt_tokens,
             completion_tokens >= 0 ? completion_tokens : 0,
             total_tokens >= 0 ? total_tokens : prompt_tokens + (completion_tokens >= 0 ? completion_tokens : 0));
     } else {
         snprintf(out, out_cap,
-            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\"}}]}",
-            enc);
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"}}]}",
+            enc, renc);
     }
 
     sw_val_t *result = sw_val_string(out);
     free(enc);
+    free(renc);
+    free(reasoning);
     free(out);
     free(buffer);
     return result;
@@ -1992,6 +2120,47 @@ static void _json_skip_ws(const char **pp) {
     while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
 }
 
+/* Parse exactly four hex digits at *pp into a 16-bit codepoint.
+ * Advances *pp past the digits. Returns -1 on bad input.
+ * Does NOT consume a leading 'u' — caller positions after it. */
+static int _json_parse_hex4(const char **pp) {
+    int cp = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = **pp;
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = 10 + c - 'a';
+        else if (c >= 'A' && c <= 'F') d = 10 + c - 'A';
+        else return -1;
+        cp = (cp << 4) | d;
+        (*pp)++;
+    }
+    return cp;
+}
+
+/* UTF-8 encode a 21-bit codepoint into buf. Returns bytes written (1-4). */
+static int _utf8_encode(unsigned int cp, char *buf) {
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    } else {
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
 static sw_val_t *_json_parse_string(const char **pp) {
     (*pp)++; /* skip opening " */
     size_t cap = 4096;
@@ -2001,16 +2170,63 @@ static sw_val_t *_json_parse_string(const char **pp) {
         if (**pp == '\\') {
             (*pp)++;
             switch (**pp) {
-                case '"': case '\\': case '/': buf[len++] = **pp; break;
-                case 'n': buf[len++] = '\n'; break;
-                case 'r': buf[len++] = '\r'; break;
-                case 't': buf[len++] = '\t'; break;
-                default: buf[len++] = **pp; break;
+                case '"': case '\\': case '/': buf[len++] = **pp; (*pp)++; break;
+                case 'n': buf[len++] = '\n'; (*pp)++; break;
+                case 'r': buf[len++] = '\r'; (*pp)++; break;
+                case 't': buf[len++] = '\t'; (*pp)++; break;
+                case 'b': buf[len++] = '\b'; (*pp)++; break;
+                case 'f': buf[len++] = '\f'; (*pp)++; break;
+                case 'u': {
+                    /* \uXXXX — parse 4 hex digits to a BMP codepoint.
+                     * Handle surrogate pairs (\uD800-\uDBFF followed by
+                     * \uDC00-\uDFFF) so emoji/CJK supplementary chars
+                     * decode correctly. Otherwise UTF-8 encode the BMP
+                     * codepoint as 1-3 bytes. The shell-special chars
+                     * the model JSON-escapes most often (& = &,
+                     * > = >, < = <) all fall in 1-byte ASCII
+                     * range, which fixes the bash-tool composition bug. */
+                    (*pp)++; /* skip 'u' */
+                    int cp = _json_parse_hex4(pp);
+                    if (cp < 0) {
+                        /* Malformed escape — emit literal 'u' so we
+                         * don't lose data. The hex parser left *pp
+                         * wherever the bad char was. */
+                        buf[len++] = 'u';
+                        break;
+                    }
+                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                        (*pp)[0] == '\\' && (*pp)[1] == 'u') {
+                        /* High surrogate followed by \uXXXX — try to
+                         * combine into a 21-bit code point. */
+                        const char *save = *pp;
+                        (*pp) += 2; /* skip "\u" */
+                        int low = _json_parse_hex4(pp);
+                        if (low >= 0xDC00 && low <= 0xDFFF) {
+                            unsigned int full = 0x10000 +
+                                (((unsigned int)(cp - 0xD800)) << 10) +
+                                (unsigned int)(low - 0xDC00);
+                            if (len + 4 >= cap - 1) {
+                                cap *= 2; buf = (char *)realloc(buf, cap);
+                            }
+                            len += _utf8_encode(full, buf + len);
+                            break;
+                        }
+                        /* Not a valid pair — rewind and treat the
+                         * high surrogate as a standalone codepoint. */
+                        *pp = save;
+                    }
+                    if (len + 4 >= cap - 1) {
+                        cap *= 2; buf = (char *)realloc(buf, cap);
+                    }
+                    len += _utf8_encode((unsigned int)cp, buf + len);
+                    break;
+                }
+                default: buf[len++] = **pp; (*pp)++; break;
             }
         } else {
             buf[len++] = **pp;
+            (*pp)++;
         }
-        (*pp)++;
         if (len >= cap - 1) { cap *= 2; buf = (char *)realloc(buf, cap); }
     }
     if (**pp == '"') (*pp)++;
@@ -2343,10 +2559,19 @@ static sw_val_t *_builtin_parse_gemma_calls(sw_val_t **a, int n) {
 
     const char *p = s;
     while ((p = strstr(p, "call:")) != NULL) {
-        /* Ensure call: is at start of string or preceded by newline/space */
-        if (p != s && *(p - 1) != '\n' && *(p - 1) != ' ' && *(p - 1) != '\t') {
-            p += 5;
-            continue;
+        /* Ensure call: is at a token boundary. Accept whitespace OR
+         * sentence-ending punctuation as the preceding char so models
+         * that emit "...broadly.call:bash{...}" (GLM-5.1) parse the
+         * same as ones that emit "...\ncall:bash{...}" (Gemma).
+         * The exclusion is alphanumeric + underscore — i.e. don't
+         * match identifiers like `http_call:` or `myCall:`. */
+        if (p != s) {
+            char prev = *(p - 1);
+            int is_word = (prev >= 'a' && prev <= 'z') ||
+                          (prev >= 'A' && prev <= 'Z') ||
+                          (prev >= '0' && prev <= '9') ||
+                          prev == '_';
+            if (is_word) { p += 5; continue; }
         }
         p += 5; /* skip "call:" */
 
