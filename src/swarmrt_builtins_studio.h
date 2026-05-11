@@ -1630,19 +1630,21 @@ static sw_val_t *_builtin_node_peers(sw_val_t **a, int n) {
 }
 
 /* Forward declare JSON encoder (defined in Phase 13 section below) */
-static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos);
+static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos);
 
 /* node_send(node_name, reg_name, msg) → 'ok' | 'error'
- * Serializes msg sw_val_t to JSON and sends via sw_node_send. */
+ * Serializes msg sw_val_t to JSON and sends via sw_node_send. The
+ * encode buffer grows automatically — large messages no longer
+ * silently truncate at 256KB. */
 static sw_val_t *_builtin_node_send(sw_val_t **a, int n) {
     if (n < 3) return sw_val_atom("error");
     if (a[0]->type != SW_VAL_STRING || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
     /* Serialize sw_val_t to JSON for cross-node transport */
-    size_t cap = 262144;
+    size_t cap = 65536;            /* initial guess; grows as needed */
     char *buf = (char *)malloc(cap);
     size_t pos = 0;
-    _json_encode_val(a[2], buf, cap, &pos);
+    _json_encode_val(a[2], &buf, &cap, &pos);
     buf[pos] = 0;
     int ok = sw_node_send(a[0]->v.str, a[1]->v.str, SW_TAG_NONE,
                           buf, (uint32_t)(pos + 1));
@@ -2022,14 +2024,33 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
 
 /* === JSON encode: sw_val_t → JSON string === */
 
-static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos);
+static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos);
 
-static void _json_append(char *buf, size_t cap, size_t *pos, const char *s) {
-    size_t len = strlen(s);
-    if (*pos + len < cap) { memcpy(buf + *pos, s, len); *pos += len; }
+/* Grow *buf to fit at least `need` more bytes (plus room for NUL +
+ * escape headroom). Doubles capacity until it fits. */
+static void _json_grow(char **buf, size_t *cap, size_t pos, size_t need) {
+    size_t want = pos + need + 8;
+    if (want <= *cap) return;
+    size_t new_cap = *cap;
+    while (new_cap < want) new_cap *= 2;
+    *buf = (char *)realloc(*buf, new_cap);
+    *cap = new_cap;
 }
 
-static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos) {
+static void _json_append(char **buf, size_t *cap, size_t *pos, const char *s) {
+    size_t len = strlen(s);
+    _json_grow(buf, cap, *pos, len);
+    memcpy(*buf + *pos, s, len);
+    *pos += len;
+}
+
+/* Single-byte append used by the inner string escape loop. */
+static void _json_putc(char **buf, size_t *cap, size_t *pos, char c) {
+    _json_grow(buf, cap, *pos, 1);
+    (*buf)[(*pos)++] = c;
+}
+
+static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) {
     if (!v || v->type == SW_VAL_NIL) {
         _json_append(buf, cap, pos, "null");
     } else if (v->type == SW_VAL_INT) {
@@ -2042,8 +2063,8 @@ static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos) {
         _json_append(buf, cap, pos, tmp);
     } else if (v->type == SW_VAL_STRING) {
         _json_append(buf, cap, pos, "\"");
-        /* Escape string contents */
-        for (const char *p = v->v.str; *p && *pos < cap - 6; p++) {
+        /* Escape string contents — buffer grows as needed via _json_putc. */
+        for (const char *p = v->v.str; *p; p++) {
             switch (*p) {
                 case '"':  _json_append(buf, cap, pos, "\\\""); break;
                 case '\\': _json_append(buf, cap, pos, "\\\\"); break;
@@ -2055,7 +2076,7 @@ static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos) {
                         char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
                         _json_append(buf, cap, pos, esc);
                     } else {
-                        buf[(*pos)++] = *p;
+                        _json_putc(buf, cap, pos, *p);
                     }
             }
         }
@@ -2099,13 +2120,16 @@ static void _json_encode_val(sw_val_t *v, char *buf, size_t cap, size_t *pos) {
     }
 }
 
-/* json_encode(val) → JSON string */
+/* json_encode(val) → JSON string. Buffer grows automatically — large
+ * agent histories with web_fetch results no longer silently truncate
+ * at 256KB (which produced "Invalid request: unexpected EOF" from
+ * the LLM API because the body ended mid-string). */
 static sw_val_t *_builtin_json_encode(sw_val_t **a, int n) {
     if (n < 1) return sw_val_string("null");
-    size_t cap = 262144;
+    size_t cap = 65536;            /* initial guess; grows as needed */
     char *buf = (char *)malloc(cap);
     size_t pos = 0;
-    _json_encode_val(a[0], buf, cap, &pos);
+    _json_encode_val(a[0], &buf, &cap, &pos);
     buf[pos] = 0;
     sw_val_t *r = sw_val_string(buf);
     free(buf);
