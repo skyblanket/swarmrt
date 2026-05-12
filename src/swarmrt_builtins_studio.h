@@ -505,15 +505,30 @@ static sw_val_t *_builtin_json_get(sw_val_t **a, int n) {
     }
 }
 
-/* === HTTP POST via curl with retry === */
+/* === HTTP POST via curl with retry + soft interrupt =========
+ *
+ * Forward-declared here; the body lives after _sw_popen_pid and the
+ * line-editor's _sw_rl state (which it depends on for interrupt
+ * detection). See the implementation below in this same file for the
+ * full design notes.
+ * ============================================================ */
+static sw_val_t *_builtin_http_post(sw_val_t **a, int n);
 
-static sw_val_t *_http_post_once(const char *url, sw_val_t *headers, const char *body,
-                                  char *resp_out, size_t resp_cap) {
+/* (Implementation moved below — see after _sw_popen_pid_close.) */
+#if 0
+static sw_val_t *_builtin_http_post_OBSOLETE(sw_val_t **a, int n) {
+    if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *url = a[0]->v.str, *body = a[2]->v.str;
+
+    /* Build the curl command once — reused across retry attempts. */
     size_t cmdcap = strlen(body) + strlen(url) + 4096;
     char *cmd = (char *)malloc(cmdcap);
     int off = 0;
-    off += snprintf(cmd + off, cmdcap - off, "curl -sS -X POST --connect-timeout 30 --max-time 300");
+    off += snprintf(cmd + off, cmdcap - off,
+        "curl -sS -X POST --connect-timeout 30 --max-time 300");
 
+    sw_val_t *headers = a[1];
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
             sw_val_t *h = headers->v.tuple.items[i];
@@ -524,58 +539,129 @@ static sw_val_t *_http_post_once(const char *url, sw_val_t *headers, const char 
         }
     }
 
-    char tmpf[256], outf[256];
-    snprintf(tmpf, sizeof(tmpf), "%s/sw_http_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
-    snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    /* Body via temp file — keeps curl arg list small and avoids
+     * shell-escaping the JSON. */
+    char tmpf[256];
+    snprintf(tmpf, sizeof(tmpf),
+        "%s/sw_http_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
     FILE *tf = fopen(tmpf, "w");
     if (tf) { fputs(body, tf); fclose(tf); }
-    off += snprintf(cmd + off, cmdcap - off, " -d @%s '%s' -o %s 2>/dev/null", tmpf, url, outf);
 
-    int status = system(cmd);
-    free(cmd);
-    swbs_unlink(tmpf);
+    /* No -o flag — let curl write to its pipe to us. We grow the
+     * response buffer as bytes arrive. */
+    off += snprintf(cmd + off, cmdcap - off,
+        " -d @%s '%s' 2>/dev/null", tmpf, url);
 
-    size_t rlen = 0;
-    resp_out[0] = 0;
-    FILE *fp = fopen(outf, "r");
-    if (fp) {
-        rlen = fread(resp_out, 1, resp_cap - 1, fp);
-        resp_out[rlen] = 0;
-        fclose(fp);
-    }
-    swbs_unlink(outf);
+    /* Stdin interrupt watcher — only enabled when stdin is a TTY AND
+     * the line editor has set up raw mode (so ESC arrives as a single
+     * byte without waiting for newline). swarm-code's reader process
+     * triggers _sw_rl_setup on first read_line; from that point on
+     * the terminal stays in raw mode for the rest of the session. */
+    int stdin_fd = -1;
+    if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) stdin_fd = STDIN_FILENO;
 
-    return NULL; /* just use rlen via resp_out */
-}
+    int interrupted = 0;
+    char *resp_buf = NULL;
+    size_t resp_len = 0;
+    size_t resp_cap_local = 65536;
 
-static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
-    if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
-        return sw_val_nil();
-    const char *url = a[0]->v.str, *body = a[2]->v.str;
-    size_t rcap = 524288;
-    char *resp = (char *)malloc(rcap);
-
-    /* Retry up to 3 times with exponential backoff */
     int delays[] = {0, 5, 15};
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (delays[attempt] > 0)
-            sw_sleep(delays[attempt]);
-        _http_post_once(url, a[1], body, resp, rcap);
-        size_t rlen = strlen(resp);
-        /* Check for server error or empty response */
-        if (rlen > 0 && strstr(resp, "Internal Server Error") == NULL &&
-            strstr(resp, "\"error\"") == NULL) {
-            sw_val_t *r = sw_val_string(resp);
-            free(resp);
-            return r;
+    for (int attempt = 0; attempt < 3 && !interrupted; attempt++) {
+        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+
+        if (resp_buf) free(resp_buf);
+        resp_buf = (char *)malloc(resp_cap_local);
+        resp_len = 0;
+        resp_buf[0] = 0;
+
+        _sw_popen_pid_t ch = _sw_popen_pid(cmd);
+        if (!ch.fp) continue;
+        int pipe_fd = fileno(ch.fp);
+        int fl = fcntl(pipe_fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(pipe_fd, F_SETFL, fl | O_NONBLOCK);
+
+        char readbuf[4096];
+        int done = 0;
+        while (!done) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(pipe_fd, &rfds);
+            if (stdin_fd >= 0) FD_SET(stdin_fd, &rfds);
+            int max_fd = pipe_fd;
+            if (stdin_fd > max_fd) max_fd = stdin_fd;
+
+            /* 1-second tick so we periodically wake up and could check
+             * additional state in the future (e.g. a sw-side interrupt
+             * flag). For now select blocks until pipe or stdin fires. */
+            struct timeval tv = {1, 0};
+            int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                done = 1;
+                break;
+            }
+
+            if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
+                unsigned char ib;
+                ssize_t nb = read(stdin_fd, &ib, 1);
+                if (nb == 1 && (ib == 0x1b || ib == 0x03)) {
+                    interrupted = 1;
+                    fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
+                    fflush(stdout);
+                    _sw_pkill_close(ch);
+                    ch.fp = NULL; ch.pid = -1;
+                    done = 1;
+                    break;
+                }
+                /* Other keystrokes during the wait: ignore. */
+            }
+
+            if (FD_ISSET(pipe_fd, &rfds)) {
+                ssize_t rn = read(pipe_fd, readbuf, sizeof(readbuf));
+                if (rn < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                    done = 1; break;
+                }
+                if (rn == 0) { done = 1; break; }   /* EOF */
+                if (resp_len + (size_t)rn + 1 > resp_cap_local) {
+                    while (resp_len + (size_t)rn + 1 > resp_cap_local) resp_cap_local *= 2;
+                    resp_buf = (char *)realloc(resp_buf, resp_cap_local);
+                }
+                memcpy(resp_buf + resp_len, readbuf, rn);
+                resp_len += (size_t)rn;
+                resp_buf[resp_len] = 0;
+            }
         }
-        (void)0; /* retry */
+
+        if (!interrupted && ch.fp) {
+            _sw_popen_pid_close(ch);
+        }
+
+        if (interrupted) break;
+
+        /* Server error or empty body → retry. Otherwise we're done. */
+        if (resp_len > 0 &&
+            strstr(resp_buf, "Internal Server Error") == NULL &&
+            strstr(resp_buf, "\"error\"") == NULL) {
+            break;
+        }
     }
-    /* Return whatever we got after retries */
-    sw_val_t *r = sw_val_string(resp);
-    free(resp);
+
+    swbs_unlink(tmpf);
+    free(cmd);
+
+    if (interrupted) {
+        free(resp_buf);
+        /* Sentinel string the sw caller checks for. Picked to be
+         * impossible to confuse with a real API response. */
+        return sw_val_string("__INTERRUPTED__");
+    }
+
+    sw_val_t *r = sw_val_string(resp_buf);
+    free(resp_buf);
     return r;
 }
+#endif /* obsolete http_post body wrapped above */
 
 /* ============================================================
  * Line editor state — forward declared here so http_post_stream
@@ -678,6 +764,161 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
     if (p.fp) fclose(p.fp);
     return 0;
 #endif
+}
+
+/* ============================================================
+ * http_post — popen+select implementation with soft interrupt
+ * ============================================================
+ *
+ * Refactored from a blocking system() call. Same retry semantics,
+ * same response shape as before — but the user can hit ESC (or
+ * Ctrl-C in raw-mode terminals) to abort an in-flight request.
+ * On interrupt, the curl child is SIGTERM'd via killpg, the partial
+ * response is discarded, and we return the sentinel string
+ * "__INTERRUPTED__" so the sw caller can show a "stopped" notice
+ * and skip retry / return to the prompt.
+ *
+ * Why this lives here (not next to the forward decl above): the
+ * popen+select machinery and the line-editor raw-mode flag are
+ * defined just above this section, so the implementation can only
+ * follow them in source order.
+ * ============================================================ */
+static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
+    if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *url = a[0]->v.str, *body = a[2]->v.str;
+
+    /* Build the curl command once — reused across retry attempts. */
+    size_t cmdcap = strlen(body) + strlen(url) + 4096;
+    char *cmd = (char *)malloc(cmdcap);
+    int off = 0;
+    off += snprintf(cmd + off, cmdcap - off,
+        "curl -sS -X POST --connect-timeout 30 --max-time 300");
+
+    sw_val_t *headers = a[1];
+    if (headers && headers->type == SW_VAL_LIST) {
+        for (int i = 0; i < headers->v.tuple.count; i++) {
+            sw_val_t *h = headers->v.tuple.items[i];
+            if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
+                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
+                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
+                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
+        }
+    }
+
+    /* Body via temp file — keeps curl arg list small and avoids
+     * shell-escaping the JSON. */
+    char tmpf[256];
+    snprintf(tmpf, sizeof(tmpf),
+        "%s/sw_http_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    FILE *tf = fopen(tmpf, "w");
+    if (tf) { fputs(body, tf); fclose(tf); }
+
+    /* No -o flag — let curl write to its pipe to us so we can stream
+     * into a growable buffer (and bail mid-flight on interrupt). */
+    off += snprintf(cmd + off, cmdcap - off,
+        " -d @%s '%s' 2>/dev/null", tmpf, url);
+
+    /* Stdin interrupt watcher — only enabled when stdin is a TTY AND
+     * the line editor has set up raw mode (so ESC arrives as a single
+     * byte without waiting for newline). swarm-code's reader process
+     * triggers _sw_rl_setup on first read_line; from that point on
+     * the terminal stays in raw mode for the rest of the session. */
+    int stdin_fd = -1;
+    if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) stdin_fd = STDIN_FILENO;
+
+    int interrupted = 0;
+    char *resp_buf = NULL;
+    size_t resp_len = 0;
+    size_t resp_cap_local = 65536;
+
+    int delays[] = {0, 5, 15};
+    for (int attempt = 0; attempt < 3 && !interrupted; attempt++) {
+        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+
+        if (resp_buf) free(resp_buf);
+        resp_buf = (char *)malloc(resp_cap_local);
+        resp_len = 0;
+        resp_buf[0] = 0;
+
+        _sw_popen_pid_t ch = _sw_popen_pid(cmd);
+        if (!ch.fp) continue;
+        int pipe_fd = fileno(ch.fp);
+        int fl = fcntl(pipe_fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(pipe_fd, F_SETFL, fl | O_NONBLOCK);
+
+        char readbuf[4096];
+        int done = 0;
+        while (!done) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(pipe_fd, &rfds);
+            if (stdin_fd >= 0) FD_SET(stdin_fd, &rfds);
+            int max_fd = pipe_fd;
+            if (stdin_fd > max_fd) max_fd = stdin_fd;
+
+            /* 1-second tick — just keeps select from blocking forever
+             * if both fds go quiet. Could be longer; 1s is fine. */
+            struct timeval tv = {1, 0};
+            int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                done = 1; break;
+            }
+
+            if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
+                unsigned char ib;
+                ssize_t nb = read(stdin_fd, &ib, 1);
+                if (nb == 1 && (ib == 0x1b || ib == 0x03)) {
+                    interrupted = 1;
+                    fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
+                    fflush(stdout);
+                    _sw_pkill_close(ch);
+                    ch.fp = NULL; ch.pid = -1;
+                    done = 1; break;
+                }
+                /* Other keystrokes during the wait: ignore. */
+            }
+
+            if (FD_ISSET(pipe_fd, &rfds)) {
+                ssize_t rn = read(pipe_fd, readbuf, sizeof(readbuf));
+                if (rn < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                    done = 1; break;
+                }
+                if (rn == 0) { done = 1; break; }   /* EOF */
+                if (resp_len + (size_t)rn + 1 > resp_cap_local) {
+                    while (resp_len + (size_t)rn + 1 > resp_cap_local) resp_cap_local *= 2;
+                    resp_buf = (char *)realloc(resp_buf, resp_cap_local);
+                }
+                memcpy(resp_buf + resp_len, readbuf, rn);
+                resp_len += (size_t)rn;
+                resp_buf[resp_len] = 0;
+            }
+        }
+
+        if (!interrupted && ch.fp) _sw_popen_pid_close(ch);
+        if (interrupted) break;
+
+        /* Server error or empty body → retry. Otherwise we're done. */
+        if (resp_len > 0 &&
+            strstr(resp_buf, "Internal Server Error") == NULL &&
+            strstr(resp_buf, "\"error\"") == NULL) {
+            break;
+        }
+    }
+
+    swbs_unlink(tmpf);
+    free(cmd);
+
+    if (interrupted) {
+        free(resp_buf);
+        return sw_val_string("__INTERRUPTED__");
+    }
+
+    sw_val_t *r = sw_val_string(resp_buf);
+    free(resp_buf);
+    return r;
 }
 
 /* ============================================================
