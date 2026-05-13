@@ -4418,4 +4418,462 @@ static sw_val_t *_builtin_sys_exit(sw_val_t **a, int n) {
     return sw_val_nil(); /* unreachable */
 }
 
+/* ============================================================
+ * WebSocket CLIENT — for talking to chrome's CDP (and anything else
+ *                     that speaks RFC 6455)
+ * ============================================================
+ *
+ * The existing ws_send / ws_close / ws_set_handler builtins above
+ * are SERVER-side (they operate on connections accepted by the HTTP
+ * server). What we need for CDP is the inverse — a client that does
+ * the RFC 6455 handshake against a remote server, sends/receives
+ * masked text frames, and gets us a JSON-over-WS pipe to chrome.
+ *
+ * Builtins exposed:
+ *   wsc_connect(ws_url)          → int handle, or nil
+ *   wsc_send(handle, text)       → 'ok' | 'error'
+ *   wsc_recv(handle, timeout_ms) → string | nil
+ *   wsc_close(handle)            → 'ok'
+ *
+ * The handle is a small integer index into a fixed pool — ample for
+ * a single browser session (one WS per page target). No
+ * Sec-WebSocket-Accept validation in v1: we just accept any 101.
+ * Chrome plays well; tighten later if we point this at adversarial
+ * servers. */
+
+#include <netdb.h>
+
+#define _SW_WSC_MAX 16
+
+typedef struct {
+    int fd;
+    int used;
+} _sw_wsc_slot_t;
+static _sw_wsc_slot_t _sw_wsc[_SW_WSC_MAX] = {0};
+
+static int _sw_wsc_alloc_slot(int fd) {
+    for (int i = 0; i < _SW_WSC_MAX; i++) {
+        if (!_sw_wsc[i].used) {
+            _sw_wsc[i].fd = fd;
+            _sw_wsc[i].used = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void _sw_wsc_free_slot(int handle) {
+    if (handle >= 0 && handle < _SW_WSC_MAX) {
+        _sw_wsc[handle].used = 0;
+        _sw_wsc[handle].fd = -1;
+    }
+}
+
+/* Local base64 encoder — swarmrt_http.c has its own but it's static.
+ * Inlined here so we don't have to relax that file's encapsulation
+ * for one caller. Standard table; output is null-terminated. */
+static void _sw_b64_encode(const uint8_t *in, int len, char *out) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i, j = 0;
+    for (i = 0; i + 2 < len; i += 3) {
+        out[j++] = tbl[(in[i] >> 2) & 0x3f];
+        out[j++] = tbl[((in[i] & 0x03) << 4) | ((in[i+1] >> 4) & 0x0f)];
+        out[j++] = tbl[((in[i+1] & 0x0f) << 2) | ((in[i+2] >> 6) & 0x03)];
+        out[j++] = tbl[in[i+2] & 0x3f];
+    }
+    if (i < len) {
+        out[j++] = tbl[(in[i] >> 2) & 0x3f];
+        if (i + 1 < len) {
+            out[j++] = tbl[((in[i] & 0x03) << 4) | ((in[i+1] >> 4) & 0x0f)];
+            out[j++] = tbl[(in[i+1] & 0x0f) << 2];
+        } else {
+            out[j++] = tbl[(in[i] & 0x03) << 4];
+            out[j++] = '=';
+        }
+        out[j++] = '=';
+    }
+    out[j] = 0;
+}
+
+/* Send exactly `len` bytes; loops until done or error. */
+static int _sw_wsc_send_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, p + off, len - off, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* Recv exactly `len` bytes (blocking). */
+static int _sw_wsc_recv_all(int fd, void *buf, size_t len) {
+    char *p = (char *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = recv(fd, p + off, len - off, 0);
+        if (n == 0) return -1;       /* peer closed */
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* wsc_connect(url) — parse ws://host[:port][/path], TCP connect, do
+ * the upgrade handshake, store fd in our slot pool. */
+static sw_val_t *_builtin_wsc_connect(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *url = a[0]->v.str;
+    if (strncmp(url, "ws://", 5) != 0) return sw_val_nil();
+    const char *p = url + 5;
+
+    char host[256] = {0};
+    int port = 80;
+    char path[2048] = "/";
+
+    /* Find host[:port] up to first / */
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    const char *host_end = slash ? slash : (p + strlen(p));
+    if (colon && colon < host_end) {
+        size_t hl = (size_t)(colon - p);
+        if (hl >= sizeof(host)) return sw_val_nil();
+        memcpy(host, p, hl); host[hl] = 0;
+        port = atoi(colon + 1);
+    } else {
+        size_t hl = (size_t)(host_end - p);
+        if (hl >= sizeof(host)) return sw_val_nil();
+        memcpy(host, p, hl); host[hl] = 0;
+    }
+    if (slash) snprintf(path, sizeof(path), "%s", slash);
+
+    /* Resolve + connect TCP. */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return sw_val_nil();
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return sw_val_nil(); }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        close(fd); freeaddrinfo(res); return sw_val_nil();
+    }
+    freeaddrinfo(res);
+
+    /* Generate 16 random bytes → base64 = Sec-WebSocket-Key. */
+    uint8_t key_raw[16];
+    for (int i = 0; i < 16; i++) key_raw[i] = (uint8_t)(rand() & 0xff);
+    char key_b64[32] = {0};
+    _sw_b64_encode(key_raw, 16, key_b64);
+
+    /* Handshake request. */
+    char req[4096];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n",
+        path, host, port, key_b64);
+    if (_sw_wsc_send_all(fd, req, (size_t)rl) < 0) { close(fd); return sw_val_nil(); }
+
+    /* Read response headers until "\r\n\r\n". 4KB cap is plenty. */
+    char resp[4096] = {0};
+    size_t rlen = 0;
+    while (rlen < sizeof(resp) - 1) {
+        ssize_t got = recv(fd, resp + rlen, sizeof(resp) - 1 - rlen, 0);
+        if (got <= 0) { close(fd); return sw_val_nil(); }
+        rlen += (size_t)got;
+        resp[rlen] = 0;
+        if (strstr(resp, "\r\n\r\n")) break;
+    }
+    if (strncmp(resp, "HTTP/1.1 101", 12) != 0) { close(fd); return sw_val_nil(); }
+
+    int handle = _sw_wsc_alloc_slot(fd);
+    if (handle < 0) { close(fd); return sw_val_nil(); }
+    return sw_val_int(handle);
+}
+
+/* wsc_send(handle, text) — text frame, masked (clients MUST mask). */
+static sw_val_t *_builtin_wsc_send(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || !a[1]) return sw_val_atom("error");
+    if (a[0]->type != SW_VAL_INT || a[1]->type != SW_VAL_STRING) return sw_val_atom("error");
+    int handle = (int)a[0]->v.i;
+    if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_atom("error");
+    int fd = _sw_wsc[handle].fd;
+
+    const char *text = a[1]->v.str;
+    size_t len = strlen(text);
+
+    uint8_t hdr[14];
+    int hlen = 0;
+    hdr[hlen++] = 0x81;  /* FIN + opcode=text */
+    if (len < 126) {
+        hdr[hlen++] = 0x80 | (uint8_t)len;
+    } else if (len < 65536) {
+        hdr[hlen++] = 0x80 | 126;
+        hdr[hlen++] = (uint8_t)(len >> 8);
+        hdr[hlen++] = (uint8_t)(len & 0xff);
+    } else {
+        hdr[hlen++] = 0x80 | 127;
+        for (int i = 7; i >= 0; i--) hdr[hlen++] = (uint8_t)((uint64_t)len >> (i * 8));
+    }
+    uint8_t mask[4];
+    for (int i = 0; i < 4; i++) mask[i] = (uint8_t)(rand() & 0xff);
+    memcpy(hdr + hlen, mask, 4);
+    hlen += 4;
+    if (_sw_wsc_send_all(fd, hdr, (size_t)hlen) < 0) return sw_val_atom("error");
+
+    /* Mask payload in 4KB chunks. */
+    char chunk[4096];
+    size_t off = 0;
+    while (off < len) {
+        size_t cn = len - off;
+        if (cn > sizeof(chunk)) cn = sizeof(chunk);
+        for (size_t i = 0; i < cn; i++) chunk[i] = text[off + i] ^ mask[(off + i) & 3];
+        if (_sw_wsc_send_all(fd, chunk, cn) < 0) return sw_val_atom("error");
+        off += cn;
+    }
+    return sw_val_atom("ok");
+}
+
+/* wsc_recv(handle, timeout_ms) — receive one text frame.
+ * Returns the payload as a string, or nil on timeout / error / close.
+ * Auto-replies to ping with pong. Skips control frames except close. */
+static sw_val_t *_builtin_wsc_recv(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_nil();
+    int handle = (int)a[0]->v.i;
+    if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_nil();
+    int fd = _sw_wsc[handle].fd;
+
+    int timeout_ms = -1;  /* default: block forever */
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) timeout_ms = (int)a[1]->v.i;
+
+    /* Wait for fd to be readable. */
+    if (timeout_ms >= 0) {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
+        struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        int rv = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (rv <= 0) return sw_val_nil();
+    }
+
+    /* Read frame header: opcode/flags + payload-len byte. */
+    uint8_t hdr[2];
+    if (_sw_wsc_recv_all(fd, hdr, 2) < 0) return sw_val_nil();
+    int opcode = hdr[0] & 0x0f;
+    int masked = hdr[1] & 0x80;
+    uint64_t plen = hdr[1] & 0x7f;
+    if (plen == 126) {
+        uint8_t ext[2];
+        if (_sw_wsc_recv_all(fd, ext, 2) < 0) return sw_val_nil();
+        plen = ((uint64_t)ext[0] << 8) | ext[1];
+    } else if (plen == 127) {
+        uint8_t ext[8];
+        if (_sw_wsc_recv_all(fd, ext, 8) < 0) return sw_val_nil();
+        plen = 0;
+        for (int i = 0; i < 8; i++) plen = (plen << 8) | ext[i];
+    }
+    uint8_t mask[4] = {0};
+    if (masked) {
+        if (_sw_wsc_recv_all(fd, mask, 4) < 0) return sw_val_nil();
+    }
+    char *payload = (char *)malloc((size_t)plen + 1);
+    if (!payload) return sw_val_nil();
+    if (_sw_wsc_recv_all(fd, payload, (size_t)plen) < 0) { free(payload); return sw_val_nil(); }
+    if (masked) {
+        for (uint64_t i = 0; i < plen; i++) payload[i] ^= mask[i & 3];
+    }
+    payload[plen] = 0;
+
+    if (opcode == 0x8) {  /* close */
+        free(payload);
+        return sw_val_nil();
+    }
+    if (opcode == 0x9) {  /* ping → pong with same payload */
+        uint8_t ph[2] = {0x8a, 0x80 | (uint8_t)(plen < 126 ? plen : 0)};
+        _sw_wsc_send_all(fd, ph, 2);
+        uint8_t pmask[4] = {0,0,0,0};
+        _sw_wsc_send_all(fd, pmask, 4);
+        if (plen > 0 && plen < 126) _sw_wsc_send_all(fd, payload, (size_t)plen);
+        free(payload);
+        /* Recurse to get the next real frame. */
+        return _builtin_wsc_recv(a, n);
+    }
+    if (opcode != 0x1 && opcode != 0x0) {
+        /* Binary or unknown — return nil for v1. */
+        free(payload);
+        return sw_val_nil();
+    }
+
+    sw_val_t *r = sw_val_string(payload);
+    free(payload);
+    return r;
+}
+
+/* wsc_close(handle) — send close frame, close socket, free slot. */
+static sw_val_t *_builtin_wsc_close(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    int handle = (int)a[0]->v.i;
+    if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_atom("error");
+    int fd = _sw_wsc[handle].fd;
+    /* Best-effort close frame. */
+    uint8_t close_frame[6] = {0x88, 0x80, 0x00, 0x00, 0x00, 0x00};
+    _sw_wsc_send_all(fd, close_frame, sizeof(close_frame));
+    close(fd);
+    _sw_wsc_free_slot(handle);
+    return sw_val_atom("ok");
+}
+
+/* ============================================================
+ * chrome_launch — find a Chromium binary, spawn detached with
+ *                 --remote-debugging-port set, wait for the port
+ *                 to answer /json/version. Return the port as int
+ *                 (so caller can build URLs) or nil on failure.
+ * ============================================================
+ *
+ * Looked-for binaries (first hit wins):
+ *   macOS:  /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+ *           /Applications/Chromium.app/Contents/MacOS/Chromium
+ *           /Applications/Brave Browser.app/Contents/MacOS/Brave Browser
+ *           /Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge
+ *   Linux:  /usr/bin/google-chrome
+ *           /usr/bin/chromium  /usr/bin/chromium-browser
+ *           /snap/bin/chromium
+ *
+ * Args we always pass:
+ *   --remote-debugging-port=<port>
+ *   --user-data-dir=/tmp/swc-chrome-<port>     (isolated profile)
+ *   --no-first-run --no-default-browser-check  (no welcome modals)
+ *   --disable-dev-shm-usage --disable-gpu      (headless friendly)
+ *   --headless=new                             (unless headless='false') */
+
+static const char *_sw_chrome_candidates[] = {
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Arc.app/Contents/MacOS/Arc",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+    NULL
+};
+
+/* Held across calls so we don't re-glob Playwright's cache every time.
+ * NULL = haven't searched; "" = searched and found nothing (don't retry). */
+static char _sw_chrome_cached[1024] = {0};
+static int _sw_chrome_cache_set = 0;
+
+/* Resolve a Chromium binary. Search order:
+ *   1. SWARM_CODE_CHROME env var (explicit override, never cached)
+ *   2. Standard install paths (table above)
+ *   3. Playwright's cache at ~/Library/Caches/ms-playwright/chromium-*
+ *      (so users who've ever run `npx playwright install` get free
+ *      browser availability — no extra download)
+ *   4. Linux Playwright cache at ~/.cache/ms-playwright/chromium-*
+ * Returns a static buffer or NULL. */
+static const char *_sw_find_chrome(void) {
+    /* (1) env override always wins, no caching. */
+    const char *env = getenv("SWARM_CODE_CHROME");
+    if (env && *env && access(env, X_OK) == 0) return env;
+
+    if (_sw_chrome_cache_set) {
+        return _sw_chrome_cached[0] ? _sw_chrome_cached : NULL;
+    }
+
+    /* (2) standard install paths */
+    for (int i = 0; _sw_chrome_candidates[i]; i++) {
+        if (access(_sw_chrome_candidates[i], X_OK) == 0) {
+            snprintf(_sw_chrome_cached, sizeof(_sw_chrome_cached), "%s",
+                     _sw_chrome_candidates[i]);
+            _sw_chrome_cache_set = 1;
+            return _sw_chrome_cached;
+        }
+    }
+
+    /* (3,4) Playwright caches — glob via shell because there's a version
+     * number in the path we don't know in advance. Newest wins. */
+    const char *home = getenv("HOME");
+    if (!home) home = "";
+    char glob_cmd[2048];
+    snprintf(glob_cmd, sizeof(glob_cmd),
+        "ls -t "
+        "\"%s/Library/Caches/ms-playwright/chromium-\"*\"/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\" "
+        "\"%s/Library/Caches/ms-playwright/chromium-\"*\"/chrome-mac/Chromium.app/Contents/MacOS/Chromium\" "
+        "\"%s/.cache/ms-playwright/chromium-\"*\"/chrome-linux/chrome\" "
+        "2>/dev/null | head -n 1",
+        home, home, home);
+    FILE *p = popen(glob_cmd, "r");
+    if (p) {
+        char line[1024];
+        if (fgets(line, sizeof(line), p)) {
+            size_t l = strlen(line);
+            while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+            if (l > 0 && access(line, X_OK) == 0) {
+                snprintf(_sw_chrome_cached, sizeof(_sw_chrome_cached), "%s", line);
+                _sw_chrome_cache_set = 1;
+                pclose(p);
+                return _sw_chrome_cached;
+            }
+        }
+        pclose(p);
+    }
+
+    _sw_chrome_cache_set = 1;   /* mark as searched-and-empty */
+    return NULL;
+}
+
+/* chrome_launch(port?, headless?) — port default 9222, headless default 'true'.
+ * Returns the port as int on success, nil on failure. Idempotent: if a
+ * chrome is already listening on that port, we accept it. */
+static sw_val_t *_builtin_chrome_launch(sw_val_t **a, int n) {
+    int port = 9222;
+    int headless = 1;
+    if (n >= 1 && a[0] && a[0]->type == SW_VAL_INT) port = (int)a[0]->v.i;
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_ATOM &&
+        strcmp(a[1]->v.str, "false") == 0) headless = 0;
+
+    /* If something already answers on that port, accept it. */
+    char check[256];
+    snprintf(check, sizeof(check),
+        "curl -sf -m 1 http://127.0.0.1:%d/json/version > /dev/null 2>&1", port);
+    if (system(check) == 0) return sw_val_int(port);
+
+    const char *bin = _sw_find_chrome();
+    if (!bin) return sw_val_nil();
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "\"%s\" --remote-debugging-port=%d "
+        "--user-data-dir=/tmp/swc-chrome-%d "
+        "--no-first-run --no-default-browser-check "
+        "--disable-dev-shm-usage --disable-gpu "
+        "%s "
+        "about:blank "
+        "> /tmp/swc-chrome-%d.log 2>&1 &",
+        bin, port, port, headless ? "--headless=new" : "", port);
+
+    if (system(cmd) != 0) return sw_val_nil();
+
+    /* Poll up to 10 seconds for the debug port to come up. */
+    for (int i = 0; i < 100; i++) {
+        if (system(check) == 0) return sw_val_int(port);
+        usleep(100000);
+    }
+    return sw_val_nil();
+}
+
 #endif /* SWARMRT_BUILTINS_STUDIO_H */

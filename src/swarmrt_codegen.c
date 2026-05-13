@@ -169,6 +169,12 @@ static int is_builtin(const char *name) {
            strcmp(name, "ws_close") == 0 ||
            strcmp(name, "ws_set_handler") == 0 ||
            strcmp(name, "live_js") == 0 ||
+           /* WebSocket CLIENT (CDP / browser control) */
+           strcmp(name, "wsc_connect") == 0 ||
+           strcmp(name, "wsc_send") == 0 ||
+           strcmp(name, "wsc_recv") == 0 ||
+           strcmp(name, "wsc_close") == 0 ||
+           strcmp(name, "chrome_launch") == 0 ||
            /* Phase 15: Feature Expansion */
            strcmp(name, "query_parse") == 0 ||
            strcmp(name, "http_serve_file") == 0 ||
@@ -1117,6 +1123,12 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "ws_close") == 0 ||
              strcmp(fname, "ws_set_handler") == 0 ||
              strcmp(fname, "live_js") == 0 ||
+             /* WebSocket CLIENT (CDP / browser control) */
+             strcmp(fname, "wsc_connect") == 0 ||
+             strcmp(fname, "wsc_send") == 0 ||
+             strcmp(fname, "wsc_recv") == 0 ||
+             strcmp(fname, "wsc_close") == 0 ||
+             strcmp(fname, "chrome_launch") == 0 ||
              /* Phase 15: Feature Expansion */
              strcmp(fname, "query_parse") == 0 ||
              strcmp(fname, "http_serve_file") == 0 ||
