@@ -11,3 +11,26 @@ build_ios/
 dist/
 CMakeCache.txt
 CMakeFiles/
+
+# Compiled .sw test programs at repo root — `make test-phase*` and
+# similar leave these behind. They're build artifacts, not source.
+/atelier
+/counter_test
+/error_test*
+/ets_test
+/hello_test
+/hello_test_bin
+/import_main
+/integration_test
+/my_test
+/patent_lab
+/research_lab
+/video_studio
+/feedback_test
+/wake_test
+/lab_*
+
+# Shell artifacts occasionally left at root
+/--version/
+/2/
+

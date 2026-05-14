@@ -38,6 +38,19 @@ make swc libswarmrt
 
 ---
 
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)** | The `.sw` language reference — syntax, types, processes, builtins, gotchas. **Start here if you're writing sw code.** |
+| **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** | C runtime API — for embedding swarmrt or writing new builtins |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Internals overview — schedulers, mailboxes, GC, distribution |
+| **[docs/AGENT_SYSTEM.md](docs/AGENT_SYSTEM.md)** | Agent behaviours and patterns |
+| **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** | Spawn / message-send / context-switch numbers |
+| **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | What changed and when, with motivation |
+
+---
+
 ## The Language
 
 ```

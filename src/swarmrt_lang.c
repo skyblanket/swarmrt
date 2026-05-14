@@ -93,7 +93,9 @@ typedef enum {
     TOK_IMPORT,
     TOK_DOTDOT,    /* .. */
     TOK_BAR,       /* | (single pipe, list cons) */
-    TOK_PERCENT,   /* % */
+    TOK_PERCENT,   /* % — binary modulo */
+    TOK_MAP_OPEN,  /* %{ — map-literal start (consumed atomically by lexer
+                    *      so the parser can disambiguate from `expr % {…}`) */
 } tok_type_t;
 
 typedef struct {
@@ -243,7 +245,16 @@ static tok_t lnext(lex_t *l) {
     if (c == '&' && lpeek2(l) == '&') { ladv(l); ladv(l); t.type = TOK_AND; strcpy(t.text, "&&"); return t; }
     if (c == '|' && lpeek2(l) == '|') { ladv(l); ladv(l); t.type = TOK_OR; strcpy(t.text, "||"); return t; }
     if (c == '.' && lpeek2(l) == '.') { ladv(l); ladv(l); t.type = TOK_DOTDOT; strcpy(t.text, ".."); return t; }
-    if (c == '%' && lpeek2(l) == '{') { ladv(l); /* consume % only, { will be next */ t.type = TOK_PERCENT; strcpy(t.text, "%"); return t; }
+    /* `%{` is a distinct token from bare `%` — needed so the parser
+     * can tell map-literal start (`expr → %{...}`) from binary modulo
+     * (`expr % expr`) at statement boundaries. Without this split,
+     * `else { 0.2 } %{...}` parsed as `(else …) % {...}` since `%` is
+     * a valid binary operator. */
+    if (c == '%' && lpeek2(l) == '{') {
+        ladv(l); /* consume %; { stays for the parser */
+        t.type = TOK_MAP_OPEN; strcpy(t.text, "%{");
+        return t;
+    }
 
     /* Single-char */
     ladv(l);
@@ -719,8 +730,9 @@ static node_t *par_primary(par_t *p) {
         return iff;
     }
 
-    /* Map literal: %{key: val, ...} */
-    if (t.type == TOK_PERCENT) {
+    /* Map literal: %{key: val, ...} — emitted as TOK_MAP_OPEN by the
+     * lexer when `%{` appears as one unit. */
+    if (t.type == TOK_MAP_OPEN) {
         par_adv(p);
         par_expect(p, TOK_LBRACE, "'{'");
         node_t *m = mknode(N_MAP, t.line);
@@ -834,10 +846,14 @@ static node_t *par_primary(par_t *p) {
     return mknode(N_ATOM, t.line); /* dummy */
 }
 
-/* Multiplicative */
+/* Multiplicative — *, /, and % (modulo). par_primary already consumed
+ * any `%{...}` map-literal at expression start, so seeing TOK_PERCENT
+ * here always means binary modulo. */
 static node_t *par_mul(par_t *p) {
     node_t *left = par_primary(p);
-    while (p->cur.type == TOK_STAR || p->cur.type == TOK_SLASH) {
+    while (p->cur.type == TOK_STAR ||
+           p->cur.type == TOK_SLASH ||
+           p->cur.type == TOK_PERCENT) {
         tok_t op = par_adv(p);
         node_t *n = mknode(N_BINOP, op.line);
         n->v.binop.left = left;

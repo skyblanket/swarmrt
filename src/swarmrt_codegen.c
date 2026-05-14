@@ -175,6 +175,10 @@ static int is_builtin(const char *name) {
            strcmp(name, "wsc_recv") == 0 ||
            strcmp(name, "wsc_close") == 0 ||
            strcmp(name, "chrome_launch") == 0 ||
+           /* String + base64 helpers (2026-05-15) */
+           strcmp(name, "string_index_of") == 0 ||
+           strcmp(name, "base64_encode") == 0 ||
+           strcmp(name, "base64_decode") == 0 ||
            /* Phase 15: Feature Expansion */
            strcmp(name, "query_parse") == 0 ||
            strcmp(name, "http_serve_file") == 0 ||
@@ -554,6 +558,19 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    double fa = a->type == SW_VAL_INT ? (double)a->v.i : a->v.f;\n"
         "    double fb = b->type == SW_VAL_INT ? (double)b->v.i : b->v.f;\n"
         "    return fb != 0.0 ? sw_val_float(fa / fb) : sw_val_nil();\n"
+        "}\n\n");
+
+    /* Modulo (`%`). Integer-only; nil on divide-by-zero. Floats fall
+     * back to fmod via cast — float modulo is rare in agent code but
+     * supported so `n % d` doesn't surprise. */
+    fprintf(f,
+        "#include <math.h>\n"
+        "static sw_val_t *_op_mod(sw_val_t *a, sw_val_t *b) {\n"
+        "    if (a->type == SW_VAL_INT && b->type == SW_VAL_INT)\n"
+        "        return b->v.i ? sw_val_int(a->v.i %% b->v.i) : sw_val_nil();\n"
+        "    double fa = a->type == SW_VAL_INT ? (double)a->v.i : a->v.f;\n"
+        "    double fb = b->type == SW_VAL_INT ? (double)b->v.i : b->v.f;\n"
+        "    return fb != 0.0 ? sw_val_float(fmod(fa, fb)) : sw_val_nil();\n"
         "}\n\n");
 
     fprintf(f,
@@ -987,6 +1004,8 @@ static void emit_binop(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         fprintf(f, "    sw_val_t *%s = _op_mul(%s, %s);\n", res, left, right);
     else if (strcmp(op, "/") == 0)
         fprintf(f, "    sw_val_t *%s = _op_div(%s, %s);\n", res, left, right);
+    else if (strcmp(op, "%") == 0)
+        fprintf(f, "    sw_val_t *%s = _op_mod(%s, %s);\n", res, left, right);
     else if (strcmp(op, "++") == 0)
         fprintf(f, "    sw_val_t *%s = _op_concat(%s, %s);\n", res, left, right);
     else if (strcmp(op, "&&") == 0)
@@ -1129,6 +1148,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "wsc_recv") == 0 ||
              strcmp(fname, "wsc_close") == 0 ||
              strcmp(fname, "chrome_launch") == 0 ||
+             /* String + base64 helpers */
+             strcmp(fname, "string_index_of") == 0 ||
+             strcmp(fname, "base64_encode") == 0 ||
+             strcmp(fname, "base64_decode") == 0 ||
              /* Phase 15: Feature Expansion */
              strcmp(fname, "query_parse") == 0 ||
              strcmp(fname, "http_serve_file") == 0 ||
@@ -1314,19 +1337,31 @@ static void emit_if(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
     fprintf(f, "    if (sw_val_is_truthy(%s)) {\n", cond);
 
+    /* Snapshot declared-variable count so anything declared inside
+     * the then-branch is forgotten when we exit it. Without this,
+     * a name reused in the else-branch (or any later sibling block)
+     * is emitted as a re-assignment instead of a fresh declaration —
+     * but C scope rules don't carry the first declaration across
+     * sibling braces, so the second use becomes "undeclared
+     * identifier 'X'" at the C compile step. Restoring ndeclared on
+     * scope exit fixes the canonical "rename _w / _h" footgun. */
+    int saved_then = ctx->ndeclared;
     char then_res[32];
     emit_expr(ctx, n->v.iff.then_b, tail, then_res, sizeof(then_res));
     if (then_res[0])
         fprintf(f, "        %s = %s;\n", res, then_res);
     fprintf(f, "    }");
+    ctx->ndeclared = saved_then;
 
     if (n->v.iff.else_b) {
         fprintf(f, " else {\n");
+        int saved_else = ctx->ndeclared;
         char else_res[32];
         emit_expr(ctx, n->v.iff.else_b, tail, else_res, sizeof(else_res));
         if (else_res[0])
             fprintf(f, "        %s = %s;\n", res, else_res);
         fprintf(f, "    }");
+        ctx->ndeclared = saved_else;
     }
     fprintf(f, "\n");
     strncpy(out, res, osz - 1);
@@ -1681,6 +1716,22 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
  * Function emission
  * ========================================================================= */
 
+/* Map a module name to its likely source path. Convention: most
+ * modules live at src/<ModName>.sw (case preserved), with the
+ * exception of `Main` → `src/main.sw` (lowercase). swc.c uses the
+ * same fallback when resolving imports. Returned in a static buffer
+ * — caller copies if needed. */
+static const char *guess_sw_path(const char *mod_name) {
+    static char path[256];
+    /* Special-case Main → main.sw (legacy convention). */
+    if (strcmp(mod_name, "Main") == 0) {
+        snprintf(path, sizeof(path), "src/main.sw");
+    } else {
+        snprintf(path, sizeof(path), "src/%s.sw", mod_name);
+    }
+    return path;
+}
+
 static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     FILE *f = ctx->out;
 
@@ -1691,6 +1742,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         strncpy(ctx->cur_params[i], fn->v.fun.params[i], 127);
     ctx->ndeclared = 0;
     ctx->has_tail = has_tail_calls(ctx, fn->v.fun.body);
+
+    /* Emit a #line directive so any C compiler error inside this
+     * function points back to the .sw source instead of the
+     * generated /tmp/swc_*.c file. Pure UX: enables editors to
+     * jump to the right sw line on compile failure. */
+    if (fn->line > 0) {
+        fprintf(f, "#line %d \"%s\"\n", fn->line, guess_sw_path(ctx->mod_name));
+    }
 
     fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
             ctx->mod_name, fn->v.fun.name);

@@ -2056,24 +2056,24 @@ static sw_val_t *_builtin_error(sw_val_t **a, int n) {
 
 /* === HTTP GET with retry === */
 
+/* http_get — read full response into a growing buffer (no silent
+ * truncation at 512KB anymore). Streams from the temp file in 64KB
+ * chunks, doubling the response buffer as needed. */
 static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
     const char *url = a[0]->v.str;
-    size_t rcap = 524288;
-    char *resp = (char *)malloc(rcap);
 
     size_t cmdcap = strlen(url) + 4096;
     char *cmd = (char *)malloc(cmdcap);
-
     char outf[256];
-    snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
 
     int off = 0;
     off += snprintf(cmd + off, cmdcap - off,
         "curl -sS --connect-timeout 30 --max-time 120");
 
-    /* Optional headers (second arg) */
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) {
         for (int i = 0; i < a[1]->v.tuple.count; i++) {
             sw_val_t *h = a[1]->v.tuple.items[i];
@@ -2085,21 +2085,35 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     }
     off += snprintf(cmd + off, cmdcap - off, " '%s' -o %s 2>/dev/null", url, outf);
 
+    char *resp = NULL;
+    size_t resp_len = 0;
     int delays[] = {0, 3, 10};
     for (int attempt = 0; attempt < 3; attempt++) {
         if (delays[attempt] > 0) sw_sleep(delays[attempt]);
         system(cmd);
-        resp[0] = 0;
         FILE *fp = fopen(outf, "r");
-        if (fp) {
-            size_t rlen = fread(resp, 1, rcap - 1, fp);
-            resp[rlen] = 0;
-            fclose(fp);
-            if (rlen > 0) { swbs_unlink(outf); break; }
+        if (!fp) continue;
+        size_t cap = 65536;
+        if (resp) free(resp);
+        resp = (char *)malloc(cap);
+        resp_len = 0;
+        char chunk[8192];
+        size_t rd;
+        while ((rd = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+            if (resp_len + rd + 1 > cap) {
+                while (resp_len + rd + 1 > cap) cap *= 2;
+                resp = (char *)realloc(resp, cap);
+            }
+            memcpy(resp + resp_len, chunk, rd);
+            resp_len += rd;
         }
+        resp[resp_len] = 0;
+        fclose(fp);
+        if (resp_len > 0) { swbs_unlink(outf); break; }
     }
     swbs_unlink(outf);
     free(cmd);
+    if (!resp) return sw_val_string("");
     sw_val_t *r = sw_val_string(resp);
     free(resp);
     return r;
@@ -2216,7 +2230,9 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
      * Binary output (gzipped pages, encrypted files, images) poisons
      * the model's context and causes empty responses.  We keep only
      * printable ASCII (0x20-0x7E) plus \t \n \r.  If the result is
-     * entirely binary (sanitized length is 0), return a placeholder. */
+     * entirely binary (sanitized length is 0), return a placeholder.
+     * Buffer grows from 64KB on demand — long pages or large shell
+     * outputs no longer truncate at the cap. */
     size_t cap = 65536, raw_len = 0;
     char *raw = (char *)malloc(cap);
     if (!raw) { swbs_unlink(outf); return sw_val_nil(); }
@@ -2224,9 +2240,14 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
 
     FILE *fp = fopen(outf, "r");
     if (fp) {
-        while (raw_len < cap - 1) {
-            size_t rd = fread(raw + raw_len, 1, cap - raw_len - 1, fp);
-            if (rd == 0) break;
+        char chunk[8192];
+        size_t rd;
+        while ((rd = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+            if (raw_len + rd + 1 > cap) {
+                while (raw_len + rd + 1 > cap) cap *= 2;
+                raw = (char *)realloc(raw, cap);
+            }
+            memcpy(raw + raw_len, chunk, rd);
             raw_len += rd;
         }
         raw[raw_len] = 0;
@@ -4874,6 +4895,89 @@ static sw_val_t *_builtin_chrome_launch(sw_val_t **a, int n) {
         usleep(100000);
     }
     return sw_val_nil();
+}
+
+/* ============================================================
+ * String + Base64 helpers (added 2026-05-15)
+ * ============================================================
+ * Three high-leverage builtins that kept getting reinvented in
+ * userland: substring search, base64 encode/decode. */
+
+/* string_index_of(haystack, needle) → int (-1 if not found, 0-based byte
+ * offset otherwise). Naive O(n*m) scan; fine for the prose-sized strings
+ * agent code passes around. */
+static sw_val_t *_builtin_string_index_of(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || !a[1]) return sw_val_int(-1);
+    if (a[0]->type != SW_VAL_STRING || a[1]->type != SW_VAL_STRING)
+        return sw_val_int(-1);
+    const char *hay = a[0]->v.str;
+    const char *needle = a[1]->v.str;
+    if (!*needle) return sw_val_int(0);
+    const char *hit = strstr(hay, needle);
+    if (!hit) return sw_val_int(-1);
+    return sw_val_int((int64_t)(hit - hay));
+}
+
+/* base64_encode(bytes_or_string) → string (no newlines, padded with '=').
+ * The existing `base64_encode` C helper in swarmrt_http.c is static; this
+ * exposes it (locally re-implemented above in _sw_b64_encode) as a
+ * builtin so sw code can encode without shelling out. */
+static sw_val_t *_builtin_base64_encode(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_string("");
+    const char *src = a[0]->v.str;
+    size_t slen = strlen(src);
+    size_t out_cap = (slen / 3 + 1) * 4 + 1;
+    char *out = (char *)malloc(out_cap);
+    _sw_b64_encode((const uint8_t *)src, (int)slen, out);
+    sw_val_t *r = sw_val_string(out);
+    free(out);
+    return r;
+}
+
+/* base64_decode(string) → string (decoded bytes; nil on malformed input).
+ * Tolerates whitespace and missing padding. Output is null-terminated so
+ * sw_val_string is safe even for binary payloads — but binary data with
+ * embedded NULs will be truncated at the first NUL when treated as a
+ * string. For PNG/JPG decoding, write to file via file_write. */
+static sw_val_t *_builtin_base64_decode(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *src = a[0]->v.str;
+    size_t slen = strlen(src);
+    /* Inverse table: char → 0..63, or -1 for skip, or -2 for invalid. */
+    static const signed char dec[256] = {
+        ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,
+        ['I']=8,['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,
+        ['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,
+        ['Y']=24,['Z']=25,['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,
+        ['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,
+        ['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,
+        ['w']=48,['x']=49,['y']=50,['z']=51,['0']=52,['1']=53,['2']=54,['3']=55,
+        ['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,['+']=62,['/']=63
+    };
+    size_t out_cap = (slen / 4 + 1) * 3 + 1;
+    char *out = (char *)malloc(out_cap);
+    size_t out_len = 0;
+    int buf = 0, bits = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '=' || c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        signed char v = dec[c];
+        if (v < 0) {
+            /* unknown char — treat as bad input */
+            free(out);
+            return sw_val_nil();
+        }
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[out_len++] = (char)((buf >> bits) & 0xff);
+        }
+    }
+    out[out_len] = 0;
+    sw_val_t *r = sw_val_string(out);
+    free(out);
+    return r;
 }
 
 #endif /* SWARMRT_BUILTINS_STUDIO_H */
