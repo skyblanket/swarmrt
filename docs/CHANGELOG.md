@@ -4,6 +4,33 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-15 — Generated programs exit when `main()` returns + repo polish
+
+**The big one.** Until now, every sw binary's generated `main()` ended in
+`while(1) usleep(...)`, so even a one-shot script like `examples/counter.sw`
+would print its output and then hang forever. Users had to either
+`sys_exit(0)` explicitly or Ctrl-C the process. Removed.
+
+The new entry+main pair waits on a `pthread_cond` that `_main_entry` signals
+when the user's `main()` function returns, then calls `sw_shutdown(0)` to
+join the scheduler threads cleanly and `return 0` from the C `main`. Result:
+every example in `examples/` now exits cleanly with code 0 after doing its
+work. Long-running servers still work — they just have to put a permanent
+`receive { ... }` or `sleep` loop at the end of `main` (Go-style, not
+Erlang-style).
+
+**Repo polish for the agent + human audiences.**
+- README rewritten as a proper landing page — strong hero, clear positioning
+  ("BEAM-shaped runtime for the AI-agent era"), agent-friendly highlights,
+  comparison table.
+- `docs/AGENT_SYSTEM.md` replaced. Was a stale architecture-design doc with
+  "Status: 🔄 Needs..." energy. Now it's a one-page practical "Writing sw —
+  for AI Agents" cheatsheet plus a recommended system-prompt snippet.
+- `examples/multi_main.sw` patched to `import MathLib` explicitly (was
+  missing the import — relied on a deprecated auto-resolution path).
+
+---
+
 ## 2026-05-15 — sw test framework + browser screenshot inline + `;` in receive arms
 
 **Test framework.** `tests/sw/test_*.sw` files + `tests/sw/run_tests.sh`

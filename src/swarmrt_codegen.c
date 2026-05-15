@@ -185,7 +185,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "map_new") == 0 || strcmp(name, "map_get") == 0 ||
            strcmp(name, "map_put") == 0 || strcmp(name, "map_keys") == 0 ||
            strcmp(name, "map_values") == 0 || strcmp(name, "map_merge") == 0 ||
-           strcmp(name, "map_has_key") == 0 ||
+           strcmp(name, "map_has_key") == 0 || strcmp(name, "map_size") == 0 ||
+           strcmp(name, "map_remove") == 0 ||
            /* Error */
            strcmp(name, "error") == 0 ||
            strcmp(name, "typeof") == 0 ||
@@ -1160,7 +1161,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "map_new") == 0 || strcmp(fname, "map_get") == 0 ||
              strcmp(fname, "map_put") == 0 || strcmp(fname, "map_keys") == 0 ||
              strcmp(fname, "map_values") == 0 || strcmp(fname, "map_merge") == 0 ||
-             strcmp(fname, "map_has_key") == 0 || strcmp(fname, "error") == 0 ||
+             strcmp(fname, "map_has_key") == 0 || strcmp(fname, "map_size") == 0 ||
+             strcmp(fname, "map_remove") == 0 || strcmp(fname, "error") == 0 ||
              strcmp(fname, "typeof") == 0 ||
              /* Phase 13: Agent stdlib */
              strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||
@@ -1857,10 +1859,25 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
 static void emit_entry_and_main(cg_ctx_t *ctx) {
     FILE *f = ctx->out;
 
+    /* Entry: when the user's main() returns, signal the OS-thread main
+     * (below) to tear down the runtime and exit cleanly. Without this,
+     * every program would hang in the run-forever loop after main
+     * finished — Erlang VM behaviour ("never exit unless told"), but
+     * unhelpful for the 90% case where main is a script that does its
+     * thing and ends. Programs that want to keep running put a
+     * permanent receive / sleep loop at the end of main themselves. */
     fprintf(f, "/* === Entry point === */\n");
+    fprintf(f, "static pthread_mutex_t _sw_done_lock = PTHREAD_MUTEX_INITIALIZER;\n");
+    fprintf(f, "static pthread_cond_t  _sw_done_cond = PTHREAD_COND_INITIALIZER;\n");
+    fprintf(f, "static volatile int    _sw_done_flag = 0;\n\n");
+
     fprintf(f, "static void _main_entry(void *_arg) {\n");
     fprintf(f, "    (void)_arg;\n");
     fprintf(f, "    %s_main(NULL, 0);\n", ctx->mod_name);
+    fprintf(f, "    pthread_mutex_lock(&_sw_done_lock);\n");
+    fprintf(f, "    _sw_done_flag = 1;\n");
+    fprintf(f, "    pthread_cond_signal(&_sw_done_cond);\n");
+    fprintf(f, "    pthread_mutex_unlock(&_sw_done_lock);\n");
     fprintf(f, "}\n\n");
 
     fprintf(f, "int main(int argc, char **argv) {\n");
@@ -1869,7 +1886,10 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
     fprintf(f, "    sw_init(\"%s\", 2);\n", ctx->mod_name);
     fprintf(f, "    sw_io_init();\n");
     fprintf(f, "    sw_spawn(_main_entry, NULL);\n");
-    fprintf(f, "    while(1) usleep(60000000); /* run forever */\n");
+    fprintf(f, "    /* Wait for the user's main() to return (set by _main_entry). */\n");
+    fprintf(f, "    pthread_mutex_lock(&_sw_done_lock);\n");
+    fprintf(f, "    while (!_sw_done_flag) pthread_cond_wait(&_sw_done_cond, &_sw_done_lock);\n");
+    fprintf(f, "    pthread_mutex_unlock(&_sw_done_lock);\n");
     fprintf(f, "    sw_shutdown(0);\n");
     fprintf(f, "    return 0;\n");
     fprintf(f, "}\n");

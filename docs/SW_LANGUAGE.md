@@ -367,7 +367,12 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `reduce(lst, init, fn)` | foldl |
 | `pmap(lst, fn)` | parallel map (each fn call in own process) |
 | `map_get(m, k)` | value or `nil` |
-| `map_put(m, k, v)` | new map |
+| `map_put(m, k, v)` | new map (functional update) |
+| `map_remove(m, k)` | new map without `k` (returns `m` if absent) |
+| `map_keys(m)` / `map_values(m)` | list of keys / values |
+| `map_merge(m1, m2)` | new map; `m2`'s keys win on collision |
+| `map_has_key(m, k)` | `'true'` / `'false'` |
+| `map_size(m)` | int |
 
 ### ETS
 | | |
@@ -467,6 +472,8 @@ These are real, hit-during-development quirks. Skim before you write a lot of sw
 - **`#line` directives surface sw line numbers in C errors.** When a generated-C compile fails, the error points at `src/<Module>.sw:<line>` instead of `/tmp/swc_*.c`. **Per-statement accuracy** since the late-2026-05-15 codegen pass — points at the exact failing line, not the function start.
 
 - **No userland `exit/2`** for killing other processes. Send a `{'stop'}` message and let the receiver clean up on its next `receive`. True preemption needs runtime support not yet exposed.
+
+- **The runtime exits when `main()` returns.** Go-style, not Erlang-style — when your program's `main` function finishes, the runtime tears down the schedulers and the process exits with code 0. If you want a long-running server, end `main` with a permanent `receive { _other -> ... }` arm or `sleep(N)` loop. (Until 2026-05-15 the generated `main()` ran an infinite `usleep` loop, so every program hung after main finished. That's now fixed.)
 
 - **Map literal `%{` is a SINGLE TOKEN.** `expr % {…}` does NOT parse as "modulo of expr by a brace block" — `%` and `{` need a space if you want modulo of `expr` by some expression starting with `{` (which is uncommon anyway). Use `expr % some_var` for clarity.
 

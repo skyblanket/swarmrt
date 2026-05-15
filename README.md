@@ -1,40 +1,116 @@
 # SwarmRT
 
-A native runtime and compiler for concurrent programs. Lock-free message passing, lightweight processes, and an ahead-of-time compiler that turns `.sw` source files into standalone binaries.
+**A from-scratch BEAM-shaped runtime for the AI-agent era — written in C, compiled ahead of time, no VM, no GC pauses.**
 
-~20,000 lines of C. No dependencies beyond libc and pthreads.
+```sw
+module Counter
+export [main, counter]
 
-Built by [Otonomy](https://otonomy.ai).
+fun counter(n) {
+    receive {
+        {'inc', by} -> counter(n + by)
+        {'get', from} -> send(from, {'count', n}) ; counter(n)
+        'stop' -> n
+    }
+}
 
----
+fun main() {
+    pid = spawn(counter(0))
+    send(pid, {'inc', 5})
+    send(pid, {'inc', 3})
+    send(pid, {'get', self()})
 
-## What This Is
-
-SwarmRT is a from-scratch implementation of the actor model with:
-
-- **Lightweight processes** — 100K+ concurrent processes via arena allocation
-- **Lock-free mailboxes** — Vyukov MPSC queues, zero-contention send path
-- **Work-stealing schedulers** — per-core threads with priority run queues
-- **Preemptive scheduling** — reduction counting, cooperative yields
-- **Behaviours** — GenServer, Supervisor, Task, GenStateMachine, ETS
-- **Ahead-of-time compiler** — `.sw` source to native binary via C codegen
-
-The language is designed for AI agents to read and write. Minimal punctuation, explicit keywords, no indentation sensitivity.
-
----
-
-## Quick Start
+    receive { {'count', n} -> print("count: " ++ to_string(n)) }
+    send(pid, 'stop')
+}
+```
 
 ```bash
-make swc libswarmrt
+$ ./bin/swc build counter.sw -o counter && ./counter
+count: 8
+```
 
-# compile a .sw program to a native binary
+---
+
+## What this is
+
+SwarmRT is a runtime + language for writing concurrent programs that compile to a single native binary.
+
+It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, hot reload, distribution — and reimplements them as a ~20K-line C library plus an ahead-of-time compiler that emits native code. No interpreter. No bytecode. No VM warm-up. Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
+
+It exists because the same workload BEAM was built for in 1986 — *thousands of long-lived, message-passing, partial-failure-tolerant processes* — is exactly what you need when you're running a swarm of AI agents. SwarmRT is the substrate behind [swarm-code](https://github.com/skyblanket/swarm-code) and a growing pile of agent-driven tools.
+
+The language is called **`sw`** and is designed so an LLM can write it correctly on the first try.
+
+---
+
+## Quickstart (60 seconds)
+
+```bash
+git clone https://github.com/skyblanket/swarmrt && cd swarmrt
+make swc libswarmrt          # builds the compiler + runtime library
 ./bin/swc build examples/counter.sw -o counter
 ./counter
-
-# or just see the generated C
-./bin/swc emit examples/counter.sw
 ```
+
+That's it. No package manager, no language server install, no VM image. The compiler is one binary, the runtime is one static library, and `cc` is the only external tool.
+
+---
+
+## Why you might care
+
+| If you're… | What SwarmRT gives you |
+|---|---|
+| **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
+| **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Hot code reload. Process linking and monitoring. |
+| **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses (per-process generational GC means no global stop-the-world), <10ms startup, dependency-free deploy. |
+
+---
+
+## The language in one screenful
+
+```sw
+module Demo
+export [main]
+
+# Spawn a worker, send it work, get a reply.
+fun worker() {
+    receive {
+        {'square', n, from} ->
+            send(from, {'result', n * n})
+            worker()
+        'stop' -> 'done'
+    }
+}
+
+fun main() {
+    pid = spawn(worker())
+
+    # Pipeline: build a list, map send over it, collect replies.
+    [1, 2, 3, 4, 5] |> each(fn(n) { send(pid, {'square', n, self()}) })
+    results = collect(5, [])
+    send(pid, 'stop')
+
+    print("squares: " ++ to_string(results))
+}
+
+fun collect(n, acc) {
+    if (n == 0) { acc }
+    else {
+        receive { {'result', r} -> collect(n - 1, list_append(acc, r)) }
+    }
+}
+
+fun each(lst, f) {
+    if (length(lst) == 0) { 'ok' }
+    else { f(hd(lst)) ; each(tl(lst), f) }
+}
+```
+
+That's the whole syntax surface for 95% of programs: `module`, `fun`, `spawn`, `send`, `receive`, `if/else`, atoms (`'ok'`), tuples (`{...}`), lists (`[...]`), the pipe (`|>`), and pattern matching in receive arms.
+
+Full reference: **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)**.
 
 ---
 
@@ -42,102 +118,32 @@ make swc libswarmrt
 
 | Doc | What it covers |
 |---|---|
-| **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)** | The `.sw` language reference — syntax, types, processes, builtins, gotchas. **Start here if you're writing sw code.** |
-| **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** | C runtime API — for embedding swarmrt or writing new builtins |
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Internals overview — schedulers, mailboxes, GC, distribution |
-| **[docs/AGENT_SYSTEM.md](docs/AGENT_SYSTEM.md)** | Agent behaviours and patterns |
-| **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** | Spawn / message-send / context-switch numbers |
-| **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | What changed and when, with motivation |
+| **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)** | The `.sw` language — syntax, types, processes, builtins, gotchas. Start here if you're writing sw code. |
+| **[docs/AGENT_SYSTEM.md](docs/AGENT_SYSTEM.md)** | Writing sw *for* AI agents — patterns, prompts, what to load into context. Read this before pointing an LLM at sw. |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Internals — schedulers, mailboxes, GC, distribution. |
+| **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** | The C runtime API — for embedding swarmrt or writing new builtins. |
+| **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** | Spawn / send / context-switch numbers. |
+| **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | What changed and when, with motivation. |
 
 ---
 
-## The Language
+## What makes `sw` agent-friendly
 
-```
-module Counter
-export [main, counter]
+Most languages were designed for humans first; LLM ergonomics are a happy accident. `sw` is the other way around — every syntax decision was made to maximise the chance that a model writes correct code on the first attempt:
 
-fun counter(n) {
-    receive {
-        {'increment', by} ->
-            counter(n + by)
+- **No indentation sensitivity.** Brace-delimited blocks. The model can't get the columns wrong because columns don't matter.
+- **Keywords over symbols.** `spawn`, `receive`, `send` instead of `!`, `case`, magic operators. Easier to recall, easier to grep.
+- **Statement separator is either newline or `;`** — both work in any block. Models trained on C-family code don't get tripped up.
+- **C reserved words are legal identifiers.** Use `inline`, `static`, `register` as variable names; the codegen mangles them silently.
+- **One way to do most things.** No three-flavours-of-async. `spawn` + `receive` covers it.
+- **Errors point at the exact failing line.** `#line` directives map every C-level codegen failure back to the source `.sw` file and statement.
+- **The whole language fits in one document.** SW_LANGUAGE.md is ~500 lines including examples — small enough to paste into a system prompt.
 
-        {'get', from} ->
-            send(from, {'count', n})
-            counter(n)
-
-        'stop' ->
-            print("stopped at " ++ n)
-    }
-}
-
-fun main() {
-    pid = spawn(counter(0))
-    send(pid, {'increment', 5})
-    send(pid, {'increment', 3})
-    send(pid, {'get', self()})
-
-    receive {
-        {'count', n} -> print("count: " ++ n)
-    }
-
-    send(pid, 'stop')
-}
-```
-
-Output:
-
-```
-count: 8
-stopped at 8
-```
+If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
 
 ---
 
-## Compiler Pipeline
-
-```
-counter.sw ──parse──> AST ──codegen──> counter.c ──cc──> counter
-                                  │
-                            obfuscate (optional)
-                            XOR strings + symbol mangle
-```
-
-The compiler (`swc`) parses `.sw` source, walks the AST, and emits C code that links against `libswarmrt.a`. The generated binary is a self-contained native executable with the full runtime embedded.
-
-### What the compiler handles
-
-| Feature | Implementation |
-|---------|---------------|
-| Spawn | Generates trampoline struct + entry function per spawn site |
-| Receive | `sw_receive_any()` + if/else chain for pattern matching |
-| Send | Builds `sw_val_t`, calls `sw_send_tagged()` directly |
-| Tail calls | Self-recursive calls in tail position compile to `goto` |
-| Pipe operator | `x \|> f()` rewrites to `f(x)` at codegen time |
-| Pattern matching | Structural match on tuples, atoms, ints, strings |
-| Obfuscation | XOR-encoded string literals (key `0xa7`) + FNV-1a symbol mangling |
-
-### CLI
-
-```
-swc build <file.sw>     Compile to native binary
-swc emit  <file.sw>     Print generated C to stdout
-
-Options:
-  -o <name>             Output binary name
-  -O                    Optimize (-O2)
-  --obfusc              XOR strings + mangle symbols
-  --strip               Strip symbol table
-  --emit-c              Save .gen.c alongside binary
-```
-
----
-
-## Runtime Architecture
-
-### Process Model
-
-Each process is a 2KB arena-allocated slot with its own stack, mailbox, and reduction counter. No malloc on the spawn hot path — processes come from a pre-allocated slab.
+## The runtime, briefly
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -158,78 +164,89 @@ Each process is a 2KB arena-allocated slot with its own stack, mailbox, and redu
 └──────────────────────────────────────────────────┘
 ```
 
-### Message Passing
+| Subsystem | What it does |
+|---|---|
+| **Scheduler** | One OS thread per core. Per-scheduler run queue with 4 priority levels. Reduction-counted preemption. Work stealing between cores. |
+| **Process** | 2KB arena-allocated PCB + 64KB stack. Lock-free MPSC mailbox. Per-process generational GC. |
+| **Behaviours** | GenServer, Supervisor, Task, GenStateMachine, ETS, Registry — all built on top of the bare `spawn`/`send`/`receive` primitives. |
+| **IO** | kqueue-based async ports. TCP accept/read/write as port messages. HTTP / WebSocket / Chrome DevTools as builtins. |
+| **Distribution** | Multi-node TCP message routing with automatic reconnection. Process linking across nodes. |
+| **Hot reload** | Module versioning, swap running code without stopping processes. |
+| **Compiler (`swc`)** | `.sw` → AST → C → native binary. Tail-call optimisation, optional XOR-string obfuscation, optional symbol stripping. |
 
-Lock-free MPSC (multi-producer, single-consumer) design:
+Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns (pointer sharing), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-- **Send path**: atomic CAS push to signal stack — no locks, no contention
-- **Receive path**: bulk steal from signal stack, reverse to FIFO, scan private queue
-- **Tagged messages**: selective receive by tag (call, cast, exit, down, timer, port)
+---
 
-### Behaviours
+## Compiler CLI
 
-Built on top of the native runtime:
+```
+swc build <file.sw> [-o <name>]   Compile to native binary
+swc emit  <file.sw>               Print generated C to stdout
 
-| Behaviour | What it does |
-|-----------|-------------|
-| GenServer | Request-reply (`sw_call`) and async cast (`sw_cast`) with state management |
-| Supervisor | Child specs, restart strategies (one-for-one, one-for-all, rest-for-one) |
-| Task | Async/await with automatic linking |
-| GenStateMachine | State machines with event-driven transitions |
-| ETS | Concurrent in-memory tables (set, ordered_set, bag) |
-| Registry | Named process lookup with O(1) hash table |
+Options
+  -o <name>     Output binary name
+  -O            Optimise (-O2)
+  --obfusc      XOR-encode string literals + mangle symbols
+  --strip       Strip the symbol table
+  --emit-c      Save the .gen.c next to the binary (useful for debugging codegen)
+```
 
-### Additional Systems
+Imports are auto-resolved from `src/` next to the file you're compiling — no manifest, no lockfile.
 
-- **IO/Ports** — kqueue-based async I/O, TCP accept/read/write as port messages
-- **Hot code reload** — module versioning, swap running code without stopping processes
-- **Generational GC** — per-process heaps with minor/major collection
-- **Distribution** — multi-node TCP message routing with automatic reconnection
+---
+
+## Examples
+
+The [`examples/`](examples/) directory has small focused programs. Each shows one core feature:
+
+| File | Shows |
+|---|---|
+| `hello.sw` | Minimal program — `print` and exit. |
+| `counter.sw` | Process spawning, send, receive, pattern matching on tuples. |
+| `pingpong.sw` | Bidirectional message passing between two processes. |
+| `lambda.sw` | Anonymous functions and closures. |
+| `mathlib.sw` + `math_test.sw` | Multi-module program with imports. |
+| `supervisor.sw` | Restart strategies in action. |
+| `mapreduce.sw` | Spawn a fan-out worker pool and collect results. |
+| `distributed.sw` | Multi-node — start two `swarms` and pass messages over TCP. |
+
+Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x`.
+
+---
+
+## Tests
+
+```bash
+make test-sw         # sw-language tests (covers builtins, processes, parser fixes)
+make test-all        # the full C-runtime + sw test suite
+```
+
+`test-sw` runs a small but growing set of `tests/sw/test_*.sw` files via the harness in `tests/sw/run_tests.sh`. Add a `test_<topic>.sw` file there and it'll be picked up automatically.
 
 ---
 
 ## Build
 
-Requires: a C compiler (cc/clang/gcc) and pthreads. macOS or Linux.
+Requires: a C compiler (cc/clang/gcc) and pthreads. Tested on macOS (Apple Silicon + Intel) and Linux.
 
 ```bash
-# everything
-make all
-
-# just the compiler + library
-make swc libswarmrt
-
-# run all phase tests (83 tests across 10 phases)
-make test-phase2 test-phase3 test-phase4 test-phase5 \
-     test-phase6 test-phase7 test-phase8 test-phase9 test-phase10
-
-# native runtime benchmark
-make test-native
+make swc libswarmrt              # compiler + runtime library only (you usually want this)
+make all                         # everything: compiler, library, examples, demos
+make test-sw                     # sw-language tests
+make test-all                    # full test suite
+make clean                       # nuke build artefacts
 ```
 
-### Compile a `.sw` program
-
-```bash
-# basic
-./bin/swc build examples/counter.sw -o counter
-
-# optimized + obfuscated
-./bin/swc build examples/counter.sw -o counter -O --obfusc --strip
-```
-
-The compiler finds `libswarmrt.a` and headers relative to its own location. If you move `swc`, set the library/include paths manually:
-
-```bash
-cc -O2 -o counter generated.c -I/path/to/src -L/path/to/bin -lswarmrt -pthread
-```
+The compiler finds `libswarmrt.a` and headers relative to its own location, so `bin/swc` is portable — copy it anywhere.
 
 ---
 
-## Project Structure
+## Project layout
 
 ```
 src/
-  swarmrt_native.{c,h}    Core runtime: scheduler, spawn, send/receive, arena
+  swarmrt_native.{c,h}     Core runtime: scheduler, spawn, send/receive, arena
   swarmrt_asm.S            ARM64 context switching (register save/restore)
   swarmrt_otp.{c,h}        GenServer, Supervisor
   swarmrt_task.{c,h}       Task (async/await)
@@ -241,104 +258,24 @@ src/
   swarmrt_gc.{c,h}         Per-process generational GC
   swarmrt_node.{c,h}       Multi-node distribution
   swarmrt_lang.{c,h}       Lexer, parser, tree-walking interpreter
-  swarmrt_codegen.{c,h}    AST-to-C code generation
+  swarmrt_codegen.{c,h}    AST → C code generation
+  swarmrt_builtins_studio.h Builtins: HTTP, JSON, ETS, files, WS, Chrome, base64
   swarmrt_obfusc.c         String XOR encoding + symbol mangling
   swc.c                    Compiler CLI driver
 
-examples/
-  counter.sw               Process spawning, send/receive, pattern matching
-  pingpong.sw              Bidirectional message passing between processes
-  hello.sw                 Minimal program
-
-Makefile                   All build targets
+examples/                  Small standalone .sw programs, one feature each
+tests/sw/                  sw-language test files + run_tests.sh
+docs/                      Long-form documentation
 ```
 
 ---
 
-## Language Reference
+## Status
 
-### Types
-
-| Type | Syntax | Example |
-|------|--------|---------|
-| Integer | bare number | `42` |
-| Float | number with dot | `3.14` |
-| String | double quotes | `"hello"` |
-| Atom | single quotes | `'ok'` |
-| Tuple | braces | `{'tag', value}` |
-| List | brackets | `[1, 2, 3]` |
-| Pid | returned by `spawn` | `spawn(f(x))` |
-| Nil | keyword | `nil` |
-
-### Operators
-
-```
-+  -  *  /          arithmetic
-++                   string concatenation
-==  !=  <  >  <=  >=  comparison
-&&  ||               logical
-|>                   pipe (left value becomes first argument)
-=                    assignment
-```
-
-### Keywords
-
-```
-module    declare module name
-export    list exported functions
-fun       define a function
-spawn     create a new process
-send      send a message to a process
-receive   wait for a message with pattern matching
-self      get current process pid
-if/else   conditional
-after     timeout in receive block
-```
-
-### Pattern Matching
-
-Receive clauses match on structure:
-
-```
-receive {
-    {'ok', value}    -> handle(value)      # match tuple with atom tag
-    {'error', reason} -> fail(reason)
-    42               -> got_the_answer()   # match literal int
-    'done'           -> cleanup()          # match atom
-}
-```
-
-Variables in patterns bind to the matched value. Atoms (single-quoted) match literally.
-
-### Tail Call Optimization
-
-Self-recursive calls in tail position are compiled to `goto`, so recursive process loops don't grow the stack:
-
-```
-fun loop(state) {
-    receive {
-        {'update', new} -> loop(new)    # compiled to: state = new; goto top
-        'stop' -> state
-    }
-}
-```
-
----
-
-## For AI Agents
-
-The `.sw` syntax was designed for LLM code generation:
-
-- **No indentation sensitivity** — brace-delimited blocks
-- **Keywords over symbols** — `spawn` instead of `!`, `receive` instead of `case`
-- **Minimal punctuation** — fewer tokens to get wrong
-- **Pipe operator** — `data |> transform()` reads naturally
-- **Explicit concurrency** — `spawn`, `send`, `receive` are named operations
-
-An agent can write a `.sw` file, compile it with `swc`, and run the resulting binary. The compilation step catches syntax errors at build time rather than runtime.
+Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). New runtime features land regularly — see [CHANGELOG](docs/CHANGELOG.md). Breaking changes are called out in the changelog and the language reference is the source of truth.
 
 ---
 
 ## License
 
-MIT — Copyright 2026 Otonomy
+MIT — built by [Otonomy](https://otonomy.ai).

@@ -2150,6 +2150,39 @@ static sw_val_t *_builtin_map_has_key(sw_val_t **a, int n) {
     return sw_val_atom("false");
 }
 
+/* map_size(map) → int. Length on a map already returns 0; this gives
+ * users the obviously-named query they reach for. */
+static sw_val_t *_builtin_map_size(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_MAP) return sw_val_int(0);
+    return sw_val_int(a[0]->v.map.count);
+}
+
+/* map_remove(map, key) → new map without key. Returns the original
+ * map if the key isn't present (no allocation). */
+static sw_val_t *_builtin_map_remove(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_MAP) return n >= 1 ? a[0] : sw_val_nil();
+    sw_val_t *m = a[0];
+    int idx = -1;
+    for (int i = 0; i < m->v.map.count; i++) {
+        if (sw_val_equal(m->v.map.keys[i], a[1])) { idx = i; break; }
+    }
+    if (idx < 0) return m; /* key not present — nothing to do */
+    int new_cnt = m->v.map.count - 1;
+    if (new_cnt == 0) return sw_val_map_new(NULL, NULL, 0);
+    sw_val_t **k = malloc(sizeof(sw_val_t*) * new_cnt);
+    sw_val_t **v = malloc(sizeof(sw_val_t*) * new_cnt);
+    int j = 0;
+    for (int i = 0; i < m->v.map.count; i++) {
+        if (i == idx) continue;
+        k[j] = m->v.map.keys[i];
+        v[j] = m->v.map.vals[i];
+        j++;
+    }
+    sw_val_t *r = sw_val_map_new(k, v, new_cnt);
+    free(k); free(v);
+    return r;
+}
+
 /* === Error mechanism for try/catch === */
 
 /* error(reason) — sets thread-local error, caught by try/catch */

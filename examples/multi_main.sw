@@ -1,5 +1,7 @@
 module MultiMain
 
+import MathLib
+
 fun main() {
   print("=== Multi-module test ===")
 
