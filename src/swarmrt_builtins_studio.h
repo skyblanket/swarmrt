@@ -238,16 +238,36 @@ static sw_val_t *_builtin_typeof(sw_val_t **a, int n) {
 
 static sw_val_t *_builtin_to_string(sw_val_t **a, int n) {
     if (n < 1) return sw_val_string("");
-    char buf[4096];
+    /* Fast paths for the common scalar cases — avoid the memstream
+     * allocation when we just want "42" or "ok". */
     switch (a[0]->type) {
-        case SW_VAL_INT: snprintf(buf, sizeof(buf), "%lld", (long long)a[0]->v.i); break;
-        case SW_VAL_FLOAT: snprintf(buf, sizeof(buf), "%g", a[0]->v.f); break;
         case SW_VAL_STRING: return a[0];
-        case SW_VAL_ATOM: return sw_val_string(a[0]->v.str);
-        case SW_VAL_NIL: return sw_val_string("nil");
-        default: snprintf(buf, sizeof(buf), "<val:%d>", a[0]->type); break;
+        case SW_VAL_ATOM:   return sw_val_string(a[0]->v.str);
+        case SW_VAL_NIL:    return sw_val_string("nil");
+        case SW_VAL_INT: {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%lld", (long long)a[0]->v.i);
+            return sw_val_string(buf);
+        }
+        case SW_VAL_FLOAT: {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%g", a[0]->v.f);
+            return sw_val_string(buf);
+        }
+        default: break;
     }
-    return sw_val_string(buf);
+    /* Composite values (tuples, lists, maps, pids) — render via the
+     * shared formatter so to_string() produces the same readable shape
+     * as print(): "{ok, 42}", "[1, 2, 3]", "%{a: 1}", "<pid:7>". */
+    char *buf = NULL;
+    size_t blen = 0;
+    FILE *m = open_memstream(&buf, &blen);
+    if (!m) return sw_val_string("?");
+    sw_val_format(m, a[0]);
+    fclose(m);
+    sw_val_t *r = sw_val_string(buf ? buf : "");
+    free(buf);
+    return r;
 }
 
 static sw_val_t *_builtin_timestamp(sw_val_t **a, int n) {
@@ -2180,6 +2200,47 @@ static sw_val_t *_builtin_map_remove(sw_val_t **a, int n) {
     }
     sw_val_t *r = sw_val_map_new(k, v, new_cnt);
     free(k); free(v);
+    return r;
+}
+
+/* format(template, args...) → string.
+ *
+ * Like Python's `"hello {}".format(name)` but variadic at the call site.
+ * Each `{}` placeholder consumes the next positional arg. `{{` and `}}`
+ * escape literal braces. Composite values (tuples, lists, maps, pids)
+ * render via sw_val_format — same shape as `print` produces — so the
+ * common "stitch a log line" use becomes:
+ *
+ *     print(format("[{}] req={} ms={}", level, req_id, elapsed_ms))
+ *
+ * instead of `"[" ++ to_string(level) ++ "] req=" ++ ... ++ ...`. */
+static sw_val_t *_builtin_format(sw_val_t **a, int n) {
+    if (n < 1 || a[0]->type != SW_VAL_STRING) return sw_val_string("");
+    const char *tpl = a[0]->v.str;
+    char *buf = NULL;
+    size_t blen = 0;
+    FILE *m = open_memstream(&buf, &blen);
+    if (!m) return sw_val_string("");
+    int arg_idx = 1;
+    for (const char *p = tpl; *p; ) {
+        if (p[0] == '{' && p[1] == '}') {
+            if (arg_idx < n) {
+                sw_val_format(m, a[arg_idx++]);
+            } else {
+                fputs("{}", m);  /* not enough args — leave the marker visible */
+            }
+            p += 2;
+        } else if (p[0] == '{' && p[1] == '{') {
+            fputc('{', m); p += 2;
+        } else if (p[0] == '}' && p[1] == '}') {
+            fputc('}', m); p += 2;
+        } else {
+            fputc(*p, m); p++;
+        }
+    }
+    fclose(m);
+    sw_val_t *r = sw_val_string(buf ? buf : "");
+    free(buf);
     return r;
 }
 

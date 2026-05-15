@@ -207,7 +207,7 @@ Inside receive arm bodies, `;` DOES separate statements (it's a recognised state
 
 ## 7. Pattern matching
 
-Patterns appear in `receive` arms and in some other binding contexts. Supported:
+Patterns appear in `receive` arms, `case` expressions, and some other binding contexts. Supported:
 
 | Pattern | Matches |
 |---|---|
@@ -219,7 +219,25 @@ Patterns appear in `receive` arms and in some other binding contexts. Supported:
 | `[]` | empty list |
 | `%{key: v}` | map containing `key`, binds value to `v` |
 
-Within a single receive arm pattern, every named variable is bound for the body that follows.
+Within a single arm pattern, every named variable is bound for the body that follows.
+
+### case — top-level pattern dispatch
+
+```sw
+fun classify(msg) {
+    case msg {
+        {'ok', v}      -> "ok: " ++ to_string(v)
+        {'error', why} -> "err: " ++ to_string(why)
+        n when n > 0   -> "positive: " ++ to_string(n)
+        'done'         -> "done"
+        _other         -> "unknown: " ++ to_string(_other)
+    }
+}
+```
+
+Same arm-clause shape as `receive` (pattern, optional `when guard`, body). Runs against an arbitrary value, not the mailbox. Falls through to the next clause if a guard rejects. Returns the body of the first matching arm, or `nil` if nothing matches.
+
+This is the structured replacement for nested `if/else` ladders. Use it whenever you'd write `if (x == 'a') { ... } else { if (x == 'b') { ... } else { ... } }`.
 
 ---
 
@@ -344,7 +362,8 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `string_trim(s)` | strip whitespace |
 | `string_upper(s)` / `string_lower(s)` | case |
 | `string_truncate(s, max_len)` | truncate to max_len |
-| `to_string(v)` | any → string |
+| `to_string(v)` | any → string (tuples / lists / maps render via the formatter) |
+| `format(template, args...)` | `format("hi {} (#{})", name, n)` — `{}` placeholders, `{{` / `}}` escape |
 | `strip_html(html)` | tags stripped, entities decoded |
 | `clean_json(s)` | strip code fences and trailing commas |
 

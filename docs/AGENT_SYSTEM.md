@@ -169,7 +169,7 @@ The full builtin index is in [SW_LANGUAGE.md](SW_LANGUAGE.md).
 
 ## Pattern matching cheatsheet
 
-Inside `receive` arm patterns:
+Same patterns work in `receive` arms AND in `case` expressions:
 
 | Pattern | Matches |
 |---|---|
@@ -181,7 +181,29 @@ Inside `receive` arm patterns:
 | `[h \| t]` | list with at least one element; `h` is head, `t` is tail |
 | `_anything` | binds to `_anything` — use as catchall |
 
-Variables in patterns *bind*; atoms (single-quoted) match *literally*. That's the entire matching system.
+Variables in patterns *bind*; atoms (single-quoted) match *literally*.
+
+### `case` — use this instead of nested if/else
+
+```sw
+case x {
+    0          -> "zero"
+    1          -> "one"
+    n when n > 0 -> "positive"
+    _          -> "negative"
+}
+```
+
+Falls through to the next arm if a guard rejects. This is the right tool for any "value → label" or "tag → handler" dispatch.
+
+### `format` — use this instead of `++ to_string(x) ++`
+
+```sw
+format("hi {} you are {}", name, age)        # → "hi alice you are 30"
+format("got {} (req={})", result, req_id)    # composite values render properly
+```
+
+`{}` placeholders consume positional args. `{{` / `}}` escape literal braces.
 
 ---
 

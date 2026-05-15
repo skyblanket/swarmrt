@@ -183,8 +183,10 @@ Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns (po
 ```
 swc build <file.sw> [-o <name>]   Compile to native binary
 swc emit  <file.sw>               Print generated C to stdout
+swc repl                          Interactive REPL (no file needed)
+swc test [<file.sw>|<dir>]        Run test_* functions in .sw files
 
-Options
+Options for build/emit
   -o <name>     Output binary name
   -O            Optimise (-O2)
   --obfusc      XOR-encode string literals + mangle symbols
@@ -193,6 +195,25 @@ Options
 ```
 
 Imports are auto-resolved from `src/` next to the file you're compiling — no manifest, no lockfile.
+
+### REPL
+
+```
+$ ./bin/swc repl
+SwarmRT REPL v0.1 — type :help for commands, :quit to exit
+sw> 2 + 3
+5
+sw> xs = [1, 2, 3, 4]
+[1, 2, 3, 4]
+sw> length(xs)
+4
+sw> case 7 { 0 -> "zero" ; n when n > 0 -> "positive" ; _ -> "neg" }
+"positive"
+sw> format("hi {} you are {}", "world", 30)
+"hi world you are 30"
+```
+
+Variables persist across lines. Multi-line input continues until brackets balance. The REPL uses a tree-walking interpreter and supports the language core plus the most-used builtins (strings, JSON, maps, formatting, `case`, `try/catch`). The codegen path supports more (HTTP, WebSocket, Chrome, ETS, processes) — for those, write a `.sw` file and `swc build` it.
 
 ---
 

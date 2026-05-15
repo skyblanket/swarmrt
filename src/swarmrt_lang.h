@@ -13,6 +13,8 @@
 #ifndef SWARMRT_LANG_H
 #define SWARMRT_LANG_H
 
+#include <stdio.h>
+
 #include "swarmrt_native.h"
 
 /* === Value Representation === */
@@ -134,6 +136,10 @@ sw_val_t *sw_val_map_put(sw_val_t *map, sw_val_t *key, sw_val_t *val);
 int sw_val_is_truthy(sw_val_t *v);
 int sw_val_equal(sw_val_t *a, sw_val_t *b);
 void sw_val_print(sw_val_t *v);
+/* Render a value to a file stream — same shape as sw_val_print but
+ * routable to a memstream so to_string() can produce a real string for
+ * tuples / lists / maps / pids. */
+void sw_val_format(FILE *f, sw_val_t *v);
 
 /* Free a value */
 void sw_val_free(sw_val_t *v);
@@ -147,6 +153,8 @@ typedef enum {
     N_SELF, N_AFTER,
     /* Phase 12: Language polish */
     N_MAP, N_FOR, N_RANGE, N_TRY, N_LIST_CONS,
+    /* Phase 13: case/match expression — top-level pattern matching */
+    N_CASE,
 } node_type_t;
 
 typedef struct node {
@@ -199,6 +207,9 @@ typedef struct node {
         struct { struct node *body; char err_var[128]; struct node *catch_body; } trycatch;
         /* N_LIST_CONS */
         struct { struct node *head; struct node *tail; } cons;
+        /* N_CASE — top-level pattern match: case subject { pat -> body ; ... }.
+         * Reuses N_CLAUSE for arms (pattern + optional guard + body). */
+        struct { struct node *subject; struct node **clauses; int nclauses; } casex;
     } v;
 } node_t;
 

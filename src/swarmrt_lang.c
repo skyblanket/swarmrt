@@ -14,6 +14,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <sys/time.h>
 #include "swarmrt_lang.h"
 
 /* Weak stubs for runtime functions — allows linking swc without the runtime.
@@ -337,6 +338,11 @@ static void node_free(node_t *n) {
     case N_RANGE: node_free(n->v.range.from); node_free(n->v.range.to); break;
     case N_TRY: node_free(n->v.trycatch.body); node_free(n->v.trycatch.catch_body); break;
     case N_LIST_CONS: node_free(n->v.cons.head); node_free(n->v.cons.tail); break;
+    case N_CASE:
+        node_free(n->v.casex.subject);
+        for (int i = 0; i < n->v.casex.nclauses; i++) node_free(n->v.casex.clauses[i]);
+        free(n->v.casex.clauses);
+        break;
     default: break;
     }
     free(n);
@@ -594,6 +600,72 @@ static node_t *par_primary(par_t *p) {
         f->v.forloop.iter = iter;
         f->v.forloop.body = body;
         return f;
+    }
+
+    /* Case expression: case <subject> { pat -> body ; pat when g -> body ; ... } */
+    if (t.type == TOK_CASE) {
+        par_adv(p);
+        node_t *cx = mknode(N_CASE, t.line);
+        cx->v.casex.subject = par_expr(p);
+        cx->v.casex.clauses = NULL;
+        cx->v.casex.nclauses = 0;
+        par_expect(p, TOK_LBRACE, "'{'");
+        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+            /* Tolerate `;` between arms (same way par_block does). */
+            while (p->cur.type == TOK_SEMI) par_adv(p);
+            if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+
+            node_t *cl = mknode(N_CLAUSE, p->cur.line);
+            cl->v.clause.pattern = par_expr(p);
+            cl->v.clause.guard = NULL;
+            if (p->cur.type == TOK_WHEN) {
+                par_adv(p);
+                cl->v.clause.guard = par_expr(p);
+            }
+            par_expect(p, TOK_ARROW, "'->'");
+
+            /* Body: collect statements up to next pattern (terminated by ->),
+             * `;`, or the closing `}`. Same approach as receive arms. */
+            node_t *body = mknode(N_BLOCK, p->cur.line);
+            body->v.block.stmts = NULL;
+            body->v.block.nstmts = 0;
+            while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+                while (p->cur.type == TOK_SEMI) par_adv(p);
+                if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+                lex_t save_lex = p->lex;
+                tok_t save_cur = p->cur;
+                int save_err = p->err;
+                node_t *expr = par_stmt(p);
+                /* Backtrack if the just-parsed expression turned out to be
+                 * the NEXT clause's pattern. Two signatures: `pat ->` and
+                 * `pat when guard ->`. We peek for either TOK_ARROW or
+                 * TOK_WHEN. (Same approach as par_receive's arm body.) */
+                if (p->cur.type == TOK_ARROW || p->cur.type == TOK_WHEN) {
+                    p->lex = save_lex;
+                    p->cur = save_cur;
+                    p->err = save_err;
+                    node_free(expr);
+                    break;
+                }
+                body->v.block.nstmts++;
+                body->v.block.stmts = realloc(body->v.block.stmts,
+                    sizeof(node_t*) * body->v.block.nstmts);
+                body->v.block.stmts[body->v.block.nstmts-1] = expr;
+            }
+            if (body->v.block.nstmts == 1) {
+                cl->v.clause.body = body->v.block.stmts[0];
+                free(body->v.block.stmts);
+                free(body);
+            } else {
+                cl->v.clause.body = body;
+            }
+            cx->v.casex.nclauses++;
+            cx->v.casex.clauses = realloc(cx->v.casex.clauses,
+                sizeof(node_t*) * cx->v.casex.nclauses);
+            cx->v.casex.clauses[cx->v.casex.nclauses-1] = cl;
+        }
+        par_expect(p, TOK_RBRACE, "'}'");
+        return cx;
     }
 
     /* Try/catch: try { body } catch e { handler } */
@@ -1255,40 +1327,44 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
     }
 }
 
-void sw_val_print(sw_val_t *v) {
-    if (!v) { printf("nil"); return; }
+void sw_val_format(FILE *f, sw_val_t *v) {
+    if (!v) { fprintf(f, "nil"); return; }
     switch (v->type) {
-    case SW_VAL_NIL: printf("nil"); break;
-    case SW_VAL_INT: printf("%lld", (long long)v->v.i); break;
-    case SW_VAL_FLOAT: printf("%.17g", v->v.f); break;
-    case SW_VAL_STRING: printf("%s", v->v.str); break;
-    case SW_VAL_ATOM: printf(":%s", v->v.str); break;
-    case SW_VAL_PID: printf("<pid:%llu>", v->v.pid ? v->v.pid->pid : 0); break;
+    case SW_VAL_NIL: fprintf(f, "nil"); break;
+    case SW_VAL_INT: fprintf(f, "%lld", (long long)v->v.i); break;
+    case SW_VAL_FLOAT: fprintf(f, "%.17g", v->v.f); break;
+    case SW_VAL_STRING: fprintf(f, "%s", v->v.str); break;
+    case SW_VAL_ATOM: fprintf(f, ":%s", v->v.str); break;
+    case SW_VAL_PID: fprintf(f, "<pid:%llu>", v->v.pid ? v->v.pid->pid : 0); break;
     case SW_VAL_TUPLE:
-        printf("{");
+        fprintf(f, "{");
         for (int i = 0; i < v->v.tuple.count; i++) {
-            if (i) printf(", ");
-            sw_val_print(v->v.tuple.items[i]);
+            if (i) fprintf(f, ", ");
+            sw_val_format(f, v->v.tuple.items[i]);
         }
-        printf("}"); break;
+        fprintf(f, "}"); break;
     case SW_VAL_LIST:
-        printf("[");
+        fprintf(f, "[");
         for (int i = 0; i < v->v.tuple.count; i++) {
-            if (i) printf(", ");
-            sw_val_print(v->v.tuple.items[i]);
+            if (i) fprintf(f, ", ");
+            sw_val_format(f, v->v.tuple.items[i]);
         }
-        printf("]"); break;
+        fprintf(f, "]"); break;
     case SW_VAL_MAP:
-        printf("%%{");
+        fprintf(f, "%%{");
         for (int i = 0; i < v->v.map.count; i++) {
-            if (i) printf(", ");
-            sw_val_print(v->v.map.keys[i]);
-            printf(": ");
-            sw_val_print(v->v.map.vals[i]);
+            if (i) fprintf(f, ", ");
+            sw_val_format(f, v->v.map.keys[i]);
+            fprintf(f, ": ");
+            sw_val_format(f, v->v.map.vals[i]);
         }
-        printf("}"); break;
-    default: printf("?"); break;
+        fprintf(f, "}"); break;
+    default: fprintf(f, "?"); break;
     }
+}
+
+void sw_val_print(sw_val_t *v) {
+    sw_val_format(stdout, v);
 }
 
 /* =========================================================================
@@ -1692,6 +1768,33 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         return sw_val_nil();
     }
 
+    case N_CASE: {
+        /* case <subject> { pat -> body ; pat when g -> body ; ... } —
+         * try each clause in order. A pattern match binds variables
+         * into a child env; if the optional guard then evaluates
+         * truthy, run the body and return. Guard failure falls through
+         * to the next clause (matching the codegen's behaviour). */
+        sw_val_t *subj = eval(interp, n->v.casex.subject, env);
+        for (int i = 0; i < n->v.casex.nclauses; i++) {
+            node_t *cl = n->v.casex.clauses[i];
+            sw_env_t *child = env_new(env);
+            if (pattern_match(cl->v.clause.pattern, subj, child)) {
+                if (cl->v.clause.guard) {
+                    sw_val_t *g = eval(interp, cl->v.clause.guard, child);
+                    if (!sw_val_is_truthy(g)) {
+                        env_free(child);
+                        continue;
+                    }
+                }
+                sw_val_t *r = eval(interp, cl->v.clause.body, child);
+                env_free(child);
+                return r;
+            }
+            env_free(child);
+        }
+        return sw_val_nil();
+    }
+
     case N_TUPLE: {
         sw_val_t *items[64];
         int count = n->v.coll.count;
@@ -1764,15 +1867,141 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (strcmp(fname, "abs") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT)
             return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
         if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
-            char buf[256];
             switch (args[0]->type) {
-            case SW_VAL_INT: snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf);
-            case SW_VAL_FLOAT: snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf);
             case SW_VAL_STRING: return args[0];
-            case SW_VAL_ATOM: return sw_val_string(args[0]->v.str);
-            case SW_VAL_NIL: return sw_val_string("nil");
-            default: return sw_val_string("<val>");
+            case SW_VAL_ATOM:   return sw_val_string(args[0]->v.str);
+            case SW_VAL_NIL:    return sw_val_string("nil");
+            case SW_VAL_INT: { char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf); }
+            case SW_VAL_FLOAT: { char buf[32]; snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf); }
+            default: {
+                /* Composite — render via the shared formatter so REPL
+                 * output matches print()/codegen output. */
+                char *buf = NULL;
+                size_t blen = 0;
+                FILE *m = open_memstream(&buf, &blen);
+                if (!m) return sw_val_string("?");
+                sw_val_format(m, args[0]);
+                fclose(m);
+                sw_val_t *r = sw_val_string(buf ? buf : "");
+                free(buf);
+                return r;
             }
+            }
+        }
+        if (strcmp(fname, "format") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+            const char *tpl = args[0]->v.str;
+            char *buf = NULL;
+            size_t blen = 0;
+            FILE *m = open_memstream(&buf, &blen);
+            if (!m) return sw_val_string("");
+            int arg_idx = 1;
+            for (const char *p = tpl; *p; ) {
+                if (p[0] == '{' && p[1] == '}') {
+                    if (arg_idx < nargs) sw_val_format(m, args[arg_idx++]);
+                    else fputs("{}", m);
+                    p += 2;
+                } else if (p[0] == '{' && p[1] == '{') { fputc('{', m); p += 2; }
+                else if (p[0] == '}' && p[1] == '}') { fputc('}', m); p += 2; }
+                else { fputc(*p, m); p++; }
+            }
+            fclose(m);
+            sw_val_t *r = sw_val_string(buf ? buf : "");
+            free(buf);
+            return r;
+        }
+        /* Common string ops — kept minimal so the REPL is useful for
+         * exploring sw without dragging in the full studio builtin
+         * surface (HTTP, WS, browser, etc. live in the codegen path). */
+        if (strcmp(fname, "string_split") == 0 && nargs >= 2 &&
+            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+            const char *s = args[0]->v.str;
+            const char *sep = args[1]->v.str;
+            int seplen = (int)strlen(sep);
+            sw_val_t *items[256];
+            int count = 0;
+            const char *cur = s;
+            if (seplen == 0) {
+                /* Empty separator: split into chars (best-effort, ASCII). */
+                for (; *cur && count < 256; cur++) {
+                    char ch[2] = { *cur, 0 };
+                    items[count++] = sw_val_string(ch);
+                }
+            } else {
+                while (count < 256) {
+                    const char *hit = strstr(cur, sep);
+                    if (!hit) break;
+                    int len = (int)(hit - cur);
+                    char *piece = malloc(len + 1);
+                    memcpy(piece, cur, len); piece[len] = '\0';
+                    items[count++] = sw_val_string(piece);
+                    free(piece);
+                    cur = hit + seplen;
+                }
+                if (count < 256) items[count++] = sw_val_string(cur);
+            }
+            return sw_val_list(items, count);
+        }
+        if (strcmp(fname, "string_contains") == 0 && nargs >= 2 &&
+            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
+            return sw_val_atom(strstr(args[0]->v.str, args[1]->v.str) ? "true" : "false");
+        if (strcmp(fname, "string_starts_with") == 0 && nargs >= 2 &&
+            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
+            return sw_val_atom(strncmp(args[0]->v.str, args[1]->v.str, strlen(args[1]->v.str)) == 0 ? "true" : "false");
+        if (strcmp(fname, "string_ends_with") == 0 && nargs >= 2 &&
+            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+            size_t la = strlen(args[0]->v.str), lb = strlen(args[1]->v.str);
+            return sw_val_atom(la >= lb && strcmp(args[0]->v.str + la - lb, args[1]->v.str) == 0 ? "true" : "false");
+        }
+        if (strcmp(fname, "string_index_of") == 0 && nargs >= 2 &&
+            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+            const char *hit = strstr(args[0]->v.str, args[1]->v.str);
+            return sw_val_int(hit ? (int64_t)(hit - args[0]->v.str) : -1);
+        }
+        if (strcmp(fname, "string_upper") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+            char *r = strdup(args[0]->v.str);
+            for (char *p = r; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
+            sw_val_t *v = sw_val_string(r); free(r); return v;
+        }
+        if (strcmp(fname, "string_lower") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+            char *r = strdup(args[0]->v.str);
+            for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+            sw_val_t *v = sw_val_string(r); free(r); return v;
+        }
+        if (strcmp(fname, "string_trim") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+            const char *s = args[0]->v.str;
+            while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+            const char *end = s + strlen(s);
+            while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
+            int len = (int)(end - s);
+            char *r = malloc(len + 1); memcpy(r, s, len); r[len] = '\0';
+            sw_val_t *v = sw_val_string(r); free(r); return v;
+        }
+        if (strcmp(fname, "string_length") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
+            return sw_val_int((int64_t)strlen(args[0]->v.str));
+        if (strcmp(fname, "json_encode") == 0 && nargs >= 1) {
+            /* Use sw_val_format and call it close-enough JSON for REPL use.
+             * The codegen path's builtin produces canonical JSON; this path
+             * is for quick interactive checks. */
+            char *buf = NULL; size_t blen = 0;
+            FILE *m = open_memstream(&buf, &blen);
+            if (!m) return sw_val_string("");
+            sw_val_format(m, args[0]); fclose(m);
+            sw_val_t *r = sw_val_string(buf ? buf : ""); free(buf); return r;
+        }
+        if (strcmp(fname, "json_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+            return sw_lang_json_decode(args[0]->v.str);
+        }
+        /* Map ops the REPL is likely to want for shape checks. */
+        if (strcmp(fname, "map_size") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP)
+            return sw_val_int(args[0]->v.map.count);
+        if (strcmp(fname, "map_has_key") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
+            for (int i = 0; i < args[0]->v.map.count; i++)
+                if (sw_val_equal(args[0]->v.map.keys[i], args[1])) return sw_val_atom("true");
+            return sw_val_atom("false");
+        }
+        if (strcmp(fname, "timestamp") == 0) {
+            struct timeval tv; gettimeofday(&tv, NULL);
+            return sw_val_int((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
         }
         if (strcmp(fname, "map_get") == 0 && nargs >= 2) return sw_val_map_get(args[0], args[1]);
         if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);

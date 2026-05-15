@@ -163,7 +163,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "ets_new") == 0 || strcmp(name, "ets_put") == 0 ||
            strcmp(name, "ets_get") == 0 || strcmp(name, "ets_delete") == 0 ||
            strcmp(name, "sleep") == 0 || strcmp(name, "getenv") == 0 ||
-           strcmp(name, "to_string") == 0 || strcmp(name, "timestamp") == 0 ||
+           strcmp(name, "to_string") == 0 || strcmp(name, "format") == 0 ||
+           strcmp(name, "timestamp") == 0 ||
            strcmp(name, "file_write") == 0 || strcmp(name, "file_read") == 0 ||
            strcmp(name, "file_mkdir") == 0 ||
            strcmp(name, "http_post") == 0 ||
@@ -339,6 +340,14 @@ static void scan_spawns(cg_ctx_t *ctx, node_t *n) {
         scan_spawns(ctx, n->v.trycatch.body);
         scan_spawns(ctx, n->v.trycatch.catch_body);
         break;
+    case N_CASE:
+        scan_spawns(ctx, n->v.casex.subject);
+        for (int i = 0; i < n->v.casex.nclauses; i++) {
+            node_t *cl = n->v.casex.clauses[i];
+            scan_spawns(ctx, cl->v.clause.body);
+            if (cl->v.clause.guard) scan_spawns(ctx, cl->v.clause.guard);
+        }
+        break;
     case N_RANGE:
         scan_spawns(ctx, n->v.range.from);
         scan_spawns(ctx, n->v.range.to);
@@ -412,6 +421,14 @@ static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
     case N_TRY:
         collect_idents(n->v.trycatch.body, ids, nids, max);
         collect_idents(n->v.trycatch.catch_body, ids, nids, max);
+        break;
+    case N_CASE:
+        collect_idents(n->v.casex.subject, ids, nids, max);
+        for (int i = 0; i < n->v.casex.nclauses; i++) {
+            node_t *cl = n->v.casex.clauses[i];
+            collect_idents(cl->v.clause.body, ids, nids, max);
+            if (cl->v.clause.guard) collect_idents(cl->v.clause.guard, ids, nids, max);
+        }
         break;
     case N_RANGE:
         collect_idents(n->v.range.from, ids, nids, max);
@@ -502,6 +519,14 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     case N_TRY:
         scan_lambdas(ctx, n->v.trycatch.body);
         scan_lambdas(ctx, n->v.trycatch.catch_body);
+        break;
+    case N_CASE:
+        scan_lambdas(ctx, n->v.casex.subject);
+        for (int i = 0; i < n->v.casex.nclauses; i++) {
+            node_t *cl = n->v.casex.clauses[i];
+            scan_lambdas(ctx, cl->v.clause.body);
+            if (cl->v.clause.guard) scan_lambdas(ctx, cl->v.clause.guard);
+        }
         break;
     case N_RANGE:
         scan_lambdas(ctx, n->v.range.from);
@@ -674,6 +699,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    if (a[0]->type == SW_VAL_LIST || a[0]->type == SW_VAL_TUPLE)\n"
         "        return sw_val_int(a[0]->v.tuple.count);\n"
         "    if (a[0]->type == SW_VAL_STRING) return sw_val_int((int64_t)strlen(a[0]->v.str));\n"
+        "    if (a[0]->type == SW_VAL_MAP) return sw_val_int(a[0]->v.map.count);\n"
         "    return sw_val_int(0);\n"
         "}\n\n");
 
@@ -1146,7 +1172,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "ets_new") == 0 || strcmp(fname, "ets_put") == 0 ||
              strcmp(fname, "ets_get") == 0 || strcmp(fname, "ets_delete") == 0 ||
              strcmp(fname, "sleep") == 0 || strcmp(fname, "getenv") == 0 ||
-             strcmp(fname, "to_string") == 0 || strcmp(fname, "timestamp") == 0 ||
+             strcmp(fname, "to_string") == 0 || strcmp(fname, "format") == 0 ||
+             strcmp(fname, "timestamp") == 0 ||
              strcmp(fname, "file_write") == 0 || strcmp(fname, "file_read") == 0 ||
              strcmp(fname, "file_mkdir") == 0 || strcmp(fname, "http_post") == 0 ||
              strcmp(fname, "json_get") == 0 || strcmp(fname, "json_escape") == 0 ||
@@ -1374,6 +1401,72 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     }
 
     fprintf(f, "    }\n");  /* end selective receive block */
+
+    strncpy(out, res, osz - 1);
+}
+
+/* emit_case — top-level pattern matching expression.
+ *
+ *   case <subject> {
+ *       pat1 -> body1
+ *       pat2 when guard -> body2
+ *       _other -> default
+ *   }
+ *
+ * Compiles to: evaluate subject once, then a chained if/else over the
+ * patterns (reusing emit_pattern_cond + emit_pattern_bind that the
+ * receive emitter uses). No mailbox involvement — this is a value
+ * dispatch, not a message dispatch. Each arm is its own scope, so we
+ * snapshot ndeclared around the body to keep parallel binding names
+ * isolated (e.g. `case x { {'a', n} -> n ; {'b', n} -> n + 1 }` —
+ * both `n`s are separate). */
+static void emit_case(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
+    FILE *f = ctx->out;
+    char subj[32], res[32];
+    emit_expr(ctx, n->v.casex.subject, 0, subj, sizeof(subj));
+    fresh_var(ctx, res, sizeof(res));
+    fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
+
+    /* Wrap in a do-while(0) so each arm can `break` to skip the rest
+     * once it matches AND its guard (if any) fires. Without this, a
+     * pattern that matches but whose guard fails would consume the
+     * dispatch even though no body ran — falling through is exactly
+     * what we want when the guard rejects. */
+    fprintf(f, "    do {\n");
+    int nclauses = n->v.casex.nclauses;
+    for (int i = 0; i < nclauses; i++) {
+        node_t *cl = n->v.casex.clauses[i];
+        int saved_ndeclared = ctx->ndeclared;
+        fprintf(f, "        if (");
+        emit_pattern_cond(ctx, cl->v.clause.pattern, subj);
+        fprintf(f, ") {\n");
+
+        emit_pattern_bind(ctx, cl->v.clause.pattern, subj);
+
+        if (cl->v.clause.guard) {
+            char guard_res[32];
+            emit_expr(ctx, cl->v.clause.guard, 0, guard_res, sizeof(guard_res));
+            fprintf(f, "            if (sw_val_is_truthy(%s)) {\n", guard_res);
+            char body_res[32];
+            emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
+            if (body_res[0])
+                fprintf(f, "                %s = %s;\n", res, body_res);
+            fprintf(f, "                break;\n");
+            fprintf(f, "            }\n");
+            /* Guard failed — close the pattern-match block and let the
+             * loop continue to the next clause. */
+        } else {
+            char body_res[32];
+            emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
+            if (body_res[0])
+                fprintf(f, "            %s = %s;\n", res, body_res);
+            fprintf(f, "            break;\n");
+        }
+
+        fprintf(f, "        }\n");
+        ctx->ndeclared = saved_ndeclared;
+    }
+    fprintf(f, "    } while (0);\n");
 
     strncpy(out, res, osz - 1);
 }
@@ -1617,6 +1710,9 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     case N_RECEIVE:
         emit_receive(ctx, n, tail, out, osz);
         break;
+    case N_CASE:
+        emit_case(ctx, n, tail, out, osz);
+        break;
     case N_IF:
         emit_if(ctx, n, tail, out, osz);
         break;
@@ -1726,25 +1822,31 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         break;
     }
     case N_TRY: {
-        /* try { body } catch e { handler } */
+        /* try { body } catch e { handler }
+         *
+         * The C `if (_sw_error) { ... }` block is its own lexical
+         * scope, so the err_var declaration belongs only to it.
+         * Snapshot ndeclared before the catch and restore after, the
+         * same pattern emit_if uses for branch scopes — without this,
+         * a second try/catch with the same err_var name would emit
+         * `e = _sw_error;` instead of `sw_val_t *e = _sw_error;` and
+         * fail with "use of undeclared identifier 'e'". */
         char v[32]; fresh_var(ctx, v, sizeof(v));
         fprintf(f, "    _sw_error = NULL;\n");
         char body_res[32];
         emit_expr(ctx, n->v.trycatch.body, 0, body_res, sizeof(body_res));
         fprintf(f, "    sw_val_t *%s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
         fprintf(f, "    if (_sw_error) {\n");
-        if (!is_declared(ctx, n->v.trycatch.err_var)) {
-            fprintf(f, "        sw_val_t *%s = _sw_error;\n", n->v.trycatch.err_var);
-            declare_var(ctx, n->v.trycatch.err_var);
-        } else {
-            fprintf(f, "        %s = _sw_error;\n", n->v.trycatch.err_var);
-        }
+        int saved_ndeclared = ctx->ndeclared;
+        fprintf(f, "        sw_val_t *%s = _sw_error;\n", mangle_for_c(n->v.trycatch.err_var));
+        declare_var(ctx, n->v.trycatch.err_var);
         fprintf(f, "        _sw_error = NULL;\n");
         char catch_res[32];
         emit_expr(ctx, n->v.trycatch.catch_body, 0, catch_res, sizeof(catch_res));
         if (catch_res[0])
             fprintf(f, "        %s = %s;\n", v, catch_res);
         fprintf(f, "    }\n");
+        ctx->ndeclared = saved_ndeclared;
         strncpy(out, v, osz - 1);
         break;
     }

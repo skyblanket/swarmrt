@@ -4,6 +4,72 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-15 — `case` expression, `format()`, REPL polish
+
+The "make LLMs love it" pass. Three big language UX wins plus a few
+sharp-edge fixes.
+
+**`case` expression — top-level pattern matching.** The single biggest
+ergonomic win for anyone (human or LLM) writing sw. Previously, dispatch
+on a value meant nested `if/else` ladders — `is_recursive_tool` in
+swarm-code was 4 levels deep, `char_ord` was 38 levels. Now:
+```
+case msg {
+    {'ok', v}      -> "ok: " ++ to_string(v)
+    {'error', why} -> "err: " ++ to_string(why)
+    n when n > 0   -> "positive"
+    _              -> "default"
+}
+```
+Same arm-clause shape as `receive` (pattern, optional `when guard`,
+body). Falls through to the next arm if a guard rejects.
+Implementation: new `N_CASE` AST node, parser at `par_primary` (after
+`try`), `emit_case` codegen mirrors `emit_if`'s scope-snapshotting
+pattern wrapped in `do { ... } while(0)` so `break;` exits on first
+match. Also added to the tree-walking interpreter so it works in the
+REPL.
+
+**`format(template, args...)` builtin.** Reduces the
+`++ to_string(x) ++` noise that polluted every prose-with-data:
+```
+print(format("[{}] req={} ms={}", level, req_id, elapsed_ms))
+```
+`{}` placeholders consume the next positional arg; `{{`/`}}` escape
+literal braces; missing args render as `{}` so you see the gap instead
+of crashing. Composite values render via the new `sw_val_format` —
+same shape as `print()` produces. Available in both compiled and REPL
+paths.
+
+**REPL is now actually useful.** `swc repl` already existed but the
+tree-walker was missing `format`, `case`, `string_split`,
+`string_contains`, `string_starts_with`, `string_ends_with`,
+`string_index_of`, `string_upper`, `string_lower`, `string_trim`,
+`string_length`, `json_encode`, `json_decode`, `map_size`,
+`map_has_key`, `timestamp`, and tuple/list/map rendering in
+`to_string`. Added all of those. Also: `length()` now works on maps
+(was silently returning 0). Variables persist across lines, multi-line
+input continues until brackets balance.
+
+**Bugs fixed along the way.**
+- `try/catch` had the same scope-shadowing bug we fixed in `if/else`
+  earlier today — second `try/catch` with the same `err_var` name
+  failed with "use of undeclared identifier". Snapshot/restore
+  `ndeclared` around the catch block.
+- `to_string` of tuples / lists / maps / pids was returning `<val:6>`
+  garbage. Refactored: split `sw_val_print` into `sw_val_format(FILE *)`
+  + a stdout wrapper, route `to_string` through a memstream-backed
+  `sw_val_format` for composite values. Now you get `{ok, 42}`,
+  `[1, 2, 3]`, `%{a: 1}`, `<pid:7>` — matching what `print()` shows.
+
+**Tests.** New `tests/sw/test_case_and_format.sw` adds 17 assertions
+covering case dispatch (literal / guard pass / guard fall-through /
+tuple bind / atom match / catchall), format (basic / multi /
+composite / escape / missing-arg), and the new map builtins. Total
+suite is now 38 assertions across 5 files, runs `make test-sw` in
+under 2s.
+
+---
+
 ## 2026-05-15 — Generated programs exit when `main()` returns + repo polish
 
 **The big one.** Until now, every sw binary's generated `main()` ended in
