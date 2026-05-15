@@ -55,6 +55,30 @@ fun test_format_list() { assert_eq("fmt_list", format("l={}", [1, 2, 3]), "l=[1,
 fun test_format_escape() { assert_eq("fmt_escape", format("{{ + }} = {}", 1), "{ + } = 1") }
 fun test_format_missing() { assert_eq("fmt_missing", format("a={} b={}", 9), "a=9 b={}") }
 
+# ---- f-strings ----
+
+fun test_fstring_var() {
+    name = "world"
+    assert_eq("fstring_var", f"hello {name}", "hello world")
+}
+
+fun test_fstring_expr() {
+    n = 7
+    assert_eq("fstring_expr", f"n*2 = {n * 2}", "n*2 = 14")
+}
+
+fun test_fstring_call() {
+    name = "alice"
+    assert_eq("fstring_call", f"upper: {string_upper(name)}", "upper: ALICE")
+}
+
+fun test_fstring_no_interp() { assert_eq("fstring_plain", f"no interp here", "no interp here") }
+
+fun test_fstring_only_expr() {
+    x = 42
+    assert_eq("fstring_only", f"{x}", "42")
+}
+
 # ---- new builtins ----
 
 fun test_map_size() {
@@ -89,9 +113,14 @@ fun main() {
     fails = fails + test_format_list()
     fails = fails + test_format_escape()
     fails = fails + test_format_missing()
+    fails = fails + test_fstring_var()
+    fails = fails + test_fstring_expr()
+    fails = fails + test_fstring_call()
+    fails = fails + test_fstring_no_interp()
+    fails = fails + test_fstring_only_expr()
     fails = fails + test_map_size()
     fails = fails + test_map_remove()
     fails = fails + test_length_on_map()
-    if (fails == 0) { print("OK case_and_format 17/17") ; sys_exit(0) }
+    if (fails == 0) { print("OK case_and_format 22/22") ; sys_exit(0) }
     else { print("FAIL case_and_format " ++ to_string(fails)) ; sys_exit(1) }
 }

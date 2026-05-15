@@ -92,7 +92,7 @@ fun main() {
     results = collect(5, [])
     send(pid, 'stop')
 
-    print("squares: " ++ to_string(results))
+    print(f"squares: {results}")
 }
 
 fun collect(n, acc) {
@@ -231,6 +231,9 @@ The [`examples/`](examples/) directory has small focused programs. Each shows on
 | `supervisor.sw` | Restart strategies in action. |
 | `mapreduce.sw` | Spawn a fan-out worker pool and collect results. |
 | `distributed.sw` | Multi-node — start two `swarms` and pass messages over TCP. |
+| `dispatcher.sw` | Studio-pattern actor: tagged messages routed via `case`, state via recursion arg. |
+| `json_pipeline.sw` | JSON load → `case` classify → f-string render. The new ergonomics in 35 lines. |
+| `http_echo.sw` | A working HTTP server in 25 lines — `case` on the path, f-strings for templating. |
 
 Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x`.
 

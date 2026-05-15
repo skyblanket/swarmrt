@@ -97,6 +97,11 @@ typedef enum {
     TOK_PERCENT,   /* % — binary modulo */
     TOK_MAP_OPEN,  /* %{ — map-literal start (consumed atomically by lexer
                     *      so the parser can disambiguate from `expr % {…}`) */
+    /* Phase 13: f-string interpolation. Lexer captures the body
+     * verbatim (including {expr} placeholders); parser desugars to
+     * format(template, expr1, expr2, ...). Single token type so we
+     * don't have to thread state across multiple lex calls. */
+    TOK_FSTRING,
 } tok_type_t;
 
 typedef struct {
@@ -215,6 +220,72 @@ static tok_t lnext(lex_t *l) {
         t.text[i] = 0;
         if (lpeek(l) == '\'') ladv(l);
         t.type = TOK_ATOM;
+        return t;
+    }
+
+    /* f-string: f"hello {name}" — desugared to "hello #{name}" so the
+     * existing #{expr} interpolation handler does the work. Lexer
+     * rewrites top-level `{` into `#{` while scanning. Inside an
+     * embedded expression we track brace depth + inner-string state so
+     * `f"name={get_name(\"key\")}"` parses correctly. After scanning
+     * the body we emit TOK_STRING — the parser's parse_interp_string
+     * picks it up unchanged. */
+    if (c == 'f' && lpeek2(l) == '"') {
+        ladv(l); /* skip f */
+        ladv(l); /* skip opening " */
+        int i = 0;
+        int brace_depth = 0;
+        int in_inner_str = 0;
+        while (lpeek(l) && i < (int)sizeof(t.text) - 4) {
+            char ch = lpeek(l);
+            if (in_inner_str) {
+                if (ch == '\\') {
+                    t.text[i++] = ladv(l);
+                    if (lpeek(l) && i < (int)sizeof(t.text) - 4)
+                        t.text[i++] = ladv(l);
+                    continue;
+                }
+                if (ch == '"') in_inner_str = 0;
+                t.text[i++] = ladv(l);
+                continue;
+            }
+            if (ch == '"') {
+                if (brace_depth == 0) break; /* end of f-string */
+                in_inner_str = 1;
+                t.text[i++] = ladv(l);
+                continue;
+            }
+            if (ch == '{' && brace_depth == 0) {
+                /* Top-level `{` — rewrite as `#{` so the existing
+                 * #{expr} interpolation kicks in. */
+                ladv(l);
+                t.text[i++] = '#';
+                t.text[i++] = '{';
+                brace_depth = 1;
+                continue;
+            }
+            if (ch == '{') { brace_depth++; t.text[i++] = ladv(l); continue; }
+            if (ch == '}') { if (brace_depth > 0) brace_depth--; t.text[i++] = ladv(l); continue; }
+            if (ch == '\\') {
+                ladv(l);
+                char esc = ladv(l);
+                switch (esc) {
+                    case 'n': t.text[i++] = '\n'; break;
+                    case 't': t.text[i++] = '\t'; break;
+                    case 'r': t.text[i++] = '\r'; break;
+                    case 'e': t.text[i++] = '\x1b'; break;
+                    case '"': t.text[i++] = '"'; break;
+                    case '\\': t.text[i++] = '\\'; break;
+                    case '#': t.text[i++] = '\x01'; break; /* sentinel: escaped # */
+                    default:  t.text[i++] = esc; break;
+                }
+                continue;
+            }
+            t.text[i++] = ladv(l);
+        }
+        t.text[i] = 0;
+        if (lpeek(l) == '"') ladv(l);
+        t.type = TOK_STRING; /* parse_interp_string handles #{...} */
         return t;
     }
 

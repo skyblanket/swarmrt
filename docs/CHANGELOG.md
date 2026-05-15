@@ -4,6 +4,45 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-15 — f-strings + showcase examples
+
+**f-string interpolation.** The third headline LLM-ergonomics win:
+
+```sw
+f"hi {name} count {n}"                  # → "hi world count 42"
+f"req={req_id} status={code} ms={elapsed}"
+f"upper: {string_upper(name)}"          # any expression in {…}
+```
+
+Implementation is delightfully small: turns out the language already
+had `"hello #{name}"` interpolation built in (`parse_interp_string`).
+The lexer for `f"..."` rewrites top-level `{` to `#{` while scanning,
+emits TOK_STRING, and the existing #{...} handler does the rest.
+Inside an embedded expression we track brace-depth + inner-string
+state so `f"name={get_name(\"key\")}"` parses correctly.
+
+f-strings work in both compiled code and the REPL.
+
+**Three new showcase examples** that flex the post-`case` / `format` /
+f-string ergonomics:
+
+- **examples/dispatcher.sw** — the studio-pattern actor in 50 lines.
+  Tagged-message dispatch via `case`, state via the recursion arg,
+  per-agent prefix lines via f-strings. The skeleton swarm-code's
+  `agents.sw` started from.
+- **examples/json_pipeline.sw** — JSON load → `case` classify by
+  age band (with guards) → f-string render. Shows how the new
+  ergonomics turn a deeply-nested if/else chain into something
+  readable in 35 lines.
+- **examples/http_echo.sw** — a working HTTP server in 25 lines.
+  `case` on the path, f-strings for templating, `http_listen` +
+  `http_respond` builtins. Hit with `curl http://localhost:8080/hello/sky`.
+
+**5 new f-string tests** added to test_case_and_format.sw — full
+suite is now 43 assertions across 5 files.
+
+---
+
 ## 2026-05-15 — `case` expression, `format()`, REPL polish
 
 The "make LLMs love it" pass. Three big language UX wins plus a few

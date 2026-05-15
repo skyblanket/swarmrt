@@ -196,14 +196,17 @@ case x {
 
 Falls through to the next arm if a guard rejects. This is the right tool for any "value → label" or "tag → handler" dispatch.
 
-### `format` — use this instead of `++ to_string(x) ++`
+### f-strings and `format` — use these instead of `++ to_string(x) ++`
 
 ```sw
-format("hi {} you are {}", name, age)        # → "hi alice you are 30"
-format("got {} (req={})", result, req_id)    # composite values render properly
+f"hi {name} you are {age}"                    # f-string — works with any expression
+f"req={req_id} status={code} ms={elapsed}"
+
+format("hi {} you are {}", name, age)         # positional version
+format("got {} (req={})", result, req_id)
 ```
 
-`{}` placeholders consume positional args. `{{` / `}}` escape literal braces.
+f-strings desugar to to_string + `++` chains. Inside `{…}` you can put any expression: `f"{string_upper(name)}"`, `f"{[1, 2, 3]}"`, `f"{map_get(user, 'name')}"`. Use `\\#{` if you need a literal `#{`. Composite values render with the same shape as `print()`.
 
 ---
 
@@ -322,7 +325,7 @@ If you're embedding sw-writing capability into an agent, this snippet (paste int
 > - Modules begin with `module Name` and `export [list, of, fns]`. Files live at `src/<ModuleName>.sw`.
 > - Processes are tail-recursive functions that call themselves in `receive { pattern -> body ; recur(state) }`.
 > - State is immutable — recurse with new values to "update" it. Use `ets_new()` + `ets_put`/`ets_get` for shared mutable state.
-> - Strings concatenate with `++`, not `+`. `++` auto-coerces numbers/atoms to strings. `print(...)` is variadic and joins args with spaces.
+> - Strings concatenate with `++`, not `+`. `++` auto-coerces numbers/atoms to strings. `print(...)` is variadic and joins args with spaces. For complex prose use `f"hi {name} count {n}"` (f-string interpolation) or `format("hi {} count {}", name, n)`.
 > - Atoms (`'ok'`, `'error'`) are message tags. Tuples (`{...}`) bundle them with data: `{'tag', payload, reply_pid}` is the convention for request/reply.
 > - Statements separate by newline OR `;` — both work in any block.
 > - Compile with `swc build src/main.sw -o myprog && ./myprog`.

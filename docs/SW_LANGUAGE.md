@@ -136,11 +136,22 @@ name = map_get(person, 'name')          # atom-key lookup
 older = map_put(person, 'age', 31)      # functional update — original unchanged
 ```
 
-Strings concat with `++`:
+Strings concat with `++` (auto-coerces non-strings):
 
 ```sw
 greeting = "hello, " ++ name ++ "!"
+log = "count: " ++ count            # int auto-coerced
 ```
+
+For anything more than a couple of pieces, prefer **f-strings** or **`format`**:
+
+```sw
+greeting = f"hello, {name}!"                          # f-string interpolation
+log      = f"req={req_id} status={code} ms={elapsed}" # any expression in {…}
+templ    = format("hi {} ({} req(s))", name, count)   # positional placeholders
+```
+
+f-strings desugar to `to_string(expr)` + `++` chains under the hood, so they work with any value (composites render via `sw_val_format` — same shape as `print()`).
 
 ---
 
