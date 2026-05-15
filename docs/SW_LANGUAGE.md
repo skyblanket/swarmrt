@@ -450,20 +450,21 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 
 These are real, hit-during-development quirks. Skim before you write a lot of sw.
 
-- **Multi-statement blocks need newlines, not `;`** — except inside `receive` arm bodies (where `;` works) and at top-level function bodies (where newlines work). For a multi-statement `if` branch, use newlines:
+- **`;` and newline both separate statements** — in any block: function body, if-branch, else-branch, receive arm. Both of these parse and run identically:
   ```sw
+  if (x) { a = compute() ; print(a) }
   if (x) {
       a = compute()
       print(a)
   }
   ```
-  `if (x) { a = compute(); print(a) }` parses but treats the whole thing oddly — prefer newlines.
+  *(Was a gotcha until 2026-05-15 — `;` in if-branches used to error.)*
 
-- **C-reserved words can't be sw identifiers.** sw passes identifier names verbatim to the C codegen. `inline`, `static`, `extern`, `const`, `register`, `volatile` etc. cannot be used as variable names — they collide with C keywords and you get a confusing C-level parse error. Use `rendered`, `marker`, `holder` etc.
+- **C-reserved words ARE legal sw identifiers.** Since 2026-05-15 the codegen mangles `inline`, `static`, `extern`, `const`, `register`, `volatile`, `auto`, `goto`, `restrict`, `signed`, `unsigned`, `union`, `enum`, `struct`, `typedef`, `return`, `break`, `continue`, etc. by appending `_sw` at every C-emission site. Source-level lookup is unchanged, so the mangling is invisible to your sw code. Use them freely.
 
 - **Variable scope shadowing FIXED 2026-05-15.** Earlier versions silently emitted "use of undeclared identifier" when the same name was used in two `if/else` branches. Codegen now snapshots and restores the declaration list around each branch. If you see this on an older swarmrt, rebuild swc.
 
-- **`#line` directives surface sw line numbers in C errors.** When a generated-C compile fails, the error points at `src/<Module>.sw:<line>` instead of `/tmp/swc_*.c`. The line may be off by a few (tracks the function start, not the exact statement) — search for the function name to home in.
+- **`#line` directives surface sw line numbers in C errors.** When a generated-C compile fails, the error points at `src/<Module>.sw:<line>` instead of `/tmp/swc_*.c`. **Per-statement accuracy** since the late-2026-05-15 codegen pass — points at the exact failing line, not the function start.
 
 - **No userland `exit/2`** for killing other processes. Send a `{'stop'}` message and let the receiver clean up on its next `receive`. True preemption needs runtime support not yet exposed.
 

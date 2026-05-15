@@ -12,6 +12,9 @@ dist/
 CMakeCache.txt
 CMakeFiles/
 
+# sw-language test build artefacts (binaries + per-file logs).
+tests/sw/.build/
+
 # Compiled .sw test programs at repo root — `make test-phase*` and
 # similar leave these behind. They're build artifacts, not source.
 /atelier

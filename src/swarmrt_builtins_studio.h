@@ -1134,7 +1134,62 @@ static void _sw_spinner_draw(const char *verb, uint64_t elapsed_ms, int tokens) 
 }
 
 /*
- * http_post_stream(url, headers_list, body) → string (full content)
+ * Stream output sink for http_post_stream.
+ *
+ * Two modes:
+ *   1. tty mode (subagent == 0)  — bytes go to stdout via the column-aware
+ *      `_sw_stream_emit` (the existing wrap+indent behaviour).
+ *   2. subagent mode (subagent == 1) — bytes are batched into small chunks
+ *      and sent as `{'stream_chunk', name, text}` messages to `target` so
+ *      a parent agent can multiplex many subagent streams without
+ *      interleaving on a shared TTY. No spinner, no ESC interrupt path,
+ *      no inline reasoning UI — the parent decides how to render.
+ */
+typedef struct {
+    int subagent;
+    sw_process_t *target;
+    const char *name;       /* agent label, included in every message */
+    char chunk[256];
+    int chunk_len;
+} _stream_out_t;
+
+static void _stream_out_init(_stream_out_t *o, sw_process_t *target, const char *name) {
+    o->subagent = (target != NULL);
+    o->target = target;
+    o->name = name;
+    o->chunk_len = 0;
+}
+
+static void _stream_out_send_tagged(sw_process_t *target, const char *tag,
+                                    const char *name, const char *text) {
+    sw_val_t *items[3];
+    items[0] = sw_val_atom(tag);
+    items[1] = sw_val_string(name);
+    items[2] = sw_val_string(text);
+    sw_val_t *msg = sw_val_tuple(items, 3);
+    sw_send_tagged(target, SW_TAG_NONE, msg);
+}
+
+static void _stream_out_flush(_stream_out_t *o) {
+    if (!o->subagent || o->chunk_len == 0) return;
+    o->chunk[o->chunk_len] = '\0';
+    _stream_out_send_tagged(o->target, "stream_chunk", o->name, o->chunk);
+    o->chunk_len = 0;
+}
+
+static void _stream_out_putc(_stream_out_t *o, char c, _sw_stream_state_t *st) {
+    if (!o->subagent) {
+        _sw_stream_emit(st, c);
+        return;
+    }
+    if (o->chunk_len >= (int)sizeof(o->chunk) - 1) _stream_out_flush(o);
+    o->chunk[o->chunk_len++] = c;
+    /* Flush at a newline so the parent renderer can produce nice line breaks. */
+    if (c == '\n') _stream_out_flush(o);
+}
+
+/*
+ * http_post_stream(url, headers_list, body, [target_pid, name]) → string (full content)
  *
  * POSTs a JSON body with "stream": true to an OpenAI-compatible endpoint,
  * parses the Server-Sent-Events stream token-by-token, prints each
@@ -1143,6 +1198,13 @@ static void _sw_spinner_draw(const char *verb, uint64_t elapsed_ms, int tokens) 
  * in a minimal OpenAI response shape so the existing extract_content
  * path keeps working:
  *    {"choices":[{"message":{"role":"assistant","content":"..."}}]}
+ *
+ * If the optional 4th + 5th args (target_pid, name_string) are supplied,
+ * runs in "subagent mode": no stdout, no spinner, no ESC interrupt — every
+ * content chunk is sent to target_pid as `{'stream_chunk', name, text}`,
+ * reasoning chunks as `{'stream_reason', name, text}`, and a final
+ * `{'stream_done', name}` is sent when the call ends. The parent agent is
+ * responsible for rendering them with whatever prefix / colour it likes.
  *
  * While waiting for the first byte from upstream, a Claude-Code-style
  * spinner shows on stdout (verb + elapsed + token estimate). It is
@@ -1158,6 +1220,16 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     const char *url = a[0]->v.str;
     sw_val_t *headers = a[1];
     const char *body = a[2]->v.str;
+
+    /* Subagent mode: route content+reasoning as messages, skip TTY UI. */
+    sw_process_t *subagent_target = NULL;
+    const char *subagent_name = "agent";
+    if (n >= 5 && a[3] && a[3]->type == SW_VAL_PID && a[4] && a[4]->type == SW_VAL_STRING) {
+        subagent_target = a[3]->v.pid;
+        subagent_name = a[4]->v.str;
+    }
+    _stream_out_t so;
+    _stream_out_init(&so, subagent_target, subagent_name);
 
     /* Write body to temp file to avoid shell-escaping the JSON. */
     char body_file[256];
@@ -1221,14 +1293,14 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * streaming generation. Not fatal if it isn't a TTY — we just skip
      * the interrupt path. */
     int stdin_fd = -1;
-    if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) {
+    if (!so.subagent && isatty(STDIN_FILENO) && _sw_rl.saved_ok) {
         stdin_fd = STDIN_FILENO;
     }
     int interrupted = 0;
 
-    /* Pick one random verb for this call. Spinner only on a TTY —
-     * piped output stays clean for tests/scripts. */
-    int is_tty = isatty(fileno(stdout));
+    /* Pick one random verb for this call. Spinner only on a TTY and
+     * only when not a subagent — subagents never touch stdout. */
+    int is_tty = !so.subagent && isatty(fileno(stdout));
     const char *verb = _sw_pick_spinner_verb();
     int spinner_drawn = 0;
     uint64_t t_start = _sw_now_ms();
@@ -1433,17 +1505,28 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                         reason_len += rtok_len;
                         reasoning[reason_len] = '\0';
 
-                        if (spinner_drawn) {
-                            fputs("\r\x1b[K", stdout);
-                            spinner_drawn = 0;
-                            _sw_stream_reset_line(&stream);
-                        }
-                        if (!reason_started) {
-                            fputs("  \x1b[38;5;240m\x1b[3m", stdout);
+                        if (so.subagent) {
+                            /* Send each reasoning chunk as a message; parent
+                             * decides whether/how to render it. */
+                            char tmp[8200];
+                            size_t cp = rtok_len < sizeof(tmp) - 1 ? rtok_len : sizeof(tmp) - 1;
+                            memcpy(tmp, rtok, cp);
+                            tmp[cp] = '\0';
+                            _stream_out_send_tagged(so.target, "stream_reason", so.name, tmp);
                             reason_started = 1;
+                        } else {
+                            if (spinner_drawn) {
+                                fputs("\r\x1b[K", stdout);
+                                spinner_drawn = 0;
+                                _sw_stream_reset_line(&stream);
+                            }
+                            if (!reason_started) {
+                                fputs("  \x1b[38;5;240m\x1b[3m", stdout);
+                                reason_started = 1;
+                            }
+                            fwrite(rtok, 1, rtok_len, stdout);
+                            fflush(stdout);
                         }
-                        fwrite(rtok, 1, rtok_len, stdout);
-                        fflush(stdout);
                     }
                 }
             }
@@ -1474,10 +1557,13 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
 
             /* Reasoning → content transition: close the dim italic block
              * with a separator so user sees the model's thinking end and
-             * its actual response begin. Only fires once per turn. */
+             * its actual response begin. Only fires once per turn.
+             * In subagent mode there's no inline UI to close. */
             if (tok_len > 0 && reason_started && !content_started) {
-                fputs("\x1b[0m\n\n", stdout);
-                fflush(stdout);
+                if (!so.subagent) {
+                    fputs("\x1b[0m\n\n", stdout);
+                    fflush(stdout);
+                }
                 content_started = 1;
             }
 
@@ -1534,10 +1620,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                         }
                     }
                     while (print_pos < marker_idx) {
-                        _sw_stream_emit(&stream, buffer[print_pos++]);
+                        _stream_out_putc(&so, buffer[print_pos++], &stream);
                     }
-                    _sw_stream_emit(&stream, '\n');
-                    fflush(stdout);
+                    _stream_out_putc(&so, '\n', &stream);
+                    if (!so.subagent) fflush(stdout);
+                    _stream_out_flush(&so);
                     /* Re-raise the spinner so the user sees continuous
                      * progress while the rest of the tool_call JSON
                      * streams in, instead of a silent multi-second gap
@@ -1555,9 +1642,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                         _sw_stream_reset_line(&stream);
                     }
                     while (print_pos + LOOKAHEAD < buf_len) {
-                        _sw_stream_emit(&stream, buffer[print_pos++]);
+                        _stream_out_putc(&so, buffer[print_pos++], &stream);
                     }
-                    fflush(stdout);
+                    if (so.subagent) _stream_out_flush(&so);
+                    else fflush(stdout);
                 }
             }
         }
@@ -1570,18 +1658,23 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         _sw_stream_reset_line(&stream);
     }
     /* If the model emitted reasoning but never started speaking content,
-     * close the dim/italic block cleanly so the terminal styling resets. */
-    if (reason_started && !content_started) {
+     * close the dim/italic block cleanly so the terminal styling resets.
+     * In subagent mode there's no inline UI to close. */
+    if (reason_started && !content_started && !so.subagent) {
         fputs("\x1b[0m\n", stdout);
         fflush(stdout);
     }
     if (!seen_tool_call) {
         while (print_pos < buf_len) {
-            _sw_stream_emit(&stream, buffer[print_pos++]);
+            _stream_out_putc(&so, buffer[print_pos++], &stream);
         }
     }
-    fputs("\n", stdout);
-    fflush(stdout);
+    if (so.subagent) {
+        _stream_out_flush(&so);
+    } else {
+        fputs("\n", stdout);
+        fflush(stdout);
+    }
     /* If the user interrupted, we already killed + waited for the
      * child inside _sw_pkill_close — don't re-close. Otherwise close
      * the FILE* and wait for the child normally. */
@@ -1614,13 +1707,20 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         while (erlen > 0 && (errbuf[erlen - 1] == '\n' || errbuf[erlen - 1] == '\r')) {
             errbuf[--erlen] = '\0';
         }
-        fprintf(stdout, "\n  \x1b[38;5;208m⚠ curl exited %d\x1b[0m\n", curl_exit);
-        if (erlen > 0) {
-            fprintf(stdout, "  \x1b[38;5;240m%s\x1b[0m\n", errbuf);
+        if (so.subagent) {
+            char emsg[1100];
+            snprintf(emsg, sizeof(emsg), "[curl exit %d] %s", curl_exit,
+                     erlen > 0 ? errbuf : "(no stderr captured)");
+            _stream_out_send_tagged(so.target, "stream_chunk", so.name, emsg);
         } else {
-            fprintf(stdout, "  \x1b[38;5;240m(no stderr captured — check the URL/endpoint)\x1b[0m\n");
+            fprintf(stdout, "\n  \x1b[38;5;208m⚠ curl exited %d\x1b[0m\n", curl_exit);
+            if (erlen > 0) {
+                fprintf(stdout, "  \x1b[38;5;240m%s\x1b[0m\n", errbuf);
+            } else {
+                fprintf(stdout, "  \x1b[38;5;240m(no stderr captured — check the URL/endpoint)\x1b[0m\n");
+            }
+            fflush(stdout);
         }
-        fflush(stdout);
     }
     swbs_unlink(err_file);
 
@@ -1652,8 +1752,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         memcpy(buffer + buf_len, trunc_marker, ml);
         buf_len += ml;
         buffer[buf_len] = '\0';
-        /* Also show it on screen so the user can see it happened. */
-        if (is_tty && !interrupted) {
+        /* Also show it on screen so the user can see it happened.
+         * In subagent mode, surface as a chunk so the parent can render. */
+        if (so.subagent) {
+            _stream_out_send_tagged(so.target, "stream_chunk", so.name, trunc_marker);
+        } else if (is_tty && !interrupted) {
             fprintf(stdout, "\n  \x1b[38;5;208m⚠%s\x1b[0m\n", trunc_marker + 2);
             fflush(stdout);
         }
@@ -1732,6 +1835,16 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     free(reasoning);
     free(out);
     free(buffer);
+
+    /* Tell the parent we're done — useful as a sentinel without having
+     * to grep the chunk stream. */
+    if (so.subagent) {
+        sw_val_t *items[2];
+        items[0] = sw_val_atom("stream_done");
+        items[1] = sw_val_string(so.name);
+        sw_val_t *msg = sw_val_tuple(items, 2);
+        sw_send_tagged(so.target, SW_TAG_NONE, msg);
+    }
     return result;
 }
 

@@ -660,6 +660,10 @@ static node_t *par_primary(par_t *p) {
             body->v.block.stmts = NULL;
             body->v.block.nstmts = 0;
             while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF && !p->err) {
+                /* Tolerate `;` between statements in arm bodies, same
+                 * way par_block does — keeps the syntax consistent. */
+                while (p->cur.type == TOK_SEMI) par_adv(p);
+                if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_AFTER || p->cur.type == TOK_EOF) break;
                 lex_t save_lex = p->lex;
                 tok_t save_cur = p->cur;
                 int save_err = p->err;
@@ -970,6 +974,15 @@ static node_t *par_block(par_t *p) {
     block->v.block.nstmts = 0;
 
     while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+        /* Tolerate `;` as a statement separator. Newlines are already
+         * whitespace at the lexer level, so block bodies historically
+         * only worked with newlines — `if (x) { a ; b }` choked.
+         * Consuming any leading semicolons before parsing the next
+         * statement makes both function bodies AND if-branch / receive-
+         * arm bodies accept either. Pure superset, no existing code
+         * regressed (the lexer ate inter-statement newlines before). */
+        while (p->cur.type == TOK_SEMI) par_adv(p);
+        if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
         block->v.block.nstmts++;
         block->v.block.stmts = realloc(block->v.block.stmts,
             sizeof(node_t*) * block->v.block.nstmts);

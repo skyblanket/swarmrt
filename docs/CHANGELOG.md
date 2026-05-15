@@ -4,6 +4,118 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-15 — sw test framework + browser screenshot inline + `;` in receive arms
+
+**Test framework.** `tests/sw/test_*.sw` files + `tests/sw/run_tests.sh`
+driver + `make test-sw` target. Each test file runs its assertions via
+in-line `assert_eq` / `assert_true` helpers, prints `PASS <name>` /
+`FAIL <name>: msg` lines, and `sys_exit(0|1)` based on rollup. The
+driver compiles + runs each, totals across files. Initial coverage:
+- `test_lang_basics.sw` — modulo, map literal, `;` in if-branch,
+  scope shadowing, C-reserved-word identifiers (5 tests)
+- `test_strings.sw` — `string_index_of` (hit / miss / empty),
+  `string_split`, concat, base64 roundtrip + known vector (7 tests)
+- `test_json.sw` — string / int / map roundtrip, `\uXXXX` decode,
+  list roundtrip (5 tests)
+- `test_processes.sw` — spawn + send + receive, self-pid, ets put/get,
+  ets-missing-returns-nil (4 tests)
+
+Total: 21 assertions across 4 files. `make test-sw` runs in <2s.
+
+**`;` separator in receive arms.** Same fix as the if-branch one —
+`receive { ... }` arm bodies now consume `TOK_SEMI` between
+statements. The two paths share no parser code (receive arms have
+their own loop, not `par_block`) so this needed a dedicated edit.
+
+**Browser screenshot inline.** Now that `base64_decode` is a builtin,
+`Browser.screenshot` decodes in-process and writes the binary PNG
+directly via `file_write`. Removes the tmp file, the `base64 -d`
+shell pipe, and the `rm -f` cleanup. ~10 LOC delta in
+`swarm-code/src/browser.sw`.
+
+---
+
+## 2026-05-15 — Codegen polish: per-statement #line + C-keyword mangling + `;` in if-branches
+
+Three small but high-leverage codegen / parser fixes that close out the
+language papercuts list.
+
+**Per-statement `#line` directives.** The function-level `#line` work from
+earlier today (every function entry emits `#line N "src/Module.sw"`) is
+extended: `emit_expr`'s N_BLOCK case now emits a `#line` before each
+statement when its source line differs from the last emitted one. C
+compiler errors now point at the *exact* failing sw line, not the
+function's start. Throttled to one directive per source line so a
+multi-expression line doesn't get spammed. Probe:
+```
+fun main() {
+    a = 1
+    b = 2
+    c = bogus_undeclared_function(a, b)   ← error now points here
+    print(c)
+}
+```
+
+**C-reserved-word mangling.** sw identifiers matching a C keyword
+(`inline`, `static`, `extern`, `const`, `register`, `volatile`, `auto`,
+`goto`, `restrict`, `signed`, `unsigned`, `union`, `enum`, `struct`,
+`typedef`, `return`, `break`, `continue`, etc.) used to error at the C
+stage with confusing messages. Now `mangle_for_c(name)` appends `_sw`
+at every C-emission site (assignments, function params, lambda captures,
+pattern bindings, identifier reads). The AST + `ctx->declared` list
+keep the original sw name, so `is_declared` lookups still work by
+source-level spelling. Mangling is deterministic, so reads and writes
+of the same variable always produce the same C-side name. 8-slot
+rotating buffer keeps multiple `mangle_for_c(...)` calls in one
+`fprintf` from clobbering each other.
+
+**`;` as statement separator inside any block.** `par_block` now
+consumes any leading `TOK_SEMI` tokens between statements, so
+`if (x) { stmt1 ; stmt2 } else { stmt3 ; stmt4 }` parses and runs.
+Pure superset — newlines (which the lexer was already eating as
+whitespace) still separate statements as before.
+
+---
+
+## 2026-05-15 — Subagent stream multiplexing (studio polish)
+
+The studio model promised "all subagent output flows through messages so
+parallel agents don't interleave on the shared TTY." Until today, subagent
+LLM streams went directly to stdout via the C `http_post_stream` builtin,
+so `parallel([a, b, c])` produced unreadable interleaved output.
+
+**Runtime change** — `http_post_stream(url, headers, body)` now accepts two
+optional 4th + 5th args: `target_pid` and `name`. When supplied, the call
+runs in **subagent mode**:
+- No spinner, no ESC interrupt path, no inline TTY UI
+- Each delta.content chunk is sent as `{'stream_chunk', name, text}` to
+  `target_pid` (flushed at newlines for nice line-break boundaries)
+- Each delta.reasoning_content chunk → `{'stream_reason', name, text}`
+- A final `{'stream_done', name}` marks end of stream
+- Truncation / curl-error markers also routed as message chunks instead
+  of stdout writes
+- Returns the same OpenAI-shaped JSON string so `extract_content` works
+  unchanged in the caller
+
+**swarm-code wiring**:
+- `LLM.chat_for_subagent(messages, opts, target_pid, name)` calls the
+  new builtin variant
+- `Agents.run_agent_turn` dispatches to `chat_for_subagent` when a
+  `main_agent` is registered (always true in normal use)
+- `UI.stream_chunk_render / stream_reason_render / stream_done_render`
+  use a dedicated ETS table (`stream_state_table`, single-key
+  `'current'`) so chunks from the same agent merge inline and prefix
+  lines only print on agent transitions
+- Receive arms added to `agent.sw` main_loop, `agents.sw`
+  `wait_for_reply_with` and `parallel_collect_with` so streams are
+  drained whether main is idle, blocking on an `ask`, or collecting
+  parallel replies
+
+Default (3-arg) calls are unchanged — the TTY path is byte-for-byte
+identical, so `swarm-code`'s own model output renders the same as before.
+
+---
+
 ## 2026-05-15 — Language ergonomics pass
 
 The "ten papercuts" pass on the sw language and codegen. None individually big, collectively the difference between fluent and frustrating.

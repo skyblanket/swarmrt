@@ -25,7 +25,7 @@ CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 # Main targets
 .PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 \
         test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
-        test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-all benchmark benchmark-native stats \
+        test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-all test-sw benchmark benchmark-native stats \
         swc libswarmrt example-counter search test-search bench-search sws mcp mcp-wrap coder coder-clean
 
 # coder — mally-like coding CLI powered by Gemma 4 via vLLM/transformers serve
@@ -163,7 +163,13 @@ h2h: core-objs
 
 test: test-v1 test-v2 test-proc
 
-test-all: test-v1 test-v2 test-proc test-native
+test-all: test-v1 test-v2 test-proc test-native test-sw
+
+# sw-language test suite. Each tests/sw/test_*.sw file is compiled with
+# bin/swc, run, and its summary captured. The driver script aggregates
+# pass/fail counts across all files. See tests/sw/run_tests.sh.
+test-sw: swc libswarmrt
+	@./tests/sw/run_tests.sh
 
 # Benchmarks
 benchmark: v1

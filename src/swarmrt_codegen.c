@@ -63,7 +63,54 @@ typedef struct {
     /* lambda (anonymous function) sites */
     lambda_info_t lambdas[64];
     int nlambdas;
+
+    /* Last source line we emitted a #line directive for in the current
+     * function. Lets emit_block emit one #line per source line (so a C
+     * error inside that statement points at the exact .sw line) without
+     * spamming the generated file. Reset to 0 at the top of each
+     * emit_function. */
+    int last_line_emitted;
 } cg_ctx_t;
+
+/* Forward decl: emit_expr's N_BLOCK case emits per-statement #line
+ * directives, but guess_sw_path is defined further down with the rest
+ * of emit_function. */
+static const char *guess_sw_path(const char *mod_name);
+
+/* C reserved words. Any sw identifier matching one of these would
+ * generate invalid C (e.g. `sw_val_t *inline = ...`) so we mangle by
+ * appending `_sw` at every C-emission site. The AST + ctx->declared
+ * list keep the ORIGINAL sw name so is_declared still matches by
+ * source-level name; only the emitted C-side spelling is rewritten.
+ * mangle_for_c is deterministic, so reads and writes of the same sw
+ * variable always produce the same C variable name. */
+static const char *_c_reserved_words[] = {
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if",
+    "inline", "int", "long", "register", "restrict", "return", "short",
+    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+    "unsigned", "void", "volatile", "while",
+    NULL
+};
+
+/* Returns either `name` verbatim or a pointer into one of 8 rotating
+ * static buffers holding `name_sw`. The rotation lets mangle_for_c be
+ * called multiple times in a single fprintf without one call clobbering
+ * another's result. Not thread-safe — codegen is single-threaded. */
+static const char *mangle_for_c(const char *name) {
+    if (!name) return "";
+    for (int i = 0; _c_reserved_words[i]; i++) {
+        if (strcmp(name, _c_reserved_words[i]) == 0) {
+            static char bufs[8][192];
+            static int slot = 0;
+            char *out = bufs[slot];
+            slot = (slot + 1) & 7;
+            snprintf(out, sizeof(bufs[0]), "%s_sw", name);
+            return out;
+        }
+    }
+    return name;
+}
 
 /* =========================================================================
  * Helpers
@@ -848,14 +895,14 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         for (int j = 0; j < fn->v.fun.nparams; j++) {
             strncpy(ctx->cur_params[j], fn->v.fun.params[j], 127);
             fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : sw_val_nil();\n",
-                    fn->v.fun.params[j], j, j);
+                    mangle_for_c(fn->v.fun.params[j]), j, j);
             declare_var(ctx, fn->v.fun.params[j]);
         }
 
         /* Extract captured variables (passed as extra args after explicit params) */
         for (int j = 0; j < li->ncaptures; j++) {
             fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : sw_val_nil();\n",
-                    li->captures[j], fn->v.fun.nparams + j, fn->v.fun.nparams + j);
+                    mangle_for_c(li->captures[j]), fn->v.fun.nparams + j, fn->v.fun.nparams + j);
             declare_var(ctx, li->captures[j]);
         }
 
@@ -958,7 +1005,7 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
     case N_IDENT:
         /* Always emit a fresh declaration (scoped to the if-block).
          * Also track it so the clause body can reference it. */
-        fprintf(f, "        sw_val_t *%s = %s;\n", pat->v.sval, val);
+        fprintf(f, "        sw_val_t *%s = %s;\n", mangle_for_c(pat->v.sval), val);
         declare_var(ctx, pat->v.sval);
         break;
     case N_TUPLE: case N_LIST:
@@ -975,7 +1022,7 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
         /* Bind tail: rest of list */
         if (pat->v.cons.tail->type == N_IDENT) {
             fprintf(f, "        sw_val_t *%s = sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1);\n",
-                    pat->v.cons.tail->v.sval, val, val);
+                    mangle_for_c(pat->v.cons.tail->v.sval), val, val);
             declare_var(ctx, pat->v.cons.tail->v.sval);
         }
         break;
@@ -1465,8 +1512,8 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     }
     case N_IDENT: {
         if (is_declared(ctx, n->v.sval)) {
-            /* Known variable */
-            strncpy(out, n->v.sval, osz - 1);
+            /* Known variable — return mangled C-side name. */
+            strncpy(out, mangle_for_c(n->v.sval), osz - 1);
         } else {
             /* Undeclared identifier → treat as atom (message tag) */
             char v[32]; fresh_var(ctx, v, sizeof(v));
@@ -1478,20 +1525,31 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     case N_ASSIGN: {
         char val[32];
         emit_expr(ctx, n->v.assign.value, 0, val, sizeof(val));
+        const char *cname = mangle_for_c(n->v.assign.name);
         if (is_declared(ctx, n->v.assign.name)) {
-            fprintf(f, "    %s = %s;\n", n->v.assign.name, val);
+            fprintf(f, "    %s = %s;\n", cname, val);
         } else {
-            fprintf(f, "    sw_val_t *%s = %s;\n", n->v.assign.name, val);
+            fprintf(f, "    sw_val_t *%s = %s;\n", cname, val);
             declare_var(ctx, n->v.assign.name);
         }
-        strncpy(out, n->v.assign.name, osz - 1);
+        strncpy(out, cname, osz - 1);
         break;
     }
     case N_BLOCK: {
         char last[32] = "";
         for (int i = 0; i < n->v.block.nstmts; i++) {
             int is_last = (i == n->v.block.nstmts - 1);
-            emit_expr(ctx, n->v.block.stmts[i], is_last ? tail : 0, last, sizeof(last));
+            /* Per-statement #line so a C error inside a multi-statement
+             * function points at the exact .sw line, not the function's
+             * start line. Skip if this stmt has no line info or shares
+             * a line with the previous emit (avoid duplicate directives
+             * for several expressions on one source line). */
+            node_t *stmt = n->v.block.stmts[i];
+            if (stmt && stmt->line > 0 && stmt->line != ctx->last_line_emitted) {
+                fprintf(f, "#line %d \"%s\"\n", stmt->line, guess_sw_path(ctx->mod_name));
+                ctx->last_line_emitted = stmt->line;
+            }
+            emit_expr(ctx, stmt, is_last ? tail : 0, last, sizeof(last));
         }
         strncpy(out, last, osz - 1);
         break;
@@ -1574,7 +1632,7 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "    sw_val_t *%s[] = {", cap_arr);
             for (int i = 0; i < li->ncaptures; i++) {
                 if (i) fprintf(f, ", ");
-                fprintf(f, "%s", li->captures[i]);
+                fprintf(f, "%s", mangle_for_c(li->captures[i]));
             }
             fprintf(f, "};\n");
             fprintf(f, "    sw_val_t *%s = sw_val_fun_native((void*)%s, %d, %s, %d);\n",
@@ -1749,6 +1807,9 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * jump to the right sw line on compile failure. */
     if (fn->line > 0) {
         fprintf(f, "#line %d \"%s\"\n", fn->line, guess_sw_path(ctx->mod_name));
+        ctx->last_line_emitted = fn->line;
+    } else {
+        ctx->last_line_emitted = 0;
     }
 
     fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
@@ -1761,10 +1822,10 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
                 char def_val[32];
                 emit_expr(ctx, fn->v.fun.defaults[i], 0, def_val, sizeof(def_val));
                 fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : %s;\n",
-                        fn->v.fun.params[i], i, i, def_val);
+                        mangle_for_c(fn->v.fun.params[i]), i, i, def_val);
             } else {
                 fprintf(f, "    sw_val_t *%s = _nargs > %d ? _args[%d] : sw_val_nil();\n",
-                        fn->v.fun.params[i], i, i);
+                        mangle_for_c(fn->v.fun.params[i]), i, i);
             }
             declare_var(ctx, fn->v.fun.params[i]);
         }
