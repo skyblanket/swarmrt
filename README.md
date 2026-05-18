@@ -108,7 +108,7 @@ fun each(lst, f) {
 }
 ```
 
-That's the whole syntax surface for 95% of programs: `module`, `fun`, `spawn`, `send`, `receive`, `if/else`, atoms (`'ok'`), tuples (`{...}`), lists (`[...]`), the pipe (`|>`), and pattern matching in receive arms.
+That's most of the syntax surface: `module`, `fun`, `spawn`, `send`, `receive`, `case`, `if/else`, `try/catch`, atoms (`'ok'`), tuples (`{...}`), lists (`[...]`), maps (`%{key: val}`), the pipe (`|>`), pattern matching in `receive` and `case` arms, and f-strings (`f"hi {name}"`).
 
 Full reference: **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)**.
 
@@ -132,12 +132,16 @@ Full reference: **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)**.
 Most languages were designed for humans first; LLM ergonomics are a happy accident. `sw` is the other way around — every syntax decision was made to maximise the chance that a model writes correct code on the first attempt:
 
 - **No indentation sensitivity.** Brace-delimited blocks. The model can't get the columns wrong because columns don't matter.
-- **Keywords over symbols.** `spawn`, `receive`, `send` instead of `!`, `case`, magic operators. Easier to recall, easier to grep.
-- **Statement separator is either newline or `;`** — both work in any block. Models trained on C-family code don't get tripped up.
+- **Keywords over symbols.** `spawn`, `receive`, `send`, `case` instead of `!`, magic operators. Easier to recall, easier to grep.
+- **Statement separator is either newline or `;`** — both work in any block (function body, if/else, receive arm, case arm). Models trained on C-family code don't get tripped up.
 - **C reserved words are legal identifiers.** Use `inline`, `static`, `register` as variable names; the codegen mangles them silently.
 - **One way to do most things.** No three-flavours-of-async. `spawn` + `receive` covers it.
-- **Errors point at the exact failing line.** `#line` directives map every C-level codegen failure back to the source `.sw` file and statement.
-- **The whole language fits in one document.** SW_LANGUAGE.md is ~500 lines including examples — small enough to paste into a system prompt.
+- **`case` for top-level pattern matching.** No nested-if-else ladders. Same arm shape as `receive`, supports guards and falls through when a guard rejects.
+- **f-strings + `format()`.** `f"req={req_id} ms={elapsed}"` instead of `"req=" ++ to_string(req_id) ++ " ms=" ++ to_string(elapsed)`. Composite values (tuples, lists, maps) render correctly.
+- **Compile errors point at the exact failing line** via per-statement `#line` directives. The C compiler's message tells you `src/Module.sw:42`, not `/tmp/swc_xxx.c:16000`.
+- **Compile-time "did you mean?"** for unknown function names. `unknown function 'strng_length' — did you mean 'string_length'?` Levenshtein over builtins + module funcs.
+- **Loud runtime failures.** `hd([])`, `elem(t, 99)`, `n / 0` panic with `at src/X.sw:N` instead of silently returning `nil`. `expect(value, msg)` is the idiomatic unwrap. `try/catch` for recoverable cases.
+- **The whole language fits in one document.** SW_LANGUAGE.md is ~600 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
 
@@ -252,7 +256,7 @@ make test-all        # the full C-runtime + sw test suite
 
 ## Build
 
-Requires: a C compiler (cc/clang/gcc) and pthreads. Tested on macOS (Apple Silicon + Intel) and Linux.
+Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and tested on macOS Apple Silicon; Linux support is the intent (pthreads + posix-only APIs) but hasn't been continuously verified.
 
 ```bash
 make swc libswarmrt              # compiler + runtime library only (you usually want this)

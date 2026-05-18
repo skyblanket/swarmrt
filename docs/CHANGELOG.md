@@ -4,6 +4,23 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## Current state — what's in the build
+
+As of `60e3964` (2026-05-18) the `.sw` language has:
+
+- **Core:** `module / fun / export / import`, `spawn / send / receive`, `case`, `if / else`, `try / catch`, pattern matching with guards.
+- **Values:** int, float, string, atom (`'ok'`), tuple (`{...}`), list (`[...]`), map (`%{key: val}`), pid, nil, fun.
+- **Concurrency:** lock-free MPSC mailboxes, selective receive, ETS for shared mutable state, supervisors with three restart strategies.
+- **Built-in I/O:** HTTP (server + client + streaming), WebSocket client/server, Chrome DevTools (browser automation), files, JSON, base64, shell.
+- **Ergonomics:** f-strings (`f"hi {name}"`), `format("hi {} count {}", n)`, `++` auto-coerces, `print(...)` is variadic, `;` works in any block, C-reserved words are legal identifiers, `case` for top-level pattern dispatch.
+- **Tooling:** `swc build / emit / repl / test`, per-statement `#line` directives, did-you-mean for unknown function names.
+- **Error story:** `panic(msg)` / `expect(value, msg)` for unrecoverable cases, `error(msg)` + `try/catch` for recoverable ones, `hd`/`tl`/`elem`/divzero panic loudly with `at src/X.sw:N`.
+- **Runtime:** programs exit when `main()` returns (Go-style). 100K+ concurrent processes per node, ~150ns context switch.
+
+Sw test suite is **48 assertions across 6 files**. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
+
+---
+
 ## 2026-05-18 — Loud failure, panic/expect, did-you-mean
 
 Self-critique pass said runtime errors were the biggest gap — silent

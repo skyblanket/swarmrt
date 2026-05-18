@@ -331,8 +331,11 @@ If you're embedding sw-writing capability into an agent, this snippet (paste int
 > - State is immutable — recurse with new values to "update" it. Use `ets_new()` + `ets_put`/`ets_get` for shared mutable state.
 > - Strings concatenate with `++`, not `+`. `++` auto-coerces numbers/atoms to strings. `print(...)` is variadic and joins args with spaces. For complex prose use `f"hi {name} count {n}"` (f-string interpolation) or `format("hi {} count {}", name, n)`.
 > - Atoms (`'ok'`, `'error'`) are message tags. Tuples (`{...}`) bundle them with data: `{'tag', payload, reply_pid}` is the convention for request/reply.
+> - For value dispatch use `case x { pat -> body ; pat when g -> body ; _ -> default }` instead of nested if/else. Same pattern shape as `receive` arms. Falls through to next arm when a guard rejects.
 > - Statements separate by newline OR `;` — both work in any block.
-> - Compile with `swc build src/main.sw -o myprog && ./myprog`.
-> - When in doubt, mirror the patterns in `examples/`.
+> - For unrecoverable bugs use `panic(msg)` (exits with file/line). For optional unwrap use `expect(value, msg)` (panics if nil, returns value otherwise). For recoverable failures use `try { ... } catch e { ... }`.
+> - `hd(lst)`, `tl(lst)`, `elem(t, i)` panic on empty/out-of-range — guard first. `map_get` and `ets_get` return nil for missing keys (intentional).
+> - Compile with `swc build src/main.sw -o myprog && ./myprog`. Programs exit when `main()` returns (Go-style) — for long-running servers, end `main` with a permanent `receive { ... }`.
+> - When in doubt, mirror the patterns in `examples/`. `examples/dispatcher.sw` is the canonical agent-shaped pattern.
 
 That's the document. Build something cool.
