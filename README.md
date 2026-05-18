@@ -119,7 +119,8 @@ Full reference: **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)**.
 | Doc | What it covers |
 |---|---|
 | **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)** | The `.sw` language — syntax, types, processes, builtins, gotchas. Start here if you're writing sw code. |
-| **[docs/AGENT_SYSTEM.md](docs/AGENT_SYSTEM.md)** | Writing sw *for* AI agents — patterns, prompts, what to load into context. Read this before pointing an LLM at sw. |
+| **[docs/BUILDING_AGENTS.md](docs/BUILDING_AGENTS.md)** | Using sw to build AI agents — process-as-agent, tool dispatch, streaming LLM, studio pattern, supervisors. Start here if that's what you're shipping. |
+| **[docs/AGENT_SYSTEM.md](docs/AGENT_SYSTEM.md)** | Cheatsheet for an LLM that's *writing* sw on demand — load this into a system prompt, not into a human's head. |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Internals — schedulers, mailboxes, GC, distribution. |
 | **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** | The C runtime API — for embedding swarmrt or writing new builtins. |
 | **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** | Spawn / send / context-switch numbers. |
@@ -144,6 +145,31 @@ Most languages were designed for humans first; LLM ergonomics are a happy accide
 - **The whole language fits in one document.** SW_LANGUAGE.md is ~600 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
+
+---
+
+## Building AI agents
+
+The reason swarmrt exists. If you've ever built an agent in Python with threading + asyncio + a tool-call parser + a retry layer + a mailbox abstraction stitched on top of `queue.Queue`, you've reinvented bad versions of what sw gives you in one binary.
+
+| Primitive | Why an agent author cares |
+|---|---|
+| **process = agent** | `spawn()` one per agent. Mailbox is its inbox. Recursion is its state. No threads, no async/await. |
+| **selective receive** | Agent A asks B a question, A blocks specifically on `{'reply', my_id, _}` — other messages stay queued. Zero callback hell. |
+| **`http_post_stream`** | Streams LLM tokens with spinner + ESC-interrupt + reasoning-channel rendering for thinking-mode models. |
+| **Subagent-mode streaming** | `http_post_stream(url, hdrs, body, parent_pid, name)` routes chunks as `{'stream_chunk', name, text}` to a parent — so `parallel([a, b, c])` doesn't interleave on the TTY. |
+| **`wsc_*` WebSocket client** | For MCP, streaming APIs, WS-based LLM servers. |
+| **`chrome_launch` + CDP** | Drive a real browser without Playwright/Node sidecar. |
+| **ETS** | Agent registry, perms cache, conversation memory, todo state. |
+| **`supervise(strategy, children)`** | Crash recovery with restart strategies (one-for-one / one-for-all / rest-for-one). |
+| **Hot reload** | Upgrade agent code without killing in-flight processes. |
+| **`case`** | Tool-call dispatch: `case tool_name { "read" -> ... ; "bash" -> ... ; _ -> ... }`. |
+
+**Read more:** [docs/BUILDING_AGENTS.md](docs/BUILDING_AGENTS.md) — the developer-facing guide with the patterns.
+
+**Working example:** [examples/llm_agent.sw](examples/llm_agent.sw) — a real LLM-driven agent in ~90 lines (prompt → http_post_stream → parse tool tags → `case` dispatch → loop). Set `API_KEY` and run; works against any OpenAI-compatible endpoint.
+
+**Real-world stack:** [swarm-code](https://github.com/skyblanket/swarm-code) — a terminal coding agent that uses all of the above in anger.
 
 ---
 
@@ -238,6 +264,7 @@ The [`examples/`](examples/) directory has small focused programs. Each shows on
 | `dispatcher.sw` | Studio-pattern actor: tagged messages routed via `case`, state via recursion arg. |
 | `json_pipeline.sw` | JSON load → `case` classify → f-string render. The new ergonomics in 35 lines. |
 | `http_echo.sw` | A working HTTP server in 25 lines — `case` on the path, f-strings for templating. |
+| `llm_agent.sw` | A real LLM-driven agent in 90 lines. Prompt → http_post_stream → parse `<tool>` tags → `case` dispatch → loop. Works against any OpenAI-compatible endpoint. |
 
 Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x`.
 

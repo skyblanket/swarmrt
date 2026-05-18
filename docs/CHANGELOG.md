@@ -21,6 +21,37 @@ Sw test suite is **48 assertions across 6 files**. swarm-code is the canonical r
 
 ---
 
+## 2026-05-18 — The agent-building story, told properly
+
+We'd shipped every primitive but never written down "use sw to BUILD AI
+agents" coherently. README mentioned HTTP + WebSocket + Chrome as
+builtins but didn't explain why those specifically + process model =
+agents. AGENT_SYSTEM.md is for LLMs *writing* sw on demand; that's a
+different audience from a developer *building* an agent with sw.
+
+This fills the gap.
+
+**New: `docs/BUILDING_AGENTS.md`.** The developer-facing guide. Lays
+out the model (process = agent, mailbox = inbox, recursion = state),
+the agent-loop skeleton, calling an LLM (sync + streaming + subagent-
+mode multiplexing), tool-call parse + `case` dispatch, the studio
+pattern, ETS for shared state, supervisor strategies, Chrome via CDP,
+MCP via WebSocket, and a "when the runtime feels wrong" debug list.
+
+**New: `examples/llm_agent.sw`.** A real LLM-driven agent in ~90
+lines. Takes a question, calls an OpenAI-compatible endpoint via
+`http_post_stream`, parses `<tool name="…">{…}</tool>` tags out of
+the response, dispatches with `case`, appends results to history,
+loops until the model emits a final answer with no tools. Set
+`API_KEY` and run.
+
+**README.** New "Building AI agents" section with the killer
+primitive table, pointing at the new doc + example. Documentation
+table now distinguishes the two agent docs: BUILDING_AGENTS.md (devs
+building agents) vs AGENT_SYSTEM.md (LLMs writing sw).
+
+---
+
 ## 2026-05-18 — Loud failure, panic/expect, did-you-mean
 
 Self-critique pass said runtime errors were the biggest gap — silent
