@@ -190,6 +190,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "map_remove") == 0 ||
            /* Error */
            strcmp(name, "error") == 0 ||
+           strcmp(name, "panic") == 0 || strcmp(name, "expect") == 0 ||
            strcmp(name, "typeof") == 0 ||
            /* Phase 13: Agent stdlib */
            strcmp(name, "http_get") == 0 || strcmp(name, "shell") == 0 ||
@@ -594,7 +595,14 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <sys/time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
 
-    fprintf(f, "__thread sw_val_t *_sw_error = NULL;\n\n");
+    fprintf(f, "__thread sw_val_t *_sw_error = NULL;\n");
+    /* Runtime line / file tracking — codegen emits
+     *   `_sw_current_line = N; _sw_current_file = \"src/Mod.sw\";`
+     * once per source line so panic() / expect() / failing builtins
+     * can report where in the .sw source the program was running.
+     * Cheap (two stores per source line, only when the line changes). */
+    fprintf(f, "__thread int _sw_current_line = 0;\n");
+    fprintf(f, "__thread const char *_sw_current_file = \"<unknown>\";\n\n");
 
     /* Binary operation helpers */
     fprintf(f,
@@ -624,26 +632,33 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    return sw_val_float(fa * fb);\n"
         "}\n\n");
 
+    /* Division panics on zero divisor. Was silently returning nil,
+     * which led to spurious "use of nil" cascades downstream. Now you
+     * get the exact line where the bad division happened. */
     fprintf(f,
         "static sw_val_t *_op_div(sw_val_t *a, sw_val_t *b) {\n"
-        "    if (a->type == SW_VAL_INT && b->type == SW_VAL_INT)\n"
-        "        return b->v.i ? sw_val_int(a->v.i / b->v.i) : sw_val_nil();\n"
+        "    if (a->type == SW_VAL_INT && b->type == SW_VAL_INT) {\n"
+        "        if (b->v.i == 0) _sw_runtime_panic(\"division by zero\");\n"
+        "        return sw_val_int(a->v.i / b->v.i);\n"
+        "    }\n"
         "    double fa = a->type == SW_VAL_INT ? (double)a->v.i : a->v.f;\n"
         "    double fb = b->type == SW_VAL_INT ? (double)b->v.i : b->v.f;\n"
-        "    return fb != 0.0 ? sw_val_float(fa / fb) : sw_val_nil();\n"
+        "    if (fb == 0.0) _sw_runtime_panic(\"division by zero\");\n"
+        "    return sw_val_float(fa / fb);\n"
         "}\n\n");
 
-    /* Modulo (`%`). Integer-only; nil on divide-by-zero. Floats fall
-     * back to fmod via cast — float modulo is rare in agent code but
-     * supported so `n % d` doesn't surprise. */
+    /* Modulo (`%`). Same divide-by-zero discipline as `/`. */
     fprintf(f,
         "#include <math.h>\n"
         "static sw_val_t *_op_mod(sw_val_t *a, sw_val_t *b) {\n"
-        "    if (a->type == SW_VAL_INT && b->type == SW_VAL_INT)\n"
-        "        return b->v.i ? sw_val_int(a->v.i %% b->v.i) : sw_val_nil();\n"
+        "    if (a->type == SW_VAL_INT && b->type == SW_VAL_INT) {\n"
+        "        if (b->v.i == 0) _sw_runtime_panic(\"modulo by zero\");\n"
+        "        return sw_val_int(a->v.i %% b->v.i);\n"
+        "    }\n"
         "    double fa = a->type == SW_VAL_INT ? (double)a->v.i : a->v.f;\n"
         "    double fb = b->type == SW_VAL_INT ? (double)b->v.i : b->v.f;\n"
-        "    return fb != 0.0 ? sw_val_float(fmod(fa, fb)) : sw_val_nil();\n"
+        "    if (fb == 0.0) _sw_runtime_panic(\"modulo by zero\");\n"
+        "    return sw_val_float(fmod(fa, fb));\n"
         "}\n\n");
 
     fprintf(f,
@@ -703,26 +718,37 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    return sw_val_int(0);\n"
         "}\n\n");
 
+    /* hd / tl / elem fail loudly via runtime panic. These three are
+     * unambiguously bugs: nobody MEANS to call hd on an empty list or
+     * index past the end of a tuple. Silent nil returns were burying
+     * mistakes deep in subsequent operations. (map_get / ets_get stay
+     * lenient — "optional lookup" is a genuine use case there.) */
     fprintf(f,
         "static sw_val_t *_builtin_hd(sw_val_t **a, int n) {\n"
-        "    if (n < 1 || a[0]->type != SW_VAL_LIST || a[0]->v.tuple.count == 0)\n"
-        "        return sw_val_nil();\n"
+        "    if (n < 1 || !a[0]) _sw_runtime_panic(\"hd: no list given\");\n"
+        "    if (a[0]->type != SW_VAL_LIST) _sw_runtime_panic(\"hd: not a list (got type %%d)\", a[0]->type);\n"
+        "    if (a[0]->v.tuple.count == 0) _sw_runtime_panic(\"hd: list is empty\");\n"
         "    return a[0]->v.tuple.items[0];\n"
         "}\n\n");
 
+    /* tl of a 1-element list returning [] is intentional (matches Erlang). */
     fprintf(f,
         "static sw_val_t *_builtin_tl(sw_val_t **a, int n) {\n"
-        "    if (n < 1 || a[0]->type != SW_VAL_LIST || a[0]->v.tuple.count <= 1)\n"
-        "        return sw_val_list(NULL, 0);\n"
+        "    if (n < 1 || !a[0]) _sw_runtime_panic(\"tl: no list given\");\n"
+        "    if (a[0]->type != SW_VAL_LIST) _sw_runtime_panic(\"tl: not a list (got type %%d)\", a[0]->type);\n"
+        "    if (a[0]->v.tuple.count == 0) _sw_runtime_panic(\"tl: list is empty\");\n"
+        "    if (a[0]->v.tuple.count == 1) return sw_val_list(NULL, 0);\n"
         "    return sw_val_list(a[0]->v.tuple.items + 1, a[0]->v.tuple.count - 1);\n"
         "}\n\n");
 
     fprintf(f,
         "static sw_val_t *_builtin_elem(sw_val_t **a, int n) {\n"
-        "    if (n < 2 || a[0]->type != SW_VAL_TUPLE || a[1]->type != SW_VAL_INT)\n"
-        "        return sw_val_nil();\n"
+        "    if (n < 2 || !a[0] || !a[1]) _sw_runtime_panic(\"elem: needs (tuple, index)\");\n"
+        "    if (a[0]->type != SW_VAL_TUPLE) _sw_runtime_panic(\"elem: not a tuple (got type %%d)\", a[0]->type);\n"
+        "    if (a[1]->type != SW_VAL_INT) _sw_runtime_panic(\"elem: index must be int\");\n"
         "    int idx = (int)a[1]->v.i;\n"
-        "    if (idx < 0 || idx >= a[0]->v.tuple.count) return sw_val_nil();\n"
+        "    if (idx < 0 || idx >= a[0]->v.tuple.count)\n"
+        "        _sw_runtime_panic(\"elem: index %%d out of range for %%d-tuple\", idx, a[0]->v.tuple.count);\n"
         "    return a[0]->v.tuple.items[idx];\n"
         "}\n\n");
 
@@ -1094,6 +1120,117 @@ static void emit_binop(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     strncpy(out, res, osz - 1);
 }
 
+/* Curated list of common builtin names — used by did_you_mean.
+ * Doesn't need to be exhaustive (it's only consulted on already-failed
+ * lookups for hint generation), just covers the names a confused user
+ * is most likely to reach for. New builtins can be added here at
+ * leisure — missing one means the suggestion is less specific, not
+ * that the compile breaks. */
+static const char *_common_builtins[] = {
+    "print", "print_inline", "length", "hd", "tl", "elem", "abs",
+    "to_string", "format", "panic", "expect", "error", "typeof",
+    "map", "pmap", "reduce", "filter", "list_append",
+    "map_get", "map_put", "map_new", "map_keys", "map_values",
+    "map_merge", "map_has_key", "map_size", "map_remove",
+    "string_length", "string_sub", "string_split", "string_replace",
+    "string_contains", "string_starts_with", "string_ends_with",
+    "string_index_of", "string_trim", "string_upper", "string_lower",
+    "string_truncate", "strip_html", "clean_json",
+    "base64_encode", "base64_decode",
+    "json_encode", "json_decode", "json_get", "json_escape",
+    "spawn", "self", "send", "register", "whereis",
+    "ets_new", "ets_put", "ets_get", "ets_delete", "ets_list", "ets_count",
+    "file_read", "file_write", "file_exists", "file_delete", "file_list",
+    "file_append", "file_mkdir",
+    "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
+    "ws_send", "ws_close", "ws_set_handler",
+    "wsc_connect", "wsc_send", "wsc_recv", "wsc_close",
+    "chrome_launch", "term_cols", "read_line", "read_char", "read_choice",
+    "sleep", "timestamp", "getenv", "sys_exit", "shell",
+    "random_int", "supervise",
+    NULL
+};
+
+/* Tiny Levenshtein distance (capped at len ~64 since identifiers are
+ * short). Standard DP, no allocation past two rows. */
+static int _lev_distance(const char *a, const char *b) {
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la > 63) la = 63;
+    if (lb > 63) lb = 63;
+    int prev[65], curr[65];
+    for (int j = 0; j <= lb; j++) prev[j] = j;
+    for (int i = 1; i <= la; i++) {
+        curr[0] = i;
+        for (int j = 1; j <= lb; j++) {
+            int cost = (a[i-1] == b[j-1]) ? 0 : 1;
+            int del = prev[j] + 1;
+            int ins = curr[j-1] + 1;
+            int sub = prev[j-1] + cost;
+            int m = del < ins ? del : ins;
+            if (sub < m) m = sub;
+            curr[j] = m;
+        }
+        for (int j = 0; j <= lb; j++) prev[j] = curr[j];
+    }
+    return prev[lb];
+}
+
+/* Print "src/Mod.sw:N: unknown function 'foo' — did you mean 'foa'?"
+ * to stderr. Threshold = lower of (3, len/2): keeps "string_xx" from
+ * matching "abs". Up to 3 suggestions, sorted by distance. */
+static void did_you_mean(cg_ctx_t *ctx, const char *fname, int line) {
+    int flen = (int)strlen(fname);
+    int threshold = flen / 2;
+    if (threshold > 3) threshold = 3;
+    if (threshold < 1) threshold = 1;
+
+    /* Collect (name, distance) pairs from builtins + module funcs. */
+    const char *cands[8] = { NULL };
+    int dists[8];
+    int ncands = 0;
+
+    for (int i = 0; _common_builtins[i]; i++) {
+        int d = _lev_distance(fname, _common_builtins[i]);
+        if (d > threshold) continue;
+        /* Insert into top-3 sorted list. */
+        int slot = ncands;
+        while (slot > 0 && dists[slot-1] > d) slot--;
+        if (slot < 3) {
+            for (int k = (ncands < 3 ? ncands : 2); k > slot; k--) {
+                cands[k] = cands[k-1]; dists[k] = dists[k-1];
+            }
+            cands[slot] = _common_builtins[i];
+            dists[slot] = d;
+            if (ncands < 3) ncands++;
+        }
+    }
+    for (int i = 0; i < ctx->nfuncs; i++) {
+        int d = _lev_distance(fname, ctx->func_names[i]);
+        if (d > threshold || d == 0) continue;
+        int slot = ncands;
+        while (slot > 0 && dists[slot-1] > d) slot--;
+        if (slot < 3) {
+            for (int k = (ncands < 3 ? ncands : 2); k > slot; k--) {
+                cands[k] = cands[k-1]; dists[k] = dists[k-1];
+            }
+            cands[slot] = ctx->func_names[i];
+            dists[slot] = d;
+            if (ncands < 3) ncands++;
+        }
+    }
+
+    fprintf(stderr, "swc: %s:%d: unknown function '%s'",
+            guess_sw_path(ctx->mod_name), line > 0 ? line : 0, fname);
+    if (ncands > 0) {
+        fprintf(stderr, " — did you mean ");
+        for (int i = 0; i < ncands; i++) {
+            fprintf(stderr, "%s'%s'", i > 0 ? (i == ncands - 1 ? " or " : ", ") : "", cands[i]);
+        }
+        fprintf(stderr, "?");
+    }
+    fprintf(stderr, "\n");
+}
+
 static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
     const char *fname = n->v.call.func->v.sval;
@@ -1190,6 +1327,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "map_values") == 0 || strcmp(fname, "map_merge") == 0 ||
              strcmp(fname, "map_has_key") == 0 || strcmp(fname, "map_size") == 0 ||
              strcmp(fname, "map_remove") == 0 || strcmp(fname, "error") == 0 ||
+             strcmp(fname, "panic") == 0 || strcmp(fname, "expect") == 0 ||
              strcmp(fname, "typeof") == 0 ||
              /* Phase 13: Agent stdlib */
              strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||
@@ -1270,7 +1408,12 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         else
             fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, NULL, 0);\n", res, fname);
     } else {
-        /* Unknown function — emit as extern call */
+        /* Unknown function — print did-you-mean to stderr so the user
+         * gets actionable suggestions BEFORE the C compiler trips. We
+         * still emit the call so the C-level error fires (with our
+         * per-statement #line directive it'll point at the right sw
+         * line); the stderr hint just makes the cause obvious. */
+        did_you_mean(ctx, fname, n->line);
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
         else
@@ -1641,7 +1784,11 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              * for several expressions on one source line). */
             node_t *stmt = n->v.block.stmts[i];
             if (stmt && stmt->line > 0 && stmt->line != ctx->last_line_emitted) {
-                fprintf(f, "#line %d \"%s\"\n", stmt->line, guess_sw_path(ctx->mod_name));
+                const char *path = guess_sw_path(ctx->mod_name);
+                fprintf(f, "#line %d \"%s\"\n", stmt->line, path);
+                /* Runtime tracker — panic() reads these for "at FILE:LINE". */
+                fprintf(f, "_sw_current_line = %d; _sw_current_file = \"%s\";\n",
+                        stmt->line, path);
                 ctx->last_line_emitted = stmt->line;
             }
             emit_expr(ctx, stmt, is_last ? tail : 0, last, sizeof(last));
@@ -1910,7 +2057,8 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * generated /tmp/swc_*.c file. Pure UX: enables editors to
      * jump to the right sw line on compile failure. */
     if (fn->line > 0) {
-        fprintf(f, "#line %d \"%s\"\n", fn->line, guess_sw_path(ctx->mod_name));
+        const char *path = guess_sw_path(ctx->mod_name);
+        fprintf(f, "#line %d \"%s\"\n", fn->line, path);
         ctx->last_line_emitted = fn->line;
     } else {
         ctx->last_line_emitted = 0;

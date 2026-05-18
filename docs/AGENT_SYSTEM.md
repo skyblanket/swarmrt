@@ -247,6 +247,10 @@ print("count: " ++ n)             # also fine — same output
 
 **4. The runtime exits when your `main()` returns.** If you spawned workers and want them to keep running, end `main` with a permanent `receive { _other -> ... }` or a `sleep(very_big)` loop. (Go-style, not Erlang-style.)
 
+**5. `hd / tl / elem` panic on bad input.** `hd([])` will exit with `panic: hd: list is empty at src/X.sw:N` — guard with `if (length(lst) == 0) { ... } else { hd(lst) }`. Same for divide-by-zero. `map_get` and `ets_get` are still lenient (return `nil` for missing keys).
+
+**6. Use `expect(value, msg)` to unwrap optionals.** `name = expect(map_get(user, 'name'), "missing name")` panics with the message if the lookup returns nil. The idiomatic shorthand for `if (x == nil) { panic("...") }`.
+
 ---
 
 ## A complete agent-shaped example

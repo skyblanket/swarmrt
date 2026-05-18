@@ -4,6 +4,55 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-18 — Loud failure, panic/expect, did-you-mean
+
+Self-critique pass said runtime errors were the biggest gap — silent
+nils everywhere, no stack-trace context, no compile-time hints when a
+function name was a typo. This commit closes those.
+
+**Runtime line / file tracking.** Codegen now emits
+`_sw_current_line = N; _sw_current_file = "src/Mod.sw";`
+alongside each `#line` directive so the runtime knows where the
+program is at any moment. Two thread-locals in the preamble, one extra
+store per source line — negligible cost.
+
+**panic(msg) + expect(value, msg) builtins.**
+- `panic(msg)` prints a red `panic: <msg>\n  at src/X.sw:N` to stderr
+  and `exit(1)`. Cannot be caught. Use for impossible states /
+  invariant violations.
+- `expect(value, msg)` is the idiomatic unwrap — passes value through
+  when non-nil, panics with msg when nil. Replaces the explicit
+  `if (x == nil) { panic("...") }` boilerplate.
+- Distinct from `error(msg)` (which is catchable by `try/catch`).
+
+**hd / tl / elem / divide-by-zero now panic instead of returning nil.**
+- `hd([])` → `panic: hd: list is empty at src/X.sw:N`
+- `tl([])` → ditto
+- `elem(tuple, 5)` when tuple has 3 elems → `elem: index 5 out of range for 3-tuple`
+- `n / 0`, `n % 0` → `division by zero`
+- New C helper `_sw_runtime_panic(fmt, ...)` does the printf-style
+  panic; uses the runtime line/file trackers above.
+- `map_get` and `ets_get` stay lenient — optional lookup with nil
+  fallback is a real use case, not a bug.
+
+**Compile-time "did you mean?"** for unknown function names. When
+`swc` sees a call to a name that isn't a builtin, module function, or
+declared variable, it prints suggestions via Levenshtein distance over
+the builtin list plus the calling module's own functions:
+```
+src/Hello.sw:4: unknown function 'strng_length' — did you mean 'string_length'?
+```
+Threshold = min(3, len/2). Up to 3 suggestions, sorted by distance.
+Hint is printed BEFORE the C compile runs so the user sees the
+actionable fix first.
+
+**Tests.** New `tests/sw/test_errors.sw` (5 assertions) covers expect
+pass-through, try/catch caught + uncaught, and the scope-shadowing
+regression from earlier today. Full suite is 48 assertions across 6
+files. swarm-code rebuilds clean against the new compiler.
+
+---
+
 ## 2026-05-15 — f-strings + showcase examples
 
 **f-string interpolation.** The third headline LLM-ergonomics win:

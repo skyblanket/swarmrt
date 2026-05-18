@@ -18,8 +18,9 @@ This doc is the reference for someone writing sw code today. For the runtime's C
 8. [Processes and message passing](#8-processes-and-message-passing)
 9. [ETS — shared mutable state](#9-ets--shared-mutable-state)
 10. [Builtins reference](#10-builtins-reference)
-11. [Known gotchas](#11-known-gotchas)
-12. [Build pipeline](#12-build-pipeline)
+11. [Errors and panics](#11-errors-and-panics)
+12. [Known gotchas](#12-known-gotchas)
+13. [Build pipeline](#13-build-pipeline)
 
 ---
 
@@ -481,7 +482,60 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 
 ---
 
-## 11. Known gotchas
+## 11. Errors and panics
+
+sw has two failure modes — choose by recoverability.
+
+### Recoverable failures: `error` + `try / catch`
+
+```sw
+r = try {
+    raw = file_read("/etc/some.conf")
+    if (raw == nil) { error("config missing") }
+    parse(raw)
+} catch e {
+    f"using defaults — {e}"
+}
+```
+
+`error(msg)` sets a thread-local error sentinel that `try { ... } catch e { ... }` catches. Outside a `try`, `error()` is silent (the calling code continues with `nil`), which makes try/catch the explicit "I want to handle failure" marker.
+
+### Unrecoverable failures: `panic` + `expect`
+
+```sw
+panic("invariant violated: queue should never be empty here")
+
+name = expect(map_get(user, 'name'), "user record missing required 'name' field")
+```
+
+`panic(msg)` prints a red `panic: <msg>` plus the exact `src/Mod.sw:LINE` where it fired, and exits with code 1. Cannot be caught. Use for programmer bugs (impossible states, broken invariants).
+
+`expect(value, msg)` is the idiomatic "unwrap" pattern — passes the value through if non-nil, otherwise panics with `msg`. Saves the explicit `if (x == nil) { panic(...) }` boilerplate.
+
+### Builtins that panic (instead of returning nil silently)
+
+| Builtin | Panics when |
+|---|---|
+| `hd(lst)` | `lst` is empty or not a list |
+| `tl(lst)` | `lst` is empty or not a list |
+| `elem(t, i)` | `i` is out of range or `t` is not a tuple |
+| `n / 0`, `n % 0` | divisor is zero |
+
+`map_get(m, k)` and `ets_get(t, k)` stay lenient — `nil` for missing keys is intentional ("optional lookup"). Pair them with `expect()` when the key MUST be present.
+
+### Compile-time "did you mean?"
+
+`swc` prints a hint when you call a function it can't resolve:
+
+```
+src/Hello.sw:4: unknown function 'strng_length' — did you mean 'string_length'?
+```
+
+Levenshtein-distance suggestions over the builtin list plus the calling module's functions.
+
+---
+
+## 12. Known gotchas
 
 These are real, hit-during-development quirks. Skim before you write a lot of sw.
 
@@ -509,7 +563,7 @@ These are real, hit-during-development quirks. Skim before you write a lot of sw
 
 ---
 
-## 12. Build pipeline
+## 13. Build pipeline
 
 ```bash
 # Build the compiler + library (do this once, or whenever you touch

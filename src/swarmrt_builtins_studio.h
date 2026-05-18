@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdarg.h>
 #ifndef _WIN32
   #include <sys/select.h>
   #include <sys/ioctl.h>
@@ -2246,11 +2247,80 @@ static sw_val_t *_builtin_format(sw_val_t **a, int n) {
 
 /* === Error mechanism for try/catch === */
 
-/* error(reason) — sets thread-local error, caught by try/catch */
+/* error(reason) — sets thread-local error, caught by try/catch.
+ * Silent if no try/catch is wrapping the call site. Pair this with
+ * `try { … } catch e { … }` for recoverable failures.
+ *
+ * For UNRECOVERABLE failures (programmer bug, invariant violated,
+ * impossible state) use panic(msg) below — it prints and exits.
+ */
 static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     extern __thread sw_val_t *_sw_error;
     _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
     return sw_val_nil();
+}
+
+/* C-level panic helper for builtins. Takes a printf-style format so
+ * we can include context ("hd of empty list", "tuple has 3 elements,
+ * asked for index 5") without allocating an sw_val_t. Reads the
+ * runtime line/file trackers the codegen keeps current. NORETURN. */
+__attribute__((noreturn))
+static void _sw_runtime_panic(const char *fmt, ...) {
+    extern __thread int _sw_current_line;
+    extern __thread const char *_sw_current_file;
+    va_list ap;
+    fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    if (_sw_current_file && _sw_current_line > 0)
+        fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
+    fflush(stderr);
+    exit(1);
+}
+
+/* panic(msg) — print "panic: msg at FILE:LINE" to stderr and exit(1).
+ * Cannot be caught. Use for programmer bugs (nil where a value was
+ * needed, list empty when it shouldn't be, impossible cases in a
+ * case expression). For recoverable conditions reach for error()
+ * + try/catch instead. */
+static sw_val_t *_builtin_panic(sw_val_t **a, int n) {
+    extern __thread int _sw_current_line;
+    extern __thread const char *_sw_current_file;
+    char msg_buf[512];
+    if (n >= 1 && a[0]) {
+        char *b = NULL; size_t bl = 0;
+        FILE *m = open_memstream(&b, &bl);
+        if (m) { sw_val_format(m, a[0]); fclose(m); }
+        snprintf(msg_buf, sizeof(msg_buf), "%s", b ? b : "(no message)");
+        free(b);
+    } else {
+        snprintf(msg_buf, sizeof(msg_buf), "(no message)");
+    }
+    fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg_buf);
+    if (_sw_current_file && _sw_current_line > 0)
+        fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
+    fflush(stderr);
+    exit(1);
+}
+
+/* expect(value, msg) — returns value if non-nil; otherwise panics
+ * with msg. The idiomatic "unwrap" pattern:
+ *
+ *   name = expect(map_get(user, 'name'), "user has no name field")
+ *
+ * Saves the explicit `if (x == nil) { panic("...") }` wrapper. */
+static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
+    if (n < 1) {
+        sw_val_t *msg = sw_val_string("expect: missing value argument");
+        sw_val_t *args[1] = { msg };
+        return _builtin_panic(args, 1);
+    }
+    if (a[0] && a[0]->type != SW_VAL_NIL) return a[0];
+    sw_val_t *msg = (n >= 2) ? a[1] : sw_val_string("expected non-nil value, got nil");
+    sw_val_t *args[1] = { msg };
+    return _builtin_panic(args, 1);
 }
 
 /* ================================================================
