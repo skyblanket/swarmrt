@@ -42,11 +42,13 @@ static void usage(void) {
         "  repl     Start interactive REPL\n"
         "  test     Run test_* functions in .sw files\n\n"
         "Options:\n"
-        "  -o <name>     Output binary name (default: module name)\n"
-        "  -O            Optimize (-O2)\n"
-        "  --obfusc      Enable obfuscation (XOR strings + symbol mangle)\n"
-        "  --strip       Strip symbols from binary\n"
-        "  --emit-c      Save generated .c file (don't delete after compile)\n");
+        "  -o <name>          Output binary name (default: module name)\n"
+        "  -O                 Optimize (-O2)\n"
+        "  --obfusc           Enable obfuscation (XOR strings + symbol mangle)\n"
+        "  --strip            Strip symbols from binary\n"
+        "  --emit-c           Save generated .c file (don't delete after compile)\n"
+        "  --target=<triple>  Cross-compile (e.g. x86_64-linux-gnu, aarch64-apple-darwin)\n"
+        "                     Needs `zig` or a matching cross-gcc for non-darwin targets.\n");
 }
 
 /* Read entire file into malloc'd string */
@@ -87,6 +89,12 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "repl") == 0)
         return sw_repl_start();
 
+    /* LSP server — speaks LSP/JSON-RPC over stdin/stdout. */
+    if (strcmp(cmd, "lsp") == 0) {
+        extern int sw_lsp_main(void);
+        return sw_lsp_main();
+    }
+
     /* Test runner */
     if (strcmp(cmd, "test") == 0) {
         if (argc < 3) {
@@ -109,6 +117,7 @@ int main(int argc, char **argv) {
     const char *inputs[64];
     int ninputs = 0;
     const char *output_name = NULL;
+    const char *target = NULL;       /* --target=<triple> for cross-compile */
     int optimize = 0, obfusc = 0, strip = 0, emit_c = 0;
 
     /* Parse arguments */
@@ -123,6 +132,8 @@ int main(int argc, char **argv) {
             strip = 1;
         else if (strcmp(argv[i], "--emit-c") == 0)
             emit_c = 1;
+        else if (strncmp(argv[i], "--target=", 9) == 0)
+            target = argv[i] + 9;
         else if (argv[i][0] != '-' && ninputs < 64)
             inputs[ninputs++] = argv[i];
         else if (argv[i][0] == '-') {
@@ -386,9 +397,61 @@ int main(int argc, char **argv) {
 #else
     const char *extra_libs = "-lssl -lcrypto -lsqlite3";
 #endif
+
+    /* --target=<triple> support. Recipes:
+     *   <arch>-apple-darwin  → `cc -arch <arch>` (native cross between
+     *                           macOS arches works with the same toolchain)
+     *   <arch>-linux-gnu     → prefer `zig cc -target <triple>`, fall back
+     *                           to `<triple>-cc` (a real cross-gcc).
+     * Other triples just pass straight to `zig cc -target` if zig exists.
+     *
+     * NOTE: libswarmrt.a is built for the HOST arch. Cross-compiling
+     * needs a target-arch libswarmrt.a too. This wiring is the host
+     * side; document the target-arch build path in BUILDING.md. */
+    char cc_cmd[256] = "cc";
+    char arch_flags[128] = "";
+    if (target) {
+        if (strstr(target, "-apple-darwin")) {
+            char arch[64] = {0};
+            const char *dash = strchr(target, '-');
+            int alen = dash ? (int)(dash - target) : (int)strlen(target);
+            if (alen > 63) alen = 63;
+            memcpy(arch, target, alen);
+            snprintf(arch_flags, sizeof(arch_flags), "-arch %s", arch);
+            /* cc with -arch handles cross-macOS-arch out of the box. */
+        } else if (strstr(target, "-linux") || strstr(target, "-musl") ||
+                   strstr(target, "-windows") || strstr(target, "-wasi")) {
+            /* Prefer zig cc — it ships a self-contained cross toolchain. */
+            if (system("command -v zig >/dev/null 2>&1") == 0) {
+                snprintf(cc_cmd, sizeof(cc_cmd), "zig cc -target %s", target);
+            } else {
+                /* Try <triple>-cc as a real gcc cross-toolchain. */
+                char probe[256];
+                snprintf(probe, sizeof(probe), "command -v %s-cc >/dev/null 2>&1", target);
+                if (system(probe) == 0) {
+                    snprintf(cc_cmd, sizeof(cc_cmd), "%s-cc", target);
+                } else {
+                    fprintf(stderr,
+                        "swc: --target=%s requires either `zig` (recommended:\n"
+                        "     brew install zig) or `%s-cc` in PATH.\n",
+                        target, target);
+                    return 1;
+                }
+            }
+        } else {
+            /* Unknown triple — pass through to zig cc, error if no zig. */
+            if (system("command -v zig >/dev/null 2>&1") != 0) {
+                fprintf(stderr, "swc: --target=%s requires `zig` in PATH\n", target);
+                return 1;
+            }
+            snprintf(cc_cmd, sizeof(cc_cmd), "zig cc -target %s", target);
+        }
+        fprintf(stderr, "swc: cross-compiling for %s via `%s`\n", target, cc_cmd);
+    }
+
     snprintf(cmd_buf, sizeof(cmd_buf),
-        "cc %s -fno-stack-protector -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s %s",
-        optimize ? "-O2" : "-O0 -g",
+        "%s %s %s -fno-stack-protector -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s %s",
+        cc_cmd, arch_flags, optimize ? "-O2" : "-O0 -g",
         out_path, tmppath,
         swc_dir, swc_dir,
         strip ? "-s" : "",

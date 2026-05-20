@@ -168,6 +168,8 @@ static int is_builtin(const char *name) {
            /* Phase 11: Studio builtins */
            strcmp(name, "register") == 0 || strcmp(name, "whereis") == 0 ||
            strcmp(name, "monitor") == 0 || strcmp(name, "link") == 0 ||
+           strcmp(name, "unlink") == 0 || strcmp(name, "demonitor") == 0 ||
+           strcmp(name, "exit_proc") == 0 || strcmp(name, "trap_exit") == 0 ||
            strcmp(name, "ets_new") == 0 || strcmp(name, "ets_put") == 0 ||
            strcmp(name, "ets_get") == 0 || strcmp(name, "ets_delete") == 0 ||
            strcmp(name, "sleep") == 0 || strcmp(name, "getenv") == 0 ||
@@ -208,6 +210,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "typeof") == 0 ||
            /* Phase 13: Agent stdlib */
            strcmp(name, "http_get") == 0 || strcmp(name, "shell") == 0 ||
+           strcmp(name, "shell_sandboxed") == 0 ||
            strcmp(name, "json_encode") == 0 || strcmp(name, "json_decode") == 0 ||
            strcmp(name, "file_exists") == 0 || strcmp(name, "file_list") == 0 ||
            strcmp(name, "file_delete") == 0 || strcmp(name, "file_append") == 0 ||
@@ -1440,6 +1443,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     /* Phase 11: Studio builtins (from swarmrt_builtins_studio.h) */
     else if (strcmp(fname, "register") == 0 || strcmp(fname, "whereis") == 0 ||
              strcmp(fname, "monitor") == 0 || strcmp(fname, "link") == 0 ||
+             strcmp(fname, "unlink") == 0 || strcmp(fname, "demonitor") == 0 ||
+             strcmp(fname, "exit_proc") == 0 || strcmp(fname, "trap_exit") == 0 ||
              strcmp(fname, "ets_new") == 0 || strcmp(fname, "ets_put") == 0 ||
              strcmp(fname, "ets_get") == 0 || strcmp(fname, "ets_delete") == 0 ||
              strcmp(fname, "sleep") == 0 || strcmp(fname, "getenv") == 0 ||
@@ -1471,6 +1476,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "typeof") == 0 ||
              /* Phase 13: Agent stdlib */
              strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||
+             strcmp(fname, "shell_sandboxed") == 0 ||
              strcmp(fname, "json_encode") == 0 || strcmp(fname, "json_decode") == 0 ||
              strcmp(fname, "file_exists") == 0 || strcmp(fname, "file_list") == 0 ||
              strcmp(fname, "file_delete") == 0 || strcmp(fname, "file_append") == 0 ||

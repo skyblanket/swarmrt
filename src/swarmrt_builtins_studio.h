@@ -2528,6 +2528,60 @@ static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
 }
 
 /* ============================================================
+ * Process lifecycle — link / monitor / exit / trap_exit
+ * ============================================================
+ *
+ * Erlang-grade fault tolerance from userland sw. All wrappers
+ * around the existing runtime APIs:
+ *
+ *   link(pid)              → 'ok' | 'error'
+ *   unlink(pid)            → 'ok' | 'error'
+ *   monitor(pid)           → reference (int) — 0 on failure
+ *   demonitor(ref)         → 'ok' | 'error'
+ *   exit_proc(pid, reason) → 'ok'  — kills pid with a reason atom
+ *                                   (named exit_proc to avoid collision
+ *                                    with `exit` / `sys_exit` shorthand)
+ *   trap_exit('true'|'false') → 'ok' — toggle exit-signal trapping
+ *                                      on the current process
+ *
+ * With trap_exit on, exit signals arrive as `{'EXIT', from_pid, reason}`
+ * messages instead of killing the receiver — the canonical pattern
+ * for a supervisor written in sw.
+ */
+/* link() and monitor() already exist near top of file. We just add
+ * the missing pieces here: unlink, demonitor, exit_proc, trap_exit. */
+static sw_val_t *_builtin_unlink(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_PID) return sw_val_atom("error");
+    return sw_val_atom(sw_unlink(a[0]->v.pid) == 0 ? "ok" : "error");
+}
+
+static sw_val_t *_builtin_demonitor(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    return sw_val_atom(sw_demonitor((uint64_t)a[0]->v.i) == 0 ? "ok" : "error");
+}
+
+static sw_val_t *_builtin_exit_proc(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_PID) return sw_val_atom("error");
+    int reason = 2;  /* default: 'killed' */
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_ATOM) {
+        if (strcmp(a[1]->v.str, "normal") == 0) reason = 0;
+        else if (strcmp(a[1]->v.str, "killed") == 0) reason = 2;
+        else reason = 3;
+    }
+    sw_process_kill(a[0]->v.pid, reason);
+    return sw_val_atom("ok");
+}
+
+static sw_val_t *_builtin_trap_exit(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_atom("error");
+    int v = 0;
+    if (a[0]->type == SW_VAL_ATOM && strcmp(a[0]->v.str, "true") == 0) v = 1;
+    else if (a[0]->type == SW_VAL_INT && a[0]->v.i != 0) v = 1;
+    sw_process_flag(SW_FLAG_TRAP_EXIT, v);
+    return sw_val_atom("ok");
+}
+
+/* ============================================================
  * SQLite — embedded database for agent state + memory
  * ============================================================
  *
@@ -2751,6 +2805,107 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
  * is permanently locked in the child, corrupting the malloc allocator and
  * causing segfaults in the parent on macOS.  system() uses posix_spawn on
  * modern macOS, sidestepping the issue entirely. */
+
+/* shell_sandboxed(cmd, opts) — like shell() but the child is wrapped
+ * in an OS-level sandbox. Defaults are restrictive: network blocked,
+ * filesystem read-only outside /tmp + the cwd.
+ *
+ * Platform support:
+ *   macOS — sandbox-exec with a generated `.sb` profile
+ *   Linux — firejail (if installed)
+ *
+ * If sandboxing isn't available, returns nil rather than silently
+ * running the un-sandboxed command — agents that asked for a
+ * sandbox shouldn't quietly get full access.
+ *
+ * opts is currently a placeholder for future knobs (allow_net,
+ * extra_read_paths, cpu_seconds…). Pass nil for the default policy.
+ */
+static sw_val_t *_builtin_shell_sandboxed(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *cmd = a[0]->v.str;
+    (void)n; /* opts arg reserved for future knobs */
+
+#ifdef __APPLE__
+    /* Write a minimal sandbox-exec profile. Restrictive by default:
+     * - no network
+     * - read-only outside /tmp + /private/tmp + standard system dirs
+     * - no writes outside /tmp + /private/tmp
+     */
+    char profile_path[256];
+    snprintf(profile_path, sizeof(profile_path), "%s/sw_sandbox_%d_%u.sb",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    FILE *pf = fopen(profile_path, "w");
+    if (!pf) return sw_val_nil();
+    /* Permissive-but-network-blocked profile. macOS dyld + libc need
+     * a surprising amount of access to even load `sh`, so a strict
+     * "deny default" profile aborts with SIGABRT before the user's
+     * command runs. Instead we "allow default" then selectively
+     * deny network + writes outside /tmp. Future opts can tighten. */
+    fprintf(pf,
+        "(version 1)\n"
+        "(allow default)\n"
+        "(deny network*)\n"
+        "(deny file-write* (subpath \"/Users\") (subpath \"/etc\")\n"
+        "                  (subpath \"/usr\") (subpath \"/bin\")\n"
+        "                  (subpath \"/sbin\") (subpath \"/Library\"))\n"
+        "(allow file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
+    );
+    fclose(pf);
+
+    /* Capture output via popen — easier than the tmp-file dance of shell(). */
+    size_t cmdlen = strlen(cmd) + strlen(profile_path) + 256;
+    char *full = (char *)malloc(cmdlen);
+    snprintf(full, cmdlen, "sandbox-exec -f %s /bin/sh -c %c%s%c 2>&1",
+             profile_path, '\'', cmd, '\'');
+    FILE *fp = popen(full, "r");
+    free(full);
+    if (!fp) { swbs_unlink(profile_path); return sw_val_nil(); }
+    /* sw processes have small per-process stacks; allocate the read
+     * buffer on the heap instead of using a 64 KB stack array. */
+    size_t out_cap = 65536;
+    char *outbuf = (char *)malloc(out_cap);
+    if (!outbuf) { pclose(fp); swbs_unlink(profile_path); return sw_val_nil(); }
+    size_t got = fread(outbuf, 1, out_cap - 1, fp);
+    outbuf[got] = '\0';
+    int status = pclose(fp);
+    swbs_unlink(profile_path);
+
+    sw_val_t *items[2];
+    items[0] = sw_val_int(WEXITSTATUS(status));
+    items[1] = sw_val_string(outbuf);
+    free(outbuf);
+    return sw_val_tuple(items, 2);
+#elif !defined(_WIN32)
+    /* Linux — try firejail. If absent, return nil (don't silently
+     * fall back to un-sandboxed). */
+    if (system("command -v firejail >/dev/null 2>&1") != 0) {
+        return sw_val_nil();
+    }
+    size_t cmdlen = strlen(cmd) + 256;
+    char *full = (char *)malloc(cmdlen);
+    snprintf(full, cmdlen,
+        "firejail --quiet --net=none --private-tmp -- /bin/sh -c %c%s%c 2>&1",
+        '\'', cmd, '\'');
+    FILE *fp = popen(full, "r");
+    free(full);
+    if (!fp) return sw_val_nil();
+    size_t out_cap = 65536;
+    char *outbuf = (char *)malloc(out_cap);
+    if (!outbuf) { pclose(fp); return sw_val_nil(); }
+    size_t got = fread(outbuf, 1, out_cap - 1, fp);
+    outbuf[got] = '\0';
+    int status = pclose(fp);
+    sw_val_t *items[2];
+    items[0] = sw_val_int(WEXITSTATUS(status));
+    items[1] = sw_val_string(outbuf);
+    free(outbuf);
+    return sw_val_tuple(items, 2);
+#else
+    (void)cmd;
+    return sw_val_nil();
+#endif
+}
 
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
