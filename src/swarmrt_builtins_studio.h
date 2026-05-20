@@ -27,6 +27,7 @@
   #include <sys/ioctl.h>
 #endif
 #include "swarmrt_platform.h"
+#include <sqlite3.h>
 #ifdef _WIN32
   #include <io.h>
   #include <direct.h>
@@ -784,6 +785,178 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
 #else
     if (p.fp) fclose(p.fp);
     return 0;
+#endif
+}
+
+/* ============================================================
+ * Bidirectional subprocess — for MCP stdio + any long-lived child
+ * ============================================================
+ *
+ * `shell()` is one-shot. `_sw_popen_pid` is read-only. For protocols
+ * like MCP (newline-delimited JSON-RPC over stdio) we need a live
+ * subprocess we can write to AND read from across many turns.
+ *
+ * Builtins:
+ *   subprocess_spawn(cmd)              → handle (int) | -1 on error
+ *   subprocess_send_line(h, line)      → 'ok' | 'error'  (appends \n if missing)
+ *   subprocess_recv_line(h, [timeout]) → string | nil    (default 5000 ms)
+ *   subprocess_close(h)                → 'ok' | 'error'
+ *
+ * Implementation: a small registry of (pid, stdin_fd, stdout_fd, buf).
+ * 32 concurrent subprocesses cap — enough for any realistic agent.
+ * Line-buffered on the read side; partial chunks survive across recv
+ * calls in the slot's buffer. */
+/* Forward decl — defined later with the spinner utilities. */
+static uint64_t _sw_now_ms(void);
+
+#define _SW_SUBPROC_MAX 32
+typedef struct {
+    pid_t pid;
+    int stdin_fd;
+    int stdout_fd;
+    char *buf;
+    int buf_len;
+    int buf_cap;
+    int active;
+} _sw_subproc_t;
+static _sw_subproc_t _sw_subprocs[_SW_SUBPROC_MAX];
+
+static sw_val_t *_builtin_subprocess_spawn(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_int(-1);
+#else
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
+    int slot = -1;
+    for (int i = 0; i < _SW_SUBPROC_MAX; i++) if (!_sw_subprocs[i].active) { slot = i; break; }
+    if (slot < 0) return sw_val_int(-1);
+
+    int p_in[2], p_out[2];
+    if (pipe(p_in) != 0) return sw_val_int(-1);
+    if (pipe(p_out) != 0) { close(p_in[0]); close(p_in[1]); return sw_val_int(-1); }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(p_in[0]); close(p_in[1]); close(p_out[0]); close(p_out[1]);
+        return sw_val_int(-1);
+    }
+    if (pid == 0) {
+        /* child */
+        dup2(p_in[0], STDIN_FILENO);
+        dup2(p_out[1], STDOUT_FILENO);
+        close(p_in[0]); close(p_in[1]); close(p_out[0]); close(p_out[1]);
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", a[0]->v.str, (char *)NULL);
+        _exit(127);
+    }
+    /* parent */
+    close(p_in[0]);
+    close(p_out[1]);
+
+    _sw_subprocs[slot].pid = pid;
+    _sw_subprocs[slot].stdin_fd = p_in[1];
+    _sw_subprocs[slot].stdout_fd = p_out[0];
+    _sw_subprocs[slot].buf = (char *)malloc(4096);
+    _sw_subprocs[slot].buf_len = 0;
+    _sw_subprocs[slot].buf_cap = 4096;
+    _sw_subprocs[slot].active = 1;
+    return sw_val_int(slot);
+#endif
+}
+
+static sw_val_t *_builtin_subprocess_send_line(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
+        return sw_val_atom("error");
+    int slot = (int)a[0]->v.i;
+    if (slot < 0 || slot >= _SW_SUBPROC_MAX || !_sw_subprocs[slot].active)
+        return sw_val_atom("error");
+    const char *s = a[1]->v.str;
+    size_t len = strlen(s);
+    ssize_t w = write(_sw_subprocs[slot].stdin_fd, s, len);
+    if (w < 0) return sw_val_atom("error");
+    if (len == 0 || s[len - 1] != '\n') {
+        if (write(_sw_subprocs[slot].stdin_fd, "\n", 1) < 0) return sw_val_atom("error");
+    }
+    return sw_val_atom("ok");
+}
+
+static sw_val_t *_builtin_subprocess_recv_line(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_nil();
+    int slot = (int)a[0]->v.i;
+    if (slot < 0 || slot >= _SW_SUBPROC_MAX || !_sw_subprocs[slot].active) return sw_val_nil();
+    int timeout_ms = (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) ? (int)a[1]->v.i : 5000;
+
+    _sw_subproc_t *sp = &_sw_subprocs[slot];
+    uint64_t start = _sw_now_ms();
+    while (1) {
+        /* Look for a complete line in the buffer. */
+        for (int i = 0; i < sp->buf_len; i++) {
+            if (sp->buf[i] == '\n') {
+                char *line = (char *)malloc(i + 1);
+                memcpy(line, sp->buf, i);
+                line[i] = '\0';
+                int rest = sp->buf_len - (i + 1);
+                if (rest > 0) memmove(sp->buf, sp->buf + i + 1, rest);
+                sp->buf_len = rest;
+                sw_val_t *r = sw_val_string(line);
+                free(line);
+                return r;
+            }
+        }
+        /* No complete line yet; check timeout, then read more. */
+        if (timeout_ms > 0 && _sw_now_ms() - start >= (uint64_t)timeout_ms) return sw_val_nil();
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sp->stdout_fd, &rfds);
+        struct timeval tv = { 0, 100000 }; /* 100ms tick */
+        int ret = select(sp->stdout_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) { if (errno == EINTR) continue; return sw_val_nil(); }
+        if (ret == 0) continue; /* timeout, recheck */
+
+        /* Grow buffer if near full. */
+        if (sp->buf_cap - sp->buf_len < 1024) {
+            sp->buf_cap *= 2;
+            sp->buf = (char *)realloc(sp->buf, sp->buf_cap);
+        }
+        ssize_t got = read(sp->stdout_fd, sp->buf + sp->buf_len, sp->buf_cap - sp->buf_len);
+        if (got > 0) sp->buf_len += (int)got;
+        else if (got == 0) return sw_val_nil(); /* EOF */
+        else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return sw_val_nil();
+    }
+}
+
+static sw_val_t *_builtin_subprocess_close(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_atom("error");
+#else
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    int slot = (int)a[0]->v.i;
+    if (slot < 0 || slot >= _SW_SUBPROC_MAX || !_sw_subprocs[slot].active) return sw_val_atom("error");
+    _sw_subproc_t *sp = &_sw_subprocs[slot];
+    close(sp->stdin_fd);
+    close(sp->stdout_fd);
+    /* Give the child 100ms to exit on its own (close stdin → graceful
+     * shutdown for MCP servers), then SIGTERM, then SIGKILL. */
+    for (int i = 0; i < 10; i++) {
+        int st;
+        if (waitpid(sp->pid, &st, WNOHANG) == sp->pid) goto cleaned;
+        usleep(10000);
+    }
+    killpg(sp->pid, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        int st;
+        if (waitpid(sp->pid, &st, WNOHANG) == sp->pid) goto cleaned;
+        usleep(10000);
+    }
+    killpg(sp->pid, SIGKILL);
+    { int st; waitpid(sp->pid, &st, 0); }
+cleaned:
+    free(sp->buf);
+    sp->buf = NULL;
+    sp->active = 0;
+    return sw_val_atom("ok");
 #endif
 }
 
@@ -2323,6 +2496,150 @@ static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
     return _builtin_panic(args, 1);
 }
 
+/* ============================================================
+ * SQLite — embedded database for agent state + memory
+ * ============================================================
+ *
+ * Builtins:
+ *   db_open(path)           → handle (int) | -1
+ *   db_exec(h, sql)         → 'ok' | error_string  (DDL or 0-result stmts)
+ *   db_query(h, sql, [args]) → list of %{col: val, ...} rows
+ *   db_close(h)             → 'ok' | 'error'
+ *
+ * Parameter binding uses `?` placeholders. Args list must match
+ * placeholder count. Ints, floats, strings, atoms, nil are bound to
+ * matching sqlite types; everything else is coerced to string.
+ *
+ * Linked against system libsqlite3. Connection cap = 32.
+ */
+#define _SW_SQLITE_MAX 32
+static sqlite3 *_sw_sqlite_db[_SW_SQLITE_MAX];
+
+static sw_val_t *_builtin_db_open(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
+    int slot = -1;
+    for (int i = 0; i < _SW_SQLITE_MAX; i++) if (!_sw_sqlite_db[i]) { slot = i; break; }
+    if (slot < 0) return sw_val_int(-1);
+    sqlite3 *db = NULL;
+    if (sqlite3_open(a[0]->v.str, &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return sw_val_int(-1);
+    }
+    _sw_sqlite_db[slot] = db;
+    return sw_val_int(slot);
+}
+
+static sw_val_t *_builtin_db_close(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    int slot = (int)a[0]->v.i;
+    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+    sqlite3_close(_sw_sqlite_db[slot]);
+    _sw_sqlite_db[slot] = NULL;
+    return sw_val_atom("ok");
+}
+
+/* Bind a single arg to a prepared sqlite stmt at 1-based index. */
+static int _sw_db_bind(sqlite3_stmt *stmt, int idx, sw_val_t *v) {
+    if (!v || v->type == SW_VAL_NIL) return sqlite3_bind_null(stmt, idx);
+    switch (v->type) {
+        case SW_VAL_INT:    return sqlite3_bind_int64(stmt, idx, v->v.i);
+        case SW_VAL_FLOAT:  return sqlite3_bind_double(stmt, idx, v->v.f);
+        case SW_VAL_STRING: return sqlite3_bind_text(stmt, idx, v->v.str, -1, SQLITE_TRANSIENT);
+        case SW_VAL_ATOM:   return sqlite3_bind_text(stmt, idx, v->v.str, -1, SQLITE_TRANSIENT);
+        default: {
+            /* Fall back: render via sw_val_format to a string. */
+            char *buf = NULL; size_t blen = 0;
+            FILE *m = open_memstream(&buf, &blen);
+            if (m) { sw_val_format(m, v); fclose(m); }
+            int rc = sqlite3_bind_text(stmt, idx, buf ? buf : "", -1, SQLITE_TRANSIENT);
+            free(buf);
+            return rc;
+        }
+    }
+}
+
+/* Take one row's columns and build a sw map %{col_name: value}. */
+static sw_val_t *_sw_db_row_to_map(sqlite3_stmt *stmt) {
+    int ncols = sqlite3_column_count(stmt);
+    sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * ncols);
+    sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * ncols);
+    for (int i = 0; i < ncols; i++) {
+        keys[i] = sw_val_string(sqlite3_column_name(stmt, i));
+        switch (sqlite3_column_type(stmt, i)) {
+            case SQLITE_INTEGER:
+                vals[i] = sw_val_int(sqlite3_column_int64(stmt, i)); break;
+            case SQLITE_FLOAT:
+                vals[i] = sw_val_float(sqlite3_column_double(stmt, i)); break;
+            case SQLITE_TEXT:
+                vals[i] = sw_val_string((const char *)sqlite3_column_text(stmt, i)); break;
+            case SQLITE_BLOB: {
+                /* Render blobs as base64-ish hex strings — agents rarely
+                 * need raw bytes. If someone does, we add a db_query_blob
+                 * variant later. */
+                int sz = sqlite3_column_bytes(stmt, i);
+                const unsigned char *bytes = (const unsigned char *)sqlite3_column_blob(stmt, i);
+                char *hex = (char *)malloc(sz * 2 + 1);
+                for (int j = 0; j < sz; j++) sprintf(hex + j * 2, "%02x", bytes[j]);
+                hex[sz * 2] = '\0';
+                vals[i] = sw_val_string(hex);
+                free(hex);
+                break;
+            }
+            case SQLITE_NULL:
+            default:
+                vals[i] = sw_val_nil(); break;
+        }
+    }
+    sw_val_t *m = sw_val_map_new(keys, vals, ncols);
+    free(keys); free(vals);
+    return m;
+}
+
+static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
+        return sw_val_atom("error");
+    int slot = (int)a[0]->v.i;
+    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+    char *err = NULL;
+    int rc = sqlite3_exec(_sw_sqlite_db[slot], a[1]->v.str, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        sw_val_t *r = sw_val_string(err ? err : "sqlite error");
+        if (err) sqlite3_free(err);
+        return r;
+    }
+    return sw_val_atom("ok");
+}
+
+static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
+        return sw_val_list(NULL, 0);
+    int slot = (int)a[0]->v.i;
+    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_list(NULL, 0);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(_sw_sqlite_db[slot], a[1]->v.str, -1, &stmt, NULL) != SQLITE_OK)
+        return sw_val_list(NULL, 0);
+
+    if (n >= 3 && a[2] && a[2]->type == SW_VAL_LIST) {
+        for (int i = 0; i < a[2]->v.tuple.count; i++)
+            _sw_db_bind(stmt, i + 1, a[2]->v.tuple.items[i]);
+    }
+
+    sw_val_t **rows = NULL;
+    int nrows = 0, rows_cap = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (nrows == rows_cap) {
+            rows_cap = rows_cap ? rows_cap * 2 : 16;
+            rows = (sw_val_t **)realloc(rows, sizeof(sw_val_t *) * rows_cap);
+        }
+        rows[nrows++] = _sw_db_row_to_map(stmt);
+    }
+    sqlite3_finalize(stmt);
+    sw_val_t *r = sw_val_list(rows, nrows);
+    free(rows);
+    return r;
+}
+
 /* ================================================================
  * Phase 13: Agent Stdlib Batteries
  *
@@ -3204,6 +3521,16 @@ static sw_val_t *_builtin_string_split(sw_val_t **a, int n) {
         free(items);
         return r;
     }
+    /* Empty input → one empty segment, matching Python/JS .split().
+     * Returning an empty list here made hd(string_split("")) panic
+     * with "hd: list is empty" all over the codebase. */
+    if (*str == 0) {
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *));
+        items[0] = sw_val_string("");
+        sw_val_t *r = sw_val_list(items, 1);
+        free(items);
+        return r;
+    }
     int cap = 32, cnt = 0;
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
     const char *p = str;
@@ -3218,8 +3545,17 @@ static sw_val_t *_builtin_string_split(sw_val_t **a, int n) {
         free(seg);
         if (*f == 0) break;
         p = f + dlen;
-        /* Handle trailing delimiter */
-        if (*p == 0) { items[cnt++] = sw_val_string(""); break; }
+        /* Trailing delimiter → emit a final empty segment. This push
+         * needs the SAME cap guard as the one above — without it, a
+         * string that splits into exactly `cap` segments and ends
+         * with the delimiter writes items[cap], one past the buffer.
+         * That heap overflow corrupts the allocator and crashes later
+         * in an unrelated malloc (the classic "trace trap"). */
+        if (*p == 0) {
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+            items[cnt++] = sw_val_string("");
+            break;
+        }
     }
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);

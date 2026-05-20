@@ -1316,8 +1316,21 @@ sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {
 
 sw_val_t *sw_val_map_get(sw_val_t *map, sw_val_t *key) {
     if (!map || map->type != SW_VAL_MAP) return sw_val_nil();
+    /* First pass: exact value-equal match. */
     for (int i = 0; i < map->v.map.count; i++)
         if (sw_val_equal(map->v.map.keys[i], key)) return map->v.map.vals[i];
+    /* Second pass: treat atom and string with the same text as
+     * equivalent for lookup. JSON decode produces string keys; sw
+     * map literals (`%{name: ...}`) produce atom keys; users expect
+     * `map_get(json_decode(...), 'msg')` to work. */
+    if (key && (key->type == SW_VAL_ATOM || key->type == SW_VAL_STRING) && key->v.str) {
+        sw_val_type_t alt_type = (key->type == SW_VAL_ATOM) ? SW_VAL_STRING : SW_VAL_ATOM;
+        for (int i = 0; i < map->v.map.count; i++) {
+            sw_val_t *k = map->v.map.keys[i];
+            if (k && k->type == alt_type && k->v.str && strcmp(k->v.str, key->v.str) == 0)
+                return map->v.map.vals[i];
+        }
+    }
     return sw_val_nil();
 }
 
@@ -1532,6 +1545,13 @@ static int pattern_match(node_t *pattern, sw_val_t *val, sw_env_t *env) {
         return val->type == SW_VAL_STRING && strcmp(val->v.str, pattern->v.sval) == 0;
 
     case N_ATOM:
+        /* Pattern `nil` matches both SW_VAL_NIL and the literal atom
+         * `'nil'` (sw_val_equal treats them as equal at the value level,
+         * so pattern match must too). */
+        if (strcmp(pattern->v.sval, "nil") == 0) {
+            return val->type == SW_VAL_NIL ||
+                   (val->type == SW_VAL_ATOM && strcmp(val->v.str, "nil") == 0);
+        }
         return val->type == SW_VAL_ATOM && strcmp(val->v.str, pattern->v.sval) == 0;
 
     case N_TUPLE:

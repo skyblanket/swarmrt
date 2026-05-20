@@ -37,6 +37,10 @@ typedef struct {
     int ncaptures;
 } lambda_info_t;
 
+/* Max functions tracked per module for is_module_func / did_you_mean.
+ * Generous — the largest swarm-code module is ~90 functions. */
+#define CG_MAX_FUNCS 512
+
 typedef struct {
     FILE *out;
     char mod_name[128];
@@ -52,8 +56,12 @@ typedef struct {
     char declared[256][128];
     int ndeclared;
 
-    /* all function names in module */
-    char func_names[64][128];
+    /* all function names in module — sized generously: a single .sw
+     * module routinely exceeds 64 functions (agent.sw has ~90), and
+     * any name past the cap was invisible to is_module_func, which
+     * produced spurious "unknown function" warnings for every
+     * forward-referenced helper. */
+    char func_names[CG_MAX_FUNCS][128];
     int nfuncs;
 
     /* spawn sites collected during pre-scan */
@@ -191,6 +199,12 @@ static int is_builtin(const char *name) {
            /* Error */
            strcmp(name, "error") == 0 ||
            strcmp(name, "panic") == 0 || strcmp(name, "expect") == 0 ||
+           strcmp(name, "subprocess_spawn") == 0 ||
+           strcmp(name, "subprocess_send_line") == 0 ||
+           strcmp(name, "subprocess_recv_line") == 0 ||
+           strcmp(name, "subprocess_close") == 0 ||
+           strcmp(name, "db_open") == 0 || strcmp(name, "db_close") == 0 ||
+           strcmp(name, "db_exec") == 0 || strcmp(name, "db_query") == 0 ||
            strcmp(name, "typeof") == 0 ||
            /* Phase 13: Agent stdlib */
            strcmp(name, "http_get") == 0 || strcmp(name, "shell") == 0 ||
@@ -450,7 +464,11 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
         lambda_info_t *li = &ctx->lambdas[ctx->nlambdas];
         li->id = ctx->nlambdas;
         li->node = n;
-        snprintf(li->gen_name, sizeof(li->gen_name), "_lambda_%d", li->id);
+        /* Module-prefix lambda names so multi-module builds don't get
+         * `_lambda_1` defined twice when two modules each have a lambda.
+         * The previous unprefixed form worked only for single-module
+         * compiles. */
+        snprintf(li->gen_name, sizeof(li->gen_name), "_lambda_%s_%d", ctx->mod_name, li->id);
 
         /* Find free variables: identifiers in body that aren't parameters */
         char body_idents[64][128];
@@ -572,6 +590,16 @@ static int has_tail_calls(cg_ctx_t *ctx, node_t *n) {
     case N_IF:
         return has_tail_calls(ctx, n->v.iff.then_b) ||
                has_tail_calls(ctx, n->v.iff.else_b);
+    case N_CASE:
+        /* A tail call inside any case arm body still produces a
+         * `goto _tail` from emit_call when tail flag propagates in,
+         * so the function header MUST emit the `_tail:` label. */
+        for (int i = 0; i < n->v.casex.nclauses; i++)
+            if (has_tail_calls(ctx, n->v.casex.clauses[i]->v.clause.body)) return 1;
+        return 0;
+    case N_TRY:
+        return has_tail_calls(ctx, n->v.trycatch.body) ||
+               has_tail_calls(ctx, n->v.trycatch.catch_body);
     default: return 0;
     }
 }
@@ -661,8 +689,26 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    return sw_val_float(fmod(fa, fb));\n"
         "}\n\n");
 
+    /* `++` is polymorphic: list ++ list → concatenated list (Erlang-style),
+     * otherwise string-concat with auto-coercion of ints/floats/atoms.
+     * Without the list path, Std.sw helpers like `reverse`/`flatten`/
+     * `intersperse` that build with `[x] ++ rest` silently produced
+     * empty strings instead of the expected lists. */
     fprintf(f,
         "static sw_val_t *_op_concat(sw_val_t *a, sw_val_t *b) {\n"
+        "    /* List ++ list — preserve list semantics. */\n"
+        "    if (a && b && a->type == SW_VAL_LIST && b->type == SW_VAL_LIST) {\n"
+        "        int la = a->v.tuple.count, lb = b->v.tuple.count;\n"
+        "        if (la == 0) return b;\n"
+        "        if (lb == 0) return a;\n"
+        "        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (la + lb));\n"
+        "        for (int i = 0; i < la; i++) items[i] = a->v.tuple.items[i];\n"
+        "        for (int i = 0; i < lb; i++) items[la + i] = b->v.tuple.items[i];\n"
+        "        sw_val_t *r = sw_val_list(items, la + lb);\n"
+        "        free(items);\n"
+        "        return r;\n"
+        "    }\n"
+        "    /* String concat with int/float/atom auto-coercion. */\n"
         "    size_t alen = 0, blen = 0;\n"
         "    char ta[64] = \"\", tb[64] = \"\";\n"
         "    const char *sa = ta, *sb = tb;\n"
@@ -698,6 +744,30 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    }\n"
         "    if (op[0]=='=' && op[1]=='=') return sw_val_atom(sw_val_equal(a, b) ? \"true\" : \"false\");\n"
         "    if (op[0]=='!' && op[1]=='=') return sw_val_atom(!sw_val_equal(a, b) ? \"true\" : \"false\");\n"
+        "    /* Ordered comparisons on float/int mix and float/float —\n"
+        "     * coerce both to double and compare. Without this, `0.5 > 0.1`\n"
+        "     * fell through to 'false' silently (only int<int worked). */\n"
+        "    if ((a->type == SW_VAL_INT || a->type == SW_VAL_FLOAT) &&\n"
+        "        (b->type == SW_VAL_INT || b->type == SW_VAL_FLOAT)) {\n"
+        "        double x = (a->type == SW_VAL_INT) ? (double)a->v.i : a->v.f;\n"
+        "        double y = (b->type == SW_VAL_INT) ? (double)b->v.i : b->v.f;\n"
+        "        int r = 0;\n"
+        "        if (op[0]=='<' && op[1]=='=') r = (x <= y);\n"
+        "        else if (op[0]=='>' && op[1]=='=') r = (x >= y);\n"
+        "        else if (op[0]=='<') r = (x < y);\n"
+        "        else if (op[0]=='>') r = (x > y);\n"
+        "        return sw_val_atom(r ? \"true\" : \"false\");\n"
+        "    }\n"
+        "    /* String ordered compare — lexicographic. */\n"
+        "    if (a->type == SW_VAL_STRING && b->type == SW_VAL_STRING) {\n"
+        "        int c = strcmp(a->v.str, b->v.str);\n"
+        "        int r = 0;\n"
+        "        if (op[0]=='<' && op[1]=='=') r = (c <= 0);\n"
+        "        else if (op[0]=='>' && op[1]=='=') r = (c >= 0);\n"
+        "        else if (op[0]=='<') r = (c < 0);\n"
+        "        else if (op[0]=='>') r = (c > 0);\n"
+        "        return sw_val_atom(r ? \"true\" : \"false\");\n"
+        "    }\n"
         "    return sw_val_atom(\"false\");\n"
         "}\n\n");
 
@@ -990,8 +1060,18 @@ static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
     (void)ctx;
     switch (pat->type) {
     case N_ATOM:
-        fprintf(f, "%s->type == SW_VAL_ATOM && strcmp(%s->v.str, \"%s\") == 0",
-                val, val, pat->v.sval);
+        /* Special case: the pattern `nil` should match the runtime
+         * nil value (SW_VAL_NIL) AND the literal atom `'nil'`, which
+         * sw_val_equal() already treats as equivalent at the value
+         * level. Without this, `case x { nil -> ... }` silently misses
+         * when x is a real nil (e.g. a map_get on a missing key). */
+        if (strcmp(pat->v.sval, "nil") == 0) {
+            fprintf(f, "(%s->type == SW_VAL_NIL || (%s->type == SW_VAL_ATOM && strcmp(%s->v.str, \"nil\") == 0))",
+                    val, val, val);
+        } else {
+            fprintf(f, "%s->type == SW_VAL_ATOM && strcmp(%s->v.str, \"%s\") == 0",
+                    val, val, pat->v.sval);
+        }
         break;
     case N_INT:
         fprintf(f, "%s->type == SW_VAL_INT && %s->v.i == %lldLL",
@@ -1091,11 +1171,40 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
 static void emit_binop(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     FILE *f = ctx->out;
     char left[32], right[32], res[32];
+    const char *op = n->v.binop.op;
+
+    /* Short-circuit && / || — the right operand must NOT be evaluated
+     * when the left already decides the result. The naive emitter
+     * flattened both operands into statements before combining, so a
+     * guard like `x != nil && elem(x, 0) == 'p'` always ran elem(x,0)
+     * and panicked when x was nil. We special-case the logical ops:
+     * emit the left, declare the result temp seeded with the
+     * short-circuit value, then emit the right operand's statements
+     * INSIDE a conditional block so they only run when needed.
+     * sw's && / || yield a boolean atom ('true' / 'false'). */
+    if (strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) {
+        int is_and = (op[0] == '&');
+        emit_expr(ctx, n->v.binop.left, 0, left, sizeof(left));
+        fresh_var(ctx, res, sizeof(res));
+        /* Seed with the value the short-circuit path yields:
+         *   &&  → left falsy  ⇒ "false"
+         *   ||  → left truthy ⇒ "true"  */
+        fprintf(f, "    sw_val_t *%s = sw_val_atom(%s);\n",
+                res, is_and ? "\"false\"" : "\"true\"");
+        fprintf(f, "    if (%ssw_val_is_truthy(%s)) {\n",
+                is_and ? "" : "!", left);
+        emit_expr(ctx, n->v.binop.right, 0, right, sizeof(right));
+        fprintf(f, "    %s = sw_val_atom(sw_val_is_truthy(%s) ? \"true\" : \"false\");\n",
+                res, right);
+        fprintf(f, "    }\n");
+        strncpy(out, res, osz - 1);
+        return;
+    }
+
     emit_expr(ctx, n->v.binop.left, 0, left, sizeof(left));
     emit_expr(ctx, n->v.binop.right, 0, right, sizeof(right));
     fresh_var(ctx, res, sizeof(res));
 
-    const char *op = n->v.binop.op;
     if (strcmp(op, "+") == 0)
         fprintf(f, "    sw_val_t *%s = _op_add(%s, %s);\n", res, left, right);
     else if (strcmp(op, "-") == 0)
@@ -1328,6 +1437,12 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "map_has_key") == 0 || strcmp(fname, "map_size") == 0 ||
              strcmp(fname, "map_remove") == 0 || strcmp(fname, "error") == 0 ||
              strcmp(fname, "panic") == 0 || strcmp(fname, "expect") == 0 ||
+             strcmp(fname, "subprocess_spawn") == 0 ||
+             strcmp(fname, "subprocess_send_line") == 0 ||
+             strcmp(fname, "subprocess_recv_line") == 0 ||
+             strcmp(fname, "subprocess_close") == 0 ||
+             strcmp(fname, "db_open") == 0 || strcmp(fname, "db_close") == 0 ||
+             strcmp(fname, "db_exec") == 0 || strcmp(fname, "db_query") == 0 ||
              strcmp(fname, "typeof") == 0 ||
              /* Phase 13: Agent stdlib */
              strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||
@@ -1752,6 +1867,18 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         if (is_declared(ctx, n->v.sval)) {
             /* Known variable — return mangled C-side name. */
             strncpy(out, mangle_for_c(n->v.sval), osz - 1);
+        } else if (is_module_func(ctx, n->v.sval)) {
+            /* Module function used by-name as a value (e.g. passed in
+             * `%{handler: handle_echo}` or stored in a var to call
+             * later). Wrap it as a callable SW_VAL_FUN so sw_val_apply
+             * dispatches correctly. Without this we silently produced
+             * an atom and any later call(args) returned nil. */
+            char v[32]; fresh_var(ctx, v, sizeof(v));
+            /* nparams = -1 means "variadic at the C ABI level"; the
+             * generated module functions all take (sw_val_t **, int). */
+            fprintf(f, "    sw_val_t *%s = sw_val_fun_native((void*)%s_%s, -1, NULL, 0);\n",
+                    v, ctx->mod_name, n->v.sval);
+            strncpy(out, v, osz - 1);
         } else {
             /* Undeclared identifier → treat as atom (message tag) */
             char v[32]; fresh_var(ctx, v, sizeof(v));
@@ -2160,7 +2287,7 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     strncpy(ctx.mod_name, mod->v.mod.name, 127);
 
     /* Collect function names */
-    for (int i = 0; i < mod->v.mod.nfuns && i < 64; i++) {
+    for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
         strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
         ctx.nfuncs++;
     }
@@ -2206,7 +2333,7 @@ int sw_codegen_module(void *ast, FILE *out) {
     ctx.out = out;
     strncpy(ctx.mod_name, mod->v.mod.name, 127);
 
-    for (int i = 0; i < mod->v.mod.nfuns && i < 64; i++) {
+    for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
         strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
         ctx.nfuncs++;
     }
@@ -2257,7 +2384,7 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
         ctx.out = out;
         strncpy(ctx.mod_name, mod->v.mod.name, 127);
 
-        for (int i = 0; i < mod->v.mod.nfuns && i < 64; i++) {
+        for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
             strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
             ctx.nfuncs++;
         }

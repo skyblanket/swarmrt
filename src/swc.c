@@ -155,8 +155,36 @@ int main(int argc, char **argv) {
         nasts++;
     }
 
+    /* Compute the swc-binary directory and the swarmrt root so the
+     * import resolver can fall back to <root>/lib/ for stdlib modules
+     * (Std, Time, Cron, etc.) without the user having to copy them. */
+    char swc_dir_early[256] = ".";
+    char swarmrt_lib[512] = "./lib";
+    {
+        char *sp = strdup(argv[0]);
+        if (sp) {
+#ifdef _WIN32
+            char *sep = strrchr(sp, '/');
+            char *bsep = strrchr(sp, '\\');
+            if (bsep > sep) sep = bsep;
+            if (sep) *sep = '\0'; else sp[0] = '.', sp[1] = '\0';
+            snprintf(swc_dir_early, sizeof(swc_dir_early), "%s", sp);
+#else
+            char *dir = dirname(sp);
+            snprintf(swc_dir_early, sizeof(swc_dir_early), "%s", dir);
+#endif
+            free(sp);
+        }
+        snprintf(swarmrt_lib, sizeof(swarmrt_lib), "%s/../lib", swc_dir_early);
+    }
+
     /* Resolve imports: for each parsed AST, find import declarations and
-     * auto-load the corresponding .sw files from the same directory */
+     * auto-load the corresponding .sw files. Lookup order:
+     *   1. <input_dir>/<Name>.sw  (capitalised — matches `import Foo`)
+     *   2. <input_dir>/<name>.sw  (lowercase — legacy `main.sw` style)
+     *   3. <swarmrt_root>/lib/<Name>.sw   (stdlib path)
+     *   4. <swarmrt_root>/lib/<name>.sw   (stdlib path, lowercase)
+     */
     {
         char input_dir[256];
         char *tmp = strdup(inputs[0]);
@@ -184,21 +212,27 @@ int main(int argc, char **argv) {
                 }
                 if (found) continue;
 
-                /* Try ModuleName.sw then modulename.sw */
+                /* Lowercase variant computed once. */
+                char lower[128];
+                strncpy(lower, imp_name, sizeof(lower) - 1);
+                for (int c = 0; lower[c]; c++)
+                    if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
+
+                /* Search in order: input_dir CamelCase → input_dir lower
+                 *   → stdlib CamelCase → stdlib lower */
                 char imp_path[512];
-                snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", input_dir, imp_name);
-                char *imp_source = read_file(imp_path);
-                if (!imp_source) {
-                    /* Try lowercase */
-                    char lower[128];
-                    strncpy(lower, imp_name, sizeof(lower) - 1);
-                    for (int c = 0; lower[c]; c++)
-                        if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
-                    snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", input_dir, lower);
+                char *imp_source = NULL;
+                const char *roots[2] = { input_dir, swarmrt_lib };
+                for (int r = 0; r < 2 && !imp_source; r++) {
+                    snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
+                    imp_source = read_file(imp_path);
+                    if (imp_source) break;
+                    snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
                     imp_source = read_file(imp_path);
                 }
                 if (!imp_source) {
-                    fprintf(stderr, "swc: cannot resolve import '%s'\n", imp_name);
+                    fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
+                            imp_name, input_dir, swarmrt_lib);
                     continue;
                 }
                 void *imp_ast = sw_lang_parse(imp_source);
@@ -348,9 +382,9 @@ int main(int argc, char **argv) {
     /* Compile with cc */
     char cmd_buf[2048];
 #ifdef __APPLE__
-    const char *extra_libs = "";
+    const char *extra_libs = "-lsqlite3";
 #else
-    const char *extra_libs = "-lssl -lcrypto";
+    const char *extra_libs = "-lssl -lcrypto -lsqlite3";
 #endif
     snprintf(cmd_buf, sizeof(cmd_buf),
         "cc %s -fno-stack-protector -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s %s",

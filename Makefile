@@ -6,9 +6,19 @@ CLANG_CHECK := $(shell $(CC) -Wno-macro-redefined -x c -c /dev/null -o /dev/null
 ifeq ($(CLANG_CHECK),yes)
 CFLAGS += -Wno-macro-redefined
 endif
-LDFLAGS = -pthread -lz
+LDFLAGS = -pthread -lz -lsqlite3
 ifneq ($(shell uname),Darwin)
 LDFLAGS += -lssl -lcrypto
+endif
+
+# On macOS Homebrew installs sqlite headers under /opt/homebrew/opt/sqlite3.
+# The system one (in /usr/include) is also valid but Homebrew's is newer.
+ifeq ($(shell uname),Darwin)
+SQLITE_PREFIX := $(shell brew --prefix sqlite3 2>/dev/null)
+ifneq ($(SQLITE_PREFIX),)
+CFLAGS += -I$(SQLITE_PREFIX)/include
+LDFLAGS += -L$(SQLITE_PREFIX)/lib
+endif
 endif
 
 SRC_DIR = src
