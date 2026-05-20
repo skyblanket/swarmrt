@@ -854,8 +854,13 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f,
         "static sw_val_t *_builtin_map(sw_val_t **a, int n) {\n"
         "    if (n < 2) return sw_val_list(NULL, 0);\n"
-        "    sw_val_t *fn = a[0];\n"
-        "    sw_val_t *lst = a[1];\n"
+        "    /* Accept either order: map(fn, list) — historical Lisp/Erlang\n"
+        "     * style — or map(list, fn) — Elixir style. Disambiguate by\n"
+        "     * the runtime types of the args. */\n"
+        "    sw_val_t *fn, *lst;\n"
+        "    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }\n"
+        "    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }\n"
+        "    else { fn = a[0]; lst = a[1]; }\n"
         "    if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);\n"
         "    int cnt = lst->v.tuple.count;\n"
         "    if (cnt == 0) return sw_val_list(NULL, 0);\n"
@@ -886,8 +891,11 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f,
         "static sw_val_t *_builtin_filter(sw_val_t **a, int n) {\n"
         "    if (n < 2) return sw_val_list(NULL, 0);\n"
-        "    sw_val_t *fn = a[0];\n"
-        "    sw_val_t *lst = a[1];\n"
+        "    /* Accept filter(fn, list) or filter(list, fn). */\n"
+        "    sw_val_t *fn, *lst;\n"
+        "    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }\n"
+        "    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }\n"
+        "    else { fn = a[0]; lst = a[1]; }\n"
         "    if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);\n"
         "    int cnt = lst->v.tuple.count;\n"
         "    sw_val_t **res = malloc(sizeof(sw_val_t*) * (cnt > 0 ? cnt : 1));\n"
@@ -1870,10 +1878,21 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         char res[32];
         fresh_var(ctx, res, sizeof(res));
 
-        if (is_builtin(fname))
+        /* Module-qualified call: `x |> Std.sum()` must become
+         * `Std_sum(args, n)`, NOT `<current_mod>_Std.sum(...)`. */
+        const char *dot = strchr(fname, '.');
+        if (dot) {
+            char mod[128], fn[128];
+            int mlen = (int)(dot - fname);
+            if (mlen >= (int)sizeof(mod)) mlen = sizeof(mod) - 1;
+            strncpy(mod, fname, mlen); mod[mlen] = '\0';
+            strncpy(fn, dot + 1, sizeof(fn) - 1); fn[sizeof(fn) - 1] = '\0';
+            fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, mod, fn, arr, nargs);
+        } else if (is_builtin(fname)) {
             fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, arr, nargs);
-        else
+        } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
+        }
 
         strncpy(out, res, osz - 1);
     } else if (func->type == N_IDENT) {
@@ -1885,10 +1904,20 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         char res[32];
         fresh_var(ctx, res, sizeof(res));
 
-        if (is_builtin(fname))
+        /* Same module-qualified handling as the N_CALL branch. */
+        const char *dot = strchr(fname, '.');
+        if (dot) {
+            char mod[128], fn[128];
+            int mlen = (int)(dot - fname);
+            if (mlen >= (int)sizeof(mod)) mlen = sizeof(mod) - 1;
+            strncpy(mod, fname, mlen); mod[mlen] = '\0';
+            strncpy(fn, dot + 1, sizeof(fn) - 1); fn[sizeof(fn) - 1] = '\0';
+            fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, mod, fn, arr);
+        } else if (is_builtin(fname)) {
             fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, 1);\n", res, fname, arr);
-        else
+        } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, ctx->mod_name, fname, arr);
+        }
 
         strncpy(out, res, osz - 1);
     } else {

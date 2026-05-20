@@ -705,32 +705,48 @@ static node_t *par_primary(par_t *p) {
             par_expect(p, TOK_ARROW, "'->'");
 
             /* Body: collect statements up to next pattern (terminated by ->),
-             * `;`, or the closing `}`. Same approach as receive arms. */
-            node_t *body = mknode(N_BLOCK, p->cur.line);
-            body->v.block.stmts = NULL;
-            body->v.block.nstmts = 0;
-            while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
-                while (p->cur.type == TOK_SEMI) par_adv(p);
-                if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
-                lex_t save_lex = p->lex;
-                tok_t save_cur = p->cur;
-                int save_err = p->err;
-                node_t *expr = par_stmt(p);
-                /* Backtrack if the just-parsed expression turned out to be
-                 * the NEXT clause's pattern. Two signatures: `pat ->` and
-                 * `pat when guard ->`. We peek for either TOK_ARROW or
-                 * TOK_WHEN. (Same approach as par_receive's arm body.) */
-                if (p->cur.type == TOK_ARROW || p->cur.type == TOK_WHEN) {
-                    p->lex = save_lex;
-                    p->cur = save_cur;
-                    p->err = save_err;
-                    node_free(expr);
-                    break;
+             * `;`, or the closing `}`. Same approach as receive arms.
+             *
+             * Special case: if the body starts with `{`, treat it as a
+             * block delimiter (parsed via par_block) rather than the
+             * default per-statement loop. Without this special-case the
+             * default loop would invoke par_expr on `{` which parses it
+             * as a tuple literal — that breaks any user who writes
+             * `_ -> { x = ... ; x }` expecting an explicit block.
+             * No existing code uses `_ -> {tuple}` as a clause body
+             * (users write the tuple bare), so this is purely additive. */
+            node_t *body;
+            if (p->cur.type == TOK_LBRACE) {
+                par_adv(p);  /* consume '{' */
+                body = par_block(p);
+                par_expect(p, TOK_RBRACE, "'}'");
+            } else {
+                body = mknode(N_BLOCK, p->cur.line);
+                body->v.block.stmts = NULL;
+                body->v.block.nstmts = 0;
+                while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+                    while (p->cur.type == TOK_SEMI) par_adv(p);
+                    if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+                    lex_t save_lex = p->lex;
+                    tok_t save_cur = p->cur;
+                    int save_err = p->err;
+                    node_t *expr = par_stmt(p);
+                    /* Backtrack if the just-parsed expression turned out to
+                     * be the NEXT clause's pattern. Two signatures: `pat ->`
+                     * and `pat when guard ->`. We peek for either TOK_ARROW
+                     * or TOK_WHEN. (Same as par_receive's arm body.) */
+                    if (p->cur.type == TOK_ARROW || p->cur.type == TOK_WHEN) {
+                        p->lex = save_lex;
+                        p->cur = save_cur;
+                        p->err = save_err;
+                        node_free(expr);
+                        break;
+                    }
+                    body->v.block.nstmts++;
+                    body->v.block.stmts = realloc(body->v.block.stmts,
+                        sizeof(node_t*) * body->v.block.nstmts);
+                    body->v.block.stmts[body->v.block.nstmts-1] = expr;
                 }
-                body->v.block.nstmts++;
-                body->v.block.stmts = realloc(body->v.block.stmts,
-                    sizeof(node_t*) * body->v.block.nstmts);
-                body->v.block.stmts[body->v.block.nstmts-1] = expr;
             }
             if (body->v.block.nstmts == 1) {
                 cl->v.clause.body = body->v.block.stmts[0];
@@ -807,31 +823,38 @@ static node_t *par_primary(par_t *p) {
                 cl->v.clause.guard = par_expr(p);
             }
             par_expect(p, TOK_ARROW, "'->'");
-            /* Body: collect expressions until next clause pattern (expr ->) or } */
-            node_t *body = mknode(N_BLOCK, p->cur.line);
-            body->v.block.stmts = NULL;
-            body->v.block.nstmts = 0;
-            while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF && !p->err) {
-                /* Tolerate `;` between statements in arm bodies, same
-                 * way par_block does — keeps the syntax consistent. */
-                while (p->cur.type == TOK_SEMI) par_adv(p);
-                if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_AFTER || p->cur.type == TOK_EOF) break;
-                lex_t save_lex = p->lex;
-                tok_t save_cur = p->cur;
-                int save_err = p->err;
-                node_t *expr = par_stmt(p);
-                if (p->cur.type == TOK_ARROW) {
-                    /* This is the next clause's pattern — backtrack */
-                    p->lex = save_lex;
-                    p->cur = save_cur;
-                    p->err = save_err;
-                    node_free(expr);
-                    break;
+            /* Body: collect expressions until next clause pattern (expr ->) or }.
+             * Special case for leading `{` — see the matching case-arm
+             * comment in par_case for why. */
+            node_t *body;
+            if (p->cur.type == TOK_LBRACE) {
+                par_adv(p);  /* consume '{' */
+                body = par_block(p);
+                par_expect(p, TOK_RBRACE, "'}'");
+            } else {
+                body = mknode(N_BLOCK, p->cur.line);
+                body->v.block.stmts = NULL;
+                body->v.block.nstmts = 0;
+                while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF && !p->err) {
+                    while (p->cur.type == TOK_SEMI) par_adv(p);
+                    if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_AFTER || p->cur.type == TOK_EOF) break;
+                    lex_t save_lex = p->lex;
+                    tok_t save_cur = p->cur;
+                    int save_err = p->err;
+                    node_t *expr = par_stmt(p);
+                    if (p->cur.type == TOK_ARROW) {
+                        /* This is the next clause's pattern — backtrack */
+                        p->lex = save_lex;
+                        p->cur = save_cur;
+                        p->err = save_err;
+                        node_free(expr);
+                        break;
+                    }
+                    body->v.block.nstmts++;
+                    body->v.block.stmts = realloc(body->v.block.stmts,
+                        sizeof(node_t*) * body->v.block.nstmts);
+                    body->v.block.stmts[body->v.block.nstmts-1] = expr;
                 }
-                body->v.block.nstmts++;
-                body->v.block.stmts = realloc(body->v.block.stmts,
-                    sizeof(node_t*) * body->v.block.nstmts);
-                body->v.block.stmts[body->v.block.nstmts-1] = expr;
             }
             if (body->v.block.nstmts == 1) {
                 cl->v.clause.body = body->v.block.stmts[0];
