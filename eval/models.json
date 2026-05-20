@@ -1,0 +1,25 @@
+{
+  "models": [
+    {
+      "id": "kimi-k2.6",
+      "label": "Kimi K2.6 (reasoning)",
+      "endpoint": "https://api.moonshot.ai/v1/chat/completions",
+      "key_env": "MOONSHOT_KEY",
+      "model_field": "kimi-k2.6"
+    },
+    {
+      "id": "kimi-k2.5",
+      "label": "Kimi K2.5 (reasoning)",
+      "endpoint": "https://api.moonshot.ai/v1/chat/completions",
+      "key_env": "MOONSHOT_KEY",
+      "model_field": "kimi-k2.5"
+    },
+    {
+      "id": "moonshot-v1-32k",
+      "label": "Moonshot v1 32K (non-reasoning baseline)",
+      "endpoint": "https://api.moonshot.ai/v1/chat/completions",
+      "key_env": "MOONSHOT_KEY",
+      "model_field": "moonshot-v1-32k"
+    }
+  ]
+}

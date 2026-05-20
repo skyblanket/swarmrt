@@ -6,7 +6,7 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ## Current state — what's in the build
 
-As of `1babe4c` (2026-05-20) the `.sw` language has:
+As of `927cb30` (2026-05-20) plus REPL builtin coverage + `eval/` benchmark, the `.sw` language has:
 
 - **Core:** `module / fun / export / import`, `spawn / send / receive`, `case`, `if / else`, `try / catch`, pattern matching with guards.
 - **Values:** int, float, string, atom (`'ok'`), tuple (`{...}`), list (`[...]`), map (`%{key: val}`), pid, nil, fun. `map_get` treats atom and string keys interchangeably; `++` works on lists too.
@@ -25,7 +25,59 @@ As of `1babe4c` (2026-05-20) the `.sw` language has:
 - **Error story:** `panic(msg)` / `expect(value, msg)` for unrecoverable cases, `error(msg)` + `try/catch` for recoverable ones. `hd`/`tl`/`elem`/divzero panic loudly. Panics now print the full **call chain** with `module.fn at src/X.sw:N` per frame.
 - **Runtime:** programs exit when `main()` returns (Go-style). 100K+ concurrent processes per node, ~150ns context switch.
 
-Sw test suite is **75 assertions across 7 files**. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
+Sw test suite is **8 compiled files (110 assertions) + 1 interpreter file (16 assertions)** = 126 total. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
+
+The `eval/` directory holds an LLM code-gen benchmark: 10 prompts × 3 models (Kimi K2.6 / K2.5 / Moonshot v1) measured pass rate on single-shot generation. See `eval/results/results.md`.
+
+---
+
+## 2026-05-20 — REPL builtin parity + eval/ benchmark
+
+The previous self-critique flagged two embarrassments: (a) the REPL
+knew ~30 builtins while compiled code knew ~100, so first-time users
+would hit "undefined function" in the REPL for things like
+`file_read` or `db_open` that worked fine in `.sw` files; (b) the
+"for AI agents" pitch had no empirical backing.
+
+Both fixed.
+
+**REPL builtin parity (`src/swarmrt_lang.c`):** added an
+`interp_extra_builtin()` dispatch helper that handles the pure-functional
+surface compiled code already had: `file_read/write/append/exists/delete/list/mkdir`,
+`db_open/exec/query/close` (SQLite), `shell`, `shell_sandboxed`,
+`string_replace/sub/truncate`, `panic / expect / error`, `sleep / random_int /
+getenv`, `map_merge / map_remove`, `json_get / json_escape`. Process-scheduler
+primitives (`spawn / link / monitor / send / receive / trap_exit` and friends)
+print a one-shot hint and return `nil` instead of silently dropping to
+"undefined function" — the REPL doesn't simulate the full scheduler, so
+those still require `swc build`.
+
+Two new tests guard against drift recurring:
+- `tests/sw/test_repl_builtins.sw` — runs through the compiled path
+  (27 assertions), exercises the new builtins.
+- `tests/sw/repl/test_repl_builtins_interp.sw` — runs through `swc
+  test` (interpreter, 16 assertions), uses the 2-arg builtin
+  `assert_eq` directly to avoid the user-defined-vs-builtin
+  assert_eq shadowing.
+
+`run_tests.sh` now scans both paths.
+
+**`eval/` benchmark:** structured directory with 10 tasks
+(`hello_world`, `fizzbuzz`, `list_sum`, `json_parse`, `actor_counter`,
+`case_dispatch`, `sqlite_crud`, `pipe_filter`, `fault_tolerance`,
+`http_pipeline`), a system prompt distilled from `docs/SW_LANGUAGE.md`,
+and a `runner.sh` that POSTs to each model in `models.json`, extracts
+the generated `.sw` from a ```sw fence, compiles via `swc build`,
+runs the binary, and diffs stdout against the prompt's expected
+output. Results land in `eval/results/<run_id>/summary.md` with the
+latest mirrored to `eval/results/results.md`.
+
+First baseline run pinned in `eval/results/results.md`. Findings
+documented there — the eval surfaces several real language quirks
+(nested case-as-RHS doesn't parse, f-strings need the `f` prefix,
+multi-line receive arm bodies need explicit semicolons) which are
+now tracked as follow-up bugs and folded into the next system_prompt
+revision.
 
 ---
 

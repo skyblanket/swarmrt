@@ -73,10 +73,40 @@ for sw in "$TESTS_DIR"/test_*.sw; do
 done
 
 echo ""
-if [ "$failed_files" -eq 0 ]; then
-    echo "${GREEN}all sw tests passed${RESET} — $total_files files, $total_assertions assertions"
+
+# === Interpreter-side tests (REPL builtin coverage) ======================
+# Tests under tests/sw/repl/ are run through `swc test` (tree-walking
+# interpreter) rather than compile+execute. They guard against the
+# REPL/codegen builtin drift that the May 2026 marathon closed.
+INTERP_DIR="$SWARMRT_ROOT/tests/sw/repl"
+interp_files=0
+interp_failed=0
+if [ -d "$INTERP_DIR" ]; then
+    echo "--- interpreter (swc test) ---"
+    for sw in "$INTERP_DIR"/test_*.sw; do
+        [ -e "$sw" ] || continue
+        interp_files=$((interp_files + 1))
+        name="$(basename "$sw" .sw)"
+        log="$BUILD_DIR/$name.interp.log"
+        if "$SWC" test "$sw" >"$log" 2>&1; then
+            summary=$(grep -E '^  [0-9]+ tests' "$log" | tail -1 | sed 's/^  //')
+            echo "${GREEN}OK${RESET}           $name ${DIM}— $summary${RESET}"
+        else
+            interp_failed=$((interp_failed + 1))
+            echo "${RED}INTERP FAIL${RESET}  $name"
+            sed 's/^/    /' "$log"
+        fi
+    done
+    echo ""
+fi
+
+total_all_files=$((total_files + interp_files))
+total_all_failed=$((failed_files + interp_failed))
+
+if [ "$total_all_failed" -eq 0 ]; then
+    echo "${GREEN}all sw tests passed${RESET} — $total_all_files files, $total_assertions assertions"
     exit 0
 else
-    echo "${RED}$failed_files of $total_files files failed${RESET} ($failed_assertions failed assertions, $total_assertions passed)"
+    echo "${RED}$total_all_failed of $total_all_files files failed${RESET} ($failed_assertions failed assertions, $total_assertions passed)"
     exit 1
 fi

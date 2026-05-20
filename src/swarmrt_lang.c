@@ -14,7 +14,14 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sqlite3.h>
 #include "swarmrt_lang.h"
 
 /* Weak stubs for runtime functions — allows linking swc without the runtime.
@@ -1755,6 +1762,384 @@ static sw_val_t *builtin_assert_ne(sw_interp_t *interp, sw_val_t **args, int nar
     return sw_val_atom("ok");
 }
 
+/* =========================================================================
+ * Extra interpreter/REPL builtins
+ *
+ * The interpreter (REPL + `swc test`) historically only knew ~30 builtins
+ * while compiled `.sw` programs had ~100+, defined as static functions in
+ * `swarmrt_builtins_studio.h` and emitted directly into generated C.
+ * That meant a user could call db_open() in a compiled program but hit
+ * "undefined function" in the REPL.
+ *
+ * This block bridges the gap with minimum-viable implementations of the
+ * pure-functional builtins (no per-process scheduler state required).
+ * Process-scheduler primitives (link/monitor/exit_proc/etc) print a one-
+ * shot hint and return nil instead of silently dropping through.
+ * ========================================================================= */
+
+#define _REPL_SQLITE_MAX 32
+static sqlite3 *_repl_sqlite_db[_REPL_SQLITE_MAX];
+
+static int _repl_scheduler_warned = 0;
+static void _repl_warn_scheduler(const char *name) {
+    if (_repl_scheduler_warned) return;
+    fprintf(stderr,
+        "note: '%s' (and similar scheduler primitives) return nil in the REPL;\n"
+        "      use `swc build file.sw -o bin/x && bin/x` for full process semantics.\n",
+        name);
+    _repl_scheduler_warned = 1;
+}
+
+/* Returns NULL if `fname` isn't a recognized extra builtin — caller
+ * continues to user-fn lookup. */
+static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
+                                       sw_val_t **args, int nargs, int line) {
+    (void)line;
+
+    /* === System ================================================ */
+    if (strcmp(fname, "sleep") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        int64_t ms = args[0]->v.i;
+        if (ms > 0) usleep((useconds_t)(ms * 1000));
+        return sw_val_atom("ok");  /* matches codegen path */
+    }
+    if (strcmp(fname, "sys_exit") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        exit((int)args[0]->v.i);
+    }
+    if (strcmp(fname, "random_int") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_INT && args[1]->type == SW_VAL_INT) {
+        int64_t lo = args[0]->v.i, hi = args[1]->v.i;
+        if (hi <= lo) return sw_val_int(lo);
+        return sw_val_int(lo + (rand() % (int)(hi - lo + 1)));
+    }
+
+    /* === Error model =========================================== */
+    if (strcmp(fname, "panic") == 0) {
+        char *buf = NULL; size_t blen = 0;
+        FILE *m = open_memstream(&buf, &blen);
+        if (m) {
+            if (nargs > 0) sw_val_format(m, args[0]);
+            else fputs("panic", m);
+            fclose(m);
+        }
+        fprintf(stderr, "panic at line %d: %s\n", line, buf ? buf : "(no message)");
+        free(buf);
+        exit(1);
+    }
+    if (strcmp(fname, "expect") == 0 && nargs >= 1) {
+        int falsy = (args[0]->type == SW_VAL_NIL) ||
+                    (args[0]->type == SW_VAL_ATOM && strcmp(args[0]->v.str, "false") == 0);
+        if (falsy) {
+            const char *msg = (nargs >= 2 && args[1]->type == SW_VAL_STRING)
+                                ? args[1]->v.str : "expect failed";
+            fprintf(stderr, "expect at line %d: %s\n", line, msg);
+            exit(1);
+        }
+        return args[0];
+    }
+    if (strcmp(fname, "error") == 0) {
+        interp->error = 1;
+        if (nargs > 0 && (args[0]->type == SW_VAL_STRING || args[0]->type == SW_VAL_ATOM))
+            snprintf(interp->error_msg, sizeof(interp->error_msg), "%s", args[0]->v.str);
+        else
+            snprintf(interp->error_msg, sizeof(interp->error_msg), "error");
+        return sw_val_nil();
+    }
+
+    /* === Strings ================================================ */
+    if (strcmp(fname, "string_sub") == 0 && nargs >= 3 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
+        const char *s = args[0]->v.str;
+        int slen = (int)strlen(s);
+        int start = (int)args[1]->v.i;
+        int len = (int)args[2]->v.i;
+        if (start < 0) start = 0;
+        if (start >= slen) return sw_val_string("");
+        if (start + len > slen) len = slen - start;
+        if (len <= 0) return sw_val_string("");
+        char *buf = (char *)malloc(len + 1);
+        memcpy(buf, s + start, len); buf[len] = '\0';
+        sw_val_t *r = sw_val_string(buf); free(buf); return r;
+    }
+    if (strcmp(fname, "string_replace") == 0 && nargs >= 3 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING && args[2]->type == SW_VAL_STRING) {
+        const char *src = args[0]->v.str, *old = args[1]->v.str, *rep = args[2]->v.str;
+        size_t olen = strlen(old), rlen = strlen(rep), slen = strlen(src);
+        if (olen == 0) return args[0];
+        size_t cap = slen * 2 + rlen + 4096;
+        char *buf = (char *)malloc(cap); size_t blen = 0;
+        const char *p = src;
+        while (*p) {
+            const char *f = strstr(p, old);
+            if (!f) {
+                size_t r = strlen(p);
+                if (blen + r < cap - 1) { memcpy(buf + blen, p, r); blen += r; }
+                break;
+            }
+            size_t chunk = (size_t)(f - p);
+            if (blen + chunk + rlen < cap - 1) {
+                memcpy(buf + blen, p, chunk); blen += chunk;
+                memcpy(buf + blen, rep, rlen); blen += rlen;
+            }
+            p = f + olen;
+        }
+        buf[blen] = '\0';
+        sw_val_t *r = sw_val_string(buf); free(buf); return r;
+    }
+    if (strcmp(fname, "string_truncate") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT) {
+        /* Matches codegen: hard truncate to max_len, no ellipsis. */
+        const char *s = args[0]->v.str;
+        int64_t max = args[1]->v.i;
+        if (max <= 0) return sw_val_string("");
+        size_t slen = strlen(s);
+        if ((int64_t)slen <= max) return args[0];
+        char *r = (char *)malloc((size_t)max + 1);
+        memcpy(r, s, (size_t)max); r[max] = '\0';
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+
+    /* === File ================================================== */
+    if (strcmp(fname, "file_read") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        FILE *fp = fopen(args[0]->v.str, "rb");
+        if (!fp) return sw_val_nil();
+        fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+        if (sz < 0 || sz > 64 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
+        char *buf = (char *)malloc(sz + 1);
+        size_t got = fread(buf, 1, sz, fp); buf[got] = '\0'; fclose(fp);
+        sw_val_t *r = sw_val_string(buf); free(buf); return r;
+    }
+    if (strcmp(fname, "file_write") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        FILE *fp = fopen(args[0]->v.str, "wb");
+        if (!fp) return sw_val_atom("error");
+        fwrite(args[1]->v.str, 1, strlen(args[1]->v.str), fp); fclose(fp);
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "file_append") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        FILE *fp = fopen(args[0]->v.str, "ab");
+        if (!fp) return sw_val_atom("error");
+        fwrite(args[1]->v.str, 1, strlen(args[1]->v.str), fp); fclose(fp);
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "file_exists") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        struct stat st;
+        return sw_val_atom(stat(args[0]->v.str, &st) == 0 ? "true" : "false");
+    }
+    if (strcmp(fname, "file_delete") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        return sw_val_atom(unlink(args[0]->v.str) == 0 ? "ok" : "error");
+    }
+    if (strcmp(fname, "file_mkdir") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        int rc = mkdir(args[0]->v.str, 0755);
+        return sw_val_atom((rc == 0 || errno == EEXIST) ? "ok" : "error");
+    }
+    if (strcmp(fname, "file_list") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        DIR *d = opendir(args[0]->v.str);
+        if (!d) return sw_val_list(NULL, 0);
+        sw_val_t *items[1024]; int count = 0;
+        struct dirent *e;
+        while ((e = readdir(d)) && count < 1024) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            items[count++] = sw_val_string(e->d_name);
+        }
+        closedir(d);
+        return sw_val_list(items, count);
+    }
+    if (strcmp(fname, "getenv") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        const char *v = getenv(args[0]->v.str);
+        return v ? sw_val_string(v) : sw_val_nil();
+    }
+
+    /* === JSON helpers ========================================== */
+    if (strcmp(fname, "json_escape") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        /* Matches codegen: returns a complete JSON string literal,
+         * including surrounding double-quotes. */
+        const char *s = args[0]->v.str;
+        size_t slen = strlen(s);
+        size_t cap = slen * 6 + 4;
+        char *buf = (char *)malloc(cap); size_t blen = 0;
+        buf[blen++] = '"';
+        for (const char *p = s; *p; p++) {
+            switch (*p) {
+            case '"':  buf[blen++] = '\\'; buf[blen++] = '"'; break;
+            case '\\': buf[blen++] = '\\'; buf[blen++] = '\\'; break;
+            case '\n': buf[blen++] = '\\'; buf[blen++] = 'n'; break;
+            case '\r': buf[blen++] = '\\'; buf[blen++] = 'r'; break;
+            case '\t': buf[blen++] = '\\'; buf[blen++] = 't'; break;
+            default:   buf[blen++] = *p; break;
+            }
+        }
+        buf[blen++] = '"';
+        buf[blen] = '\0';
+        sw_val_t *r = sw_val_string(buf); free(buf); return r;
+    }
+    if (strcmp(fname, "json_get") == 0 && nargs >= 2 && args[0]->type == SW_VAL_STRING) {
+        sw_val_t *decoded = sw_lang_json_decode(args[0]->v.str);
+        if (!decoded || decoded->type != SW_VAL_MAP) return sw_val_nil();
+        return sw_val_map_get(decoded, args[1]);
+    }
+
+    /* === Map ops =============================================== */
+    if (strcmp(fname, "map_merge") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_MAP && args[1]->type == SW_VAL_MAP) {
+        int total = args[0]->v.map.count + args[1]->v.map.count;
+        sw_val_t **k = (sw_val_t **)malloc(sizeof(sw_val_t *) * total);
+        sw_val_t **v = (sw_val_t **)malloc(sizeof(sw_val_t *) * total);
+        int n = 0;
+        for (int i = 0; i < args[0]->v.map.count; i++) {
+            k[n] = args[0]->v.map.keys[i];
+            v[n] = args[0]->v.map.vals[i];
+            n++;
+        }
+        for (int i = 0; i < args[1]->v.map.count; i++) {
+            int overrode = 0;
+            for (int j = 0; j < n; j++) {
+                if (sw_val_equal(k[j], args[1]->v.map.keys[i])) {
+                    v[j] = args[1]->v.map.vals[i]; overrode = 1; break;
+                }
+            }
+            if (!overrode) {
+                k[n] = args[1]->v.map.keys[i];
+                v[n] = args[1]->v.map.vals[i];
+                n++;
+            }
+        }
+        sw_val_t *r = sw_val_map_new(k, v, n);
+        free(k); free(v); return r;
+    }
+    if (strcmp(fname, "map_remove") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
+        int n = args[0]->v.map.count;
+        sw_val_t **k = (sw_val_t **)malloc(sizeof(sw_val_t *) * (n > 0 ? n : 1));
+        sw_val_t **v = (sw_val_t **)malloc(sizeof(sw_val_t *) * (n > 0 ? n : 1));
+        int kept = 0;
+        for (int i = 0; i < n; i++) {
+            if (sw_val_equal(args[0]->v.map.keys[i], args[1])) continue;
+            k[kept] = args[0]->v.map.keys[i];
+            v[kept] = args[0]->v.map.vals[i];
+            kept++;
+        }
+        sw_val_t *r = sw_val_map_new(k, v, kept);
+        free(k); free(v); return r;
+    }
+
+    /* === Shell ================================================= */
+    if (strcmp(fname, "shell") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        size_t buflen = strlen(args[0]->v.str) + 16;
+        char *cmd_buf = (char *)malloc(buflen);
+        snprintf(cmd_buf, buflen, "%s 2>&1", args[0]->v.str);
+        FILE *fp = popen(cmd_buf, "r"); free(cmd_buf);
+        if (!fp) return sw_val_nil();
+        size_t cap = 65536;
+        char *out = (char *)malloc(cap);
+        size_t got = fread(out, 1, cap - 1, fp); out[got] = '\0';
+        int status = pclose(fp);
+        sw_val_t *items[2];
+        items[0] = sw_val_int(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        items[1] = sw_val_string(out);
+        free(out);
+        return sw_val_tuple(items, 2);
+    }
+    if (strcmp(fname, "shell_sandboxed") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        /* REPL skips sandbox-exec — just delegates to shell. The compiled
+         * path still uses sandbox-exec/firejail. Note this in docs. */
+        return interp_extra_builtin(interp, "shell", args, nargs, line);
+    }
+
+    /* === SQLite ================================================ */
+    if (strcmp(fname, "db_open") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        int slot = -1;
+        for (int i = 0; i < _REPL_SQLITE_MAX; i++)
+            if (!_repl_sqlite_db[i]) { slot = i; break; }
+        if (slot < 0) return sw_val_int(-1);
+        sqlite3 *db = NULL;
+        if (sqlite3_open(args[0]->v.str, &db) != SQLITE_OK) {
+            if (db) sqlite3_close(db);
+            return sw_val_int(-1);
+        }
+        _repl_sqlite_db[slot] = db;
+        return sw_val_int(slot);
+    }
+    if (strcmp(fname, "db_close") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        int slot = (int)args[0]->v.i;
+        if (slot < 0 || slot >= _REPL_SQLITE_MAX || !_repl_sqlite_db[slot])
+            return sw_val_atom("error");
+        sqlite3_close(_repl_sqlite_db[slot]);
+        _repl_sqlite_db[slot] = NULL;
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "db_exec") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_INT && args[1]->type == SW_VAL_STRING) {
+        int slot = (int)args[0]->v.i;
+        if (slot < 0 || slot >= _REPL_SQLITE_MAX || !_repl_sqlite_db[slot])
+            return sw_val_atom("error");
+        char *err = NULL;
+        int rc = sqlite3_exec(_repl_sqlite_db[slot], args[1]->v.str, NULL, NULL, &err);
+        if (rc != SQLITE_OK) {
+            sw_val_t *r = sw_val_string(err ? err : "sqlite error");
+            if (err) sqlite3_free(err);
+            return r;
+        }
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "db_query") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_INT && args[1]->type == SW_VAL_STRING) {
+        int slot = (int)args[0]->v.i;
+        if (slot < 0 || slot >= _REPL_SQLITE_MAX || !_repl_sqlite_db[slot])
+            return sw_val_list(NULL, 0);
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(_repl_sqlite_db[slot], args[1]->v.str, -1, &stmt, NULL) != SQLITE_OK)
+            return sw_val_list(NULL, 0);
+        if (nargs >= 3 && args[2]->type == SW_VAL_LIST) {
+            for (int i = 0; i < args[2]->v.tuple.count; i++) {
+                sw_val_t *p = args[2]->v.tuple.items[i];
+                if (p->type == SW_VAL_INT)         sqlite3_bind_int64(stmt, i + 1, p->v.i);
+                else if (p->type == SW_VAL_FLOAT)  sqlite3_bind_double(stmt, i + 1, p->v.f);
+                else if (p->type == SW_VAL_STRING) sqlite3_bind_text(stmt, i + 1, p->v.str, -1, SQLITE_TRANSIENT);
+                else if (p->type == SW_VAL_NIL)    sqlite3_bind_null(stmt, i + 1);
+            }
+        }
+        sw_val_t *rows[1024]; int nrows = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW && nrows < 1024) {
+            int ncols = sqlite3_column_count(stmt);
+            sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * ncols);
+            sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * ncols);
+            for (int c = 0; c < ncols; c++) {
+                keys[c] = sw_val_string(sqlite3_column_name(stmt, c));
+                int type = sqlite3_column_type(stmt, c);
+                switch (type) {
+                case SQLITE_INTEGER: vals[c] = sw_val_int(sqlite3_column_int64(stmt, c)); break;
+                case SQLITE_FLOAT:   vals[c] = sw_val_float(sqlite3_column_double(stmt, c)); break;
+                case SQLITE_TEXT:    vals[c] = sw_val_string((const char *)sqlite3_column_text(stmt, c)); break;
+                case SQLITE_NULL:    vals[c] = sw_val_nil(); break;
+                default:             vals[c] = sw_val_nil();
+                }
+            }
+            rows[nrows++] = sw_val_map_new(keys, vals, ncols);
+            free(keys); free(vals);
+        }
+        sqlite3_finalize(stmt);
+        return sw_val_list(rows, nrows);
+    }
+
+    /* === Process-scheduler primitives — warn + degrade ========= */
+    static const char *scheduler_names[] = {
+        "send", "register", "whereis", "link", "unlink", "monitor",
+        "demonitor", "exit_proc", "trap_exit", "supervise",
+        "http_listen", "http_respond", "ws_send", "ws_close",
+        "ws_set_handler", "telemetry_emit", "telemetry_subscribe",
+        "pubsub_broadcast", "pubsub_subscribe", "chrome_launch",
+        NULL
+    };
+    for (int i = 0; scheduler_names[i]; i++) {
+        if (strcmp(fname, scheduler_names[i]) == 0) {
+            _repl_warn_scheduler(fname);
+            return sw_val_nil();
+        }
+    }
+
+    return NULL;  /* not handled — fall through to user-fn lookup */
+}
+
 /* Evaluate node */
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     if (!n || interp->error) return sw_val_nil();
@@ -2133,6 +2518,14 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
         if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
         if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
+
+        /* Extra REPL builtins — bridges the gap to the codegen surface
+         * (file_*, db_*, shell, panic, expect, error, etc.). See
+         * interp_extra_builtin() above. */
+        {
+            sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
+            if (xr) return xr;
+        }
 
         /* User-defined function in module */
         node_t *fn = find_fun(interp->module_ast, fname);

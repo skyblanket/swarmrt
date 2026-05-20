@@ -255,7 +255,11 @@ sw> format("hi {} you are {}", "world", 30)
 "hi world you are 30"
 ```
 
-Variables persist across lines. Multi-line input continues until brackets balance. The REPL uses a tree-walking interpreter and supports the language core plus the most-used builtins (strings, JSON, maps, formatting, `case`, `try/catch`). The codegen path supports more (HTTP, WebSocket, Chrome, ETS, processes) — for those, write a `.sw` file and `swc build` it.
+Variables persist across lines. Multi-line input continues until brackets balance. The REPL uses a tree-walking interpreter and supports the language core, the stdlib, and **most pure-functional builtins**: strings, JSON, maps, formatting, `case`, `try/catch`, files (`file_read/write/exists/list/mkdir`), SQLite (`db_open/exec/query`), one-shot shell (`shell`), `panic`, `expect`, `error`, `sleep`, `random_int`, `getenv`, `string_replace`/`sub`/`truncate`, `map_merge`/`remove`, `json_get`/`escape`, and the `Std`/`Mcp`/`Vec`/`Embed`/`Prompt` modules.
+
+Process-scheduler primitives (`spawn`, `link`, `monitor`, `send`, `receive`, `trap_exit`, HTTP server, WebSocket, browser automation) still need the compiled path — the REPL doesn't simulate the full scheduler. Hit one of those names and the REPL prints a one-shot hint and returns `nil` instead of dropping through to "undefined function".
+
+For everything else: write a `.sw` file and `swc build` it.
 
 ### Editor support
 
@@ -308,7 +312,27 @@ make test-sw         # sw-language tests (covers builtins, processes, parser fix
 make test-all        # the full C-runtime + sw test suite
 ```
 
-`test-sw` runs a small but growing set of `tests/sw/test_*.sw` files via the harness in `tests/sw/run_tests.sh`. Add a `test_<topic>.sw` file there and it'll be picked up automatically.
+`test-sw` runs the `tests/sw/test_*.sw` suite via `tests/sw/run_tests.sh`. It now covers two execution paths:
+
+- **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run. ~110 assertions across 8 files.
+- **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
+
+Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
+
+---
+
+## LLM eval
+
+The [`eval/`](eval/) directory is an empirical benchmark of how well LLMs write `sw` from the published docs. Pure code-gen, single-shot, no agent harness — measures the floor.
+
+```bash
+export MOONSHOT_KEY=...           # or whichever endpoint's key
+cd eval && ./runner.sh            # 10 prompts × 3 models, ~20 min
+```
+
+Each prompt is a self-contained task with a deterministic stdout check. The runner extracts the LLM's `.sw` from a code fence, compiles it with `swc build`, runs it, and diffs stdout against the prompt's expected output. Per-run results land in `eval/results/<id>/summary.md`; the latest is mirrored to [`eval/results/results.md`](eval/results/results.md).
+
+The point is to surface real gaps — the first baseline run flagged several quirks (nested case-as-RHS, f-string `f` prefix, pipe + module-prefix codegen) that are now tracked as fix-its.
 
 ---
 
