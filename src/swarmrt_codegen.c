@@ -323,6 +323,7 @@ static void scan_spawns(cg_ctx_t *ctx, node_t *n) {
     case N_RECEIVE:
         for (int i = 0; i < n->v.recv.nclauses; i++) scan_spawns(ctx, n->v.recv.clauses[i]);
         if (n->v.recv.after_body) scan_spawns(ctx, n->v.recv.after_body);
+        if (n->v.recv.after_expr) scan_spawns(ctx, n->v.recv.after_expr);
         break;
     case N_CLAUSE:
         scan_spawns(ctx, n->v.clause.body);
@@ -509,6 +510,7 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     case N_RECEIVE:
         for (int i = 0; i < n->v.recv.nclauses; i++) scan_lambdas(ctx, n->v.recv.clauses[i]);
         if (n->v.recv.after_body) scan_lambdas(ctx, n->v.recv.after_body);
+        if (n->v.recv.after_expr) scan_lambdas(ctx, n->v.recv.after_expr);
         break;
     case N_CLAUSE: scan_lambdas(ctx, n->v.clause.body); break;
     case N_IF:
@@ -630,7 +632,24 @@ static void emit_preamble(cg_ctx_t *ctx) {
      * can report where in the .sw source the program was running.
      * Cheap (two stores per source line, only when the line changes). */
     fprintf(f, "__thread int _sw_current_line = 0;\n");
-    fprintf(f, "__thread const char *_sw_current_file = \"<unknown>\";\n\n");
+    fprintf(f, "__thread const char *_sw_current_file = \"<unknown>\";\n");
+
+    /* Call-stack ring buffer for stack traces. The typedef `_sw_frame_t`
+     * comes from builtins_studio.h (included above); we just define
+     * the thread-locals + push/pop helpers here. Capacity 64 frames —
+     * deeper recursion sets the overflow flag rather than blowing up. */
+    fprintf(f, "__thread _sw_frame_t _sw_trace[64];\n");
+    fprintf(f, "__thread int _sw_trace_top = 0;\n");
+    fprintf(f, "__thread int _sw_trace_overflowed = 0;\n");
+    fprintf(f, "static inline void _sw_trace_push(const char *m, const char *fn, int line) {\n"
+               "    if (_sw_trace_top < 64) {\n"
+               "        _sw_trace[_sw_trace_top].module_name = m;\n"
+               "        _sw_trace[_sw_trace_top].fn_name = fn;\n"
+               "        _sw_trace[_sw_trace_top].line = line;\n"
+               "    } else { _sw_trace_overflowed = 1; }\n"
+               "    _sw_trace_top++;\n"
+               "}\n");
+    fprintf(f, "static inline void _sw_trace_pop(void) { if (_sw_trace_top > 0) _sw_trace_top--; }\n\n");
 
     /* Binary operation helpers */
     fprintf(f,
@@ -1032,9 +1051,15 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         if (fn->v.fun.nparams == 0 && li->ncaptures == 0)
             fprintf(f, "    (void)_args; (void)_nargs;\n");
 
+        /* Push trace frame for the lambda — uses the lambda's gen_name
+         * since anonymous functions have no source name. */
+        fprintf(f, "    _sw_trace_push(\"%s\", \"%s\", %d);\n",
+                ctx->mod_name, li->gen_name, fn->line);
+
         /* Body */
         char result[32];
         emit_expr(ctx, fn->v.fun.body, 1, result, sizeof(result));
+        fprintf(f, "    _sw_trace_pop();\n");
         if (result[0])
             fprintf(f, "    return %s;\n", result);
         else
@@ -1592,7 +1617,29 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
 
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
     fprintf(f, "    { /* selective receive */\n");
+
+    /* Dynamic timeout: `after some_var { ... }`. Evaluate the
+     * expression once before the wait loop and use that. (Re-eval
+     * each iteration would be nice but rare in practice.) */
+    char to_ms[32] = "";
+    if (n->v.recv.after_expr) {
+        char to_val[32];
+        emit_expr(ctx, n->v.recv.after_expr, 0, to_val, sizeof(to_val));
+        fresh_var(ctx, to_ms, sizeof(to_ms));
+        fprintf(f, "      uint64_t %s = (%s && %s->type == SW_VAL_INT) ? (uint64_t)%s->v.i : (uint64_t)-1;\n",
+                to_ms, to_val, to_val, to_val);
+    }
+
     fprintf(f, "      int _matched = 0;\n");
+    /* Track elapsed time so `after N` actually times out. wait_new
+     * returns 1 (got message) on EVERY wake, including its own
+     * internal timer wake — we can't rely on its return code alone.
+     * Pre-record start_ms and call wait_new with remaining budget;
+     * when budget hits 0 we break out and fall through to after_body. */
+    int has_timeout = n->v.recv.after_body && (to_ms[0] || n->v.recv.after_ms >= 0);
+    if (has_timeout) {
+        fprintf(f, "      uint64_t _recv_start_ms = _sw_now_ms();\n");
+    }
     fprintf(f, "      while (!_matched) {\n");
     fprintf(f, "        sw_mailbox_drain_signals();\n");
     fprintf(f, "        sw_msg_t *%s = sw_mailbox_peek();\n", cur);
@@ -1644,7 +1691,29 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
 
     /* No match in current queue — wait for new messages or timeout */
     fprintf(f, "        if (!_matched) {\n");
-    fprintf(f, "          if (!sw_mailbox_wait_new(%lluULL)) break;\n", (unsigned long long)timeout);
+    if (has_timeout) {
+        /* Compute remaining budget. If exhausted, break and fall
+         * through to after_body. Otherwise wait_new with the
+         * remaining time. */
+        const char *budget_src = to_ms[0] ? to_ms : NULL;
+        if (budget_src) {
+            fprintf(f, "          uint64_t _elapsed = _sw_now_ms() - _recv_start_ms;\n");
+            fprintf(f, "          if (_elapsed >= %s) break;\n", budget_src);
+            fprintf(f, "          sw_mailbox_wait_new(%s - _elapsed);\n", budget_src);
+        } else {
+            fprintf(f, "          uint64_t _elapsed = _sw_now_ms() - _recv_start_ms;\n");
+            fprintf(f, "          if (_elapsed >= %lluULL) break;\n", (unsigned long long)timeout);
+            fprintf(f, "          sw_mailbox_wait_new(%lluULL - _elapsed);\n", (unsigned long long)timeout);
+        }
+    } else {
+        /* No after-clause — wait forever (or use the literal-int path
+         * if some other code path set after_ms but no after_body). */
+        if (to_ms[0]) {
+            fprintf(f, "          if (!sw_mailbox_wait_new(%s)) break;\n", to_ms);
+        } else {
+            fprintf(f, "          if (!sw_mailbox_wait_new(%lluULL)) break;\n", (unsigned long long)timeout);
+        }
+    }
     fprintf(f, "        }\n");
     fprintf(f, "      }\n");  /* end outer while (!matched) */
 
@@ -2212,6 +2281,11 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         fprintf(f, "    (void)_args; (void)_nargs;\n");
     }
 
+    /* Push stack frame for tracing. _tail goto reuses the SAME
+     * frame — tail-recursion doesn't grow the call stack visually. */
+    fprintf(f, "    _sw_trace_push(\"%s\", \"%s\", %d);\n",
+            ctx->mod_name, fn->v.fun.name, fn->line);
+
     /* Tail call label */
     if (ctx->has_tail)
         fprintf(f, "_tail:;\n");
@@ -2219,6 +2293,9 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     /* Body */
     char result[32];
     emit_expr(ctx, fn->v.fun.body, 1, result, sizeof(result));
+
+    /* Pop frame before returning. */
+    fprintf(f, "    _sw_trace_pop();\n");
 
     /* Return */
     if (result[0])

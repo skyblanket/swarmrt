@@ -178,7 +178,11 @@ typedef struct node {
         /* N_SEND */
         struct { struct node *to; struct node *msg; } send;
         /* N_RECEIVE */
-        struct { struct node **clauses; int nclauses; struct node *after_body; int after_ms; } recv;
+        /* after_ms is the literal-int fast path (set to -1 when no
+         * `after` clause exists). after_expr is the dynamic case:
+         * any expression that evaluates to a millisecond timeout,
+         * used when the user writes `after some_var { ... }`. */
+        struct { struct node **clauses; int nclauses; struct node *after_body; int after_ms; struct node *after_expr; } recv;
         /* N_CLAUSE */
         struct { struct node *pattern; struct node *body; struct node *guard; } clause;
         /* N_IF */

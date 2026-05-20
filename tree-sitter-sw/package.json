@@ -1,0 +1,27 @@
+{
+  "name": "tree-sitter-sw",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for sw — the SwarmRT language",
+  "main": "bindings/node",
+  "keywords": ["parser", "tree-sitter", "sw", "swarmrt"],
+  "author": "Otonomy",
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^7.0.0",
+    "node-gyp-build": "^4.6.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.22.6"
+  },
+  "scripts": {
+    "build": "tree-sitter generate && node-gyp-build",
+    "test": "tree-sitter test"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.sw",
+      "file-types": ["sw"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

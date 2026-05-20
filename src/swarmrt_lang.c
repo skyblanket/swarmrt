@@ -389,7 +389,9 @@ static void node_free(node_t *n) {
     case N_RECEIVE:
         for (int i = 0; i < n->v.recv.nclauses; i++) node_free(n->v.recv.clauses[i]);
         free(n->v.recv.clauses);
-        node_free(n->v.recv.after_body); break;
+        node_free(n->v.recv.after_body);
+        node_free(n->v.recv.after_expr);
+        break;
     case N_CLAUSE:
         node_free(n->v.clause.pattern);
         node_free(n->v.clause.guard);
@@ -840,11 +842,21 @@ static node_t *par_primary(par_t *p) {
         if (par_match(p, TOK_AFTER)) {
             node_t *timeout_expr = par_expr(p);
             if (timeout_expr && timeout_expr->type == N_INT) {
+                /* Literal-int fast path — folded into after_ms. */
                 recv->v.recv.after_ms = (int)timeout_expr->v.ival;
+                node_free(timeout_expr);
+                recv->v.recv.after_expr = NULL;
+            } else {
+                /* Dynamic timeout — evaluated at runtime each receive.
+                 * Common pattern: `after some_var { ... }`. */
+                recv->v.recv.after_ms = -1;
+                recv->v.recv.after_expr = timeout_expr;
             }
-            node_free(timeout_expr);
             par_expect(p, TOK_LBRACE, "'{'");
-            recv->v.recv.after_body = par_expr(p);
+            /* Use par_block so multi-statement after bodies work — the
+             * common pattern is `after N { fn() ; loop(...) }` and
+             * par_expr would only consume `fn()`. */
+            recv->v.recv.after_body = par_block(p);
             par_expect(p, TOK_RBRACE, "'}'");
         }
 

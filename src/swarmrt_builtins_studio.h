@@ -2433,6 +2433,35 @@ static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     return sw_val_nil();
 }
 
+/* Print the current call stack to stderr, top of stack first. Reads
+ * the per-thread ring buffer the codegen maintains via
+ * _sw_trace_push / _sw_trace_pop. Static — included by the generated
+ * C, which is the only place the trace globals are defined. */
+typedef struct { const char *module_name; const char *fn_name; int line; } _sw_frame_t;
+extern __thread _sw_frame_t _sw_trace[];
+extern __thread int _sw_trace_top;
+extern __thread int _sw_trace_overflowed;
+
+static void _sw_print_trace(void) {
+    extern __thread int _sw_current_line;
+    extern __thread const char *_sw_current_file;
+    int top = _sw_trace_top;
+    if (top <= 0) return;
+    if (top > 64) top = 64;
+    fprintf(stderr, "  call chain (innermost first):\n");
+    /* The innermost frame's "current line" lives in _sw_current_line —
+     * the frame's stored `line` is the function's *entry* line. */
+    for (int i = top - 1; i >= 0; i--) {
+        const char *m = _sw_trace[i].module_name ? _sw_trace[i].module_name : "?";
+        const char *fn = _sw_trace[i].fn_name ? _sw_trace[i].fn_name : "?";
+        int line = (i == top - 1 && _sw_current_line > 0)
+                       ? _sw_current_line : _sw_trace[i].line;
+        fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", top - 1 - i, m, fn, m, line);
+    }
+    if (_sw_trace_overflowed)
+        fprintf(stderr, "    ... (truncated; %d frames omitted)\n", _sw_trace_top - 64);
+}
+
 /* C-level panic helper for builtins. Takes a printf-style format so
  * we can include context ("hd of empty list", "tuple has 3 elements,
  * asked for index 5") without allocating an sw_val_t. Reads the
@@ -2449,6 +2478,7 @@ static void _sw_runtime_panic(const char *fmt, ...) {
     fprintf(stderr, "\n");
     if (_sw_current_file && _sw_current_line > 0)
         fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
+    _sw_print_trace();
     fflush(stderr);
     exit(1);
 }
@@ -2474,6 +2504,7 @@ static sw_val_t *_builtin_panic(sw_val_t **a, int n) {
     fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg_buf);
     if (_sw_current_file && _sw_current_line > 0)
         fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
+    _sw_print_trace();
     fflush(stderr);
     exit(1);
 }
