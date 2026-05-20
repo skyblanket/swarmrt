@@ -141,7 +141,8 @@ Most languages were designed for humans first; LLM ergonomics are a happy accide
 - **f-strings + `format()`.** `f"req={req_id} ms={elapsed}"` instead of `"req=" ++ to_string(req_id) ++ " ms=" ++ to_string(elapsed)`. Composite values (tuples, lists, maps) render correctly.
 - **Compile errors point at the exact failing line** via per-statement `#line` directives. The C compiler's message tells you `src/Module.sw:42`, not `/tmp/swc_xxx.c:16000`.
 - **Compile-time "did you mean?"** for unknown function names. `unknown function 'strng_length' — did you mean 'string_length'?` Levenshtein over builtins + module funcs.
-- **Loud runtime failures.** `hd([])`, `elem(t, 99)`, `n / 0` panic with `at src/X.sw:N` instead of silently returning `nil`. `expect(value, msg)` is the idiomatic unwrap. `try/catch` for recoverable cases.
+- **Loud runtime failures with full stack traces.** `hd([])`, `elem(t, 99)`, `n / 0` panic with `at src/X.sw:N` and the full call chain (`outer → middle → deep`). `expect(value, msg)` is the idiomatic unwrap. `try/catch` for recoverable cases.
+- **A real stdlib in sw, auto-imported.** `import Std` (list / map / string helpers) just works from any project — swc falls back to `<swarmrt>/lib/`. Same goes for `Mcp`, `Embed`, `Vec`, `Prompt`, `Cron`, `Telemetry`.
 - **The whole language fits in one document.** SW_LANGUAGE.md is ~600 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
@@ -158,10 +159,17 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **selective receive** | Agent A asks B a question, A blocks specifically on `{'reply', my_id, _}` — other messages stay queued. Zero callback hell. |
 | **`http_post_stream`** | Streams LLM tokens with spinner + ESC-interrupt + reasoning-channel rendering for thinking-mode models. |
 | **Subagent-mode streaming** | `http_post_stream(url, hdrs, body, parent_pid, name)` routes chunks as `{'stream_chunk', name, text}` to a parent — so `parallel([a, b, c])` doesn't interleave on the TTY. |
-| **`wsc_*` WebSocket client** | For MCP, streaming APIs, WS-based LLM servers. |
+| **`Mcp` module** | MCP client + server (JSON-RPC over stdio) so sw agents can both consume any MCP tool AND expose their own tools as MCP. |
+| **`wsc_*` WebSocket client** | For streaming APIs, WS-based LLM servers, custom RPC. |
 | **`chrome_launch` + CDP** | Drive a real browser without Playwright/Node sidecar. |
+| **`Vec` + `Embed`** | Vector memory: cosine-similarity store backed by ETS, embeddings via any OpenAI-compatible endpoint. |
+| **`db_*` (SQLite)** | Embedded structured store — conversation history, todos, telemetry rollups. |
+| **`Cron` module** | `Cron.every(ms, fn)` / `Cron.at("HH:MM", fn)` for autonomy loops + scheduled work. |
+| **`Telemetry`** | One emit point, pluggable sinks (stdout / JSONL / your own). Real observability. |
+| **`Prompt` templates** | `Prompt.render("Hello {{name}}", %{name: "Alice"})` — no more giant inline strings. |
 | **ETS** | Agent registry, perms cache, conversation memory, todo state. |
-| **`supervise(strategy, children)`** | Crash recovery with restart strategies (one-for-one / one-for-all / rest-for-one). |
+| **`supervise` + `link` + `monitor` + `trap_exit`** | Full OTP fault tolerance from userland. Crash → restart → DOWN messages → `{'EXIT', from, reason}` for trappers. |
+| **Sandboxed shell** | `shell_sandboxed(cmd, opts)` — sandbox-exec on macOS, firejail on Linux. Network blocked by default. |
 | **Hot reload** | Upgrade agent code without killing in-flight processes. |
 | **`case`** | Tool-call dispatch: `case tool_name { "read" -> ... ; "bash" -> ... ; _ -> ... }`. |
 
@@ -215,13 +223,17 @@ swc build <file.sw> [-o <name>]   Compile to native binary
 swc emit  <file.sw>               Print generated C to stdout
 swc repl                          Interactive REPL (no file needed)
 swc test [<file.sw>|<dir>]        Run test_* functions in .sw files
+swc lsp                           Language Server (LSP 3.17 over stdio)
 
 Options for build/emit
-  -o <name>     Output binary name
-  -O            Optimise (-O2)
-  --obfusc      XOR-encode string literals + mangle symbols
-  --strip       Strip the symbol table
-  --emit-c      Save the .gen.c next to the binary (useful for debugging codegen)
+  -o <name>          Output binary name
+  -O                 Optimise (-O2)
+  --obfusc           XOR-encode string literals + mangle symbols
+  --strip            Strip the symbol table
+  --emit-c           Save the .gen.c next to the binary (useful for debugging codegen)
+  --target=<triple>  Cross-compile (e.g. x86_64-linux-gnu, aarch64-apple-darwin).
+                     Cross-macOS-arch works out of the box; non-darwin targets
+                     need `zig` or a matching cross-gcc in PATH.
 ```
 
 Imports are auto-resolved from `src/` next to the file you're compiling — no manifest, no lockfile.
@@ -244,6 +256,25 @@ sw> format("hi {} you are {}", "world", 30)
 ```
 
 Variables persist across lines. Multi-line input continues until brackets balance. The REPL uses a tree-walking interpreter and supports the language core plus the most-used builtins (strings, JSON, maps, formatting, `case`, `try/catch`). The codegen path supports more (HTTP, WebSocket, Chrome, ETS, processes) — for those, write a `.sw` file and `swc build` it.
+
+### Editor support
+
+- **Tree-sitter grammar** at [`tree-sitter-sw/`](tree-sitter-sw/) covers the full language. Drop into Helix / Neovim / VS Code for syntax highlighting — see the directory's README for the wiring.
+- **LSP** via `swc lsp`. Speaks LSP 3.17 over stdin/stdout, surfaces parse errors as diagnostics (red squigglies). Hook into your editor's LSP client.
+
+### Standard library
+
+The [`lib/`](lib/) directory ships modules that auto-resolve via `import` — no copy-paste, no manifest. Just write `import Std` and the compiler finds `<swarmrt>/lib/Std.sw`.
+
+| Module | What it gives you |
+|---|---|
+| `Std` | List / map / string helpers (range, take, drop, zip, partition, sort, unique, find, any, all, sum, product, group_by, …) |
+| `Mcp` | Model Context Protocol client + server (JSON-RPC over stdio) |
+| `Embed` | Embeddings client for any OpenAI-compatible `/v1/embeddings` endpoint |
+| `Vec` | ETS-backed cosine-similarity vector store (`Vec.new / add / search / size`) |
+| `Prompt` | `{{var}}` template engine — render from a string or a file |
+| `Cron` | Wake scheduler — `Cron.every(ms, fn)` / `Cron.at("14:00", fn)` |
+| `Telemetry` | Event hub with stdout / file / JSONL sinks |
 
 ---
 

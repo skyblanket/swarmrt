@@ -254,23 +254,123 @@ The Chrome integration is the same one swarm-code uses for web tools — see `sw
 
 ---
 
-## Tools that need MCP or other WebSocket APIs
+## MCP (Model Context Protocol)
+
+You don't need to hand-roll JSON-RPC — `import Mcp` gives you both sides:
 
 ```sw
-handle = wsc_connect("ws://localhost:3000/mcp")
-wsc_send(handle, json_encode(%{method: "tools/list", id: 1}))
-reply = wsc_recv(handle, 5000)   # 5s timeout
-wsc_close(handle)
+import Mcp
+
+# Client: consume tools from any MCP server (stdio transport).
+client = Mcp.client_start("npx -y @modelcontextprotocol/server-filesystem /tmp")
+tools  = Mcp.list_tools(client)
+result = Mcp.call_tool(client, "read_file", %{path: "/tmp/x"})
+Mcp.close(client)
+
+# Server: expose your own tools as MCP.
+Mcp.serve(%{
+    name: "my-agent-tools",
+    version: "0.1",
+    tools: [
+        %{name: "echo", description: "echo back",
+          input_schema: %{type: "object", properties: %{msg: %{type: "string"}}},
+          handler: fun(args) { map_get(args, 'msg') }}
+    ]
+})
 ```
 
-Same WebSocket client powers CDP and any MCP/RPC server. Pair with `case` to dispatch on the method/id:
+For other RPC protocols, the raw `wsc_connect / wsc_send / wsc_recv / wsc_close` builtins are still there.
+
+---
+
+## Memory: SQLite + embeddings + vector store
+
+For structured state (conversation history, tasks, telemetry rollups) use SQLite:
 
 ```sw
-case decode_mcp(reply) {
-    {'result', id, payload} when id == 1 -> tools_list = payload
-    {'error', id, err}                   -> handle_error(err)
-}
+db = db_open("./agent.db")
+db_exec(db, "CREATE TABLE IF NOT EXISTS conv (id INTEGER PRIMARY KEY, turn TEXT, role TEXT)")
+db_exec(db, f"INSERT INTO conv (role, turn) VALUES ('user', '{escape(user_input)}')")
+rows = db_query(db, "SELECT role, turn FROM conv WHERE id > ?", [last_seen])
 ```
+
+For semantic memory (retrieve-the-3-most-relevant-prior-conversations), pair `Embed` + `Vec`:
+
+```sw
+import Embed
+import Vec
+
+opts = %{endpoint: "https://api.openai.com", key: getenv("OPENAI_KEY"),
+         model: "text-embedding-3-small"}
+store = Vec.new()
+
+# Index
+vec = Embed.create(opts, "the quick brown fox")
+Vec.add(store, "doc-1", vec, %{text: "the quick brown fox"})
+
+# Query
+qvec = Embed.create(opts, "speedy animal")
+hits = Vec.search(store, qvec, 3)
+# → [{id, score, payload}, ...] top-3 by cosine similarity
+```
+
+`Vec` is O(N) per query — fine to ~100K vectors. For bigger, swap in an external service via `wsc_*`.
+
+---
+
+## Autonomy: scheduled work
+
+For agents that need to do something every N seconds / at a specific time:
+
+```sw
+import Cron
+
+Cron.every(30000, fn() { check_inbox() })          # every 30 sec
+Cron.at("09:00", fn() { send_daily_report() })     # daily at 09:00 local
+Cron.in_ms(5000, fn() { print("one-shot timer") }) # one-shot in 5 sec
+```
+
+Each call returns a wake-pid you can send `'stop'` to (or use `Cron.stop(pid)`).
+
+---
+
+## Observability: telemetry
+
+One emit point, pluggable sinks:
+
+```sw
+import Telemetry
+
+Telemetry.configure(%{sinks: [
+    Telemetry.stdout_sink(),
+    Telemetry.jsonl_sink("/var/log/agent.jsonl")
+]})
+
+Telemetry.emit("tool.bash.start", %{cmd: "ls"})
+# ... run tool ...
+Telemetry.emit("tool.bash.end",   %{exit_code: 0, ms: 42})
+```
+
+Custom sinks are just functions `fun(event_map) { ... }`. Push to OpenTelemetry, Slack webhooks, a dashboard ETS table — your call.
+
+---
+
+## Prompt templates
+
+Stop stuffing 200-line strings inline:
+
+```sw
+import Prompt
+
+system = Prompt.from_file("prompts/system.md",
+                          %{user: "Sky", role: "agent", date: today()})
+
+# Or inline strings:
+greeting = Prompt.render("Hello {{name}}, you have {{n}} messages",
+                         %{name: "Alice", n: 3})
+```
+
+Missing variables render empty by default; `Prompt.render_strict` panics on missing instead.
 
 ---
 

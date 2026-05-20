@@ -334,8 +334,11 @@ If you're embedding sw-writing capability into an agent, this snippet (paste int
 > - For value dispatch use `case x { pat -> body ; pat when g -> body ; _ -> default }` instead of nested if/else. Same pattern shape as `receive` arms. Falls through to next arm when a guard rejects.
 > - Statements separate by newline OR `;` — both work in any block.
 > - For unrecoverable bugs use `panic(msg)` (exits with file/line). For optional unwrap use `expect(value, msg)` (panics if nil, returns value otherwise). For recoverable failures use `try { ... } catch e { ... }`.
-> - `hd(lst)`, `tl(lst)`, `elem(t, i)` panic on empty/out-of-range — guard first. `map_get` and `ets_get` return nil for missing keys (intentional).
+> - `hd(lst)`, `tl(lst)`, `elem(t, i)` panic on empty/out-of-range — guard first. `map_get` and `ets_get` return nil for missing keys (intentional). Panics print the full call chain with file:line.
 > - Compile with `swc build src/main.sw -o myprog && ./myprog`. Programs exit when `main()` returns (Go-style) — for long-running servers, end `main` with a permanent `receive { ... }`.
-> - When in doubt, mirror the patterns in `examples/`. `examples/dispatcher.sw` is the canonical agent-shaped pattern.
+> - **Standard library**: `import Std` (list/map/string helpers), `import Mcp` (MCP client+server), `import Embed` + `import Vec` (embeddings + vector store), `import Prompt` (`{{var}}` templates), `import Cron` (`every(ms, fn)`, `at("HH:MM", fn)`), `import Telemetry` (event emit + sinks). All auto-resolve from `<swarmrt>/lib/`.
+> - **Builtins for memory + state**: `db_open / db_exec / db_query / db_close` (SQLite), `subprocess_spawn / send_line / recv_line / close` (bidirectional child), `shell_sandboxed(cmd, opts)` (sandbox-exec or firejail). ETS for shared in-memory state.
+> - **Fault tolerance**: `link(pid)`, `monitor(pid) → ref`, `exit_proc(pid, reason_atom)`, `trap_exit('true' | 'false')`. With trap_exit on, exit signals arrive as `{'EXIT', from, reason}` messages.
+> - When in doubt, mirror the patterns in `examples/`. `examples/dispatcher.sw` is the canonical agent-shaped pattern; `examples/llm_agent.sw` is the full prompt→tool-call loop.
 
 That's the document. Build something cool.

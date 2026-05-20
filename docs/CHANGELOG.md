@@ -6,18 +6,26 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ## Current state — what's in the build
 
-As of `60e3964` (2026-05-18) the `.sw` language has:
+As of `1babe4c` (2026-05-20) the `.sw` language has:
 
 - **Core:** `module / fun / export / import`, `spawn / send / receive`, `case`, `if / else`, `try / catch`, pattern matching with guards.
-- **Values:** int, float, string, atom (`'ok'`), tuple (`{...}`), list (`[...]`), map (`%{key: val}`), pid, nil, fun.
-- **Concurrency:** lock-free MPSC mailboxes, selective receive, ETS for shared mutable state, supervisors with three restart strategies.
-- **Built-in I/O:** HTTP (server + client + streaming), WebSocket client/server, Chrome DevTools (browser automation), files, JSON, base64, shell.
-- **Ergonomics:** f-strings (`f"hi {name}"`), `format("hi {} count {}", n)`, `++` auto-coerces, `print(...)` is variadic, `;` works in any block, C-reserved words are legal identifiers, `case` for top-level pattern dispatch.
-- **Tooling:** `swc build / emit / repl / test`, per-statement `#line` directives, did-you-mean for unknown function names.
-- **Error story:** `panic(msg)` / `expect(value, msg)` for unrecoverable cases, `error(msg)` + `try/catch` for recoverable ones, `hd`/`tl`/`elem`/divzero panic loudly with `at src/X.sw:N`.
+- **Values:** int, float, string, atom (`'ok'`), tuple (`{...}`), list (`[...]`), map (`%{key: val}`), pid, nil, fun. `map_get` treats atom and string keys interchangeably; `++` works on lists too.
+- **Concurrency:** lock-free MPSC mailboxes, selective receive, ETS for shared mutable state. Supervisors (one-for-one / one-for-all / rest-for-one) plus `link`, `unlink`, `monitor`, `demonitor`, `exit_proc`, `trap_exit` — full Erlang fault-tolerance surface from userland sw.
+- **Built-in I/O:** HTTP (server + client + streaming), WebSocket client/server, Chrome DevTools (browser automation), files, JSON, base64, shell (+ `shell_sandboxed` for sandbox-exec / firejail isolation), bidirectional subprocesses (`subprocess_*`), SQLite (`db_open / db_exec / db_query`).
+- **Ergonomics:** f-strings (`f"hi {name}"`), `format("hi {} count {}", n)`, `++` polymorphic, variadic `print`, `;` works in any block, C-reserved words legal as identifiers, `case` for top-level pattern dispatch.
+- **Stdlib (lib/, auto-imported from `<swarmrt>/lib/`):**
+  - `Std` — list/map/string helpers (range, take, drop, zip, partition, group_by, sort, unique, contains, find, any, all, count, last, init, chunk_every, intersperse, max_by, min_by, sum, product, string_join, string_pad_*, string_repeat, string_indent…)
+  - `Prompt` — `{{var}}` template engine (file or string source)
+  - `Cron` — `every(ms, fn)` / `at("HH:MM", fn)` / `in_ms(ms, fn)` wake scheduler
+  - `Telemetry` — event hub with stdout / file / JSONL sinks
+  - `Mcp` — Model Context Protocol client + server (JSON-RPC over stdio)
+  - `Embed` — OpenAI-compatible embeddings client
+  - `Vec` — ETS-backed cosine-similarity vector store
+- **Tooling:** `swc build / emit / repl / test / lsp`, `--target=<triple>` cross-compile (`zig cc` or matching cross-gcc), per-statement `#line` directives, did-you-mean for unknown function names, tree-sitter grammar at `tree-sitter-sw/` for editor highlighting.
+- **Error story:** `panic(msg)` / `expect(value, msg)` for unrecoverable cases, `error(msg)` + `try/catch` for recoverable ones. `hd`/`tl`/`elem`/divzero panic loudly. Panics now print the full **call chain** with `module.fn at src/X.sw:N` per frame.
 - **Runtime:** programs exit when `main()` returns (Go-style). 100K+ concurrent processes per node, ~150ns context switch.
 
-Sw test suite is **48 assertions across 6 files**. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
+Sw test suite is **75 assertions across 7 files**. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
 
 ---
 

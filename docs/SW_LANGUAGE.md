@@ -452,6 +452,32 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `process_info(pid)` | inspection map |
 | `process_list()` | all live pids |
 | `registered()` | all registered atoms |
+| `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |
+| `monitor(pid)` → ref | one-way watch; watcher receives `{'DOWN', ref, pid, reason}` on death. `demonitor(ref)` to cancel |
+| `exit_proc(pid, reason)` | targeted exit signal — `'normal'` / `'killed'` / other atom |
+| `trap_exit('true' \| 'false')` | toggle exit-signal trapping; on, exit signals arrive as `{'EXIT', from, reason}` messages |
+| `supervise(strategy, [{name, fn, restart}, …])` | restart-tree supervisor (`'one_for_one'` / `'one_for_all'` / `'rest_for_one'`) |
+
+### Subprocesses (bidirectional)
+| | |
+|---|---|
+| `subprocess_spawn(cmd)` → handle | fork/exec with pipes for stdin + stdout |
+| `subprocess_send_line(h, line)` | append `\n` if missing, write to child stdin |
+| `subprocess_recv_line(h, timeout_ms?)` | block up to timeout for one newline-terminated line |
+| `subprocess_close(h)` | close pipes, SIGTERM then SIGKILL, reap |
+
+### SQLite
+| | |
+|---|---|
+| `db_open(path)` → handle | `:memory:` works |
+| `db_exec(h, sql)` | `'ok'` or error string. DDL or no-result statements |
+| `db_query(h, sql, [args])` | `?` parameters; returns list of `%{col: value}` row maps |
+| `db_close(h)` | `'ok'` |
+
+### Sandboxed shell
+| | |
+|---|---|
+| `shell_sandboxed(cmd, opts?)` | `{exit_code, output}` tuple. Wraps `cmd` in `sandbox-exec` (macOS) or `firejail` (Linux). Returns `nil` if no sandbox tool is available (deliberate — refuses to silently un-sandbox). Default policy: allow default, deny network, deny writes outside `/tmp`. |
 
 ### Distribution (multi-node)
 | | |
@@ -508,7 +534,17 @@ panic("invariant violated: queue should never be empty here")
 name = expect(map_get(user, 'name'), "user record missing required 'name' field")
 ```
 
-`panic(msg)` prints a red `panic: <msg>` plus the exact `src/Mod.sw:LINE` where it fired, and exits with code 1. Cannot be caught. Use for programmer bugs (impossible states, broken invariants).
+`panic(msg)` prints a red `panic: <msg>` plus the exact `src/Mod.sw:LINE` where it fired AND the full call chain (innermost first), then exits with code 1. Cannot be caught. Use for programmer bugs (impossible states, broken invariants).
+
+```
+panic: hit the bottom
+  at src/Trace.sw:4
+  call chain (innermost first):
+    [0] Trace.deep at src/Trace.sw:4
+    [1] Trace.middle at src/Trace.sw:12
+    [2] Trace.outer at src/Trace.sw:8
+    [3] Trace.main at src/Trace.sw:16
+```
 
 `expect(value, msg)` is the idiomatic "unwrap" pattern — passes the value through if non-nil, otherwise panics with `msg`. Saves the explicit `if (x == nil) { panic(...) }` boilerplate.
 
@@ -555,11 +591,21 @@ These are real, hit-during-development quirks. Skim before you write a lot of sw
 
 - **`#line` directives surface sw line numbers in C errors.** When a generated-C compile fails, the error points at `src/<Module>.sw:<line>` instead of `/tmp/swc_*.c`. **Per-statement accuracy** since the late-2026-05-15 codegen pass — points at the exact failing line, not the function start.
 
-- **No userland `exit/2`** for killing other processes. Send a `{'stop'}` message and let the receiver clean up on its next `receive`. True preemption needs runtime support not yet exposed.
+- **Userland fault tolerance is FULL.** `link`, `unlink`, `monitor`, `demonitor`, `exit_proc(pid, reason)`, `trap_exit('true' | 'false')` are all wired. The classic OTP "let it crash" pattern works: spawn supervised children, trap_exit, receive `{'EXIT', from, reason}` and restart. (Previously this was listed as missing — landed 2026-05-20.)
 
 - **The runtime exits when `main()` returns.** Go-style, not Erlang-style — when your program's `main` function finishes, the runtime tears down the schedulers and the process exits with code 0. If you want a long-running server, end `main` with a permanent `receive { _other -> ... }` arm or `sleep(N)` loop. (Until 2026-05-15 the generated `main()` ran an infinite `usleep` loop, so every program hung after main finished. That's now fixed.)
 
 - **Map literal `%{` is a SINGLE TOKEN.** `expr % {…}` does NOT parse as "modulo of expr by a brace block" — `%` and `{` need a space if you want modulo of `expr` by some expression starting with `{` (which is uncommon anyway). Use `expr % some_var` for clarity.
+
+- **`++` is polymorphic** — strings concat, lists concat. `"foo" ++ "bar"` → `"foobar"`, `[1] ++ [2, 3]` → `[1, 2, 3]`. (Was string-only until 2026-05-20.)
+
+- **`map_get` treats atom and string keys as the same** when values match by text. So `map_get(json_decode("{\"x\":1}"), 'x')` finds the string-keyed `"x"` — JSON-decoded maps interop with atom-keyed sw literals.
+
+- **`after N` in receive timed out correctly since 2026-05-20.** Earlier the internal timer-wake confused the wait loop and the receive spun forever. The codegen now tracks elapsed time at the receive level. `after VAR` (dynamic timeout) also works now.
+
+- **Pattern `nil`** matches BOTH the runtime nil value AND the literal atom `'nil'`. They were treated as different in pattern position until 2026-05-20 — `case map_get(...) { nil -> ... }` silently missed when the value was actually nil.
+
+- **Module functions are first-class values.** `%{handler: my_fn}` stores a callable closure to `my_fn`, not the atom `'my_fn'`. (Was stored as atom until 2026-05-20.)
 
 ---
 
