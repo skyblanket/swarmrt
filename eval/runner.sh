@@ -188,16 +188,32 @@ run_one() {
             continue
         fi
 
-        # Run. macOS doesn't ship `timeout(1)`; if it's installed via
-        # coreutils we use it, otherwise we just trust the program to
-        # finish (compiled sw is usually < 1s; pathological loops will
-        # be killed when the shell session exits).
+        # Run with a hard timeout. macOS doesn't ship `timeout(1)`;
+        # if `gtimeout` (coreutils) is installed we use it, otherwise
+        # fall back to a portable launch+sleep+kill pattern so a hung
+        # LLM-generated program (e.g. infinite receive) doesn't stall
+        # the whole eval. Without this, a single bad program can pin
+        # the runner indefinitely.
         local actual
-        local timeout_cmd=""
-        if command -v gtimeout >/dev/null 2>&1; then timeout_cmd="gtimeout 15"
-        elif command -v timeout >/dev/null 2>&1; then timeout_cmd="timeout 15"
+        if command -v gtimeout >/dev/null 2>&1; then
+            actual=$(gtimeout 15 "$model_dir/program" 2>"$model_dir/run.err" | normalize_output)
+        elif command -v timeout >/dev/null 2>&1; then
+            actual=$(timeout 15 "$model_dir/program" 2>"$model_dir/run.err" | normalize_output)
+        else
+            # Portable timeout: launch in background, sleep, kill.
+            # Wrap the watchdog in a subshell with stderr to /dev/null so
+            # the "Terminated: 15" job-control message doesn't leak into
+            # the eval output when the program finishes before the killer.
+            "$model_dir/program" > "$model_dir/run.out" 2>"$model_dir/run.err" &
+            local pid=$!
+            ( sleep 15 && kill -9 "$pid" 2>/dev/null ) 2>/dev/null &
+            local killer=$!
+            wait "$pid" 2>/dev/null
+            kill "$killer" 2>/dev/null
+            wait "$killer" 2>/dev/null
+            actual=$(cat "$model_dir/run.out" | normalize_output)
+            rm -f "$model_dir/run.out"
         fi
-        actual=$($timeout_cmd "$model_dir/program" 2>"$model_dir/run.err" | normalize_output)
         echo "$actual" > "$model_dir/actual.txt"
         echo "$expected" > "$model_dir/expected.txt"
 

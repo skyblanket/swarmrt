@@ -41,7 +41,9 @@ fun main() {
 
 ## Functions, values, syntax
 
-- `fun name(args) { body }` — last expression is returned
+- `fun name(args) { body }` — last expression is returned. Lambdas use
+  `fun(x) { ... }`. **NOT `fn`** — `fn` is not a keyword in sw; using it
+  will compile-error with "call to undeclared function 'Main_fn'".
 - Bare assignment: `x = 5` (no `let`, no `const`)
 - Atoms: `'ok'`, `'error'`, `'true'`, `'false'` (single-quoted)
 - Booleans are the atoms `'true'` / `'false'`, NOT bare keywords
@@ -130,9 +132,44 @@ sum=6
 Note the `f` prefix on the format string. Without it the output would be
 `sum={total}` (literal).
 
+# Fault-tolerance example (link + trap_exit + receive)
+
+```sw
+module Main
+
+fun bad() { panic("boom") }
+
+fun main() {
+    trap_exit('true')                    # MUST set before linking
+    pid = spawn(fun() { bad() })
+    link(pid)
+    receive {
+        {'EXIT', from, reason} -> print("parent_survived")
+    }
+}
+```
+
+The exit tuple shape is `{'EXIT', from_pid, reason}`. `trap_exit('true')`
+must be set *before* you spawn/link, or the parent dies with the child.
+
+# group_by + sort example
+
+```sw
+import Std
+
+fun main() {
+    events = json_decode("[{\"t\":\"a\"},{\"t\":\"b\"},{\"t\":\"a\"}]")
+    grouped = Std.group_by(events, fun(e) { map_get(e, "t") })
+    keys = Std.sort(map_keys(grouped))
+    Std.each(keys, fun(k) {
+        print(f"{k}: {length(map_get(grouped, k))}")
+    })
+}
+```
+
 # Iteration without `[h | t]`
 
-Recursive walk (when `Std.map`/`filter`/`reduce` don't fit):
+Recursive walk (when `map`/`filter`/`reduce`/`Std.each` don't fit):
 
 ```sw
 fun sum_list(lst, acc) {

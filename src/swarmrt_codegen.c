@@ -461,6 +461,44 @@ static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
     }
 }
 
+/* Collect names that are the LHS of an N_ASSIGN anywhere in a tree.
+ * Used by scan_lambdas to distinguish lambda-local vars (assigned
+ * inside the body, NOT captures from outer scope) from real captures. */
+static void collect_assigned_names(node_t *n, char names[][128], int *nnames, int max) {
+    if (!n) return;
+    if (n->type == N_ASSIGN) {
+        const char *nm = n->v.assign.name;
+        for (int i = 0; i < *nnames; i++) if (strcmp(names[i], nm) == 0) goto recur;
+        if (*nnames < max) { strncpy(names[*nnames], nm, 127); (*nnames)++; }
+recur:
+        collect_assigned_names(n->v.assign.value, names, nnames, max);
+        return;
+    }
+    switch (n->type) {
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++)
+            collect_assigned_names(n->v.block.stmts[i], names, nnames, max);
+        break;
+    case N_CALL:
+        for (int i = 0; i < n->v.call.nargs; i++)
+            collect_assigned_names(n->v.call.args[i], names, nnames, max);
+        break;
+    case N_IF:
+        collect_assigned_names(n->v.iff.then_b, names, nnames, max);
+        collect_assigned_names(n->v.iff.else_b, names, nnames, max);
+        break;
+    case N_CASE:
+        for (int i = 0; i < n->v.casex.nclauses; i++)
+            collect_assigned_names(n->v.casex.clauses[i]->v.clause.body, names, nnames, max);
+        break;
+    case N_TRY:
+        collect_assigned_names(n->v.trycatch.body, names, nnames, max);
+        collect_assigned_names(n->v.trycatch.catch_body, names, nnames, max);
+        break;
+    default: break;
+    }
+}
+
 static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     if (!n) return;
     /* Anonymous function: N_FUN with empty name */
@@ -474,17 +512,29 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
          * compiles. */
         snprintf(li->gen_name, sizeof(li->gen_name), "_lambda_%s_%d", ctx->mod_name, li->id);
 
-        /* Find free variables: identifiers in body that aren't parameters */
+        /* Find free variables: identifiers in body that aren't params
+         * AND aren't assigned inside the body. Without the assigned-
+         * check, a lambda like `fun(t) { total = ... ; f"{total}" }`
+         * would try to capture `total` from outer scope and fail. */
         char body_idents[64][128];
         int nbody_idents = 0;
         collect_idents(n->v.fun.body, body_idents, &nbody_idents, 64);
+
+        char assigned[32][128];
+        int nassigned = 0;
+        collect_assigned_names(n->v.fun.body, assigned, &nassigned, 32);
 
         li->ncaptures = 0;
         for (int i = 0; i < nbody_idents; i++) {
             int is_param = 0;
             for (int j = 0; j < n->v.fun.nparams; j++)
                 if (strcmp(body_idents[i], n->v.fun.params[j]) == 0) { is_param = 1; break; }
-            if (!is_param && li->ncaptures < 32)
+            if (is_param) continue;
+            int is_local = 0;
+            for (int j = 0; j < nassigned; j++)
+                if (strcmp(body_idents[i], assigned[j]) == 0) { is_local = 1; break; }
+            if (is_local) continue;
+            if (li->ncaptures < 32)
                 strncpy(li->captures[li->ncaptures++], body_idents[i], 127);
         }
 
@@ -1172,6 +1222,12 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
     FILE *f = ctx->out;
     switch (pat->type) {
     case N_IDENT:
+        /* The conventional anonymous-bind `_` means "I don't care
+         * about this value". Multiple `_` in one pattern (e.g.
+         * `{'EXIT', _, _}`) used to collide as `sw_val_t *_ = ...; ...
+         * sw_val_t *_ = ...;` — a C redefinition error. Skip the
+         * emission entirely; no name to bind. */
+        if (strcmp(pat->v.sval, "_") == 0) break;
         /* Always emit a fresh declaration (scoped to the if-block).
          * Also track it so the clause body can reference it. */
         fprintf(f, "        sw_val_t *%s = %s;\n", mangle_for_c(pat->v.sval), val);
