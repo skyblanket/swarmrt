@@ -315,16 +315,24 @@ struct sw_scheduler {
     volatile int active;
     volatile int should_exit;
 
-    /* Deferred-free queue — see process_destroy. Holds slot+block
-     * indices that the current scheduler iteration just released. They
-     * only get returned to the partition free list on the NEXT loop
-     * iteration, so any in-flight context swap on the destroyed
-     * process has time to drain before another sw_spawn can reuse the
-     * slot. Single-slot ring (the slot freed last iteration is what we
-     * release now). -1 = empty. Fixes the high-process-count arena
-     * race documented as R2-#4 in docs/notes/KNOWN_ISSUES.md. */
-    int32_t pending_free_slot;
-    int32_t pending_free_block;
+    /* Deferred-free ring — see process_destroy. Holds slot+block
+     * indices for the most-recently destroyed processes. Slots only
+     * become reusable after N more destroys on the same scheduler
+     * pass through (i.e. the slot has been "cold" for N destroy
+     * intervals = tens to hundreds of microseconds in practice).
+     * The first iteration of this fix used N=1 (single pending),
+     * which the reviewer measured as still racy — the deferral
+     * interval was the same order as the swap-in-flight window, so
+     * slots could be re-released during the race. Bumping to N=64
+     * grows the wall-clock deferral by ~64x without much cost
+     * (we keep up to 64 slots out of circulation per scheduler at a
+     * time). See R2-#4 / R3-C / R4-B in docs/notes/KNOWN_ISSUES.md.
+     * -1 in either array means that ring slot is empty. */
+#define SW_PENDING_FREE_RING 64
+    int32_t pending_free_slots[SW_PENDING_FREE_RING];
+    int32_t pending_free_blocks[SW_PENDING_FREE_RING];
+    uint32_t pending_free_head;   /* next index to evict (oldest) */
+    uint32_t pending_free_count;  /* how many entries are live */
 };
 
 /* === Swarm (the runtime) === */

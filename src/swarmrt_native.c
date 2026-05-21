@@ -252,7 +252,12 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
     }
 
     /* PID counter starts at 0 */
-    atomic_store(&arena->next_pid, 0);
+    /* Start at 1 — pid 0 is reserved as the "no pid" sentinel that
+     * sw_find_by_pid rejects. With cross-node messaging in play, the
+     * very first spawned process (the wrapper around user main) would
+     * otherwise get pid 0 and any remote reply to `self()` would
+     * vanish on lookup. */
+    atomic_store(&arena->next_pid, 1);
 
     return 0;
 }
@@ -442,15 +447,32 @@ static void process_destroy(sw_process_t *proc) {
         if (part_id >= g_swarm->arena.num_partitions) part_id = 0;
         sw_arena_partition_t *part = &g_swarm->arena.partitions[part_id];
 
-        sw_spin_lock(&part->lock);
-        if (sched->pending_free_slot >= 0) {
-            part_push_pid(part, (uint32_t)sched->pending_free_slot);
-            part_push_block(part, (uint32_t)sched->pending_free_block);
+        /* Ring-buffer eviction policy:
+         *   - if ring isn't full yet, just append.
+         *   - if it's full, evict the oldest entry (head) to the
+         *     partition free list, then overwrite that slot.
+         * Net result: any slot has been "cold" for at least
+         * SW_PENDING_FREE_RING destroy operations on this scheduler
+         * before it goes back to the allocator. */
+        uint32_t ring = SW_PENDING_FREE_RING;
+        if (sched->pending_free_count == ring) {
+            int32_t old_slot = sched->pending_free_slots[sched->pending_free_head];
+            int32_t old_block = sched->pending_free_blocks[sched->pending_free_head];
+            sw_spin_lock(&part->lock);
+            if (old_slot >= 0) {
+                part_push_pid(part, (uint32_t)old_slot);
+                part_push_block(part, (uint32_t)old_block);
+            }
+            sw_spin_unlock(&part->lock);
+            sched->pending_free_slots[sched->pending_free_head] = (int32_t)slot;
+            sched->pending_free_blocks[sched->pending_free_head] = (int32_t)block_idx;
+            sched->pending_free_head = (sched->pending_free_head + 1) % ring;
+        } else {
+            uint32_t tail = (sched->pending_free_head + sched->pending_free_count) % ring;
+            sched->pending_free_slots[tail] = (int32_t)slot;
+            sched->pending_free_blocks[tail] = (int32_t)block_idx;
+            sched->pending_free_count++;
         }
-        sw_spin_unlock(&part->lock);
-
-        sched->pending_free_slot = (int32_t)slot;
-        sched->pending_free_block = (int32_t)block_idx;
     } else {
         /* Called from a non-scheduler thread (shouldn't happen on the
          * normal hot path). Fall back to the legacy immediate-push. */
@@ -462,19 +484,24 @@ static void process_destroy(sw_process_t *proc) {
     }
 }
 
-/* Flush a scheduler's pending_free pair into its partition. Called at
- * scheduler shutdown so leftover slots don't leak forever. */
+/* Flush a scheduler's entire pending_free ring into its partition.
+ * Called at scheduler shutdown so leftover slots don't leak forever. */
 static void flush_pending_free(sw_scheduler_t *sched) {
-    if (!sched || sched->pending_free_slot < 0) return;
+    if (!sched || sched->pending_free_count == 0) return;
     uint32_t part_id = sched->id;
     if (part_id >= g_swarm->arena.num_partitions) part_id = 0;
     sw_arena_partition_t *part = &g_swarm->arena.partitions[part_id];
     sw_spin_lock(&part->lock);
-    part_push_pid(part, (uint32_t)sched->pending_free_slot);
-    part_push_block(part, (uint32_t)sched->pending_free_block);
+    for (uint32_t k = 0; k < sched->pending_free_count; k++) {
+        uint32_t idx = (sched->pending_free_head + k) % SW_PENDING_FREE_RING;
+        if (sched->pending_free_slots[idx] >= 0) {
+            part_push_pid(part, (uint32_t)sched->pending_free_slots[idx]);
+            part_push_block(part, (uint32_t)sched->pending_free_blocks[idx]);
+        }
+    }
     sw_spin_unlock(&part->lock);
-    sched->pending_free_slot = -1;
-    sched->pending_free_block = -1;
+    sched->pending_free_head = 0;
+    sched->pending_free_count = 0;
 }
 
 /* ============================================================================
@@ -883,8 +910,12 @@ int sw_init(const char *name, uint32_t num_schedulers) {
 
         sched->id = i;
         sched->swarm = g_swarm;
-        sched->pending_free_slot = -1;
-        sched->pending_free_block = -1;
+        for (int k = 0; k < SW_PENDING_FREE_RING; k++) {
+            sched->pending_free_slots[k] = -1;
+            sched->pending_free_blocks[k] = -1;
+        }
+        sched->pending_free_head = 0;
+        sched->pending_free_count = 0;
 
         /* Initialize MPSC queues — stub is both head and tail */
         for (int p = 0; p < SW_PRIO_NUM; p++) {

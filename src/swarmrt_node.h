@@ -20,9 +20,27 @@
 /* Type-preserving marshal/unmarshal — used by node_send/handle_remote_data
  * and exposed for any code that needs to serialize an sw_val_t over the
  * wire without losing the tuple-vs-list / atom-vs-string distinction.
- * See marsh_val in swarmrt_node.c for the on-wire layout. */
+ * See marsh_val in swarmrt_node.c for the on-wire layout.
+ * `default_remote_node` is the node name used to reconstruct SW_VAL_PID
+ * payloads as SW_VAL_REMOTE_PID values on the receiving side (so they
+ * route back via TCP when used as a `send()` target). Pass NULL when
+ * decoding a payload that was generated locally. */
 int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len);
-sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len);
+sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len,
+                       const char *default_remote_node);
+
+/* Dispatch a send() — local SW_VAL_PID goes through sw_send_tagged;
+ * SW_VAL_REMOTE_PID goes through sw_node_send_pid (marshals the message
+ * and writes to the peer's TCP connection). Anything else is a no-op.
+ * Used by the codegen emit_send so user code doesn't have to know
+ * whether the target is local or remote. */
+void sw_send_dispatch(sw_val_t *target, sw_val_t *msg);
+
+/* The name passed to sw_node_start (e.g. "alpha@127.0.0.1"). Returns an
+ * empty string if no node has been started. Used by sw_marshal so the
+ * receiver can reconstruct local pids as remote pids tagged with the
+ * sending node's name. */
+const char *sw_node_local_name(void);
 
 #define SW_NODE_NAME_MAX 64
 #define SW_NODE_MAX_PEERS 32

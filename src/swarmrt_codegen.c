@@ -1736,7 +1736,11 @@ static void emit_send(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     char to_var[32], msg_var[32];
     emit_expr(ctx, n->v.send.to, 0, to_var, sizeof(to_var));
     emit_expr(ctx, n->v.send.msg, 0, msg_var, sizeof(msg_var));
-    fprintf(f, "    sw_send_tagged(%s->v.pid, SW_TAG_NONE, %s);\n", to_var, msg_var);
+    /* sw_send_dispatch handles both SW_VAL_PID (local) and
+     * SW_VAL_REMOTE_PID (cross-node TCP). Previously this called
+     * sw_send_tagged(to->v.pid, ...) directly, which crashed for
+     * remote pids since they don't have a pid pointer. */
+    fprintf(f, "    sw_send_dispatch(%s, %s);\n", to_var, msg_var);
     strncpy(out, msg_var, osz - 1);
 }
 

@@ -70,6 +70,13 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
 #define SW_MARSHAL_MAP    0x07
 #define SW_MARSHAL_PID    0x08
 
+/* Thread-local node name used by unmarsh_val to construct
+ * SW_VAL_REMOTE_PID values when it decodes a SW_MARSHAL_PID byte.
+ * Set on entry to sw_unmarshal, cleared on exit. unmarsh_val doesn't
+ * take this as a parameter because it's recursive and most callers
+ * don't care; this keeps the recursive plumbing clean. */
+static __thread const char *tls_unmarshal_default_node = NULL;
+
 static void marsh_grow(uint8_t **buf, uint32_t *cap, uint32_t need) {
     if (need <= *cap) return;
     uint32_t nc = *cap ? *cap * 2 : 256;
@@ -143,12 +150,27 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
         return 0;
     }
     case SW_VAL_PID: {
-        /* Local pid id only — cross-node pid routing not implemented.
-         * Reply paths should embed node_name() in the message instead. */
+        /* Encode the pid id only — the sending node's name is set on the
+         * receiver side via tls_unmarshal_default_node so the receiver
+         * can reconstruct this as a SW_VAL_REMOTE_PID that routes back
+         * over TCP when used in `send()`. */
         marsh_grow(buf, cap, *pos + 1 + 8);
         (*buf)[(*pos)++] = SW_MARSHAL_PID;
         uint64_t pid = v->v.pid ? v->v.pid->pid : 0;
         memcpy(*buf + *pos, &pid, 8); *pos += 8;
+        return 0;
+    }
+    case SW_VAL_REMOTE_PID: {
+        /* Forwarding an already-remote pid: same wire format as a
+         * local pid (id only), but the receiver's default_remote_node
+         * will be the FORWARDER's node, not the original owner. We
+         * encode the owner's node here as a string sentinel to preserve
+         * identity — kept as SW_MARSHAL_PID for now since cross-node
+         * forwarding is a future-iteration feature. */
+        marsh_grow(buf, cap, *pos + 1 + 8);
+        (*buf)[(*pos)++] = SW_MARSHAL_PID;
+        uint64_t id = v->v.rpid.id;
+        memcpy(*buf + *pos, &id, 8); *pos += 8;
         return 0;
     }
     default:
@@ -238,8 +260,14 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
     }
     case SW_MARSHAL_PID: {
         if (*pos + 8 > len) return sw_val_nil();
-        /* Drop the pid id — no cross-node pid routing yet. Return nil. */
-        *pos += 8;
+        uint64_t id; memcpy(&id, buf + *pos, 8); *pos += 8;
+        /* Reconstruct as a SW_VAL_REMOTE_PID tagged with the sending
+         * node's name. `tls_unmarshal_default_node` is set by
+         * sw_unmarshal at entry — see that function for why. If unset
+         * (decode path that isn't a cross-node message), fall back to
+         * nil; the user shouldn't be seeing pids in that case. */
+        if (tls_unmarshal_default_node && tls_unmarshal_default_node[0])
+            return sw_val_remote_pid(tls_unmarshal_default_node, id);
         return sw_val_nil();
     }
     default:
@@ -247,9 +275,41 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
     }
 }
 
-sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len) {
+sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len,
+                       const char *default_remote_node) {
     uint32_t pos = 0;
-    return unmarsh_val(buf, len, &pos);
+    tls_unmarshal_default_node = default_remote_node;
+    sw_val_t *r = unmarsh_val(buf, len, &pos);
+    tls_unmarshal_default_node = NULL;
+    return r;
+}
+
+const char *sw_node_local_name(void) {
+    return g_node.active ? g_node.name : "";
+}
+
+/* Send dispatch — handles both local pids and remote pids. Local sends
+ * use the existing scheduler mailbox path; remote sends marshal the
+ * message and write to the peer's TCP connection.
+ *
+ * The codegen emit_send used to call sw_send_tagged directly on
+ * `target->v.pid`, which crashes for SW_VAL_REMOTE_PID (no pid pointer)
+ * and silently drops for non-pid types. This wrapper handles both. */
+void sw_send_dispatch(sw_val_t *target, sw_val_t *msg) {
+    if (!target) return;
+    if (target->type == SW_VAL_PID) {
+        sw_send_tagged(target->v.pid, SW_TAG_NONE, msg);
+    } else if (target->type == SW_VAL_REMOTE_PID && target->v.rpid.node) {
+        uint8_t *buf = NULL;
+        uint32_t blen = 0;
+        if (sw_marshal(msg, &buf, &blen) == 0) {
+            sw_node_send_pid(target->v.rpid.node, target->v.rpid.id,
+                             SW_TAG_NONE, buf, blen);
+            free(buf);
+        }
+    }
+    /* else: silent no-op for nil / wrong type. Same forgiveness as
+     * the old direct sw_send_tagged path. */
 }
 
 /* === Internal Helpers === */
@@ -285,10 +345,39 @@ static int send_remote_msg(sw_port_t *conn, sw_remote_msg_t *hdr,
 }
 
 /* Handle received data from a remote node */
-static void handle_remote_data(uint8_t *data, uint32_t len) {
+static void handle_remote_data(uint8_t *data, uint32_t len, sw_port_t *conn) {
     if (len < sizeof(sw_remote_msg_t)) return;
 
     sw_remote_msg_t *hdr = (sw_remote_msg_t *)data;
+
+    /* Auto-register the sender as a peer if this is the first time
+     * we've seen it on this connection — happens when alpha connects
+     * to beta (only alpha's side called node_connect, but beta needs
+     * to know alpha as a peer to send replies via sw_node_send_pid).
+     * The conn already exists; we just bind it to the from_node name
+     * so find_peer() can locate it later. */
+    if (conn && hdr->from_node[0]) {
+        pthread_mutex_lock(&g_dist_lock);
+        sw_peer_t *existing = NULL;
+        for (uint32_t i = 0; i < g_peer_count; i++) {
+            if (strcmp(g_peers[i].name, hdr->from_node) == 0) {
+                existing = &g_peers[i];
+                break;
+            }
+        }
+        if (!existing && g_peer_count < SW_NODE_MAX_PEERS) {
+            sw_peer_t *p = &g_peers[g_peer_count++];
+            memset(p, 0, sizeof(*p));
+            strncpy(p->name, hdr->from_node, SW_NODE_NAME_MAX - 1);
+            p->conn = conn;
+            p->connected = 1;
+        } else if (existing && !existing->conn) {
+            existing->conn = conn;
+            existing->connected = 1;
+        }
+        pthread_mutex_unlock(&g_dist_lock);
+    }
+
     void *payload = NULL;
     uint32_t plen = hdr->payload_len;
 
@@ -309,9 +398,11 @@ static void handle_remote_data(uint8_t *data, uint32_t len) {
     if (target && payload) {
         /* Type-preserving unmarshal — round-trips tuples-as-tuples and
          * atoms-as-atoms, so user-side `receive { {'echo', ...} -> }`
-         * patterns actually match. The previous JSON path lost both
-         * distinctions. */
-        sw_val_t *msg = sw_unmarshal((const uint8_t *)payload, plen);
+         * patterns actually match. Passes hdr->from_node so PID bytes
+         * decode as SW_VAL_REMOTE_PID tagged with the sender — that
+         * lets `send(from, reply)` route back through TCP. */
+        sw_val_t *msg = sw_unmarshal((const uint8_t *)payload, plen,
+                                     hdr->from_node);
         free(payload);
         sw_send_tagged(target, hdr->tag, msg);
     } else if (target) {
@@ -346,7 +437,9 @@ static void dist_handler(void *arg) {
             if (data->len >= 4) {
                 uint32_t msg_len = ntohl(*(uint32_t *)data->data);
                 if (data->len >= 4 + msg_len) {
-                    handle_remote_data(data->data + 4, msg_len);
+                    /* Pass the conn so handle_remote_data can auto-
+                     * register the sender for reverse-direction replies. */
+                    handle_remote_data(data->data + 4, msg_len, data->port);
                 }
             }
             free(data->data);

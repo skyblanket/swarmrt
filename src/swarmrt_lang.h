@@ -30,6 +30,8 @@ typedef enum {
     SW_VAL_LIST,
     SW_VAL_FUN,
     SW_VAL_MAP,
+    SW_VAL_REMOTE_PID,   /* pid that lives on another node — carries node
+                            name + pid id; `send` routes via TCP. */
 } sw_val_type_t;
 
 typedef struct sw_val sw_val_t;
@@ -62,6 +64,10 @@ struct sw_val {
             int count;
             int cap;
         } map;
+        struct {
+            char *node;          /* node name string, owned */
+            uint64_t id;         /* remote pid id */
+        } rpid;
     } v;
 };
 
@@ -121,6 +127,7 @@ sw_val_t *sw_val_float(double f);
 sw_val_t *sw_val_string(const char *s);
 sw_val_t *sw_val_atom(const char *s);
 sw_val_t *sw_val_pid(sw_process_t *p);
+sw_val_t *sw_val_remote_pid(const char *node, uint64_t id);
 sw_val_t *sw_val_tuple(sw_val_t **items, int count);
 sw_val_t *sw_val_list(sw_val_t **items, int count);
 sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,

@@ -233,6 +233,7 @@ static sw_val_t *_builtin_typeof(sw_val_t **a, int n) {
         case SW_VAL_TUPLE: return sw_val_string("tuple");
         case SW_VAL_LIST: return sw_val_string("list");
         case SW_VAL_PID: return sw_val_string("pid");
+        case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
         case SW_VAL_MAP: return sw_val_string("map");
         default: return sw_val_string("unknown");
     }

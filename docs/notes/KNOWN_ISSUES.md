@@ -7,21 +7,25 @@ hypothesis; PRs welcome.
 
 ## High-process-count crash — arena-slot reuse race (~62k spawn cliff)
 
-**Status:** **Speculative fix landed (R3-C).** Per-scheduler deferred
-free — process_destroy stashes the slot+block in `sched->pending_free_*`
-and only releases the *previous* iteration's pending to the partition
-free list. Slots become reusable after one full scheduler iteration,
-which is microseconds longer than any in-flight `sw_context_swap`.
-Macros + helper at `src/swarmrt_native.c:process_destroy /
-flush_pending_free`. Verification is on the GitHub Actions
-ubuntu-24.04 runner (native amd64, where the race fires reliably)
-via the `make stress` job in `.github/workflows/linux-quickstart.yml`
-— that job no longer has `continue-on-error: true`, so a regression
-flips the workflow red.
+**Status:** **R4-B speculative fix landed.** Second attempt at deferred
+slot reuse. The R3-C version held one slot per scheduler — reviewer
+measured 9/50 at 80k, no real improvement (the 1-slot deferral interval
+was the same order as the race window). R4-B widens the deferral to a
+64-slot ring per scheduler, so any freed slot is held for ~64 destroy
+operations on the same scheduler before going back to the allocator.
+Wall-clock deferral should be ~64x longer than R3-C without much
+overhead.
 
-**If the next round-2-style review hits this on real Linux:** the fix
-didn't take, and one of the heavier paths is needed. Both are
-documented below.
+If R4-B still doesn't move the needle on native Linux: the heavier
+paths below are the proper next step. The reviewer specifically
+recommends a per-slot generation counter — that's a deeper runtime
+change but actually correct (vs. "deferral long enough to win the
+race", which is heuristic).
+
+Verification is on the GitHub Actions ubuntu-24.04 runner (native
+amd64, where the race fires reliably) via the `make stress` job in
+`.github/workflows/linux-quickstart.yml`. That job enforces the gate
+— a red workflow means the fix didn't take.
 
 ---
 
@@ -111,17 +115,24 @@ thread gets a torn read.
 
 ### Fix paths
 
-1. **Defer the free by one scheduler tick** (the one landed in
-   R3-C). Per-scheduler `pending_free_slot/block`. Slots only become
-   reusable after a full scheduler iteration. Smallest change.
+1. **Defer the free by one scheduler tick** — R3-C, failed (deferral
+   too short).
 
-2. **Per-process in-swap mutex.** `sw_context_swap` locks before
+2. **64-slot ring deferral** — R4-B, the current attempt.
+
+3. **Per-slot generation counter.** Each slot has a `uint64_t
+   generation` that increments on every `process_init_arena`. When a
+   scheduler picks a process to run, it records the gen. Before
+   `sw_context_swap`, it checks that the gen still matches; if not,
+   the slot was reused — abort the swap and pick something else. This
+   is the reviewer's recommendation. Cleaner than refcounting, harder
+   to retrofit because the check has to happen at the right granularity
+   (probably wrap `sw_context_swap` in a C function that does an atomic
+   compare before calling into asm).
+
+4. **Per-process in-swap mutex.** `sw_context_swap` locks before
    reading `to`'s ctx, unlocks after. `process_destroy` acquires the
    lock once before returning the slot. Correct but adds a lock to
    every context switch — measurable hot-path cost.
-
-3. **Refcount the slot.** `sw_spawn`/`sw_context_swap` incref the
-   target; `process_destroy` waits for refcount = 0. Same cost
-   structure as the mutex.
 
 ---

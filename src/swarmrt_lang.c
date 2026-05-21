@@ -1296,6 +1296,19 @@ sw_val_t *sw_val_pid(sw_process_t *p) {
     return v;
 }
 
+/* sw_val_remote_pid: pid that lives on another node. `node` is the
+ * remote node's name (e.g. "alpha@127.0.0.1"); `id` is the integer
+ * pid id assigned on that node. `send(rpid, msg)` routes via TCP
+ * through sw_node_send_pid. Constructed by sw_unmarshal when a
+ * SW_MARSHAL_PID is decoded out of a wire message. */
+sw_val_t *sw_val_remote_pid(const char *node, uint64_t id) {
+    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    v->type = SW_VAL_REMOTE_PID;
+    v->v.rpid.node = node ? strdup(node) : NULL;
+    v->v.rpid.id = id;
+    return v;
+}
+
 sw_val_t *sw_val_tuple(sw_val_t **items, int count) {
     sw_val_t *v = calloc(1, sizeof(sw_val_t));
     v->type = SW_VAL_TUPLE;
@@ -1441,6 +1454,11 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
     case SW_VAL_FLOAT: return a->v.f == b->v.f;
     case SW_VAL_STRING: case SW_VAL_ATOM: return strcmp(a->v.str, b->v.str) == 0;
     case SW_VAL_PID: return a->v.pid == b->v.pid;
+    case SW_VAL_REMOTE_PID:
+        return a->v.rpid.id == b->v.rpid.id &&
+               ((a->v.rpid.node == b->v.rpid.node) ||
+                (a->v.rpid.node && b->v.rpid.node &&
+                 strcmp(a->v.rpid.node, b->v.rpid.node) == 0));
     case SW_VAL_TUPLE: case SW_VAL_LIST:
         if (a->v.tuple.count != b->v.tuple.count) return 0;
         for (int i = 0; i < a->v.tuple.count; i++)
@@ -1466,6 +1484,11 @@ void sw_val_format(FILE *f, sw_val_t *v) {
     case SW_VAL_STRING: fprintf(f, "%s", v->v.str); break;
     case SW_VAL_ATOM: fprintf(f, ":%s", v->v.str); break;
     case SW_VAL_PID: fprintf(f, "<pid:%llu>", v->v.pid ? v->v.pid->pid : 0); break;
+    case SW_VAL_REMOTE_PID:
+        fprintf(f, "<rpid:%s:%llu>",
+                v->v.rpid.node ? v->v.rpid.node : "?",
+                (unsigned long long)v->v.rpid.id);
+        break;
     case SW_VAL_TUPLE:
         fprintf(f, "{");
         for (int i = 0; i < v->v.tuple.count; i++) {
