@@ -393,10 +393,10 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `tl(lst)` | rest |
 | `elem(tuple, i)` | nth element |
 | `list_append(lst, x)` | new list with x appended |
-| `map(lst, fn)` | apply fn to each, return new list |
+| `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
 | `reduce(lst, init, fn)` | foldl |
-| `pmap(lst, fn)` | parallel map (each fn call in own process) |
+| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map` |
 | `map_get(m, k)` | value or `nil` |
 | `map_put(m, k, v)` | new map (functional update) |
 | `map_remove(m, k)` | new map without `k` (returns `m` if absent) |
@@ -495,7 +495,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 ### Async helpers (OTP-style)
 | | |
 |---|---|
-| `every(ms, fn)` / `after(ms, fn)` | timer-driven |
+| `Cron.every(ms, fn)` / `Cron.in_ms(ms, fn)` / `Cron.at("HH:MM", fn)` | timer-driven (import `Cron`); `after` is a `receive` keyword so the one-shot is named `in_ms` |
 | `pubsub_subscribe(topic)` / `pubsub_broadcast(topic, msg)` / `pubsub_unsubscribe(topic)` | pub/sub |
 | `breaker_new` / `breaker_call` / `breaker_state` | circuit breaker |
 

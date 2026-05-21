@@ -7,8 +7,35 @@ hypothesis; PRs welcome.
 
 ## High-process-count crash — arena-slot reuse race (~62k spawn cliff)
 
-**Status:** **R5 fix landed — believed closed; CI is the gate.**
-Per-slot generation counter + ctx_lock close the race deterministically.
+**Status:** **R5 closed the ORIGINAL race deterministically — a DIFFERENT
+race fires under spawn-storm on Linux x86_64.** Reviewer round-6
+verified:
+
+- The ctx-tear race documented below is gone — single-scheduler
+  reproduces the new crash, so it can't be the multi-scheduler ctx
+  read (was the original race).
+- New backtrace lands in `sw_val_atom`'s `strdup` with the
+  trampoline return address at `0x0`. Classic heap-corruption-then-
+  next-malloc-crashes pattern.
+- `quietkids.sw` (80k spawns, `1+1`, no sends) fails 4/20 — so
+  spawn+exit alone is partly racy.
+- The sends-version (this bench) fails 17/20 — the message-send
+  path is the dominant additional contributor.
+
+R6 partial mitigation shipped:
+
+1. `sw_msg_release(sw_msg_t *)` exposed as a public function and
+   wired into emit_receive so the envelope returns to the per-thread
+   `tls_msg_free` freelist after a matched receive. Before, every
+   receive leaked the envelope — `msg_alloc` always missed the cache
+   and hit `malloc`, stressing the glibc arena. This doesn't close
+   the race but it removes per-receive allocator pressure that was
+   making the race fire harder.
+2. CI stress widened: 50 runs at 90% threshold, also runs a
+   `SW_SCHEDULERS=1` variant since the new race reproduces there.
+
+Per-slot generation counter + ctx_lock close the original ctx-tear
+race deterministically.
 The previous heuristic attempts (R3-C 1-slot ring, R4-B 64-slot ring)
 were the wrong shape: they delayed slot return hoping to outrun the
 swap-in window, but the race is event-bounded (context-switch duration),

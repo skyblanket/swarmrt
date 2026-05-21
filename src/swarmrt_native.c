@@ -74,6 +74,13 @@ static inline void msg_free(sw_msg_t *m) {
     free(m);
 }
 
+/* Public wrapper around msg_free for codegen — sw_msg_t and msg_free
+ * are runtime-internal but the receive codegen needs to release the
+ * envelope after pattern matching. See header for ownership notes. */
+void sw_msg_release(sw_msg_t *m) {
+    if (m) msg_free(m);
+}
+
 #define TIMER_FREELIST_MAX 64
 static __thread sw_timer_t *tls_timer_free = NULL;
 static __thread int tls_timer_free_count = 0;

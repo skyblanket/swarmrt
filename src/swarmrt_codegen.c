@@ -1023,8 +1023,14 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "}\n"
         "static sw_val_t *_builtin_pmap(sw_val_t **a, int n) {\n"
         "    if (n < 2) return sw_val_list(NULL, 0);\n"
-        "    sw_val_t *fn = a[0];\n"
-        "    sw_val_t *lst = a[1];\n"
+        "    /* Accept either order: pmap(fn, list) or pmap(list, fn) —\n"
+        "     * matches map/filter's permissive convention. Previously\n"
+        "     * pmap was strict-order and returned [] when called as\n"
+        "     * pmap(list, fn) (the order the docs showed). */\n"
+        "    sw_val_t *fn, *lst;\n"
+        "    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }\n"
+        "    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }\n"
+        "    else { fn = a[0]; lst = a[1]; }\n"
         "    if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);\n"
         "    int cnt = lst->v.tuple.count;\n"
         "    if (cnt == 0) return sw_val_list(NULL, 0);\n"
@@ -1884,7 +1890,19 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
 
         int saved_ndeclared = ctx->ndeclared;
 
-        /* Guard check — if guard fails, don't match */
+        /* Guard check — if guard fails, don't match.
+         *
+         * After a match: remove the msg from the mailbox, run the
+         * body, then release the sw_msg_t envelope. The PAYLOAD
+         * (sw_val_t) is left alive on purpose — pattern bindings and
+         * body_res can alias subparts of it, so the body owns it
+         * after match. The envelope (sw_msg_t) is small and not
+         * aliased; releasing it lets msg_alloc reuse it via the
+         * per-thread freelist instead of hitting malloc on every
+         * receive. Reduces glibc arena pressure during spawn-storms
+         * (R6-A observed: heavy send/receive workloads previously
+         * forced every msg_alloc through malloc and tcache stayed
+         * empty). */
         if (cl->v.clause.guard) {
             emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
             char guard_res[32];
@@ -1896,6 +1914,7 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
             emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
             if (body_res[0])
                 fprintf(f, "              %s = %s;\n", res, body_res);
+            fprintf(f, "              sw_msg_release(%s);\n", cur);
             fprintf(f, "            }\n");
         } else {
             fprintf(f, "            sw_mailbox_remove_msg(%s);\n", cur);
@@ -1905,6 +1924,7 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
             emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
             if (body_res[0])
                 fprintf(f, "            %s = %s;\n", res, body_res);
+            fprintf(f, "            sw_msg_release(%s);\n", cur);
         }
 
         ctx->ndeclared = saved_ndeclared;

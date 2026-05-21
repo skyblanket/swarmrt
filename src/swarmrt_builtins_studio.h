@@ -2341,12 +2341,17 @@ static sw_val_t *_builtin_map_merge(sw_val_t **a, int n) {
     return result;
 }
 
-/* map_has_key(map, key) → 'true' | 'false' */
+/* map_has_key(map, key) → 'true' | 'false'.
+ *
+ * Reuses sw_val_map_get for the lookup so the atom-vs-string fallback
+ * matches: a map built with literal atom keys (`%{a: 1}`) returns true
+ * for both `map_has_key(m, 'a')` AND `map_has_key(m, "a")`, mirroring
+ * map_get's behaviour. The older direct sw_val_equal loop diverged
+ * from map_get and surprised users. */
 static sw_val_t *_builtin_map_has_key(sw_val_t **a, int n) {
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_MAP) return sw_val_atom("false");
-    for (int i = 0; i < a[0]->v.map.count; i++)
-        if (sw_val_equal(a[0]->v.map.keys[i], a[1])) return sw_val_atom("true");
-    return sw_val_atom("false");
+    sw_val_t *v = sw_val_map_get(a[0], a[1]);
+    return (v && v->type != SW_VAL_NIL) ? sw_val_atom("true") : sw_val_atom("false");
 }
 
 /* map_size(map) → int. Length on a map already returns 0; this gives
@@ -2534,14 +2539,23 @@ static sw_val_t *_builtin_panic(sw_val_t **a, int n) {
  *
  *   name = expect(map_get(user, 'name'), "user has no name field")
  *
- * Saves the explicit `if (x == nil) { panic("...") }` wrapper. */
+ * Saves the explicit `if (x == nil) { panic("...") }` wrapper.
+ *
+ * The literal `nil` lexes to atom 'nil', so we also treat that as
+ * the absent value here — otherwise `expect(nil, ...)` returns the
+ * atom 'nil' instead of panicking, defeating the whole point of
+ * expect for callers who literally wrote `nil`. sw_val_is_truthy
+ * uses the same equivalence. */
 static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
     if (n < 1) {
         sw_val_t *msg = sw_val_string("expect: missing value argument");
         sw_val_t *args[1] = { msg };
         return _builtin_panic(args, 1);
     }
-    if (a[0] && a[0]->type != SW_VAL_NIL) return a[0];
+    int is_nil = (!a[0] || a[0]->type == SW_VAL_NIL ||
+                  (a[0]->type == SW_VAL_ATOM && a[0]->v.str &&
+                   strcmp(a[0]->v.str, "nil") == 0));
+    if (!is_nil) return a[0];
     sw_val_t *msg = (n >= 2) ? a[1] : sw_val_string("expected non-nil value, got nil");
     sw_val_t *args[1] = { msg };
     return _builtin_panic(args, 1);

@@ -379,6 +379,17 @@ struct sw_swarm {
 /* === Assembly Context Switch === */
 extern void sw_context_swap(sw_process_t *from, sw_process_t *to);
 
+/* Release a sw_msg_t envelope back to its allocator (currently a
+ * per-thread freelist with malloc/free fallback). Does NOT free the
+ * payload — pattern bindings in the receive body alias into the
+ * payload, and the body's return value may itself be one of those
+ * bindings, so payload ownership is left to the caller. Without this
+ * release, the codegen receive path used to leak the envelope on every
+ * matched message, defeating the per-thread msg freelist (msg_alloc
+ * always hit malloc) and stressing the glibc arena during spawn-storms
+ * with high receive counts. */
+void sw_msg_release(sw_msg_t *m);
+
 /* Swap into a context captured in a caller-owned struct rather than read
  * straight from `to->ctx`. Use this on the scheduler → process direction
  * after copying the destination ctx under proc->ctx_lock — the copy
