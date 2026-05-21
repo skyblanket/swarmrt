@@ -10,11 +10,13 @@ ifeq ($(shell uname),Darwin)
 CFLAGS += -D_DARWIN_C_SOURCE
 endif
 
-# `-Wno-macro-redefined` is a clang flag — gcc warns "unrecognized
-# command-line option" for it. Probe stderr (not just exit code) so we
-# only enable it where it's actually understood silently.
-CLANG_CHECK := $(shell $(CC) -Wno-macro-redefined -x c -c /dev/null -o /dev/null 2>&1 | grep -qi "unrecognized\|unknown" && echo no || echo yes)
-ifeq ($(CLANG_CHECK),yes)
+# `-Wno-macro-redefined` is clang-only. gcc accepts it silently on the
+# command line but then *notes* "unrecognized command-line option" when
+# it later emits any other diagnostic — which makes every build look
+# noisy. Just check whether the compiler is clang and only pass the
+# flag in that case.
+IS_CLANG := $(shell $(CC) --version 2>/dev/null | head -1 | grep -qi clang && echo yes || echo no)
+ifeq ($(IS_CLANG),yes)
 CFLAGS += -Wno-macro-redefined
 endif
 

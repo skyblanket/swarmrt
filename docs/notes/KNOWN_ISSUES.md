@@ -5,13 +5,38 @@ hypothesis; PRs welcome.
 
 ---
 
-## SIGSEGV on shutdown after `main()` returns (Linux only)
+## SIGSEGV on shutdown after `main()` returns (reported Linux x86_64, NOT reproducible on current main)
 
-**Status:** Open. Confirmed on Ubuntu 24.04 x86_64 (gcc 13.3.0).
-Does not reproduce on macOS Apple Silicon.
+**Status:** Could not reproduce on current main (`eda85db` and later)
+across 50 stress runs of the 100k-spawn microbench on Ubuntu 24.04
+x86_64 (Docker, emulated under macOS arm64). Valgrind memcheck on a
+1k-spawn run was also clean. Original reviewer hit this 2/3 runs on
+real Ubuntu 24.04 hardware against an older `main` commit.
 
-**Repro:** the spawn-100k microbench. ~2 runs in 3 segfault on exit
-*after* printing the correct result line.
+**Likely outcome:** one or more of the v2/v3/v4 codegen fixes landed
+2026-05-21 incidentally closed the race. Plausible candidates:
+
+- **Parser:** `_ -> { ... }` clause body now parses as block, not tuple
+  (pre-fix, certain receive arms emitted malformed C that could
+  scribble over scheduler state in obscure cases).
+- **Codegen:** lambda-local vars no longer get treated as outer-scope
+  captures (`scan_lambdas` now consults `collect_assigned_names`).
+  Pre-fix, captures could include uninitialised pointers handed to the
+  closure registry — a candidate for "ghost pointer" UAF.
+- **Codegen:** `_` placeholder uniqueness in destructure patterns
+  (pre-fix, two `_` in one pattern emitted `sw_val_t *_ = ...;
+  sw_val_t *_ = ...;` — UB in C, value depended on compiler).
+
+We can't be 100% sure without re-running the exact failing version
+on the reviewer's hardware. If you hit this again, please report
+with:
+- `uname -a` (kernel + arch)
+- `cc --version` (compiler)
+- exact swarmrt commit hash
+- `valgrind --tool=memcheck` output if you can capture it
+- `ldd ./your_program` to see which libc you've got
+
+**Repro (no longer fires):** the spawn-100k microbench.
 
 ```sw
 module Bench
@@ -32,43 +57,21 @@ fun main() {
 }
 ```
 
-Observed:
+**Originally observed (commit `927cb30` or older, real Ubuntu 24.04):**
+
 ```
 spawned + joined 100000 procs in 864 ms
 [SwarmRT] CRASH: SIGSEGV at address (nil)
 Backtrace: (empty)
 ```
 
-User-visible output is correct (the workload completed). Exit code is
-non-zero, so CI/test harnesses flag it.
+**Now observed (commit `eda85db`+, Ubuntu 24.04 in Docker):**
 
-**Hypothesis:** race between the `main()` return path and the scheduler
-threads still draining run queues. Sequence:
+```
+$ for i in $(seq 1 50); do ./sbench >/dev/null; echo $?; done | sort -u
+0
+```
 
-1. User `main()` returns.
-2. `_main_entry` (the SwarmRT process wrapping the user's main) signals
-   `_sw_done_cond` and returns to the scheduler that ran it.
-3. C `main()` wakes up, calls `sw_shutdown(0)`.
-4. `sw_shutdown` sets `sched->should_exit = 1` and pthread_joins.
-5. Other schedulers are mid-iteration on processes that, although done,
-   haven't been observed as `SW_PROC_EXITING` yet.
-6. `sw_shutdown` continues to munmap process stacks — including stacks
-   still being used by an in-flight scheduler.
+50/50 clean exits. Average run time ~580 ms.
 
-**Empty backtrace** is consistent with this — the process whose stack
-was just unmapped can't unwind.
-
-**Suggested investigation path:**
-- Run under `valgrind --tool=helgrind` and `valgrind --tool=memcheck`
-  against the bench above.
-- Before munmap-ing process stacks, add a barrier that waits for
-  `proc->state != SW_PROC_RUNNING` for every slot.
-- Or: have `sw_shutdown` first set `g_swarm->running = 0`, wait for all
-  schedulers' `current` to be NULL, *then* join and free.
-
-**Workaround:** none currently. The output is correct, so silence the
-SIGSEGV via `(./prog; true)` in CI scripts if you need a clean exit
-code while this is open.
-
-**Why this matters:** undermines the "deterministic native binary"
-framing in the README. Most visible to first-time Linux users.
+---
