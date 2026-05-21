@@ -164,11 +164,22 @@ typedef struct sw_monitor {
     struct sw_monitor *next_in_watched;  /* In watched's monitors_me list */
 } sw_monitor_t;
 
-/* === Exit/DOWN signal payload === */
+/* === Exit/DOWN signal payload ===
+ *
+ * `reason` is the legacy integer (-1 = panic, 0 = normal, other = user).
+ * `reason_str` carries the human-readable message ("hd: list is empty",
+ * "panic: foo", etc.) for trap_exit handlers that want to log or
+ * dispatch on it. NULL when there's no string available (normal exit,
+ * monitor DOWN for a process that exited cleanly). The codegen receive
+ * loop synthesises {'EXIT', from, reason_str-or-int} so user patterns
+ * see the message text instead of an opaque -1.
+ *
+ * Owned by the signal — deliver_signal strdups, msg_free frees. */
 typedef struct {
     uint64_t pid;
     uint64_t ref;
     int reason;
+    char *reason_str;
 } sw_signal_t;
 
 /* === Process Registry === */
@@ -248,7 +259,14 @@ struct sw_process {
     sw_monitor_t *monitors_me;         /* Others monitoring this process */
     sw_monitor_t *my_monitors;         /* Monitors this process created */
     volatile int kill_flag;            /* Set by exit signal propagation */
-    int exit_reason;                   /* Why this process exited */
+    int exit_reason;                   /* Why this process exited (legacy int) */
+    char *panic_msg;                   /* Human-readable panic message,
+                                          set by sw_process_panic, read by
+                                          process_exit -> deliver_signal so
+                                          {'EXIT', from, MSG_STR} reaches
+                                          trap_exit handlers. malloc'd;
+                                          freed in process_destroy. NULL
+                                          if not a panic exit. */
     sw_reg_entry_t *reg_entry;         /* Registry entry (or NULL) */
     void *ets_tables;                  /* Linked list of owned ETS tables */
 
@@ -296,6 +314,17 @@ struct sw_scheduler {
     /* State */
     volatile int active;
     volatile int should_exit;
+
+    /* Deferred-free queue — see process_destroy. Holds slot+block
+     * indices that the current scheduler iteration just released. They
+     * only get returned to the partition free list on the NEXT loop
+     * iteration, so any in-flight context swap on the destroyed
+     * process has time to drain before another sw_spawn can reuse the
+     * slot. Single-slot ring (the slot freed last iteration is what we
+     * release now). -1 = empty. Fixes the high-process-count arena
+     * race documented as R2-#4 in docs/notes/KNOWN_ISSUES.md. */
+    int32_t pending_free_slot;
+    int32_t pending_free_block;
 };
 
 /* === Swarm (the runtime) === */
@@ -432,13 +461,14 @@ extern void sw_process_trampoline(void);
 void sw_process_done(sw_process_t *proc);
 
 /* sw_process_panic: abort the current process with a non-zero exit
- * reason and context-swap back to the scheduler. The scheduler then
- * runs process_exit() which delivers EXIT signals to linked processes
- * (or kills them if they're not trapping exits) and DOWN messages to
- * monitors. Does not return — call only from inside a running sw
- * process (i.e. when sw_self() is non-NULL). Used by panic()/expect()
- * + the codegen-emitted runtime panics (hd of empty list, /0, etc.)
- * so a single process panicking no longer kills the whole binary. */
-void sw_process_panic(sw_process_t *proc, int reason);
+ * reason and an optional human-readable message, then context-swap
+ * back to the scheduler. The scheduler runs process_exit() which
+ * delivers EXIT signals to linked processes (or kills them if they're
+ * not trapping exits) and DOWN messages to monitors. Does not return.
+ * `msg` is strdup'd onto the process so process_exit can hand it to
+ * deliver_signal — pass NULL for "no useful message" (the int reason
+ * is still propagated). Used by panic()/expect() + the codegen-emitted
+ * runtime panics (hd of empty list, /0, etc.). */
+void sw_process_panic(sw_process_t *proc, int reason, const char *msg);
 
 #endif /* SWARMRT_NATIVE_H */

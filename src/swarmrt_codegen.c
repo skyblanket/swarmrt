@@ -1076,6 +1076,19 @@ static void emit_forward_decls(cg_ctx_t *ctx, node_t *mod) {
 
 static void emit_spawn_trampolines(cg_ctx_t *ctx) {
     FILE *f = ctx->out;
+
+    /* Generic lambda-spawn trampoline. Used by `spawn(fun() { ... })`
+     * where the spawned value is an sw_val_t* of SW_VAL_FUN type.
+     * Guarded by `#ifndef` so multi-module builds (which call this once
+     * per module into one merged TU) don't get a redefinition error. */
+    fprintf(f, "#ifndef _SW_LAMBDA_SPAWN_TRAMPOLINE_DEFINED\n");
+    fprintf(f, "#define _SW_LAMBDA_SPAWN_TRAMPOLINE_DEFINED\n");
+    fprintf(f, "static void _sw_lambda_spawn_trampoline(void *_raw) {\n");
+    fprintf(f, "    sw_val_t *_fn = (sw_val_t *)_raw;\n");
+    fprintf(f, "    if (_fn) sw_val_apply(_fn, NULL, 0);\n");
+    fprintf(f, "}\n");
+    fprintf(f, "#endif\n\n");
+
     if (ctx->nspawns == 0) return;
     fprintf(f, "/* === Spawn trampolines === */\n");
     for (int i = 0; i < ctx->nspawns; i++) {
@@ -1730,12 +1743,33 @@ static void emit_send(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
 static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     FILE *f = ctx->out;
     node_t *inner = n->v.spawn.expr;
-    int sp_id = find_spawn_id(ctx, inner);
-    if (sp_id < 0) {
-        /* Fallback: can't find trampoline */
+
+    /* Lambda form: spawn(fun() { ... }) — evaluate to a sw_val_t fun
+     * value, hand off to a generic trampoline that calls sw_val_apply.
+     * Without this branch the lambda fell through to the "spawn failed"
+     * fallback and silently produced pid 0. */
+    if (inner && inner->type == N_FUN && inner->v.fun.name[0] == '\0') {
+        char fn_val[32];
+        emit_expr(ctx, inner, 0, fn_val, sizeof(fn_val));
         char res[32];
         fresh_var(ctx, res, sizeof(res));
-        fprintf(f, "    sw_val_t *%s = sw_val_pid(NULL); /* spawn failed */\n", res);
+        fprintf(f, "    sw_val_t *%s = sw_val_pid(sw_spawn(_sw_lambda_spawn_trampoline, %s));\n",
+                res, fn_val);
+        strncpy(out, res, osz - 1);
+        return;
+    }
+
+    int sp_id = find_spawn_id(ctx, inner);
+    if (sp_id < 0) {
+        /* Non-call, non-lambda — refuse rather than silently returning
+         * pid 0. Tells the user exactly what's wrong instead of letting
+         * them debug a null pid downstream. */
+        fprintf(stderr, "swc: src/%s.sw:%d: spawn(...) requires a function call (e.g. `spawn(worker())`) or a lambda (e.g. `spawn(fun() { body })`)\n",
+                ctx->mod_name, n->line);
+        ctx->had_arity_error = 1;
+        char res[32];
+        fresh_var(ctx, res, sizeof(res));
+        fprintf(f, "    sw_val_t *%s = sw_val_pid(NULL);\n", res);
         strncpy(out, res, osz - 1);
         return;
     }
@@ -1816,11 +1850,21 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     fprintf(f, "          sw_val_t *%s;\n", msg);
     fprintf(f, "          if (%s->tag == SW_TAG_EXIT && %s->payload) {\n", cur, cur);
     fprintf(f, "            sw_signal_t *_sig = (sw_signal_t *)%s->payload;\n", cur);
-    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_int((int64_t)_sig->pid), sw_val_int((int64_t)_sig->reason) };\n");
+    /* Prefer the human-readable reason_str when present so trap_exit
+     * handlers receive the panic message (e.g. "hd: list is empty")
+     * instead of an opaque integer. Falls back to the int reason for
+     * normal/killed exits where there's no message. */
+    fprintf(f, "            sw_val_t *_reason = _sig->reason_str\n");
+    fprintf(f, "                ? sw_val_string(_sig->reason_str)\n");
+    fprintf(f, "                : sw_val_int((int64_t)_sig->reason);\n");
+    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_int((int64_t)_sig->pid), _reason };\n");
     fprintf(f, "            %s = sw_val_tuple(_items, 3);\n", msg);
     fprintf(f, "          } else if (%s->tag == SW_TAG_DOWN && %s->payload) {\n", cur, cur);
     fprintf(f, "            sw_signal_t *_sig = (sw_signal_t *)%s->payload;\n", cur);
-    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_int((int64_t)_sig->pid), sw_val_int((int64_t)_sig->reason) };\n");
+    fprintf(f, "            sw_val_t *_reason = _sig->reason_str\n");
+    fprintf(f, "                ? sw_val_string(_sig->reason_str)\n");
+    fprintf(f, "                : sw_val_int((int64_t)_sig->reason);\n");
+    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_int((int64_t)_sig->pid), _reason };\n");
     fprintf(f, "            %s = sw_val_tuple(_items, 5);\n", msg);
     fprintf(f, "          } else {\n");
     fprintf(f, "            %s = %s->payload ? (sw_val_t *)%s->payload : sw_val_nil();\n",

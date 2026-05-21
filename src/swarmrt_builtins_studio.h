@@ -2474,23 +2474,27 @@ __attribute__((noreturn))
 static void _sw_runtime_panic(const char *fmt, ...) {
     extern __thread int _sw_current_line;
     extern __thread const char *_sw_current_file;
+    /* Format the message twice: once for stderr (with the ANSI banner
+     * and call chain) and once into a clean buffer that we hand to
+     * sw_process_panic so it lands in EXIT/DOWN messages. */
+    char reason_buf[512];
     va_list ap;
-    fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: ");
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(reason_buf, sizeof(reason_buf), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "\n");
+
+    fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", reason_buf);
     if (_sw_current_file && _sw_current_line > 0)
         fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
     _sw_print_trace();
     fflush(stderr);
     /* Panic the CURRENT sw process, not the whole binary. The scheduler
-     * tears down our process slot and propagates EXIT signals to linked
-     * processes — so supervisors, link, monitor, trap_exit all work as
-     * documented. exit(1) is the fallback only for panics outside any
-     * sw process (e.g. from the C main thread). */
+     * tears down our process slot and propagates EXIT signals (carrying
+     * `reason_buf`) to linked processes — so supervisors, link, monitor,
+     * trap_exit all work as documented. exit(1) is the fallback only for
+     * panics outside any sw process (e.g. from the C main thread). */
     sw_process_t *me = sw_self();
-    if (me) sw_process_panic(me, -1);
+    if (me) sw_process_panic(me, -1, reason_buf);
     exit(1);
 }
 
@@ -2517,9 +2521,10 @@ static sw_val_t *_builtin_panic(sw_val_t **a, int n) {
         fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
     _sw_print_trace();
     fflush(stderr);
-    /* Per-process panic — see _sw_runtime_panic for the rationale. */
+    /* Per-process panic — pass msg_buf as the reason so trap_exit
+     * handlers receive the user's message in {'EXIT', from, msg}. */
     sw_process_t *me = sw_self();
-    if (me) sw_process_panic(me, -1);
+    if (me) sw_process_panic(me, -1, msg_buf);
     exit(1);
 }
 

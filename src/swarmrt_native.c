@@ -382,19 +382,32 @@ static void process_destroy(sw_process_t *proc) {
     uint32_t block_idx = proc->heap_block_idx;
     uint32_t slot = proc->arena_slot;
 
-    /* Free any remaining messages in signal stack */
+    /* Free any remaining messages in signal stack. EXIT/DOWN payloads
+     * are sw_signal_t with an owned reason_str — must free that too. */
     sw_msg_t *sig = atomic_exchange(&proc->mailbox.sig_head, NULL);
     while (sig) {
         sw_msg_t *next = (sw_msg_t *)atomic_load_explicit(&sig->sig_next, memory_order_relaxed);
-        if (sig->payload) free(sig->payload);
+        if (sig->payload) {
+            if (sig->tag == SW_TAG_EXIT || sig->tag == SW_TAG_DOWN) {
+                sw_signal_t *s = (sw_signal_t *)sig->payload;
+                free(s->reason_str);
+            }
+            free(sig->payload);
+        }
         msg_free(sig);
         sig = next;
     }
-    /* Free any remaining messages in private queue */
+    /* Free any remaining messages in private queue (same shape). */
     sw_msg_t *msg = proc->mailbox.priv_head;
     while (msg) {
         sw_msg_t *next = msg->next;
-        if (msg->payload) free(msg->payload);
+        if (msg->payload) {
+            if (msg->tag == SW_TAG_EXIT || msg->tag == SW_TAG_DOWN) {
+                sw_signal_t *s = (sw_signal_t *)msg->payload;
+                free(s->reason_str);
+            }
+            free(msg->payload);
+        }
         msg_free(msg);
         msg = next;
     }
@@ -402,16 +415,66 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.priv_tail = NULL;
     proc->mailbox.count = 0;
 
-    /* Return block and slot to the current scheduler's partition.
-     * After unlock, the slot may be immediately reused by sw_spawn —
-     * do NOT write to proc after unlocking. */
-    uint32_t part_id = tls_scheduler ? tls_scheduler->id : 0;
+    /* Free the panic_msg string set by sw_process_panic. */
+    free(proc->panic_msg);
+    proc->panic_msg = NULL;
+
+    /* Return block and slot to the current scheduler's partition —
+     * but DEFERRED BY ONE SCHEDULER ITERATION via the per-scheduler
+     * pending_free pair. Rationale: the high-process-count race
+     * (R2-#4, see KNOWN_ISSUES.md) is on `proc->ctx`. Another
+     * scheduler may still be mid-`sw_context_swap` reading our ctx
+     * fields when this thread starts the destroy; if we immediately
+     * return the slot, sw_spawn can grab it and overwrite ctx
+     * mid-flight. Holding the slot for one tick guarantees any
+     * concurrent context-swap (microseconds) has time to drain.
+     *
+     * Flow:
+     *   1. Flush whatever this scheduler had pending from the *previous*
+     *      iteration into the partition free list.
+     *   2. Stash the current slot/block as the new pending.
+     *
+     * Net result: the slot becomes reusable after one full loop
+     * iteration on this scheduler, instead of immediately. */
+    sw_scheduler_t *sched = tls_scheduler;
+    if (sched) {
+        uint32_t part_id = sched->id;
+        if (part_id >= g_swarm->arena.num_partitions) part_id = 0;
+        sw_arena_partition_t *part = &g_swarm->arena.partitions[part_id];
+
+        sw_spin_lock(&part->lock);
+        if (sched->pending_free_slot >= 0) {
+            part_push_pid(part, (uint32_t)sched->pending_free_slot);
+            part_push_block(part, (uint32_t)sched->pending_free_block);
+        }
+        sw_spin_unlock(&part->lock);
+
+        sched->pending_free_slot = (int32_t)slot;
+        sched->pending_free_block = (int32_t)block_idx;
+    } else {
+        /* Called from a non-scheduler thread (shouldn't happen on the
+         * normal hot path). Fall back to the legacy immediate-push. */
+        sw_arena_partition_t *part = &g_swarm->arena.partitions[0];
+        sw_spin_lock(&part->lock);
+        part_push_pid(part, slot);
+        part_push_block(part, block_idx);
+        sw_spin_unlock(&part->lock);
+    }
+}
+
+/* Flush a scheduler's pending_free pair into its partition. Called at
+ * scheduler shutdown so leftover slots don't leak forever. */
+static void flush_pending_free(sw_scheduler_t *sched) {
+    if (!sched || sched->pending_free_slot < 0) return;
+    uint32_t part_id = sched->id;
     if (part_id >= g_swarm->arena.num_partitions) part_id = 0;
     sw_arena_partition_t *part = &g_swarm->arena.partitions[part_id];
     sw_spin_lock(&part->lock);
-    part_push_pid(part, slot);
-    part_push_block(part, block_idx);
+    part_push_pid(part, (uint32_t)sched->pending_free_slot);
+    part_push_block(part, (uint32_t)sched->pending_free_block);
     sw_spin_unlock(&part->lock);
+    sched->pending_free_slot = -1;
+    sched->pending_free_block = -1;
 }
 
 /* ============================================================================
@@ -820,6 +883,8 @@ int sw_init(const char *name, uint32_t num_schedulers) {
 
         sched->id = i;
         sched->swarm = g_swarm;
+        sched->pending_free_slot = -1;
+        sched->pending_free_block = -1;
 
         /* Initialize MPSC queues — stub is both head and tail */
         for (int p = 0; p < SW_PRIO_NUM; p++) {
@@ -880,6 +945,9 @@ void sw_shutdown(int swarm_id) {
         pthread_cond_signal(&sched->runq.idle_cond);
         pthread_mutex_unlock(&sched->runq.idle_lock);
         pthread_join(sched->thread, NULL);
+        /* Drop the slot this scheduler had pending from its last
+         * iteration so subsequent shutdown logic sees it as free. */
+        flush_pending_free(sched);
         pthread_mutex_destroy(&sched->runq.idle_lock);
         pthread_cond_destroy(&sched->runq.idle_cond);
         free(sched);
@@ -1081,9 +1149,16 @@ void sw_process_done(sw_process_t *proc) {
  * unrecoverable panics; 0 = normal exit (don't use for crashes); other
  * values are user-defined.
  */
-void sw_process_panic(sw_process_t *proc, int reason) {
+void sw_process_panic(sw_process_t *proc, int reason, const char *msg) {
     if (!proc) return;  /* shouldn't happen — caller must check sw_self() */
     proc->exit_reason = reason;
+    if (msg) {
+        /* Strdup so the buffer outlives the caller's stack frame. The
+         * scheduler reads this in process_exit, then process_destroy
+         * frees it. */
+        free(proc->panic_msg);
+        proc->panic_msg = strdup(msg);
+    }
     proc->state = SW_PROC_EXITING;
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Should never reach here — scheduler tears down the process. */
@@ -1455,11 +1530,13 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
  * ============================================================================ */
 
 static void deliver_signal(sw_process_t *target, uint64_t tag,
-                           uint64_t from_pid, uint64_t ref, int reason) {
+                           uint64_t from_pid, uint64_t ref, int reason,
+                           const char *reason_str) {
     sw_signal_t *sig = (sw_signal_t *)malloc(sizeof(sw_signal_t));
     sig->pid = from_pid;
     sig->ref = ref;
     sig->reason = reason;
+    sig->reason_str = reason_str ? strdup(reason_str) : NULL;
 
     sw_msg_t *m = msg_alloc();
     m->tag = tag;
@@ -1499,7 +1576,7 @@ static void process_exit(sw_process_t *proc, int reason) {
         if (reason != 0) {
             /* Abnormal exit — kill peer or send message */
             if (peer->flags & SW_FLAG_TRAP_EXIT) {
-                deliver_signal(peer, SW_TAG_EXIT, proc->pid, 0, reason);
+                deliver_signal(peer, SW_TAG_EXIT, proc->pid, 0, reason, proc->panic_msg);
             } else {
                 /* Kill the linked process */
                 peer->kill_flag = 1;
@@ -1510,7 +1587,7 @@ static void process_exit(sw_process_t *proc, int reason) {
         } else {
             /* Normal exit — only notify if trapping exits */
             if (peer->flags & SW_FLAG_TRAP_EXIT) {
-                deliver_signal(peer, SW_TAG_EXIT, proc->pid, 0, 0);
+                deliver_signal(peer, SW_TAG_EXIT, proc->pid, 0, 0, NULL);
             }
         }
 
@@ -1525,7 +1602,7 @@ static void process_exit(sw_process_t *proc, int reason) {
         sw_monitor_t *next = mon->next_in_watched;
 
         /* Send DOWN message to watcher */
-        deliver_signal(mon->watcher, SW_TAG_DOWN, proc->pid, mon->ref, reason);
+        deliver_signal(mon->watcher, SW_TAG_DOWN, proc->pid, mon->ref, reason, proc->panic_msg);
 
         /* Remove from watcher's my_monitors list */
         sw_monitor_t **mp = &mon->watcher->my_monitors;
@@ -1591,7 +1668,7 @@ int sw_link(sw_process_t *other) {
     if (other->state == SW_PROC_EXITING || other->state == SW_PROC_FREE) {
         /* Linking to dead process — deliver exit signal immediately */
         if (self->flags & SW_FLAG_TRAP_EXIT) {
-            deliver_signal(self, SW_TAG_EXIT, other->pid, 0, other->exit_reason);
+            deliver_signal(self, SW_TAG_EXIT, other->pid, 0, other->exit_reason, other->panic_msg);
         } else if (other->exit_reason != 0) {
             self->kill_flag = 1;
             self->exit_reason = other->exit_reason;
@@ -1716,7 +1793,7 @@ uint64_t sw_monitor(sw_process_t *target) {
 
     if (target->state == SW_PROC_EXITING || target->state == SW_PROC_FREE) {
         /* Target already dead — deliver DOWN immediately */
-        deliver_signal(self, SW_TAG_DOWN, target->pid, ref, target->exit_reason);
+        deliver_signal(self, SW_TAG_DOWN, target->pid, ref, target->exit_reason, target->panic_msg);
         return ref;
     }
 

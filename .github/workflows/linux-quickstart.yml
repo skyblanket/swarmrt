@@ -48,12 +48,10 @@ jobs:
         run: make test-sw
 
       - name: Stress test (high-process-count race guard)
-        # Catches the documented arena-slot reuse race (R2-#4 in
-        # docs/notes/KNOWN_ISSUES.md). Native amd64 ubuntu-24.04 thread
-        # scheduling reliably fires the race above ~62k spawns — this
-        # job will go red until that bug is fixed, and that's the
-        # intent: a continuous repro signal, not a green-light theater.
-        # `continue-on-error: true` keeps the rest of CI honest while
-        # the bug is open. Remove the line when the runtime fix lands.
+        # Catches the arena-slot reuse race (R2-#4 / R3-C). The
+        # deferred-free fix (one-tick hold via per-scheduler
+        # pending_free) should make this green on native amd64
+        # ubuntu-24.04 runners. If it goes red, the fix didn't take —
+        # see docs/notes/KNOWN_ISSUES.md for the alternative paths
+        # (per-process in-swap mutex, refcounted slots).
         run: make stress
-        continue-on-error: true
