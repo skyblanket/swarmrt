@@ -34,6 +34,224 @@ static uint32_t g_peer_count = 0;
 static pthread_mutex_t g_dist_lock = PTHREAD_MUTEX_INITIALIZER;
 static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
 
+/* === Type-preserving binary marshal/unmarshal ===
+ *
+ * JSON loses the tuples-vs-lists and atoms-vs-strings distinction, so a
+ * `{'echo', from, msg}` tuple round-tripped through JSON arrives as an
+ * `["echo", from, msg]` list of strings — the sw receive pattern stops
+ * matching. This compact tagged-binary format preserves the types that
+ * the runtime pattern-matcher cares about.
+ *
+ * Wire format per value: 1 type byte + length-prefixed payload.
+ *
+ *   0x00  nil
+ *   0x01  int64  (8 bytes, little-endian)
+ *   0x02  double (8 bytes, IEEE 754)
+ *   0x03  atom   (uint16 len + bytes, no terminator)
+ *   0x04  string (uint32 len + bytes, no terminator)
+ *   0x05  tuple  (uint16 count + N values)
+ *   0x06  list   (uint32 count + N values)
+ *   0x07  map    (uint16 count + N key-value pairs)
+ *   0x08  pid    (8 bytes pid id — only meaningful on local node; cross-
+ *                 node pid routing isn't wired yet — see KNOWN_ISSUES)
+ *
+ * Multi-byte fields use native byte order; both nodes are assumed to
+ * have the same word size and endianness for v1. A version byte can be
+ * added later if cross-arch distribution becomes a goal.
+ */
+
+#define SW_MARSHAL_NIL    0x00
+#define SW_MARSHAL_INT    0x01
+#define SW_MARSHAL_FLOAT  0x02
+#define SW_MARSHAL_ATOM   0x03
+#define SW_MARSHAL_STRING 0x04
+#define SW_MARSHAL_TUPLE  0x05
+#define SW_MARSHAL_LIST   0x06
+#define SW_MARSHAL_MAP    0x07
+#define SW_MARSHAL_PID    0x08
+
+static void marsh_grow(uint8_t **buf, uint32_t *cap, uint32_t need) {
+    if (need <= *cap) return;
+    uint32_t nc = *cap ? *cap * 2 : 256;
+    while (nc < need) nc *= 2;
+    *buf = (uint8_t *)realloc(*buf, nc);
+    *cap = nc;
+}
+
+static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
+    if (!v || v->type == SW_VAL_NIL) {
+        marsh_grow(buf, cap, *pos + 1);
+        (*buf)[(*pos)++] = SW_MARSHAL_NIL;
+        return 0;
+    }
+    switch (v->type) {
+    case SW_VAL_INT: {
+        marsh_grow(buf, cap, *pos + 1 + 8);
+        (*buf)[(*pos)++] = SW_MARSHAL_INT;
+        int64_t i = v->v.i;
+        memcpy(*buf + *pos, &i, 8); *pos += 8;
+        return 0;
+    }
+    case SW_VAL_FLOAT: {
+        marsh_grow(buf, cap, *pos + 1 + 8);
+        (*buf)[(*pos)++] = SW_MARSHAL_FLOAT;
+        double d = v->v.f;
+        memcpy(*buf + *pos, &d, 8); *pos += 8;
+        return 0;
+    }
+    case SW_VAL_ATOM: {
+        uint16_t len = (uint16_t)strlen(v->v.str);
+        marsh_grow(buf, cap, *pos + 1 + 2 + len);
+        (*buf)[(*pos)++] = SW_MARSHAL_ATOM;
+        memcpy(*buf + *pos, &len, 2); *pos += 2;
+        memcpy(*buf + *pos, v->v.str, len); *pos += len;
+        return 0;
+    }
+    case SW_VAL_STRING: {
+        uint32_t len = (uint32_t)strlen(v->v.str);
+        marsh_grow(buf, cap, *pos + 1 + 4 + len);
+        (*buf)[(*pos)++] = SW_MARSHAL_STRING;
+        memcpy(*buf + *pos, &len, 4); *pos += 4;
+        memcpy(*buf + *pos, v->v.str, len); *pos += len;
+        return 0;
+    }
+    case SW_VAL_TUPLE:
+    case SW_VAL_LIST: {
+        uint8_t tag = (v->type == SW_VAL_TUPLE) ? SW_MARSHAL_TUPLE : SW_MARSHAL_LIST;
+        marsh_grow(buf, cap, *pos + 1 + 4);
+        (*buf)[(*pos)++] = tag;
+        if (tag == SW_MARSHAL_TUPLE) {
+            uint16_t c = (uint16_t)v->v.tuple.count;
+            memcpy(*buf + *pos, &c, 2); *pos += 2;
+        } else {
+            uint32_t c = (uint32_t)v->v.tuple.count;
+            memcpy(*buf + *pos, &c, 4); *pos += 4;
+        }
+        for (int i = 0; i < v->v.tuple.count; i++)
+            if (marsh_val(v->v.tuple.items[i], buf, cap, pos) < 0) return -1;
+        return 0;
+    }
+    case SW_VAL_MAP: {
+        uint16_t c = (uint16_t)v->v.map.count;
+        marsh_grow(buf, cap, *pos + 1 + 2);
+        (*buf)[(*pos)++] = SW_MARSHAL_MAP;
+        memcpy(*buf + *pos, &c, 2); *pos += 2;
+        for (int i = 0; i < v->v.map.count; i++) {
+            if (marsh_val(v->v.map.keys[i], buf, cap, pos) < 0) return -1;
+            if (marsh_val(v->v.map.vals[i], buf, cap, pos) < 0) return -1;
+        }
+        return 0;
+    }
+    case SW_VAL_PID: {
+        /* Local pid id only — cross-node pid routing not implemented.
+         * Reply paths should embed node_name() in the message instead. */
+        marsh_grow(buf, cap, *pos + 1 + 8);
+        (*buf)[(*pos)++] = SW_MARSHAL_PID;
+        uint64_t pid = v->v.pid ? v->v.pid->pid : 0;
+        memcpy(*buf + *pos, &pid, 8); *pos += 8;
+        return 0;
+    }
+    default:
+        /* Unsupported (FUN, etc.) — encode as nil to avoid silent corruption */
+        marsh_grow(buf, cap, *pos + 1);
+        (*buf)[(*pos)++] = SW_MARSHAL_NIL;
+        return 0;
+    }
+}
+
+/* Returns the marshalled byte length; -1 on failure. Caller frees *out. */
+int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
+    uint8_t *buf = NULL;
+    uint32_t cap = 0, pos = 0;
+    if (marsh_val(v, &buf, &cap, &pos) < 0) { free(buf); return -1; }
+    *out = buf;
+    *out_len = pos;
+    return 0;
+}
+
+static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
+    if (*pos >= len) return sw_val_nil();
+    uint8_t tag = buf[(*pos)++];
+    switch (tag) {
+    case SW_MARSHAL_NIL: return sw_val_nil();
+    case SW_MARSHAL_INT: {
+        if (*pos + 8 > len) return sw_val_nil();
+        int64_t i; memcpy(&i, buf + *pos, 8); *pos += 8;
+        return sw_val_int(i);
+    }
+    case SW_MARSHAL_FLOAT: {
+        if (*pos + 8 > len) return sw_val_nil();
+        double d; memcpy(&d, buf + *pos, 8); *pos += 8;
+        return sw_val_float(d);
+    }
+    case SW_MARSHAL_ATOM: {
+        if (*pos + 2 > len) return sw_val_nil();
+        uint16_t l; memcpy(&l, buf + *pos, 2); *pos += 2;
+        if (*pos + l > len) return sw_val_nil();
+        char *tmp = (char *)malloc(l + 1);
+        memcpy(tmp, buf + *pos, l); tmp[l] = 0; *pos += l;
+        sw_val_t *r = sw_val_atom(tmp);
+        free(tmp);
+        return r;
+    }
+    case SW_MARSHAL_STRING: {
+        if (*pos + 4 > len) return sw_val_nil();
+        uint32_t l; memcpy(&l, buf + *pos, 4); *pos += 4;
+        if (*pos + l > len) return sw_val_nil();
+        char *tmp = (char *)malloc(l + 1);
+        memcpy(tmp, buf + *pos, l); tmp[l] = 0; *pos += l;
+        sw_val_t *r = sw_val_string(tmp);
+        free(tmp);
+        return r;
+    }
+    case SW_MARSHAL_TUPLE:
+    case SW_MARSHAL_LIST: {
+        int is_tuple = (tag == SW_MARSHAL_TUPLE);
+        uint32_t c;
+        if (is_tuple) {
+            if (*pos + 2 > len) return sw_val_nil();
+            uint16_t s; memcpy(&s, buf + *pos, 2); *pos += 2; c = s;
+        } else {
+            if (*pos + 4 > len) return sw_val_nil();
+            memcpy(&c, buf + *pos, 4); *pos += 4;
+        }
+        if (c > 100000) return sw_val_nil(); /* sanity cap */
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (c ? c : 1));
+        for (uint32_t i = 0; i < c; i++) items[i] = unmarsh_val(buf, len, pos);
+        sw_val_t *r = is_tuple ? sw_val_tuple(items, (int)c)
+                               : sw_val_list(items, (int)c);
+        free(items);
+        return r;
+    }
+    case SW_MARSHAL_MAP: {
+        if (*pos + 2 > len) return sw_val_nil();
+        uint16_t c; memcpy(&c, buf + *pos, 2); *pos += 2;
+        sw_val_t **k = (sw_val_t **)malloc(sizeof(sw_val_t *) * (c ? c : 1));
+        sw_val_t **v = (sw_val_t **)malloc(sizeof(sw_val_t *) * (c ? c : 1));
+        for (int i = 0; i < c; i++) {
+            k[i] = unmarsh_val(buf, len, pos);
+            v[i] = unmarsh_val(buf, len, pos);
+        }
+        sw_val_t *r = sw_val_map_new(k, v, c);
+        free(k); free(v);
+        return r;
+    }
+    case SW_MARSHAL_PID: {
+        if (*pos + 8 > len) return sw_val_nil();
+        /* Drop the pid id — no cross-node pid routing yet. Return nil. */
+        *pos += 8;
+        return sw_val_nil();
+    }
+    default:
+        return sw_val_nil();
+    }
+}
+
+sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len) {
+    uint32_t pos = 0;
+    return unmarsh_val(buf, len, &pos);
+}
+
 /* === Internal Helpers === */
 
 static sw_peer_t *find_peer(const char *name) {
@@ -89,20 +307,11 @@ static void handle_remote_data(uint8_t *data, uint32_t len) {
     }
 
     if (target && payload) {
-        /* Deserialize JSON payload back to sw_val_t */
-        extern sw_val_t *sw_val_nil(void);
-        extern sw_val_t *sw_val_string(const char *s);
-        const char *p = (const char *)payload;
-        /* Try JSON parse — if it looks like JSON, parse it */
-        sw_val_t *msg = NULL;
-        if (p[0] == '{' || p[0] == '[' || p[0] == '"' ||
-            (p[0] >= '0' && p[0] <= '9') || p[0] == '-' ||
-            p[0] == 't' || p[0] == 'f' || p[0] == 'n') {
-            /* Forward-declare json_decode from lang */
-            extern sw_val_t *sw_lang_json_decode(const char *s);
-            msg = sw_lang_json_decode(p);
-        }
-        if (!msg) msg = sw_val_string(p);
+        /* Type-preserving unmarshal — round-trips tuples-as-tuples and
+         * atoms-as-atoms, so user-side `receive { {'echo', ...} -> }`
+         * patterns actually match. The previous JSON path lost both
+         * distinctions. */
+        sw_val_t *msg = sw_unmarshal((const uint8_t *)payload, plen);
         free(payload);
         sw_send_tagged(target, hdr->tag, msg);
     } else if (target) {

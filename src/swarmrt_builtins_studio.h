@@ -2188,14 +2188,18 @@ static sw_val_t *_builtin_node_send(sw_val_t **a, int n) {
     if (n < 3) return sw_val_atom("error");
     if (a[0]->type != SW_VAL_STRING || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
-    /* Serialize sw_val_t to JSON for cross-node transport */
-    size_t cap = 65536;            /* initial guess; grows as needed */
-    char *buf = (char *)malloc(cap);
-    size_t pos = 0;
-    _json_encode_val(a[2], &buf, &cap, &pos);
-    buf[pos] = 0;
+    /* Type-preserving binary marshal — see sw_marshal in swarmrt_node.c.
+     * Replaces the JSON path that lost tuple/atom semantics on the
+     * round-trip and broke any send pattern more structured than a
+     * single string. */
+    uint8_t *buf = NULL;
+    uint32_t blen = 0;
+    if (sw_marshal(a[2], &buf, &blen) < 0) {
+        if (buf) free(buf);
+        return sw_val_atom("error");
+    }
     int ok = sw_node_send(a[0]->v.str, a[1]->v.str, SW_TAG_NONE,
-                          buf, (uint32_t)(pos + 1));
+                          buf, blen);
     free(buf);
     return sw_val_atom(ok == 0 ? "ok" : "error");
 }

@@ -15,6 +15,14 @@
 
 #include "swarmrt_native.h"
 #include "swarmrt_io.h"
+#include "swarmrt_lang.h"
+
+/* Type-preserving marshal/unmarshal — used by node_send/handle_remote_data
+ * and exposed for any code that needs to serialize an sw_val_t over the
+ * wire without losing the tuple-vs-list / atom-vs-string distinction.
+ * See marsh_val in swarmrt_node.c for the on-wire layout. */
+int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len);
+sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len);
 
 #define SW_NODE_NAME_MAX 64
 #define SW_NODE_MAX_PEERS 32

@@ -95,11 +95,43 @@ and reinitialised its `ctx` (rsp, rip, …) under Thread 3's feet.
 per node." That claim is empirically false on native Linux x86_64
 above ~62k.
 
-**Suggested fix:** refcount or "in-swap" flag on the process slot —
-`process_destroy` must wait for any in-flight context swap targeting
-the slot to complete before returning the slot to the partition free
-list. Or defer the free by one full scheduler iteration so any
-concurrent swap has observably finished.
+**Working hypothesis** (from reading the code, *not* verified against a
+real failing run): the race is on `proc->ctx`, not on the stack memory
+itself. `process_init_arena` (src/swarmrt_native.c:322-345) `memset`s
+ctx to zero and writes new values for rsp/rip/etc. `sw_context_swap`
+(src/swarmrt_asm.S:73-86) reads ctx fields one at a time into
+registers, then `ret`s. If the destroying thread frees the slot,
+another thread's `sw_spawn` pops it and starts overwriting ctx mid-way
+through a *third* thread's swap into that same slot, the third thread
+gets a torn read — old rbx / new rsp, for instance. `ret` then jumps
+to whatever the stale rsp points to.
+
+Schedulers don't share runqs directly, but the slot lifecycle is:
+1. Scheduler A destroys proc → returns slot to partition free list.
+2. Scheduler B's sw_spawn pops the slot → process_init_arena rewrites ctx.
+3. Some scheduler C may still be reading the old ctx if its swap
+   started in (1)'s window.
+
+**Suggested fix paths** (none yet attempted):
+
+1. **Defer the free by one scheduler tick.** Add `pending_free_slot`
+   to `sw_scheduler_t`; `process_destroy` pushes the previous
+   pending to the partition free list and sets the new pending.
+   Slots only become reusable after a full scheduler iteration —
+   long enough for any in-flight swap (microseconds) to complete.
+   Smallest code change; testable in isolation.
+
+2. **Per-process in-swap mutex.** `sw_context_swap` locks before
+   reading `to`'s ctx, unlocks after. `process_destroy` acquires the
+   lock once before returning the slot. Correct but adds a lock to
+   every context switch — measurable hot-path cost.
+
+3. **Refcount the slot.** `sw_spawn`/sw_context_swap incref the
+   target; `process_destroy` waits for refcount = 0. Same cost
+   structure as the mutex, slightly different ergonomics.
+
+Whoever takes this on: please verify on native Linux x86_64 against
+the `make stress` job and post a before/after run count.
 
 **CI guard:** `make stress` runs the 80k bench 20 times and asserts
 ≥18 successful `ok 80000` lines. The Linux quickstart workflow
