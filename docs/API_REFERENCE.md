@@ -832,6 +832,13 @@ Internal: close all ports owned by a dying process.
 
 Live module upgrade without stopping processes.
 
+> **Available to C embedders only.** There is no `sw`-level builtin yet —
+> `sw_module_upgrade()` takes a `void (*)(void *)` C function pointer, which
+> doesn't fit the `sw_val_t *(sw_val_t **, int)` ABI sw functions compile to,
+> and the runtime has no `dlopen`-based .so loader. Pre-compiled C entry
+> functions only (see `src/test_phase7.c` for the working pattern). A future
+> sw-level binding would need a dynamic-loader path plus an ABI wrapper.
+
 ### Types
 
 ```c

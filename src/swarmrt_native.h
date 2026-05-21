@@ -431,4 +431,14 @@ extern void sw_process_trampoline(void);
 /* Called by trampoline when entry() returns */
 void sw_process_done(sw_process_t *proc);
 
+/* sw_process_panic: abort the current process with a non-zero exit
+ * reason and context-swap back to the scheduler. The scheduler then
+ * runs process_exit() which delivers EXIT signals to linked processes
+ * (or kills them if they're not trapping exits) and DOWN messages to
+ * monitors. Does not return — call only from inside a running sw
+ * process (i.e. when sw_self() is non-NULL). Used by panic()/expect()
+ * + the codegen-emitted runtime panics (hd of empty list, /0, etc.)
+ * so a single process panicking no longer kills the whole binary. */
+void sw_process_panic(sw_process_t *proc, int reason);
+
 #endif /* SWARMRT_NATIVE_H */

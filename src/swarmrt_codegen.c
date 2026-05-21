@@ -66,7 +66,26 @@ typedef struct {
      * produced spurious "unknown function" warnings for every
      * forward-referenced helper. */
     char func_names[CG_MAX_FUNCS][128];
+    int func_nparams[CG_MAX_FUNCS];
     int nfuncs;
+
+    /* Sticky flag: set by emit_call when it detects an arity mismatch
+     * on a user-defined function. sw_codegen() checks this after the
+     * whole module has been walked and fails the codegen so swc aborts
+     * before invoking cc. Walking the whole module first means we can
+     * report ALL mismatches in one shot rather than bailing on the
+     * first one. */
+    int had_arity_error;
+
+    /* Sticky flag: set by did_you_mean when it reports an unknown
+     * function call. Same pattern as had_arity_error — emit_call still
+     * walks the rest of the module so we surface ALL unknown calls in
+     * one pass, then sw_codegen() / sw_codegen_multi() return -1 so
+     * swc aborts before invoking cc. Without this flag, swc emitted
+     * the hint but still synthesised `Main_helper(...)` calls into the
+     * generated C, and the user got a second wave of cascading
+     * "undeclared function" errors out of clang. */
+    int had_unknown_fn;
 
     /* spawn sites collected during pre-scan */
     spawn_info_t spawns[64];
@@ -291,6 +310,32 @@ static int is_module_func(cg_ctx_t *ctx, const char *name) {
     for (int i = 0; i < ctx->nfuncs; i++)
         if (strcmp(ctx->func_names[i], name) == 0) return 1;
     return 0;
+}
+
+/* Returns the declared arity of a user-defined module function, or -1
+ * if `name` is not one of the module's functions. Used by emit_call
+ * for compile-time arity checking. */
+static int module_func_nparams(cg_ctx_t *ctx, const char *name) {
+    for (int i = 0; i < ctx->nfuncs; i++)
+        if (strcmp(ctx->func_names[i], name) == 0) return ctx->func_nparams[i];
+    return -1;
+}
+
+/* Compile-time arity check for calls to user-defined module functions.
+ * Builtins are skipped (they take an array+count at the C ABI level and
+ * each builtin enforces its own arity at runtime); cross-module calls
+ * (Mod.fn) are also skipped because the called module isn't in our
+ * func_names table. Reports the mismatch to stderr at the original .sw
+ * source location and sets had_arity_error so sw_codegen() can fail
+ * the whole compile before cc runs. */
+static void check_user_call_arity(cg_ctx_t *ctx, const char *fname, int nargs, int line) {
+    int expected = module_func_nparams(ctx, fname);
+    if (expected < 0) return;            /* not a user-defined module fun */
+    if (expected == nargs) return;
+    fprintf(stderr, "swc: %s:%d: function '%s' takes %d arg%s, got %d\n",
+            guess_sw_path(ctx->mod_name), line > 0 ? line : 0,
+            fname, expected, expected == 1 ? "" : "s", nargs);
+    ctx->had_arity_error = 1;
 }
 
 /* =========================================================================
@@ -1381,13 +1426,35 @@ static int _lev_distance(const char *a, const char *b) {
 }
 
 /* Print "src/Mod.sw:N: unknown function 'foo' — did you mean 'foa'?"
- * to stderr. Threshold = lower of (3, len/2): keeps "string_xx" from
- * matching "abs". Up to 3 suggestions, sorted by distance. */
+ * to stderr and mark the codegen as having seen an unknown call so
+ * sw_codegen() returns -1 (swc aborts before cc, no cascading C
+ * "undeclared function" wave). Up to 3 suggestions, sorted by
+ * distance.
+ *
+ * Threshold:
+ *   - long names (len >= 8): distance ≤ 3
+ *   - shorter names: distance ≤ 2
+ *   - very short (len ≤ 2): distance ≤ 1 (otherwise every 2-char
+ *     identifier matches everything)
+ *
+ * The earlier formula was `min(3, len/2)`, which was tuned around the
+ * README example `strng_length` → `string_length` (distance 1) but
+ * gave bad recall for medium-length typos: `strng_lenghth` (distance
+ * 2) sometimes squeaked through, while a less specifically-shaped
+ * length-13 typo would silently produce nothing because the threshold
+ * happened to be exactly 3 and the closest candidate was 4 away. The
+ * new schedule is more generous for the >=8-char identifiers that
+ * dominate real-world calls (most builtins are 8-20 chars). */
 static void did_you_mean(cg_ctx_t *ctx, const char *fname, int line) {
+    /* Mark the whole codegen as failing — the per-site message is the
+     * error, sw_codegen() returns -1 once the walk completes. */
+    ctx->had_unknown_fn = 1;
+
     int flen = (int)strlen(fname);
-    int threshold = flen / 2;
-    if (threshold > 3) threshold = 3;
-    if (threshold < 1) threshold = 1;
+    int threshold;
+    if (flen >= 8)      threshold = 3;
+    else if (flen >= 3) threshold = 2;
+    else                threshold = 1;
 
     /* Collect (name, distance) pairs from builtins + module funcs. */
     const char *cands[8] = { NULL };
@@ -1440,6 +1507,15 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
     const char *fname = n->v.call.func->v.sval;
     int nargs = n->v.call.nargs;
+
+    /* Compile-time arity check for direct calls to user-defined module
+     * functions. Builtins are skipped (they're variadic at the C ABI
+     * level — array+count) and cross-module calls (Mod.fn) are also
+     * skipped (the imported module's signatures aren't in our table).
+     * Lambda / closure dispatch via is_declared is also intentionally
+     * uncheckable here (the variable holds an opaque sw_val_t). */
+    if (!is_builtin(fname) && !strchr(fname, '.'))
+        check_user_call_arity(ctx, fname, nargs, n->line);
 
     /* Evaluate arguments */
     char arg_vars[16][32];
@@ -1622,11 +1698,16 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         else
             fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, NULL, 0);\n", res, fname);
     } else {
-        /* Unknown function — print did-you-mean to stderr so the user
-         * gets actionable suggestions BEFORE the C compiler trips. We
-         * still emit the call so the C-level error fires (with our
-         * per-statement #line directive it'll point at the right sw
-         * line); the stderr hint just makes the cause obvious. */
+        /* Unknown function — print did-you-mean to stderr. did_you_mean
+         * also sets ctx->had_unknown_fn, so sw_codegen() returns -1 and
+         * swc aborts before invoking cc; no cascade of "undeclared
+         * function" noise from clang on top of our own message.
+         *
+         * We still emit a placeholder call (NOT relied on for the user-
+         * visible error any more) because the rest of emit_function /
+         * the surrounding statement walker expects emit_call to produce
+         * a valid C variable name. The emitted C is unreachable: swc
+         * never invokes cc once had_unknown_fn is set. */
         did_you_mean(ctx, fname, n->line);
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
@@ -1660,6 +1741,13 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     }
 
     spawn_info_t *sp = &ctx->spawns[sp_id];
+
+    /* Compile-time arity check for `spawn helper(...)` when helper is a
+     * user-defined module function. (Cross-module spawns aren't in our
+     * table; builtin names can't be spawned at all.) */
+    if (!strchr(sp->func_name, '.'))
+        check_user_call_arity(ctx, sp->func_name, sp->nargs, n->line);
+
     char sa[32];
     fresh_var(ctx, sa, sizeof(sa));
     fprintf(f, "    _%s_sp%d_t *%s = malloc(sizeof(_%s_sp%d_t));\n",
@@ -1719,8 +1807,25 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     fprintf(f, "        sw_msg_t *%s = sw_mailbox_peek();\n", cur);
     fprintf(f, "        while (%s && !_matched) {\n", cur);
     fprintf(f, "          sw_msg_t *_next = %s->next;\n", cur);
-    fprintf(f, "          sw_val_t *%s = %s->payload ? (sw_val_t *)%s->payload : sw_val_nil();\n",
+    /* For runtime-injected signals (EXIT from a dying linked peer, DOWN
+     * from a monitor) the payload is a sw_signal_t* not a sw_val_t* —
+     * synthesise the documented tuple shape so the sw `receive {
+     * {'EXIT', from, reason} -> ... }` and `{'DOWN', ref, 'process',
+     * from, reason}` patterns match. Plain `send(pid, msg)` messages
+     * pass through unchanged. */
+    fprintf(f, "          sw_val_t *%s;\n", msg);
+    fprintf(f, "          if (%s->tag == SW_TAG_EXIT && %s->payload) {\n", cur, cur);
+    fprintf(f, "            sw_signal_t *_sig = (sw_signal_t *)%s->payload;\n", cur);
+    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_int((int64_t)_sig->pid), sw_val_int((int64_t)_sig->reason) };\n");
+    fprintf(f, "            %s = sw_val_tuple(_items, 3);\n", msg);
+    fprintf(f, "          } else if (%s->tag == SW_TAG_DOWN && %s->payload) {\n", cur, cur);
+    fprintf(f, "            sw_signal_t *_sig = (sw_signal_t *)%s->payload;\n", cur);
+    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_int((int64_t)_sig->pid), sw_val_int((int64_t)_sig->reason) };\n");
+    fprintf(f, "            %s = sw_val_tuple(_items, 5);\n", msg);
+    fprintf(f, "          } else {\n");
+    fprintf(f, "            %s = %s->payload ? (sw_val_t *)%s->payload : sw_val_nil();\n",
             msg, cur, cur);
+    fprintf(f, "          }\n");
 
     /* Pattern matching clauses */
     for (int i = 0; i < n->v.recv.nclauses; i++) {
@@ -1921,6 +2026,10 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         const char *fname = func->v.call.func->v.sval;
         int nargs = func->v.call.nargs + 1;
 
+        /* Same compile-time arity check as emit_call. */
+        if (!is_builtin(fname) && !strchr(fname, '.'))
+            check_user_call_arity(ctx, fname, nargs, func->line);
+
         char arg_vars[16][32];
         strncpy(arg_vars[0], val, 31);
         for (int i = 0; i < func->v.call.nargs && i < 15; i++)
@@ -1958,6 +2067,11 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     } else if (func->type == N_IDENT) {
         /* val |> func → func(val) */
         const char *fname = func->v.sval;
+
+        /* Compile-time arity check: pipe always passes exactly 1 arg. */
+        if (!is_builtin(fname) && !strchr(fname, '.'))
+            check_user_call_arity(ctx, fname, 1, func->line);
+
         char arr[32];
         fresh_var(ctx, arr, sizeof(arr));
         fprintf(f, "    sw_val_t *%s[] = {%s};\n", arr, val);
@@ -2432,7 +2546,15 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
     fprintf(f, "int main(int argc, char **argv) {\n");
     fprintf(f, "    (void)argc; (void)argv;\n");
     fprintf(f, "    setvbuf(stdout, NULL, _IONBF, 0);\n");
-    fprintf(f, "    sw_init(\"%s\", 2);\n", ctx->mod_name);
+    /* Scheduler count: honor $SW_SCHEDULERS if set, else one OS thread
+     * per online core (BEAM-style). Previously hardcoded to 2, which
+     * silently underused every multicore host. */
+    fprintf(f, "    {\n");
+    fprintf(f, "        const char *_sw_env = getenv(\"SW_SCHEDULERS\");\n");
+    fprintf(f, "        int _sw_nsched = _sw_env ? atoi(_sw_env) : (int)sysconf(_SC_NPROCESSORS_ONLN);\n");
+    fprintf(f, "        if (_sw_nsched < 1) _sw_nsched = 1;\n");
+    fprintf(f, "        sw_init(\"%s\", _sw_nsched);\n", ctx->mod_name);
+    fprintf(f, "    }\n");
     fprintf(f, "    sw_io_init();\n");
     fprintf(f, "    sw_spawn(_main_entry, NULL);\n");
     fprintf(f, "    /* Wait for the user's main() to return (set by _main_entry). */\n");
@@ -2458,9 +2580,10 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     ctx.out = out;
     strncpy(ctx.mod_name, mod->v.mod.name, 127);
 
-    /* Collect function names */
+    /* Collect function names + arities for compile-time arity checks. */
     for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
         strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
+        ctx.func_nparams[i] = mod->v.mod.funs[i]->v.fun.nparams;
         ctx.nfuncs++;
     }
 
@@ -2481,6 +2604,13 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     emit_entry_and_main(&ctx);
 
     (void)obfuscate; /* handled externally by sw_obfuscate() */
+    /* Fail the whole codegen if any call site had an arity mismatch
+     * or unknown-function call. emit_call / did_you_mean already
+     * reported per-site errors to stderr; this just makes swc return
+     * non-zero so cc never runs on the bad C we still emitted (we keep
+     * emitting so the walk surfaces ALL problems in one pass, not just
+     * the first). */
+    if (ctx.had_arity_error || ctx.had_unknown_fn) return -1;
     return 0;
 }
 
@@ -2507,6 +2637,7 @@ int sw_codegen_module(void *ast, FILE *out) {
 
     for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
         strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
+        ctx.func_nparams[i] = mod->v.mod.funs[i]->v.fun.nparams;
         ctx.nfuncs++;
     }
 
@@ -2522,6 +2653,7 @@ int sw_codegen_module(void *ast, FILE *out) {
     for (int i = 0; i < mod->v.mod.nfuns; i++)
         emit_function(&ctx, mod->v.mod.funs[i]);
 
+    if (ctx.had_arity_error || ctx.had_unknown_fn) return -1;
     return 0;
 }
 
@@ -2547,6 +2679,8 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
     }
 
     /* Emit each module's functions */
+    int any_arity_error = 0;
+    int any_unknown_fn = 0;
     for (int m = 0; m < nmodules; m++) {
         node_t *mod = (node_t *)modules[m];
         if (!mod || mod->type != N_MODULE) continue;
@@ -2558,6 +2692,7 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
 
         for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
             strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
+            ctx.func_nparams[i] = mod->v.mod.funs[i]->v.fun.nparams;
             ctx.nfuncs++;
         }
 
@@ -2570,6 +2705,9 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
 
         for (int i = 0; i < mod->v.mod.nfuns; i++)
             emit_function(&ctx, mod->v.mod.funs[i]);
+
+        if (ctx.had_arity_error) any_arity_error = 1;
+        if (ctx.had_unknown_fn) any_unknown_fn = 1;
     }
 
     /* Entry point from main module */
@@ -2580,5 +2718,6 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
     strncpy(main_ctx.mod_name, main_mod->v.mod.name, 127);
     emit_entry_and_main(&main_ctx);
 
+    if (any_arity_error || any_unknown_fn) return -1;
     return 0;
 }

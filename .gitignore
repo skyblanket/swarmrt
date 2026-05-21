@@ -37,3 +37,4 @@ tests/sw/.build/
 /--version/
 /2/
 
+tests/stress/.build/

@@ -1066,6 +1066,29 @@ void sw_process_done(sw_process_t *proc) {
     /* Should never reach here */
 }
 
+/*
+ * sw_process_panic: Mark the current process as crashed and swap back
+ * to the scheduler, which will run process_exit() — that's where
+ * link-propagation + monitor-DOWN + arena cleanup live. Used by the
+ * codegen panic helpers (hd of empty list, /0, panic(), expect()) in
+ * place of the previous exit(1), so a single process going down no
+ * longer takes the whole binary with it. Supervision + link + monitor
+ * + trap_exit now actually work.
+ *
+ * `reason` is the exit reason that gets propagated to linked processes
+ * (or surfaced as the second element of a `{'EXIT', from, reason}`
+ * message if the linked peer has trap_exit set). Convention: -1 for
+ * unrecoverable panics; 0 = normal exit (don't use for crashes); other
+ * values are user-defined.
+ */
+void sw_process_panic(sw_process_t *proc, int reason) {
+    if (!proc) return;  /* shouldn't happen — caller must check sw_self() */
+    proc->exit_reason = reason;
+    proc->state = SW_PROC_EXITING;
+    sw_context_swap(proc, &proc->scheduler->sched_proc);
+    /* Should never reach here — scheduler tears down the process. */
+}
+
 void sw_yield(void) {
     sw_process_t *proc = tls_current;
     if (!proc) return;

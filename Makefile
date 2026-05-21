@@ -195,6 +195,15 @@ test-all: test-v1 test-v2 test-proc test-native test-sw
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 
+# Stress: 80k-spawn microbench × 20 runs. Asserts ≥18 print the
+# expected `ok 80000` line. Surfaces the high-process-count arena-slot
+# reuse race (see docs/notes/KNOWN_ISSUES.md). Requires native Linux
+# x86_64 thread scheduling — emulated/serialised setups (Docker on
+# Apple Silicon, valgrind, qemu user-mode) suppress the race.
+.PHONY: stress
+stress: swc libswarmrt
+	@./tests/stress/run_stress.sh
+
 # Benchmarks
 benchmark: v1
 	$(CC) $(CFLAGS) $(SRC_DIR)/benchmark.c $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o -o $(BIN_DIR)/benchmark $(LDFLAGS)

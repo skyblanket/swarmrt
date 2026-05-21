@@ -262,6 +262,8 @@ static void http_try_parse(int cid) {
     int is_upgrade = 0;
     char ws_key[128] = {0};
     uint32_t content_length = 0;
+    int has_content_length = 0;
+    int is_chunked = 0;
     int keep_alive = (strstr(version, "1.1") != NULL) ? 1 : 0; /* HTTP/1.1 default */
 
     char *hdr = (char *)c->buf;
@@ -291,10 +293,23 @@ static void http_try_parse(int cid) {
                 ws_key[klen] = '\0';
             }
         }
-        if (strncasecmp(line, "Content-Length:", 14) == 0) {
-            char *val = line + 14;
+        /* "Content-Length:" is 15 chars (note the trailing colon) — earlier
+         * versions used 14 here, which left `val` pointing at the ':' and made
+         * strtoul return 0 for every POST body. */
+        if (strncasecmp(line, "Content-Length:", 15) == 0) {
+            char *val = line + 15;
             while (*val == ' ' || *val == '\t') val++;
             content_length = (uint32_t)strtoul(val, NULL, 10);
+            has_content_length = 1;
+        }
+        if (strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+            char *val = line + 18;
+            while (*val == ' ' || *val == '\t') val++;
+            /* RFC 7230: chunked is always the last (or only) coding */
+            if (strncasecmp(val, "chunked", 7) == 0 ||
+                (line_end - val >= 7 && strncasecmp(line_end - 7, "chunked", 7) == 0)) {
+                is_chunked = 1;
+            }
         }
         if (strncasecmp(line, "Connection:", 11) == 0) {
             char *val = line + 11;
@@ -304,6 +319,30 @@ static void http_try_parse(int cid) {
         }
 
         line = line_end + 2;
+    }
+
+    /* Chunked transfer-encoding: not fully supported. Don't hang waiting for
+     * a Content-Length that will never arrive — drain anything that looks
+     * like a terminating chunk and dispatch with empty body. */
+    if (is_chunked && !has_content_length) {
+        fprintf(stderr,
+            "swarmrt_http: Transfer-Encoding: chunked is not yet supported; "
+            "dispatching %s %s with empty body\n", method, path);
+        /* Best-effort: if "0\r\n\r\n" is in the buffer, skip past it */
+        if (c->buf_len >= 5) {
+            for (uint32_t i = 0; i + 5 <= c->buf_len; i++) {
+                if (c->buf[i] == '0' && c->buf[i+1] == '\r' && c->buf[i+2] == '\n' &&
+                    c->buf[i+3] == '\r' && c->buf[i+4] == '\n') {
+                    uint32_t skip = i + 5;
+                    uint32_t rem = c->buf_len - skip;
+                    if (rem > 0)
+                        memmove(c->buf, c->buf + skip, rem);
+                    c->buf_len = rem;
+                    break;
+                }
+            }
+        }
+        content_length = 0;
     }
 
     c->keep_alive = keep_alive;

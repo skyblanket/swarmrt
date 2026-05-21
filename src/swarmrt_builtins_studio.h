@@ -2480,6 +2480,13 @@ static void _sw_runtime_panic(const char *fmt, ...) {
         fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
     _sw_print_trace();
     fflush(stderr);
+    /* Panic the CURRENT sw process, not the whole binary. The scheduler
+     * tears down our process slot and propagates EXIT signals to linked
+     * processes — so supervisors, link, monitor, trap_exit all work as
+     * documented. exit(1) is the fallback only for panics outside any
+     * sw process (e.g. from the C main thread). */
+    sw_process_t *me = sw_self();
+    if (me) sw_process_panic(me, -1);
     exit(1);
 }
 
@@ -2506,6 +2513,9 @@ static sw_val_t *_builtin_panic(sw_val_t **a, int n) {
         fprintf(stderr, "  at %s:%d\n", _sw_current_file, _sw_current_line);
     _sw_print_trace();
     fflush(stderr);
+    /* Per-process panic — see _sw_runtime_panic for the rationale. */
+    sw_process_t *me = sw_self();
+    if (me) sw_process_panic(me, -1);
     exit(1);
 }
 
@@ -4562,19 +4572,26 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
 
 /* === D1: ETS List/Count Builtins === */
 
-/* ets_list() → list of table IDs */
+/* ets_list(table_id) → list of keys in that table */
 static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
-    (void)a; (void)n;
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_list(NULL, 0);
+    int id = (int)a[0]->v.i;
+    if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_list(NULL, 0);
+    _vets_table_t *t = &_vets_tables[id];
+
     int cap = 64, cnt = 0;
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
 
-    /* Use sw_ets_list_tids from swarmrt_ets.c */
-    uint32_t tids[256];
-    int ntids = sw_ets_list_tids(tids, 256);
-    for (int i = 0; i < ntids; i++) {
-        if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
-        items[cnt++] = sw_val_int((int64_t)tids[i]);
+    pthread_rwlock_rdlock(&t->lock);
+    for (int b = 0; b < _VETS_BUCKETS; b++) {
+        _vets_entry_t *e = t->buckets[b];
+        while (e) {
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+            items[cnt++] = e->key;
+            e = e->next;
+        }
     }
+    pthread_rwlock_unlock(&t->lock);
 
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);
@@ -4584,7 +4601,17 @@ static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
 /* ets_count(table_id) → int */
 static sw_val_t *_builtin_ets_count(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_int(-1);
-    int count = sw_ets_info_count((sw_ets_tid_t)a[0]->v.i);
+    int id = (int)a[0]->v.i;
+    if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_int(-1);
+    _vets_table_t *t = &_vets_tables[id];
+
+    int count = 0;
+    pthread_rwlock_rdlock(&t->lock);
+    for (int b = 0; b < _VETS_BUCKETS; b++) {
+        for (_vets_entry_t *e = t->buckets[b]; e; e = e->next) count++;
+    }
+    pthread_rwlock_unlock(&t->lock);
+
     return sw_val_int((int64_t)count);
 }
 

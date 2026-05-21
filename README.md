@@ -181,8 +181,9 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **ETS** | Agent registry, perms cache, conversation memory, todo state. |
 | **`supervise` + `link` + `monitor` + `trap_exit`** | Full OTP fault tolerance from userland. Crash → restart → DOWN messages → `{'EXIT', from, reason}` for trappers. |
 | **Sandboxed shell** | `shell_sandboxed(cmd, opts)` — sandbox-exec on macOS, firejail on Linux. Network blocked by default. |
-| **Hot reload** | Upgrade agent code without killing in-flight processes. |
 | **`case`** | Tool-call dispatch: `case tool_name { "read" -> ... ; "bash" -> ... ; _ -> ... }`. |
+
+> Hot reload is implemented in the runtime (`sw_module_register` / `sw_module_upgrade`) but is currently only reachable from **C embedders** — there is no `sw`-level builtin yet. See [docs/API_REFERENCE.md §12](docs/API_REFERENCE.md#12-hot-code-reload).
 
 **Read more:** [docs/BUILDING_AGENTS.md](docs/BUILDING_AGENTS.md) — the developer-facing guide with the patterns.
 
@@ -220,7 +221,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **Behaviours** | GenServer, Supervisor, Task, GenStateMachine, ETS, Registry — all built on top of the bare `spawn`/`send`/`receive` primitives. |
 | **IO** | kqueue-based async ports. TCP accept/read/write as port messages. HTTP / WebSocket / Chrome DevTools as builtins. |
 | **Distribution** | Multi-node TCP message routing with automatic reconnection. Process linking across nodes. |
-| **Hot reload** | Module versioning, swap running code without stopping processes. |
+| **Hot reload** | Module versioning, swap running code without stopping processes. *(C API only — no `sw`-level builtin yet.)* |
 | **Compiler (`swc`)** | `.sw` → AST → C → native binary. Tail-call optimisation, optional XOR-string obfuscation, optional symbol stripping. |
 
 Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns (pointer sharing), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
