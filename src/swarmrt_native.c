@@ -49,6 +49,12 @@ static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread sw_scheduler_t *tls_scheduler = NULL;
 static __thread sw_process_t *tls_current = NULL;
 
+/* Optional per-spawn pin set by sw_spawn_link so the child lands on a
+ * specific scheduler (not the parent's). sw_spawn_opts honours this
+ * when non-NULL and falls back to round-robin otherwise. NULL on
+ * external (non-scheduler) threads. */
+static __thread sw_scheduler_t *tls_spawn_override = NULL;
+
 /* === Per-thread freelists (avoid malloc/free on hot path) === */
 #define MSG_FREELIST_MAX 128
 static __thread sw_msg_t *tls_msg_free = NULL;
@@ -1072,15 +1078,31 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
 
     sw_arena_t *arena = &g_swarm->arena;
 
-    /* 1. Pick the target scheduler via round-robin.
-     * Originally this preferred the current scheduler for zero cross-thread
-     * overhead, but that starves background processes when the parent
-     * blocks on a C syscall (popen fread, fgetc) — the child would be
-     * queued on the same pinned thread and never run. Round-robin
-     * distributes across all schedulers so heartbeats and watchers keep
-     * ticking while main is busy with an HTTP call. */
-    uint32_t sched_id = __sync_fetch_and_add(&g_swarm->next_sched, 1)
-                        % g_swarm->num_schedulers;
+    /* 1. Pick the target scheduler.
+     *
+     * sw_spawn_link sets tls_spawn_override to a specific scheduler
+     * (the non-parent one it picked to avoid cooperative-deadlock
+     * with a blocking parent). Honour that pin when present —
+     * previously sw_spawn_opts always used the global round-robin
+     * counter and ignored the hint, so spawn-and-wait patterns like
+     * `spawn_link + usleep(50ms)` would routinely land one child on
+     * the parent's scheduler, where the child couldn't run until
+     * usleep returned and the pg tests in phase5 missed members.
+     *
+     * Without a pin, round-robin — originally this preferred the
+     * current scheduler for zero cross-thread overhead, but that
+     * starves background processes when the parent blocks on a C
+     * syscall (popen fread, fgetc); the child would be queued on the
+     * same pinned thread and never run. Round-robin distributes across
+     * all schedulers so heartbeats and watchers keep ticking while
+     * main is busy with an HTTP call. */
+    uint32_t sched_id;
+    if (tls_spawn_override) {
+        sched_id = tls_spawn_override->id;
+    } else {
+        sched_id = __sync_fetch_and_add(&g_swarm->next_sched, 1)
+                   % g_swarm->num_schedulers;
+    }
     uint32_t part_id = sched_id;
     if (part_id >= arena->num_partitions) part_id = 0;
     sw_arena_partition_t *part = &arena->partitions[part_id];
@@ -1769,24 +1791,28 @@ int sw_unlink(sw_process_t *other) {
 }
 
 sw_process_t *sw_spawn_link(void (*func)(void*), void *arg) {
-    /* In cooperative mode, scheduling locally deadlocks if parent blocks
-     * waiting for child (both on same scheduler thread). Force child to
-     * a DIFFERENT scheduler — not just round-robin (which can cycle back). */
-    sw_scheduler_t *save_sched = tls_scheduler;
-    if (save_sched && g_swarm->num_schedulers > 1) {
-        /* Round-robin but skip parent's scheduler to avoid cooperative deadlock */
+    /* Pin the child to a scheduler that is NOT the parent's. In
+     * cooperative mode the parent often blocks waiting for the child
+     * (usleep, sw_receive without a producer, etc.) — if both end up
+     * on the same scheduler the child can't run, the parent never
+     * unblocks, and the test sees missing members / lost messages.
+     *
+     * The pin is published via tls_spawn_override (a separate TLS slot
+     * from tls_scheduler — overwriting tls_scheduler doesn't influence
+     * sw_spawn's scheduler pick, which was the original bug behind
+     * phase5 pg_* failures). sw_spawn_opts reads tls_spawn_override
+     * and uses it as the scheduler id; we clear it after the spawn. */
+    sw_scheduler_t *parent_sched = tls_scheduler;
+    if (parent_sched && g_swarm->num_schedulers > 1) {
         uint32_t target;
         do {
             target = __sync_fetch_and_add(&g_swarm->next_sched, 1)
                      % g_swarm->num_schedulers;
-        } while (target == save_sched->id);
-        tls_scheduler = g_swarm->schedulers[target];
-    } else if (save_sched) {
-        tls_scheduler = NULL; /* Single scheduler — best effort */
+        } while (target == parent_sched->id);
+        tls_spawn_override = g_swarm->schedulers[target];
     }
-    /* If save_sched == NULL (external thread), keep NULL → uses round-robin */
     sw_process_t *child = sw_spawn(func, arg);
-    tls_scheduler = save_sched;
+    tls_spawn_override = NULL;
     if (!child) return NULL;
 
     sw_process_t *self = tls_current;

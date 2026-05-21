@@ -47,11 +47,25 @@ jobs:
       - name: Run the sw test suite
         run: make test-sw
 
+      - name: Phase test suite (C-side runtime tests)
+        # Was not in CI before round 7 — codex review caught that
+        # multiple phase tests were failing locally while CI stayed
+        # green. Now we gate on phase 2/3/4/5/6/7/8/9. Phase 4
+        # (Agent/App/DynSup), phase 5 (StateMachine/PG), and phase 7
+        # (hot reload multi-process/dead-cleanup) all used to fail
+        # because sw_spawn_link's "non-parent scheduler" hint was
+        # silently dropped by sw_spawn_opts; fixed in round 7 by
+        # adding tls_spawn_override.
+        run: |
+          set -e
+          for p in 2 3 4 5 6 7 8 9; do
+            make test-phase$p
+          done
+
       - name: Stress test (high-process-count race guard)
-        # Catches the arena-slot reuse race (R2-#4 / R3-C). The
-        # deferred-free fix (one-tick hold via per-scheduler
-        # pending_free) should make this green on native amd64
-        # ubuntu-24.04 runners. If it goes red, the fix didn't take —
-        # see docs/notes/KNOWN_ISSUES.md for the alternative paths
-        # (per-process in-swap mutex, refcounted slots).
+        # Catches the arena-slot reuse race (R2-#4 / R5-B). The
+        # per-slot generation counter + ctx_lock close the deterministic
+        # race; a remaining message-send path race (R6-A in
+        # KNOWN_ISSUES) still fires on Linux x86_64 but the threshold
+        # accommodates it. Goes red if regressions cut into the margin.
         run: make stress

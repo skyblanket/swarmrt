@@ -6,28 +6,29 @@
 module Counter
 export [main, counter]
 
-fun counter(n) {
+fun counter(start) {
     receive {
-        {'inc', by} -> counter(n + by)
-        {'get', from} -> send(from, {'count', n}) ; counter(n)
-        'stop' -> n
+        {'increment', by} -> counter(start + by)
+        {'get', from}     -> send(from, {'count', start}) ; counter(start)
+        'stop'            -> print("Counter stopped at " ++ start)
     }
 }
 
 fun main() {
     pid = spawn(counter(0))
-    send(pid, {'inc', 5})
-    send(pid, {'inc', 3})
+    send(pid, {'increment', 5})
+    send(pid, {'increment', 3})
     send(pid, {'get', self()})
 
-    receive { {'count', n} -> print("count: " ++ to_string(n)) }
+    receive { {'count', n} -> print("Count: " ++ n) }
     send(pid, 'stop')
 }
 ```
 
 ```bash
-$ ./bin/swc build counter.sw -o counter && ./counter
-count: 8
+$ ./bin/swc build examples/counter.sw -o counter && ./counter
+Count: 8
+Counter stopped at 8
 ```
 
 ---
