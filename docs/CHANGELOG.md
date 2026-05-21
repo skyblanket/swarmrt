@@ -31,6 +31,101 @@ The `eval/` directory holds an LLM code-gen benchmark: 10 prompts × 3 models (K
 
 ---
 
+## 2026-05-21 — Reviewer-driven hardening (rounds 2–7)
+
+Six rounds of external review (Claude web agent + Codex). Each round
+filed a markdown report against the latest commit; this entry
+consolidates what each round shipped. The full narrative is at
+[`docs/notes/REVIEW_HARDENING.md`](notes/REVIEW_HARDENING.md), the
+remaining open item is the lone entry in
+[`docs/notes/KNOWN_ISSUES.md`](notes/KNOWN_ISSUES.md).
+
+**Round 2** — first deep audit. Fixed: per-process panic recovery
+(replaced `exit(1)` with scheduler `longjmp` so a panic in one process
+no longer kills the runtime), HTTP POST body delivery (length-prefix
+off-by-one), ETS enumeration (`ets_list`/`ets_count` always returned
+empty), scheduler count auto-detect (was hardcoded 2),
+compile-time arity check + did-you-mean suggestions + halt-on-unknown
+function, hot-reload doc honesty. Distribution now uses a
+type-preserving binary marshal/unmarshal instead of JSON so tuples
+stay tuples and atoms stay atoms over the wire.
+
+**Round 3** — process lifecycle fixes. `spawn(fun() {...})` lambdas
+returned pid 0 silently (only N_CALL spawns registered a trampoline);
+now goes through a generic lambda trampoline. EXIT/DOWN signal reasons
+arrive as the panic message string instead of an opaque `-1`. First
+attempt at the arena slot-reuse race documented since round 2:
+1-slot deferred-free per scheduler.
+
+**Round 4** — distribution + heavier race attempt. Added
+`SW_VAL_REMOTE_PID` so `self()` over the wire becomes a routable pid
+on the receiver; `sw_send_dispatch` routes by type; receiving node
+auto-registers the sender on first packet so `send(from, reply)`
+works in the natural read. `arena->next_pid` starts at 1 (pid 0 is
+the no-pid sentinel — the very first spawned process used to be
+silently invisible to `sw_find_by_pid`). 1-slot ring widened to
+64-slot deferred-free.
+
+**Round 5** — distribution framing + deterministic race fix. (1) TCP
+framing: `dist_handler` used to consume one length-prefixed frame
+per `PORT_DATA` event and drop the rest; per-peer `rx_buf` + drain
+loop fixes both coalesced reads and split reads (verified: 10k
+back-to-back messages, 50KB payloads). (2) Arena race: ripped out
+the 64-slot ring (it actually regressed 40k/50k thresholds —
+allocation-rate pressure, not the right shape). Replaced with the
+deterministic ABA pattern: per-slot `_Atomic generation` +
+`sw_spinlock_t ctx_lock`. `sw_safe_swap_into` copies ctx to a
+stack-local under the lock, re-checks the generation, then calls a
+new asm `sw_context_swap_from_copy` that reads from the local
+copy — `process_init_arena` can no longer tear the swap. New asm
+added for x86_64 SysV, x86_64 Windows, and ARM64.
+
+**Round 6** — message envelope leak + audit cleanups. `emit_receive`
+used to leak the `sw_msg_t` envelope on every matched receive — the
+per-thread `tls_msg_free` freelist stayed empty and `msg_alloc`
+always missed straight to `malloc`. Exposed `sw_msg_release()` and
+wired it into the codegen so envelopes return to the freelist; the
+payload `sw_val_t` is left alive on purpose since pattern bindings
+alias subparts of it. CI stress widened to 50 runs at 90% threshold
+across both multi- and single-scheduler variants (the round-5 fix
+closed the original race deterministically but a different race in
+the message-send path still fires on Linux x86_64 spawn-storms;
+single-scheduler reproduces, so the multi-only run wasn't catching
+it). Round-4 audit cleanups: `pmap` accepts either arg order like
+`map`/`filter`; `map_has_key` matches `map_get`'s atom-vs-string
+fallback; `expect(nil, msg)` now panics (the literal `nil` lexes to
+atom `'nil'`, not `SW_VAL_NIL`, so the previous strict-type check
+fell through and silently returned the atom).
+
+**Round 7** — Codex review caught CI was green while seven phase
+tests were failing locally (`make test-sw` runs only the .sw
+language suite, not the C-side runtime tests). One root cause for
+all seven: `sw_spawn_link` set `tls_scheduler` to a non-parent
+scheduler to avoid cooperative-deadlock, but `sw_spawn_opts` picks
+its scheduler from the global `next_sched` round-robin counter and
+**ignored `tls_scheduler` entirely** — the whole "force child to a
+different scheduler" block was a no-op. Children would routinely
+land on the parent's scheduler, get stuck behind the parent's
+`usleep`/blocking-receive, and the test would see 2/3 group members
+instead of 3/3. Fix: separate TLS slot `tls_spawn_override`,
+honoured by `sw_spawn_opts` when non-NULL. After the fix all 8 phase
+test files pass 100% — phase 2 (GenServer/Supervisor), 3 (ETS, 15
+tests), 4 (Agent/App/DynSup, 14 tests), 5 (StateMachine/PG, 12
+tests), 6 (TCP, 6), 7 (hot reload, 5), 8 (GC, 5), 9 (distribution,
+4). All wired into CI. README example now mirrors
+`examples/counter.sw` verbatim so what you see is what `./counter`
+prints (`Count: 8` + `Counter stopped at 8`).
+
+What's still open: one spawn-storm race in the message-send path on
+Linux x86_64 (single-scheduler reproduces; 80k spawn workload, ~16%
+crash rate under stress). Heap-corruption-then-strdup-SIGSEGV
+pattern, not the ctx-tear race. macOS arm64 + ASan doesn't
+reproduce. Documented in KNOWN_ISSUES with the suspect (mailbox/atom
+allocator interaction) and the next investigation step
+(helgrind/TSan on Linux).
+
+---
+
 ## 2026-05-20 — REPL builtin parity + eval/ benchmark
 
 The previous self-critique flagged two embarrassments: (a) the REPL
