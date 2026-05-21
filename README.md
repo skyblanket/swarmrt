@@ -36,11 +36,13 @@ count: 8
 
 SwarmRT is a runtime + language for writing concurrent programs that compile to a single native binary.
 
-It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, hot reload, distribution — and reimplements them as a ~20K-line C library plus an ahead-of-time compiler that emits native code. No interpreter. No bytecode. No VM warm-up. Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
+It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, hot reload, distribution — and reimplements them as a ~13K-line core C runtime + ~6K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~3K-line ahead-of-time compiler that emits native code. No interpreter. No bytecode. No VM warm-up. Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
+
+(The full `src/` tree is ~42K lines; the rest is tests, benchmarks, three earlier prototype runtimes kept for reference, and tools like the search CLI and MCP server.)
 
 It exists because the same workload BEAM was built for in 1986 — *thousands of long-lived, message-passing, partial-failure-tolerant processes* — is exactly what you need when you're running a swarm of AI agents. SwarmRT is the substrate behind [swarm-code](https://github.com/skyblanket/swarm-code) and a growing pile of agent-driven tools.
 
-The language is called **`sw`** and is designed so an LLM can write it correctly on the first try.
+The language is called **`sw`** and is designed so an LLM can write it correctly on the first try. There's an [`eval/`](eval/) directory that measures this with real numbers: single-shot code-gen against 10 prompts × 3 models, no agent harness, no retries. Latest result: **Kimi K2.6 80%, Kimi K2.5 70%** ([results](eval/results/results.md)).
 
 ---
 
@@ -281,7 +283,7 @@ The [`lib/`](lib/) directory ships modules that auto-resolve via `import` — no
 
 | Module | What it gives you |
 |---|---|
-| `Std` | List / map / string helpers (range, take, drop, zip, partition, sort, unique, find, any, all, sum, product, group_by, …) |
+| `Std` | List / map / string helpers (range, take, drop, nth/at, zip, partition, sort, unique, find, any, all, sum, product, group_by, chunk_every, intersperse, …) — see `lib/Std.sw` for the full list. |
 | `Mcp` | Model Context Protocol client + server (JSON-RPC over stdio) |
 | `Embed` | Embeddings client for any OpenAI-compatible `/v1/embeddings` endpoint |
 | `Vec` | ETS-backed cosine-similarity vector store (`Vec.new / add / search / size`) |
@@ -391,7 +393,9 @@ docs/                      Long-form documentation
 
 ## Status
 
-Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). New runtime features land regularly — see [CHANGELOG](docs/CHANGELOG.md). Breaking changes are called out in the changelog and the language reference is the source of truth.
+Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; Linux x86_64 builds and runs (CI: [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)) but has one known issue with shutdown on long-running programs — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md). Windows is best-effort.
+
+New runtime features land regularly — see [CHANGELOG](docs/CHANGELOG.md). Breaking changes are called out in the changelog and the language reference is the source of truth.
 
 ---
 
