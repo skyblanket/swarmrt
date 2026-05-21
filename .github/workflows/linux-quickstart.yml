@@ -1,0 +1,48 @@
+name: Linux quickstart
+
+# Runs the exact README quickstart on a fresh Ubuntu image. If this
+# job is red, the README is lying — fix the README (or the build) before
+# pushing. Surfaced after a Linux user filed a review where every README
+# step failed; this guards against that regression coming back.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quickstart:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install README-listed system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Build swc + libswarmrt
+        run: make swc libswarmrt
+
+      - name: Run the README quickstart verbatim
+        run: |
+          ./bin/swc build examples/counter.sw -o counter
+          # `counter` is a long-running actor demo — give it a few seconds
+          # then check it produced the documented output.
+          timeout 5s ./counter > counter.out || true
+          grep -q "Count:" counter.out
+
+      - name: Run a few more examples
+        run: |
+          set -e
+          ./bin/swc build examples/hello.sw -o /tmp/hello
+          /tmp/hello | grep -q "Hello"
+
+          ./bin/swc build examples/lambda.sw -o /tmp/lambda
+          /tmp/lambda > /tmp/lambda.out
+          test -s /tmp/lambda.out
+
+      - name: Run the sw test suite
+        run: make test-sw

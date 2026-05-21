@@ -47,13 +47,22 @@ The language is called **`sw`** and is designed so an LLM can write it correctly
 ## Quickstart (60 seconds)
 
 ```bash
+# Install the C system libraries SwarmRT links against:
+#   Ubuntu / Debian:
+sudo apt-get install -y build-essential libsqlite3-dev libssl-dev zlib1g-dev
+#   macOS (Homebrew):
+brew install sqlite openssl@3 zlib
+
+# Then:
 git clone https://github.com/skyblanket/swarmrt && cd swarmrt
 make swc libswarmrt          # builds the compiler + runtime library
 ./bin/swc build examples/counter.sw -o counter
 ./counter
 ```
 
-That's it. No package manager, no language server install, no VM image. The compiler is one binary, the runtime is one static library, and `cc` is the only external tool.
+That's it. No package manager for the language, no language server install, no VM image. The compiler is one binary and the runtime is one static library.
+
+**Dependencies (small list, all in every major distro):** `cc` (clang or gcc) + pthreads (libc), plus four system libraries — `-lsqlite3`, `-lssl -lcrypto`, `-lz`, `-lm`. `sqlite` powers `db_*` builtins, openssl powers the WebSocket handshake, zlib is for PDF decompression, libm is for codegen-emitted math. If you want a truly minimal build later, those modules can be feature-flagged off.
 
 ---
 
@@ -64,7 +73,7 @@ That's it. No package manager, no language server install, no VM image. The comp
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
 | **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Hot code reload. Process linking and monitoring. |
 | **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
-| **Avoiding language overhead** | One binary, no VM, no GC pauses (per-process generational GC means no global stop-the-world), <10ms startup, dependency-free deploy. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses (per-process generational GC means no global stop-the-world), <10ms startup. The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
 
 ---
 
@@ -88,7 +97,7 @@ fun main() {
     pid = spawn(worker())
 
     # Pipeline: build a list, map send over it, collect replies.
-    [1, 2, 3, 4, 5] |> each(fn(n) { send(pid, {'square', n, self()}) })
+    [1, 2, 3, 4, 5] |> each(fun(n) { send(pid, {'square', n, self()}) })
     results = collect(5, [])
     send(pid, 'stop')
 

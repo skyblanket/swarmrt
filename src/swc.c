@@ -10,8 +10,12 @@
  * otonomy.ai
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -393,9 +397,12 @@ int main(int argc, char **argv) {
     /* Compile with cc */
     char cmd_buf[2048];
 #ifdef __APPLE__
-    const char *extra_libs = "-lsqlite3";
+    /* macOS links libm via libSystem implicitly; -lm is harmless. */
+    const char *extra_libs = "-lsqlite3 -lm";
 #else
-    const char *extra_libs = "-lssl -lcrypto -lsqlite3";
+    /* Linux glibc requires explicit -lm — generated C uses fmod() and
+     * friends, and ld --as-needed rejects implicit libm dependencies. */
+    const char *extra_libs = "-lssl -lcrypto -lsqlite3 -lz -lm";
 #endif
 
     /* --target=<triple> support. Recipes:

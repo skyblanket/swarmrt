@@ -209,6 +209,17 @@ fun init(lst) {
     else { take(lst, length(lst) - 1) }
 }
 
+# nth(lst, i) -> 0-indexed element. Panics if i is out of range.
+# `elem/2` is the tuple-only positional accessor; this is the list
+# equivalent.  `Std.at` is an alias for the same operation.
+fun nth(lst, i) {
+    if (i < 0) { panic("Std.nth: negative index") }
+    else { if (length(lst) <= i) { panic("Std.nth: index out of range") }
+           else { if (i == 0) { hd(lst) } else { nth(tl(lst), i - 1) } } }
+}
+
+fun at(lst, i) { nth(lst, i) }
+
 # chunk_every(lst, size) -> list of size-N sublists. Last chunk may be shorter.
 fun chunk_every(lst, size) { _chunk_acc(lst, size, []) }
 fun _chunk_acc(lst, size, acc) {

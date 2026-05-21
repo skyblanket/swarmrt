@@ -1,14 +1,26 @@
 # SwarmRT Makefile
 
 CC = cc
-CFLAGS = -Wall -Wextra -Wno-unused-function -g -O2 -pthread -D_GNU_SOURCE -D_DARWIN_C_SOURCE
-CLANG_CHECK := $(shell $(CC) -Wno-macro-redefined -x c -c /dev/null -o /dev/null 2>/dev/null && echo yes)
+# Per-source files use `#ifndef _GNU_SOURCE / #define _GNU_SOURCE` guards
+# so -D_GNU_SOURCE is no longer needed on the command line. Kept the
+# define on Darwin only because some macOS-specific APIs (kqueue, etc.)
+# still want _DARWIN_C_SOURCE visible early. The Linux build uses neither.
+CFLAGS = -Wall -Wextra -Wno-unused-function -g -O2 -pthread
+ifeq ($(shell uname),Darwin)
+CFLAGS += -D_DARWIN_C_SOURCE
+endif
+
+# `-Wno-macro-redefined` is a clang flag — gcc warns "unrecognized
+# command-line option" for it. Probe stderr (not just exit code) so we
+# only enable it where it's actually understood silently.
+CLANG_CHECK := $(shell $(CC) -Wno-macro-redefined -x c -c /dev/null -o /dev/null 2>&1 | grep -qi "unrecognized\|unknown" && echo no || echo yes)
 ifeq ($(CLANG_CHECK),yes)
 CFLAGS += -Wno-macro-redefined
 endif
+
 LDFLAGS = -pthread -lz -lsqlite3
 ifneq ($(shell uname),Darwin)
-LDFLAGS += -lssl -lcrypto
+LDFLAGS += -lssl -lcrypto -lm
 endif
 
 # On macOS Homebrew installs sqlite headers under /opt/homebrew/opt/sqlite3.
@@ -29,7 +41,7 @@ EXAMPLES_DIR = examples
 # Core object files (needed by all native targets since process_exit hooks into all modules)
 CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
             swarmrt_phase4 swarmrt_phase5 swarmrt_hotload swarmrt_io swarmrt_gc swarmrt_node \
-            swarmrt_lang swarmrt_http
+            swarmrt_lang swarmrt_http swarmrt_pdf
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets

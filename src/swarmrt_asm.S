@@ -353,3 +353,11 @@ CNAME(sw_rdtsc):
     ret
 
 #endif /* __aarch64__ */
+
+/* Tell GNU ld this object doesn't need an executable stack. Without the
+ * marker, ld defaults to "executable stack" if any input object lacks it
+ * — that's a security warning AND a perf hit on Linux. macOS uses Mach-O
+ * and ignores ELF section directives, so we gate on __ELF__. */
+#if defined(__ELF__)
+.section .note.GNU-stack,"",%progbits
+#endif
