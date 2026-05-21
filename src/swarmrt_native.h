@@ -270,6 +270,20 @@ struct sw_process {
     sw_reg_entry_t *reg_entry;         /* Registry entry (or NULL) */
     void *ets_tables;                  /* Linked list of owned ETS tables */
 
+    /* === ABA / arena slot-reuse defense ===
+     *
+     * `generation` is bumped on every process_init_arena. The scheduler
+     * samples it at pick time and verifies it again before swapping in;
+     * if the slot was reused in between, the picked process is stale and
+     * we skip it.
+     *
+     * `ctx_lock` serialises the ctx write in process_init_arena against
+     * the ctx copy in sw_safe_swap_into. Once copied to a local struct,
+     * the asm swap reads from the local copy — process_init_arena can no
+     * longer race with the asm reads (which used to be the crash path
+     * documented in R2-#4 / R3-C / R4-B). */
+    _Atomic uint64_t generation;
+    sw_spinlock_t ctx_lock;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -315,24 +329,6 @@ struct sw_scheduler {
     volatile int active;
     volatile int should_exit;
 
-    /* Deferred-free ring — see process_destroy. Holds slot+block
-     * indices for the most-recently destroyed processes. Slots only
-     * become reusable after N more destroys on the same scheduler
-     * pass through (i.e. the slot has been "cold" for N destroy
-     * intervals = tens to hundreds of microseconds in practice).
-     * The first iteration of this fix used N=1 (single pending),
-     * which the reviewer measured as still racy — the deferral
-     * interval was the same order as the swap-in-flight window, so
-     * slots could be re-released during the race. Bumping to N=64
-     * grows the wall-clock deferral by ~64x without much cost
-     * (we keep up to 64 slots out of circulation per scheduler at a
-     * time). See R2-#4 / R3-C / R4-B in docs/notes/KNOWN_ISSUES.md.
-     * -1 in either array means that ring slot is empty. */
-#define SW_PENDING_FREE_RING 64
-    int32_t pending_free_slots[SW_PENDING_FREE_RING];
-    int32_t pending_free_blocks[SW_PENDING_FREE_RING];
-    uint32_t pending_free_head;   /* next index to evict (oldest) */
-    uint32_t pending_free_count;  /* how many entries are live */
 };
 
 /* === Swarm (the runtime) === */
@@ -382,6 +378,14 @@ struct sw_swarm {
 
 /* === Assembly Context Switch === */
 extern void sw_context_swap(sw_process_t *from, sw_process_t *to);
+
+/* Swap into a context captured in a caller-owned struct rather than read
+ * straight from `to->ctx`. Use this on the scheduler → process direction
+ * after copying the destination ctx under proc->ctx_lock — the copy
+ * eliminates the swap-in / process_init_arena race documented as R2-#4
+ * in KNOWN_ISSUES. Saves from->ctx exactly like sw_context_swap. */
+extern void sw_context_swap_from_copy(sw_process_t *from,
+                                      const sw_context_t *to_ctx);
 extern uint64_t sw_rdtsc(void);
 
 /* === Public API === */

@@ -55,13 +55,22 @@ typedef struct sw_node {
     int active;
 } sw_node_t;
 
-/* Peer (remote node) connection */
+/* Peer (remote node) connection.
+ *
+ * `rx_buf` accumulates bytes from the TCP byte stream so dist_handler
+ * can drain whatever framed messages are complete on each PORT_DATA
+ * event. TCP coalesces small writes — without this buffer the handler
+ * would consume one frame per read and silently drop the rest. See
+ * dist_handler in swarmrt_node.c. */
 typedef struct sw_peer {
     char name[SW_NODE_NAME_MAX];
     char host[64];
     uint16_t port;
     sw_port_t *conn;            /* TCP connection to peer */
     int connected;
+    uint8_t *rx_buf;
+    uint32_t rx_len;
+    uint32_t rx_cap;
 } sw_peer_t;
 
 /* Remote message envelope (serialized over TCP) */

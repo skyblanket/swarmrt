@@ -27,6 +27,7 @@
 
 .text
 .globl CNAME(sw_context_swap)
+.globl CNAME(sw_context_swap_from_copy)
 .globl CNAME(sw_process_trampoline)
 .globl CNAME(sw_rdtsc)
 
@@ -82,6 +83,39 @@ CNAME(sw_context_swap):
      * For resuming processes: [rsp] has the saved return address from `call`.
      * For new processes: [rsp] was pre-initialized with trampoline address. */
     movq CTX_OFFSET+0x30(%rsi), %rsp
+
+    ret
+
+/*
+ * void sw_context_swap_from_copy(sw_process_t *from, const sw_context_t *to_ctx)
+ *
+ * Same save side as sw_context_swap (writes through `from` at CTX_OFFSET),
+ * but restores from a caller-owned ctx struct rather than from
+ * `to->ctx`. The C wrapper (sw_safe_swap_into) copies the destination
+ * ctx into a stack-local under proc->ctx_lock so a concurrent
+ * process_init_arena writing the slot cannot tear our read.
+ *
+ *   %rdi = from process
+ *   %rsi = ctx pointer (offset 0 — no CTX_OFFSET adjustment)
+ */
+CNAME(sw_context_swap_from_copy):
+    /* Save current context to 'from' */
+    movq %rbx, CTX_OFFSET+0x00(%rdi)
+    movq %rbp, CTX_OFFSET+0x08(%rdi)
+    movq %r12, CTX_OFFSET+0x10(%rdi)
+    movq %r13, CTX_OFFSET+0x18(%rdi)
+    movq %r14, CTX_OFFSET+0x20(%rdi)
+    movq %r15, CTX_OFFSET+0x28(%rdi)
+    movq %rsp, CTX_OFFSET+0x30(%rdi)
+
+    /* Restore from the ctx struct directly (rsi already points at it) */
+    movq 0x00(%rsi), %rbx
+    movq 0x08(%rsi), %rbp
+    movq 0x10(%rsi), %r12
+    movq 0x18(%rsi), %r13
+    movq 0x20(%rsi), %r14
+    movq 0x28(%rsi), %r15
+    movq 0x30(%rsi), %rsp
 
     ret
 
@@ -219,6 +253,55 @@ sw_context_swap:
     movq CTX_OFFSET+0x40(%rdx), %rsp
     ret
 
+/* Windows variant of sw_context_swap_from_copy. rdx points at a
+ * caller-owned sw_context_t (no CTX_OFFSET adjustment). See the
+ * Sys-V comment above sw_context_swap_from_copy for the rationale. */
+.globl sw_context_swap_from_copy
+sw_context_swap_from_copy:
+    movq %rbx, CTX_OFFSET+0x00(%rcx)
+    movq %rbp, CTX_OFFSET+0x08(%rcx)
+    movq %rdi, CTX_OFFSET+0x10(%rcx)
+    movq %rsi, CTX_OFFSET+0x18(%rcx)
+    movq %r12, CTX_OFFSET+0x20(%rcx)
+    movq %r13, CTX_OFFSET+0x28(%rcx)
+    movq %r14, CTX_OFFSET+0x30(%rcx)
+    movq %r15, CTX_OFFSET+0x38(%rcx)
+    movq %rsp, CTX_OFFSET+0x40(%rcx)
+
+    movaps %xmm6,  CTX_OFFSET+0x50(%rcx)
+    movaps %xmm7,  CTX_OFFSET+0x60(%rcx)
+    movaps %xmm8,  CTX_OFFSET+0x70(%rcx)
+    movaps %xmm9,  CTX_OFFSET+0x80(%rcx)
+    movaps %xmm10, CTX_OFFSET+0x90(%rcx)
+    movaps %xmm11, CTX_OFFSET+0xA0(%rcx)
+    movaps %xmm12, CTX_OFFSET+0xB0(%rcx)
+    movaps %xmm13, CTX_OFFSET+0xC0(%rcx)
+    movaps %xmm14, CTX_OFFSET+0xD0(%rcx)
+    movaps %xmm15, CTX_OFFSET+0xE0(%rcx)
+
+    movq 0x00(%rdx), %rbx
+    movq 0x08(%rdx), %rbp
+    movq 0x10(%rdx), %rdi
+    movq 0x18(%rdx), %rsi
+    movq 0x20(%rdx), %r12
+    movq 0x28(%rdx), %r13
+    movq 0x30(%rdx), %r14
+    movq 0x38(%rdx), %r15
+
+    movaps 0x50(%rdx), %xmm6
+    movaps 0x60(%rdx), %xmm7
+    movaps 0x70(%rdx), %xmm8
+    movaps 0x80(%rdx), %xmm9
+    movaps 0x90(%rdx), %xmm10
+    movaps 0xA0(%rdx), %xmm11
+    movaps 0xB0(%rdx), %xmm12
+    movaps 0xC0(%rdx), %xmm13
+    movaps 0xD0(%rdx), %xmm14
+    movaps 0xE0(%rdx), %xmm15
+
+    movq 0x40(%rdx), %rsp
+    ret
+
 sw_process_trampoline:
     /* r12 = process pointer (set during spawn) */
     movq ARG_OFFSET(%r12), %rcx     /* arg → first argument (rcx on Windows) */
@@ -254,6 +337,7 @@ sw_rdtsc:
 
 .text
 .globl CNAME(sw_context_swap)
+.globl CNAME(sw_context_swap_from_copy)
 .globl CNAME(sw_process_trampoline)
 .globl CNAME(sw_rdtsc)
 
@@ -320,6 +404,49 @@ CNAME(sw_context_swap):
     br x10
 
 1:  /* Resume point after context switch */
+    ret
+
+/*
+ * void sw_context_swap_from_copy(sw_process_t *from, const sw_context_t *to_ctx)
+ *
+ * Same save side as sw_context_swap. Restore side uses x1 as a direct
+ * pointer to a caller-owned sw_context_t (no CTX_OFFSET adjustment).
+ * The C wrapper (sw_safe_swap_into) copies destination ctx into a
+ * stack-local under proc->ctx_lock so the read is race-free.
+ */
+CNAME(sw_context_swap_from_copy):
+    add x9, x0, #CTX_OFFSET
+
+    stp x19, x20, [x9, #0x00]
+    stp x21, x22, [x9, #0x10]
+    stp x23, x24, [x9, #0x20]
+    stp x25, x26, [x9, #0x30]
+    stp x27, x28, [x9, #0x40]
+    stp x29, x30, [x9, #0x50]
+
+    mov x10, sp
+    str x10, [x9, #0x60]
+
+    adr x10, 2f
+    str x10, [x9, #0x68]
+
+    /* x1 already points at the ctx struct */
+    mov x9, x1
+
+    ldp x19, x20, [x9, #0x00]
+    ldp x21, x22, [x9, #0x10]
+    ldp x23, x24, [x9, #0x20]
+    ldp x25, x26, [x9, #0x30]
+    ldp x27, x28, [x9, #0x40]
+    ldp x29, x30, [x9, #0x50]
+
+    ldr x10, [x9, #0x60]
+    mov sp, x10
+
+    ldr x10, [x9, #0x68]
+    br x10
+
+2:  /* Resume point after context switch */
     ret
 
 /*

@@ -249,6 +249,15 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
         mb->priv_tail = NULL;
         atomic_store(&mb->waiting, 0);
         mb->count = 0;
+
+        /* Per-slot ctx_lock + generation — guards process_init_arena
+         * against concurrent swap-in. See sw_safe_swap_into for the
+         * read side. Lock value zero-initializes correctly for both
+         * os_unfair_lock (macOS) and pthread_mutex (Linux) — the
+         * arena is calloc-zeroed — but we set it explicitly to make
+         * the intent visible. */
+        slab[i].ctx_lock = (sw_spinlock_t)SW_SPINLOCK_INIT;
+        atomic_store(&slab[i].generation, 0);
     }
 
     /* PID counter starts at 0 */
@@ -324,7 +333,17 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         proc->stack_size = total - page_size;
     }
 
-    /* Initialize context for first context switch → trampoline */
+    /* Initialize context for first context switch → trampoline.
+     *
+     * ctx_lock + generation bump close the slot-reuse race (R2-#4):
+     * a scheduler that picked this slot before reuse is mid-
+     * sw_safe_swap_into, which holds the same lock to copy ctx to a
+     * stack-local before calling asm. If the scheduler's expected
+     * generation no longer matches what we set here, it skips the
+     * swap. See sw_safe_swap_into for the read side. */
+    sw_spin_lock(&proc->ctx_lock);
+    atomic_fetch_add_explicit(&proc->generation, 1, memory_order_release);
+
     memset(&proc->ctx, 0, sizeof(sw_context_t));
     uint8_t *stack_top = (uint8_t *)proc->stack_mem + proc->stack_size;
     stack_top = (uint8_t *)((uintptr_t)stack_top & ~0xFULL);  /* 16-byte align */
@@ -342,6 +361,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
 #endif
     proc->ctx.stack_base = (uint64_t)stack_top;
     proc->ctx.stack_limit = (uint64_t)proc->stack_mem;
+    sw_spin_unlock(&proc->ctx_lock);
     proc->state = SW_PROC_RUNNABLE;
     proc->priority = SW_PRIO_NORMAL;
     proc->fcalls = SWARM_CONTEXT_REDS;
@@ -424,84 +444,19 @@ static void process_destroy(sw_process_t *proc) {
     free(proc->panic_msg);
     proc->panic_msg = NULL;
 
-    /* Return block and slot to the current scheduler's partition —
-     * but DEFERRED BY ONE SCHEDULER ITERATION via the per-scheduler
-     * pending_free pair. Rationale: the high-process-count race
-     * (R2-#4, see KNOWN_ISSUES.md) is on `proc->ctx`. Another
-     * scheduler may still be mid-`sw_context_swap` reading our ctx
-     * fields when this thread starts the destroy; if we immediately
-     * return the slot, sw_spawn can grab it and overwrite ctx
-     * mid-flight. Holding the slot for one tick guarantees any
-     * concurrent context-swap (microseconds) has time to drain.
-     *
-     * Flow:
-     *   1. Flush whatever this scheduler had pending from the *previous*
-     *      iteration into the partition free list.
-     *   2. Stash the current slot/block as the new pending.
-     *
-     * Net result: the slot becomes reusable after one full loop
-     * iteration on this scheduler, instead of immediately. */
+    /* Return block and slot to the current scheduler's partition
+     * immediately. The slot-reuse race (R2-#4) is now closed by the
+     * per-slot ctx_lock + generation counter on the swap-in path, not
+     * by deferring the free here. See sw_safe_swap_into in scheduler_loop
+     * for the read side, and process_init_arena for the write side. */
     sw_scheduler_t *sched = tls_scheduler;
-    if (sched) {
-        uint32_t part_id = sched->id;
-        if (part_id >= g_swarm->arena.num_partitions) part_id = 0;
-        sw_arena_partition_t *part = &g_swarm->arena.partitions[part_id];
-
-        /* Ring-buffer eviction policy:
-         *   - if ring isn't full yet, just append.
-         *   - if it's full, evict the oldest entry (head) to the
-         *     partition free list, then overwrite that slot.
-         * Net result: any slot has been "cold" for at least
-         * SW_PENDING_FREE_RING destroy operations on this scheduler
-         * before it goes back to the allocator. */
-        uint32_t ring = SW_PENDING_FREE_RING;
-        if (sched->pending_free_count == ring) {
-            int32_t old_slot = sched->pending_free_slots[sched->pending_free_head];
-            int32_t old_block = sched->pending_free_blocks[sched->pending_free_head];
-            sw_spin_lock(&part->lock);
-            if (old_slot >= 0) {
-                part_push_pid(part, (uint32_t)old_slot);
-                part_push_block(part, (uint32_t)old_block);
-            }
-            sw_spin_unlock(&part->lock);
-            sched->pending_free_slots[sched->pending_free_head] = (int32_t)slot;
-            sched->pending_free_blocks[sched->pending_free_head] = (int32_t)block_idx;
-            sched->pending_free_head = (sched->pending_free_head + 1) % ring;
-        } else {
-            uint32_t tail = (sched->pending_free_head + sched->pending_free_count) % ring;
-            sched->pending_free_slots[tail] = (int32_t)slot;
-            sched->pending_free_blocks[tail] = (int32_t)block_idx;
-            sched->pending_free_count++;
-        }
-    } else {
-        /* Called from a non-scheduler thread (shouldn't happen on the
-         * normal hot path). Fall back to the legacy immediate-push. */
-        sw_arena_partition_t *part = &g_swarm->arena.partitions[0];
-        sw_spin_lock(&part->lock);
-        part_push_pid(part, slot);
-        part_push_block(part, block_idx);
-        sw_spin_unlock(&part->lock);
-    }
-}
-
-/* Flush a scheduler's entire pending_free ring into its partition.
- * Called at scheduler shutdown so leftover slots don't leak forever. */
-static void flush_pending_free(sw_scheduler_t *sched) {
-    if (!sched || sched->pending_free_count == 0) return;
-    uint32_t part_id = sched->id;
+    uint32_t part_id = sched ? sched->id : 0;
     if (part_id >= g_swarm->arena.num_partitions) part_id = 0;
     sw_arena_partition_t *part = &g_swarm->arena.partitions[part_id];
     sw_spin_lock(&part->lock);
-    for (uint32_t k = 0; k < sched->pending_free_count; k++) {
-        uint32_t idx = (sched->pending_free_head + k) % SW_PENDING_FREE_RING;
-        if (sched->pending_free_slots[idx] >= 0) {
-            part_push_pid(part, (uint32_t)sched->pending_free_slots[idx]);
-            part_push_block(part, (uint32_t)sched->pending_free_blocks[idx]);
-        }
-    }
+    part_push_pid(part, slot);
+    part_push_block(part, block_idx);
     sw_spin_unlock(&part->lock);
-    sched->pending_free_head = 0;
-    sched->pending_free_count = 0;
 }
 
 /* ============================================================================
@@ -739,6 +694,38 @@ static void overflow_rq_push(sw_process_t *proc) {
 }
 
 /* ============================================================================
+ * SAFE SWAP-IN
+ * ============================================================================
+ *
+ * Closes the high-process-count crash (R2-#4): scheduler X swapping into
+ * P concurrently with the slot being reused for Q by another scheduler.
+ *
+ * Earlier attempts (R3-C 1-slot ring, R4-B 64-slot ring) just delayed the
+ * slot return — heuristic, not deterministic, and R4-B actually regressed
+ * 40k/50k thresholds by spreading allocator pressure.
+ *
+ * R5 approach: under per-slot ctx_lock, (1) verify the generation we saw
+ * at pick time still matches and (2) copy ctx to a stack-local. After
+ * the unlock, the asm reads from the local copy — process_init_arena on
+ * any other thread can run freely; it can't tear our snapshot. Returns
+ * 0 if the swap happened, -1 if the slot was reused before we could swap
+ * (caller treats this as "process disappeared, pick something else"). */
+static int sw_safe_swap_into(sw_process_t *from, sw_process_t *to,
+                             uint64_t expected_gen) {
+    sw_context_t local_ctx;
+    sw_spin_lock(&to->ctx_lock);
+    uint64_t actual = atomic_load_explicit(&to->generation, memory_order_acquire);
+    if (actual != expected_gen) {
+        sw_spin_unlock(&to->ctx_lock);
+        return -1;
+    }
+    local_ctx = to->ctx;
+    sw_spin_unlock(&to->ctx_lock);
+    sw_context_swap_from_copy(from, &local_ctx);
+    return 0;
+}
+
+/* ============================================================================
  * SCHEDULER THREAD
  * ============================================================================ */
 
@@ -758,6 +745,13 @@ static void scheduler_loop(sw_scheduler_t *sched) {
         }
 
         if (proc) {
+            /* Sample the generation BEFORE any side effect. If another
+             * scheduler reuses this slot between pick and swap, the
+             * generation will have advanced and sw_safe_swap_into
+             * returns -1. */
+            uint64_t expected_gen = atomic_load_explicit(&proc->generation,
+                                                         memory_order_acquire);
+
             /* Check if this process was killed by an exit signal */
             if (proc->kill_flag) {
                 proc->state = SW_PROC_EXITING;
@@ -773,8 +767,15 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             sched->current = proc;
             tls_current = proc;
 
-            /* Context switch to process (runs on process's own stack) */
-            sw_context_swap(&sched->sched_proc, proc);
+            /* Context switch to process (runs on process's own stack).
+             * sw_safe_swap_into copies ctx under proc->ctx_lock so the
+             * asm reads a stable snapshot — see R5-B in KNOWN_ISSUES. */
+            if (sw_safe_swap_into(&sched->sched_proc, proc, expected_gen) < 0) {
+                /* Slot was reused between pick and swap — just loop. */
+                tls_current = NULL;
+                sched->current = NULL;
+                continue;
+            }
 
             /* Process yielded, blocked on receive, or finished */
             tls_current = NULL;
@@ -910,12 +911,6 @@ int sw_init(const char *name, uint32_t num_schedulers) {
 
         sched->id = i;
         sched->swarm = g_swarm;
-        for (int k = 0; k < SW_PENDING_FREE_RING; k++) {
-            sched->pending_free_slots[k] = -1;
-            sched->pending_free_blocks[k] = -1;
-        }
-        sched->pending_free_head = 0;
-        sched->pending_free_count = 0;
 
         /* Initialize MPSC queues — stub is both head and tail */
         for (int p = 0; p < SW_PRIO_NUM; p++) {
@@ -976,9 +971,6 @@ void sw_shutdown(int swarm_id) {
         pthread_cond_signal(&sched->runq.idle_cond);
         pthread_mutex_unlock(&sched->runq.idle_lock);
         pthread_join(sched->thread, NULL);
-        /* Drop the slot this scheduler had pending from its last
-         * iteration so subsequent shutdown logic sees it as free. */
-        flush_pending_free(sched);
         pthread_mutex_destroy(&sched->runq.idle_lock);
         pthread_cond_destroy(&sched->runq.idle_cond);
         free(sched);

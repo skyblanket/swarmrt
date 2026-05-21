@@ -323,6 +323,66 @@ static sw_peer_t *find_peer(const char *name) {
     return NULL;
 }
 
+/* Locate the peer entry that owns this TCP connection. Used by
+ * dist_handler to find where to append incoming bytes for framing.
+ * Caller must hold g_dist_lock. */
+static sw_peer_t *find_peer_by_conn_locked(sw_port_t *conn) {
+    if (!conn) return NULL;
+    for (uint32_t i = 0; i < g_peer_count; i++) {
+        if (g_peers[i].conn == conn) return &g_peers[i];
+    }
+    return NULL;
+}
+
+/* Append bytes to a peer's rx buffer, growing as needed. Single-writer
+ * (dist_handler) so no lock needed on the buffer fields themselves. */
+static void peer_rx_append(sw_peer_t *peer, const uint8_t *data, uint32_t len) {
+    if (peer->rx_len + len > peer->rx_cap) {
+        uint32_t nc = peer->rx_cap ? peer->rx_cap : 1024;
+        while (nc < peer->rx_len + len) nc *= 2;
+        peer->rx_buf = (uint8_t *)realloc(peer->rx_buf, nc);
+        peer->rx_cap = nc;
+    }
+    memcpy(peer->rx_buf + peer->rx_len, data, len);
+    peer->rx_len += len;
+}
+
+/* Discard `consumed` bytes from the head of the rx buffer. */
+static void peer_rx_consume(sw_peer_t *peer, uint32_t consumed) {
+    if (consumed >= peer->rx_len) {
+        peer->rx_len = 0;
+        return;
+    }
+    memmove(peer->rx_buf, peer->rx_buf + consumed, peer->rx_len - consumed);
+    peer->rx_len -= consumed;
+}
+
+/* Create a placeholder peer for a freshly-accepted incoming connection.
+ * The name is filled in lazily by handle_remote_data when the first
+ * framed message arrives (we don't know who connected to us until we
+ * parse the sw_remote_msg_t header). Returns NULL if no slot available
+ * — caller falls back to inline single-frame processing. */
+static sw_peer_t *register_inbound_conn(sw_port_t *conn) {
+    pthread_mutex_lock(&g_dist_lock);
+    /* Already registered? */
+    for (uint32_t i = 0; i < g_peer_count; i++) {
+        if (g_peers[i].conn == conn) {
+            pthread_mutex_unlock(&g_dist_lock);
+            return &g_peers[i];
+        }
+    }
+    if (g_peer_count >= SW_NODE_MAX_PEERS) {
+        pthread_mutex_unlock(&g_dist_lock);
+        return NULL;
+    }
+    sw_peer_t *p = &g_peers[g_peer_count++];
+    memset(p, 0, sizeof(*p));
+    p->conn = conn;
+    p->connected = 1;
+    pthread_mutex_unlock(&g_dist_lock);
+    return p;
+}
+
 /* Serialize and send a remote message over TCP */
 static int send_remote_msg(sw_port_t *conn, sw_remote_msg_t *hdr,
                            const void *payload, uint32_t payload_len) {
@@ -354,26 +414,43 @@ static void handle_remote_data(uint8_t *data, uint32_t len, sw_port_t *conn) {
      * we've seen it on this connection — happens when alpha connects
      * to beta (only alpha's side called node_connect, but beta needs
      * to know alpha as a peer to send replies via sw_node_send_pid).
-     * The conn already exists; we just bind it to the from_node name
-     * so find_peer() can locate it later. */
+     *
+     * dist_handler creates a placeholder peer (name="") for every
+     * incoming PORT_ACCEPT so the rx buffer has a home. The first
+     * framed message gives us hdr->from_node — we promote the
+     * placeholder to a named peer here. If we already have a named
+     * peer for this name (rare; would require a reconnect or
+     * crossed connect), keep the placeholder named for this conn so
+     * find_peer_by_conn_locked still resolves it. */
     if (conn && hdr->from_node[0]) {
         pthread_mutex_lock(&g_dist_lock);
-        sw_peer_t *existing = NULL;
+        sw_peer_t *placeholder = NULL;
         for (uint32_t i = 0; i < g_peer_count; i++) {
-            if (strcmp(g_peers[i].name, hdr->from_node) == 0) {
-                existing = &g_peers[i];
+            if (g_peers[i].conn == conn && !g_peers[i].name[0]) {
+                placeholder = &g_peers[i];
                 break;
             }
         }
-        if (!existing && g_peer_count < SW_NODE_MAX_PEERS) {
-            sw_peer_t *p = &g_peers[g_peer_count++];
-            memset(p, 0, sizeof(*p));
-            strncpy(p->name, hdr->from_node, SW_NODE_NAME_MAX - 1);
-            p->conn = conn;
-            p->connected = 1;
-        } else if (existing && !existing->conn) {
-            existing->conn = conn;
-            existing->connected = 1;
+        if (placeholder) {
+            strncpy(placeholder->name, hdr->from_node, SW_NODE_NAME_MAX - 1);
+        } else {
+            sw_peer_t *existing = NULL;
+            for (uint32_t i = 0; i < g_peer_count; i++) {
+                if (strcmp(g_peers[i].name, hdr->from_node) == 0) {
+                    existing = &g_peers[i];
+                    break;
+                }
+            }
+            if (!existing && g_peer_count < SW_NODE_MAX_PEERS) {
+                sw_peer_t *p = &g_peers[g_peer_count++];
+                memset(p, 0, sizeof(*p));
+                strncpy(p->name, hdr->from_node, SW_NODE_NAME_MAX - 1);
+                p->conn = conn;
+                p->connected = 1;
+            } else if (existing && !existing->conn) {
+                existing->conn = conn;
+                existing->connected = 1;
+            }
         }
         pthread_mutex_unlock(&g_dist_lock);
     }
@@ -428,18 +505,40 @@ static void dist_handler(void *arg) {
             sw_port_accept_t *acc = (sw_port_accept_t *)msg;
             /* Transfer conn ownership to this process */
             sw_port_controlling_process(acc->conn, sw_self());
+            /* Pre-register a placeholder peer keyed by conn so PORT_DATA
+             * has somewhere to buffer bytes. handle_remote_data fills in
+             * the peer name on the first complete frame. */
+            register_inbound_conn(acc->conn);
             free(msg);
 
         } else if (tag == SW_TAG_PORT_DATA) {
             sw_port_data_t *data = (sw_port_data_t *)msg;
 
-            /* Check if this looks like a framed message (length-prefixed) */
-            if (data->len >= 4) {
-                uint32_t msg_len = ntohl(*(uint32_t *)data->data);
-                if (data->len >= 4 + msg_len) {
-                    /* Pass the conn so handle_remote_data can auto-
-                     * register the sender for reverse-direction replies. */
-                    handle_remote_data(data->data + 4, msg_len, data->port);
+            pthread_mutex_lock(&g_dist_lock);
+            sw_peer_t *peer = find_peer_by_conn_locked(data->port);
+            pthread_mutex_unlock(&g_dist_lock);
+
+            if (peer) {
+                /* Append to peer rx buffer and drain every complete
+                 * length-prefixed frame. TCP is a byte stream so the
+                 * kernel can hand us multiple frames in one read, or a
+                 * frame split across reads. */
+                peer_rx_append(peer, data->data, data->len);
+                while (peer->rx_len >= 4) {
+                    uint32_t msg_len = ntohl(*(uint32_t *)peer->rx_buf);
+                    if (peer->rx_len < 4 + msg_len) break;
+                    handle_remote_data(peer->rx_buf + 4, msg_len, data->port);
+                    peer_rx_consume(peer, 4 + msg_len);
+                }
+            } else {
+                /* No peer slot (max peers reached) — degrade to the
+                 * legacy single-frame path so at least the first frame
+                 * isn't dropped. */
+                if (data->len >= 4) {
+                    uint32_t msg_len = ntohl(*(uint32_t *)data->data);
+                    if (data->len >= 4 + msg_len) {
+                        handle_remote_data(data->data + 4, msg_len, data->port);
+                    }
                 }
             }
             free(data->data);
@@ -499,6 +598,12 @@ void sw_node_stop(void) {
     for (uint32_t i = 0; i < g_peer_count; i++) {
         if (g_peers[i].conn) {
             sw_port_close(g_peers[i].conn);
+        }
+        if (g_peers[i].rx_buf) {
+            free(g_peers[i].rx_buf);
+            g_peers[i].rx_buf = NULL;
+            g_peers[i].rx_len = 0;
+            g_peers[i].rx_cap = 0;
         }
     }
     g_peer_count = 0;
@@ -568,6 +673,12 @@ int sw_node_disconnect(const char *name) {
         peer->conn = NULL;
     }
     peer->connected = 0;
+    if (peer->rx_buf) {
+        free(peer->rx_buf);
+        peer->rx_buf = NULL;
+        peer->rx_len = 0;
+        peer->rx_cap = 0;
+    }
 
     pthread_mutex_unlock(&g_dist_lock);
     return 0;
