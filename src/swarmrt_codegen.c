@@ -249,6 +249,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "parse_gemma_calls") == 0 ||
            strcmp(name, "clean_json") == 0 ||
            strcmp(name, "strip_html") == 0 ||
+           strcmp(name, "is_list") == 0 ||
+           strcmp(name, "is_map") == 0 ||
            /* Process introspection */
            strcmp(name, "process_info") == 0 ||
            strcmp(name, "process_list") == 0 ||
@@ -1405,7 +1407,7 @@ static const char *_common_builtins[] = {
     "string_length", "string_sub", "string_split", "string_replace",
     "string_contains", "string_starts_with", "string_ends_with",
     "string_index_of", "string_trim", "string_upper", "string_lower",
-    "string_truncate", "strip_html", "clean_json",
+    "string_truncate", "strip_html", "clean_json", "is_list", "is_map",
     "base64_encode", "base64_decode",
     "json_encode", "json_decode", "json_get", "json_escape",
     "spawn", "self", "send", "register", "whereis",
@@ -1655,6 +1657,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "parse_gemma_calls") == 0 ||
              strcmp(fname, "clean_json") == 0 ||
              strcmp(fname, "strip_html") == 0 ||
+             strcmp(fname, "is_list") == 0 ||
+             strcmp(fname, "is_map") == 0 ||
              /* Process introspection */
              strcmp(fname, "process_info") == 0 ||
              strcmp(fname, "process_list") == 0 ||

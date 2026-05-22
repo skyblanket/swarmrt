@@ -835,6 +835,12 @@ typedef struct {
     int active;
 } _sw_subproc_t;
 static _sw_subproc_t _sw_subprocs[_SW_SUBPROC_MAX];
+/* Guards slot allocation in subprocess_spawn — swarm-code's MCP boot
+ * spawns servers from concurrent worker processes, so two spawn calls
+ * can run on different scheduler threads at once. Without this lock
+ * they race to claim the same free slot and clobber each other's
+ * pipes (one server then receives no input and hangs). */
+static pthread_mutex_t _sw_subproc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static sw_val_t *_builtin_subprocess_spawn(sw_val_t **a, int n) {
 #ifdef _WIN32
@@ -842,17 +848,30 @@ static sw_val_t *_builtin_subprocess_spawn(sw_val_t **a, int n) {
     return sw_val_int(-1);
 #else
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
+
+    /* Hold the lock across slot scan + claim + fork. fork() under the
+     * lock is safe here: the child execs immediately and never touches
+     * the mutex, and the parent always unlocks. */
+    pthread_mutex_lock(&_sw_subproc_lock);
     int slot = -1;
     for (int i = 0; i < _SW_SUBPROC_MAX; i++) if (!_sw_subprocs[i].active) { slot = i; break; }
-    if (slot < 0) return sw_val_int(-1);
+    if (slot < 0) { pthread_mutex_unlock(&_sw_subproc_lock); return sw_val_int(-1); }
 
     int p_in[2], p_out[2];
-    if (pipe(p_in) != 0) return sw_val_int(-1);
-    if (pipe(p_out) != 0) { close(p_in[0]); close(p_in[1]); return sw_val_int(-1); }
+    if (pipe(p_in) != 0) {
+        pthread_mutex_unlock(&_sw_subproc_lock);
+        return sw_val_int(-1);
+    }
+    if (pipe(p_out) != 0) {
+        close(p_in[0]); close(p_in[1]);
+        pthread_mutex_unlock(&_sw_subproc_lock);
+        return sw_val_int(-1);
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
         close(p_in[0]); close(p_in[1]); close(p_out[0]); close(p_out[1]);
+        pthread_mutex_unlock(&_sw_subproc_lock);
         return sw_val_int(-1);
     }
     if (pid == 0) {
@@ -875,6 +894,7 @@ static sw_val_t *_builtin_subprocess_spawn(sw_val_t **a, int n) {
     _sw_subprocs[slot].buf_len = 0;
     _sw_subprocs[slot].buf_cap = 4096;
     _sw_subprocs[slot].active = 1;
+    pthread_mutex_unlock(&_sw_subproc_lock);
     return sw_val_int(slot);
 #endif
 }
@@ -3907,6 +3927,17 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
 
 /* === Extra String Utilities === */
 
+/* is_list(x) → 'true' | 'false' — runtime type predicate. */
+static sw_val_t *_builtin_is_list(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_atom("false");
+    return sw_val_atom(a[0]->type == SW_VAL_LIST ? "true" : "false");
+}
+/* is_map(x) → 'true' | 'false' — runtime type predicate. */
+static sw_val_t *_builtin_is_map(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_atom("false");
+    return sw_val_atom(a[0]->type == SW_VAL_MAP ? "true" : "false");
+}
+
 /* parse_gemma_calls(content) → list of {name_atom, args_map} tuples
  *
  * Extracts Gemma 4's native tool-call format: call:name{json_object}
@@ -3946,8 +3977,8 @@ static sw_val_t *_builtin_parse_gemma_calls(sw_val_t **a, int n) {
         const char *brace = strchr(p, '{');
         if (!brace) break;
         size_t name_len = brace - p;
-        if (name_len == 0 || name_len > 64) { p = brace; continue; }
-        char name_buf[65];
+        if (name_len == 0 || name_len > 256) { p = brace; continue; }
+        char name_buf[257];
         memcpy(name_buf, p, name_len);
         name_buf[name_len] = '\0';
         /* Trim whitespace from name */
