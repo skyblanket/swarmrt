@@ -1397,6 +1397,134 @@ static void _stream_out_putc(_stream_out_t *o, char c, _sw_stream_state_t *st) {
     if (c == '\n') _stream_out_flush(o);
 }
 
+/* ============================================================
+ * Native tool-call streaming — SSE delta.tool_calls reassembly
+ * ============================================================
+ *
+ * OpenAI-compatible servers stream tool calls fragmented across many
+ * `data:` frames. The first frame for a given call carries `index`,
+ * `id`, and `function.name`; every later frame appends a slice of
+ * `function.arguments`. This is TCP segment reassembly — `index` is
+ * the sequence key, the argument fragments are payload appended in
+ * arrival order.
+ *
+ * The argument fragments need no un-escaping: each SSE frame's
+ * `arguments` value is independently JSON-escaped, and JSON escaping
+ * is a context-free per-character map, so esc(a)++esc(b) == esc(a++b).
+ * We therefore concatenate the RAW (escaped) bytes and emit them
+ * straight into the synthetic response's `arguments` string. */
+#define SW_MAX_TOOL_CALLS 64
+
+/* http_post_stream scratch-buffer sizes. These buffers are heap-
+ * allocated, not stack: the builtin runs deep in the agent call chain
+ * and the swarmrt per-process stack is only 64 KB — 16K+8K+8K+4K of
+ * stack arrays here overflowed it (SIGBUS in the prologue). */
+#define SW_HPS_LINE_CAP 16384
+#define SW_HPS_READ_CAP 4096
+#define SW_HPS_TOK_CAP  8192
+
+typedef struct {
+    int    used;
+    char   id[160];
+    char   name[160];
+    char  *args;            /* growable, raw JSON-escaped bytes */
+    size_t args_len, args_cap;
+} _sw_toolcall_t;
+
+/* Return ptr to the bracket/brace that matches the open one at `p`,
+ * honouring JSON string boundaries + escapes. NULL if unbalanced. */
+static const char *_sw_match_bracket(const char *p) {
+    int depth = 0, instr = 0;
+    for (; *p; p++) {
+        if (instr) {
+            if (*p == '\\') { if (*(p + 1)) p++; continue; }
+            if (*p == '"') instr = 0;
+            continue;
+        }
+        if (*p == '"') { instr = 1; continue; }
+        if (*p == '{' || *p == '[') depth++;
+        else if (*p == '}' || *p == ']') { depth--; if (depth == 0) return p; }
+    }
+    return NULL;
+}
+
+/* `p` points just past a JSON string's opening quote; return ptr to
+ * its closing (unescaped) quote, or NULL. */
+static const char *_sw_json_str_end(const char *p) {
+    for (; *p; p++) {
+        if (*p == '\\') { if (*(p + 1)) p++; continue; }
+        if (*p == '"') return p;
+    }
+    return NULL;
+}
+
+/* Parse the `tool_calls` array out of one SSE `data:` JSON line and
+ * fold each fragment into the per-index accumulator set. */
+static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_count) {
+    const char *arr = strstr(json, "\"tool_calls\":");
+    if (!arr) return;
+    arr += 13;
+    while (*arr == ' ') arr++;
+    if (*arr != '[') return;            /* e.g. "tool_calls":null */
+    const char *arr_end = _sw_match_bracket(arr);
+    const char *q = arr + 1;
+    while (*q && (!arr_end || q < arr_end)) {
+        if (*q != '{') { q++; continue; }
+        const char *obj_end = _sw_match_bracket(q);
+        if (!obj_end) break;
+
+        int idx = 0;
+        const char *ip = strstr(q, "\"index\":");
+        if (ip && ip < obj_end) idx = (int)strtol(ip + 8, NULL, 10);
+        if (idx < 0 || idx >= SW_MAX_TOOL_CALLS) { q = obj_end + 1; continue; }
+        _sw_toolcall_t *tc = &tcs[idx];
+        tc->used = 1;
+        if (idx + 1 > *tc_count) *tc_count = idx + 1;
+
+        const char *idp = strstr(q, "\"id\":\"");
+        if (idp && idp < obj_end && tc->id[0] == '\0') {
+            const char *s = idp + 6;
+            const char *e = _sw_json_str_end(s);
+            if (e && e < obj_end) {
+                size_t l = (size_t)(e - s);
+                if (l > sizeof(tc->id) - 1) l = sizeof(tc->id) - 1;
+                memcpy(tc->id, s, l); tc->id[l] = '\0';
+            }
+        }
+        const char *np = strstr(q, "\"name\":\"");
+        if (np && np < obj_end && tc->name[0] == '\0') {
+            const char *s = np + 8;
+            const char *e = _sw_json_str_end(s);
+            if (e && e < obj_end) {
+                size_t l = (size_t)(e - s);
+                if (l > sizeof(tc->name) - 1) l = sizeof(tc->name) - 1;
+                memcpy(tc->name, s, l); tc->name[l] = '\0';
+            }
+        }
+        const char *ap = strstr(q, "\"arguments\":\"");
+        if (ap && ap < obj_end) {
+            const char *s = ap + 13;
+            const char *e = _sw_json_str_end(s);
+            if (e && e <= obj_end) {
+                size_t l = (size_t)(e - s);
+                if (tc->args_cap == 0) {
+                    tc->args_cap = (l + 1 < 256) ? 256 : l + 64;
+                    tc->args = (char *)malloc(tc->args_cap);
+                    tc->args_len = 0;
+                }
+                if (tc->args_len + l + 1 > tc->args_cap) {
+                    while (tc->args_len + l + 1 > tc->args_cap) tc->args_cap *= 2;
+                    tc->args = (char *)realloc(tc->args, tc->args_cap);
+                }
+                memcpy(tc->args + tc->args_len, s, l);
+                tc->args_len += l;
+                tc->args[tc->args_len] = '\0';
+            }
+        }
+        q = obj_end + 1;
+    }
+}
+
 /*
  * http_post_stream(url, headers_list, body, [target_pid, name]) → string (full content)
  *
@@ -1553,10 +1681,14 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
 
     /* Line buffer for SSE parsing. We read non-blocking into a scratch
      * buffer and split lines ourselves — fgets() would block and prevent
-     * spinner ticking during dead air. */
-    char line[16384];
+     * spinner ticking during dead air. Heap-allocated (see SW_HPS_*). */
+    char *line = (char *)malloc(SW_HPS_LINE_CAP);
     size_t line_len = 0;
-    char readbuf[4096];
+    char *readbuf = (char *)malloc(SW_HPS_READ_CAP);
+    /* Per-delta token scratch for content + reasoning. Hoisted out of
+     * the loop and onto the heap to keep the stack frame small. */
+    char *tok = (char *)malloc(SW_HPS_TOK_CAP);
+    char *rtok = (char *)malloc(SW_HPS_TOK_CAP);
     int done = 0;
     const int spinner_tick_ms = 80;
 
@@ -1571,6 +1703,13 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     /* Track the server's finish_reason so we can distinguish a normal
      * "stop" from a truncation ("length") or a content filter. */
     char finish_reason[32] = {0};
+
+    /* Native function-calling: per-index tool-call accumulators.
+     * Reassembled from delta.tool_calls fragments (see _sw_parse_tc_deltas).
+     * Heap-allocated — the array is ~22 KB and this function already runs
+     * close to the swarmrt green-thread stack limit (line[16384] etc.). */
+    _sw_toolcall_t *tcs = (_sw_toolcall_t *)calloc(SW_MAX_TOOL_CALLS, sizeof(_sw_toolcall_t));
+    int tc_count = 0;
 
     while (!done) {
         fd_set rfds;
@@ -1638,7 +1777,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             continue;
         }
 
-        ssize_t rn = read(pipe_fd, readbuf, sizeof(readbuf));
+        ssize_t rn = read(pipe_fd, readbuf, SW_HPS_READ_CAP);
         if (rn < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             break;
@@ -1647,7 +1786,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
 
         for (ssize_t ri = 0; ri < rn && !done; ri++) {
             char ch = readbuf[ri];
-            if (line_len < sizeof(line) - 1) line[line_len++] = ch;
+            if (line_len < SW_HPS_LINE_CAP - 1) line[line_len++] = ch;
             if (ch != '\n') continue;
             line[line_len] = '\0';
             size_t this_line_len = line_len;
@@ -1687,9 +1826,8 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                 const char *rp = strstr(json, "\"reasoning_content\":\"");
                 if (rp) {
                     rp += 21;
-                    char rtok[8192];
                     size_t rtok_len = 0;
-                    while (*rp && *rp != '"' && rtok_len < sizeof(rtok) - 1) {
+                    while (*rp && *rp != '"' && rtok_len < SW_HPS_TOK_CAP - 1) {
                         if (*rp == '\\' && *(rp + 1)) {
                             char esc = *(rp + 1);
                             switch (esc) {
@@ -1740,13 +1878,19 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                 }
             }
 
+            /* Native function-calling channel: reassemble fragmented
+             * tool_calls. Runs BEFORE the content `continue` below — a
+             * tool-call-only delta usually carries no `content` field. */
+            if (tcs && strstr(json, "\"tool_calls\":")) {
+                _sw_parse_tc_deltas(json, tcs, &tc_count);
+            }
+
             const char *p = strstr(json, "\"content\":\"");
             if (!p) continue;
             p += 11;
 
-            char tok[8192];
             size_t tok_len = 0;
-            while (*p && *p != '"' && tok_len < sizeof(tok) - 1) {
+            while (*p && *p != '"' && tok_len < SW_HPS_TOK_CAP - 1) {
                 if (*p == '\\' && *(p + 1)) {
                     char esc = *(p + 1);
                     switch (esc) {
@@ -2019,31 +2163,81 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     }
     renc[rep] = '\0';
 
-    size_t out_cap = ep + rep + 512;
+    /* Assemble the native tool_calls array (if any streamed). The
+     * argument bytes are already JSON-escaped — see _sw_parse_tc_deltas
+     * — so they go in verbatim. Slots without a name never got a real
+     * first delta and are skipped. The whole field is empty when the
+     * turn produced no tool calls (the common chat-only case). */
+    char *tcenc = NULL;
+    size_t tcenc_len = 0;
+    if (tc_count > 0) {
+        size_t cap = 512;
+        tcenc = (char *)malloc(cap);
+        size_t l = (size_t)snprintf(tcenc, cap, ",\"tool_calls\":[");
+        int emitted = 0;
+        for (int i = 0; i < tc_count; i++) {
+            _sw_toolcall_t *tc = &tcs[i];
+            if (!tc->used || tc->name[0] == '\0') continue;
+            const char *args = (tc->args && tc->args_len > 0) ? tc->args : "{}";
+            char idbuf[32];
+            const char *idstr = tc->id[0] ? tc->id : idbuf;
+            if (!tc->id[0]) snprintf(idbuf, sizeof(idbuf), "call_%d", i);
+            size_t need = strlen(args) + strlen(idstr) + strlen(tc->name) + 96;
+            while (l + need > cap) { cap *= 2; tcenc = (char *)realloc(tcenc, cap); }
+            l += (size_t)snprintf(tcenc + l, cap - l,
+                "%s{\"id\":\"%s\",\"type\":\"function\","
+                "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}",
+                emitted ? "," : "", idstr, tc->name, args);
+            emitted++;
+        }
+        if (emitted) {
+            if (l + 2 > cap) { cap += 2; tcenc = (char *)realloc(tcenc, cap); }
+            tcenc[l++] = ']';
+            tcenc[l] = '\0';
+            tcenc_len = l;
+        } else {
+            free(tcenc);
+            tcenc = NULL;
+        }
+    }
+    const char *tc_field = tcenc ? tcenc : "";
+
+    size_t out_cap = ep + rep + tcenc_len + 512;
     char *out = (char *)malloc(out_cap);
     /* Include the usage block so sw callers can read real token counts
      * from the server. Missing values (no usage chunk seen) are omitted
      * rather than sent as 0 to distinguish "unknown" from "zero". */
     if (prompt_tokens >= 0) {
         snprintf(out, out_cap,
-            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"}}],"
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"%s}}],"
             "\"usage\":{\"prompt_tokens\":%lld,\"completion_tokens\":%lld,\"total_tokens\":%lld}}",
-            enc, renc,
+            enc, renc, tc_field,
             prompt_tokens,
             completion_tokens >= 0 ? completion_tokens : 0,
             total_tokens >= 0 ? total_tokens : prompt_tokens + (completion_tokens >= 0 ? completion_tokens : 0));
     } else {
         snprintf(out, out_cap,
-            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"}}]}",
-            enc, renc);
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"%s}}]}",
+            enc, renc, tc_field);
     }
 
     sw_val_t *result = sw_val_string(out);
     free(enc);
     free(renc);
+    if (tcenc) free(tcenc);
+    if (tcs) {
+        for (int i = 0; i < SW_MAX_TOOL_CALLS; i++) {
+            if (tcs[i].args) free(tcs[i].args);
+        }
+        free(tcs);
+    }
     free(reasoning);
     free(out);
     free(buffer);
+    free(line);
+    free(readbuf);
+    free(tok);
+    free(rtok);
 
     /* Tell the parent we're done — useful as a sentinel without having
      * to grep the chunk stream. */
