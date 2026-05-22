@@ -1147,7 +1147,9 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
  *     without advancing the column counter.
  *   - Newlines reset column to 0 and defer the 2-space indent until
  *     the next non-newline byte, so blank lines stay blank.
- *   - Wrapping is mid-column for v1 — no word-boundary detection.
+ *   - Wrapping is word-aware: visible bytes accumulate in a pending
+ *     word buffer and commit only at a whitespace boundary, so a wrap
+ *     never splits a word. A word wider than the line is hard-broken.
  */
 
 typedef struct {
@@ -1156,6 +1158,13 @@ typedef struct {
     int col;
     int in_ansi;
     int line_started;
+    /* Pending-word buffer — visible bytes (and any ANSI sequences
+     * embedded in them) collect here and flush at the next space /
+     * tab / newline, so soft-wrap breaks between words, not within. */
+    char word[256];
+    int  word_len;
+    int  word_cols;     /* display columns: ANSI + UTF-8 conts excluded */
+    int  word_in_ansi;  /* mid-ANSI-escape while filling word[] */
 } _sw_stream_state_t;
 
 static int _sw_term_cols(void) {
@@ -1194,53 +1203,100 @@ static void _sw_stream_init(_sw_stream_state_t *s) {
     s->col = 0;
     s->in_ansi = 0;
     s->line_started = 0;
+    s->word_len = 0;
+    s->word_cols = 0;
+    s->word_in_ansi = 0;
 }
 
 static void _sw_stream_reset_line(_sw_stream_state_t *s) {
     /* Called after \r\e[K clears the spinner line: cursor is at col 0
-     * and we need to re-emit the 2-space indent before the next byte. */
+     * and we need to re-emit the 2-space indent before the next byte.
+     * The word buffer is intentionally preserved — its bytes were
+     * never emitted, so a word mid-built across a spinner repaint just
+     * continues and flushes cleanly afterward. */
     s->col = 0;
     s->line_started = 0;
     s->in_ansi = 0;
 }
 
-static void _sw_stream_emit(_sw_stream_state_t *s, char c) {
-    /* Lazy leading indent: emit 2 spaces at the start of each line,
-     * but only when about to write a non-newline byte. */
-    if (!s->line_started && !s->in_ansi && c != '\n' && c != '\r' && c != '\x1b') {
+/* Lazy leading indent: emit 2 spaces at the start of a line, deferred
+ * until a visible byte is actually about to land. */
+static void _sw_stream_indent(_sw_stream_state_t *s) {
+    if (!s->line_started) {
         fputs("  ", stdout);
         s->col = 2;
         s->line_started = 1;
     }
-    if (s->in_ansi) {
-        fputc(c, stdout);
-        if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7E) s->in_ansi = 0;
-        return;
+}
+
+/* Commit the pending word to stdout. Wraps to a fresh indented line
+ * first if the word would overrun the right margin AND the current
+ * line already carries real content (col past the indent). */
+static void _sw_stream_flush_word(_sw_stream_state_t *s) {
+    if (s->word_len == 0) return;
+    _sw_stream_indent(s);
+    if (s->col > 2 && s->col + s->word_cols > s->right_margin) {
+        fputs("\n  ", stdout);
+        s->col = 2;
     }
-    if (c == '\x1b') {
-        s->in_ansi = 1;
-        fputc(c, stdout);
-        return;
-    }
+    fwrite(s->word, 1, (size_t)s->word_len, stdout);
+    s->col += s->word_cols;
+    s->word_len = 0;
+    s->word_cols = 0;
+    s->word_in_ansi = 0;
+}
+
+static void _sw_stream_emit(_sw_stream_state_t *s, char c) {
     if (c == '\n') {
-        fputc(c, stdout);
+        _sw_stream_flush_word(s);
+        fputc('\n', stdout);
         s->col = 0;
         s->line_started = 0;
         return;
     }
     if (c == '\r') {
-        fputc(c, stdout);
+        _sw_stream_flush_word(s);
+        fputc('\r', stdout);
         s->col = 0;
         return;
     }
-    int is_cont = ((unsigned char)c & 0xC0) == 0x80;
-    if (!is_cont && s->col >= s->right_margin) {
-        fputs("\n  ", stdout);
-        s->col = 2;
-        s->line_started = 1;
+    if (c == ' ' || c == '\t') {
+        /* Whitespace ends a word. Commit it, then place the space —
+         * unless we're already at the margin, where the space would
+         * just be an invisible trailing char, so wrap instead. */
+        _sw_stream_flush_word(s);
+        if (s->col > 2 && s->col >= s->right_margin) {
+            fputs("\n  ", stdout);
+            s->col = 2;
+        } else {
+            _sw_stream_indent(s);
+            fputc(c, stdout);
+            s->col++;
+        }
+        return;
     }
-    fputc(c, stdout);
-    if (!is_cont) s->col++;
+    /* Word byte — a visible char or part of an embedded ANSI escape.
+     * Buffer it; ANSI bytes and UTF-8 continuation bytes add no cols. */
+    int is_cont = ((unsigned char)c & 0xC0) == 0x80;
+    if (s->word_in_ansi) {
+        if (s->word_len < (int)sizeof(s->word)) s->word[s->word_len++] = c;
+        if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7E) s->word_in_ansi = 0;
+        return;
+    }
+    if (c == '\x1b') {
+        s->word_in_ansi = 1;
+        if (s->word_len < (int)sizeof(s->word)) s->word[s->word_len++] = c;
+        return;
+    }
+    if (s->word_len < (int)sizeof(s->word)) s->word[s->word_len++] = c;
+    if (!is_cont) s->word_cols++;
+    /* A word wider than the line can't be wrapped whole — hard-break
+     * it by committing the chunk we have. Also flush before the buffer
+     * fills (only when not mid-escape, so a sequence stays intact). */
+    if (s->word_cols >= s->right_margin - 2 ||
+        (s->word_len >= (int)sizeof(s->word) - 4 && !s->word_in_ansi)) {
+        _sw_stream_flush_word(s);
+    }
 }
 
 /* ============================================================
@@ -2025,6 +2081,9 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     if (so.subagent) {
         _stream_out_flush(&so);
     } else {
+        /* Commit the last word — content rarely ends on whitespace,
+         * so without this the final word would stay buffered + lost. */
+        _sw_stream_flush_word(&stream);
         fputs("\n", stdout);
         fflush(stdout);
     }
