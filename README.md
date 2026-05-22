@@ -1,5 +1,8 @@
 # SwarmRT
 
+[![CI](https://github.com/skyblanket/swarmrt/actions/workflows/linux-quickstart.yml/badge.svg)](https://github.com/skyblanket/swarmrt/actions/workflows/linux-quickstart.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A from-scratch BEAM-shaped runtime for the AI-agent era — written in C, compiled ahead of time, no VM, no GC pauses.**
 
 ```sw
@@ -408,6 +411,16 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **Reliability backstory:** the runtime has been through six rounds of external review (Claude web agent + Codex), each filing a markdown report against the latest commit. The full hardening narrative — what each round found, what was fixed, what's still open — is at [docs/notes/REVIEW_HARDENING.md](docs/notes/REVIEW_HARDENING.md).
 
 New runtime features land regularly — see [CHANGELOG](docs/CHANGELOG.md). Breaking changes are called out in the changelog and the language reference is the source of truth.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md)
+covers the build, the test suite, and what CI gates on — run `make
+test-sw` and the phase tests before opening a PR. By participating you
+agree to the [Code of Conduct](CODE_OF_CONDUCT.md). Security reports go
+through a private channel — see [SECURITY.md](SECURITY.md).
 
 ---
 

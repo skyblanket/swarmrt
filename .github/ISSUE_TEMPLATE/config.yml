@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Language reference
+    url: https://github.com/skyblanket/swarmrt/blob/main/docs/SW_LANGUAGE.md
+    about: How to write sw — read this before filing a "bug" that's a usage question.
+  - name: Known issues
+    url: https://github.com/skyblanket/swarmrt/blob/main/docs/notes/KNOWN_ISSUES.md
+    about: Check whether your bug is already tracked here.
