@@ -944,13 +944,19 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     /* Let schedulers start */
     usleep(10000);
 
-    printf("[SwarmRT] Arena initialized: %zu MB mmap, %u proc slots, %u heap blocks\n",
-           g_swarm->arena.size / (1024 * 1024),
-           g_swarm->arena.proc_capacity,
-           g_swarm->arena.block_count);
-    printf("[SwarmRT] Swarm '%s' initialized with %d scheduler(s)\n",
-           name, num_schedulers);
-    fflush(stdout);
+    /* Startup banner — diagnostics, not program output, so it goes to
+     * stderr. That keeps stdout clean for programs whose output is
+     * piped or captured (e.g. a CLI answering `--version`). Silence it
+     * entirely with SW_QUIET=1. */
+    if (!getenv("SW_QUIET")) {
+        fprintf(stderr, "[SwarmRT] Arena initialized: %zu MB mmap, %u proc slots, %u heap blocks\n",
+               g_swarm->arena.size / (1024 * 1024),
+               g_swarm->arena.proc_capacity,
+               g_swarm->arena.block_count);
+        fprintf(stderr, "[SwarmRT] Swarm '%s' initialized with %d scheduler(s)\n",
+               name, num_schedulers);
+        fflush(stderr);
+    }
 
     /* Install crash handler so segfaults produce a backtrace instead of
      * a bare "segmentation fault" message.  macOS provides backtrace()
