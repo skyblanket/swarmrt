@@ -2017,6 +2017,15 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         free(items);
         return r;
     }
+    if (strcmp(fname, "print_above") == 0) {
+        /* No raw line editor under the interpreter — behaves as print. */
+        for (int i = 0; i < nargs; i++) {
+            if (i) printf(" ");
+            sw_val_print(args[i]);
+        }
+        printf("\n");
+        return sw_val_atom("ok");
+    }
 
     /* === JSON helpers ========================================== */
     if (strcmp(fname, "json_escape") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {

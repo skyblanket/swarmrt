@@ -197,6 +197,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "ets_get") == 0 || strcmp(name, "ets_delete") == 0 ||
            strcmp(name, "sleep") == 0 || strcmp(name, "getenv") == 0 ||
            strcmp(name, "os_args") == 0 ||
+           strcmp(name, "print_above") == 0 ||
            strcmp(name, "to_string") == 0 || strcmp(name, "format") == 0 ||
            strcmp(name, "timestamp") == 0 ||
            strcmp(name, "file_write") == 0 || strcmp(name, "file_read") == 0 ||
@@ -1710,7 +1711,9 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              /* Phase 19: interactive picker */
              strcmp(fname, "read_choice") == 0 ||
              /* Phase 20: process command-line arguments */
-             strcmp(fname, "os_args") == 0)
+             strcmp(fname, "os_args") == 0 ||
+             /* Phase 21: input-aware terminal output */
+             strcmp(fname, "print_above") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)

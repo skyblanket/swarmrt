@@ -716,9 +716,23 @@ typedef struct {
     int saved_ok;
     char *entries[SW_RL_HIST_MAX];
     int count;
+    /* Async-redraw cooperation: while a raw-mode read_line is showing
+     * a line, `active` is set and the cur_* fields point at the live
+     * editor state. print_above() uses them to wipe the input line,
+     * print above it, and redraw it — so output from other processes
+     * never clobbers what the user is mid-typing. */
+    volatile int active;
+    const char *cur_prompt;
+    char **cur_buf;
+    size_t *cur_len;
+    size_t *cur_cursor;
 } _sw_rl_state_t;
 
 static _sw_rl_state_t _sw_rl = {0};
+
+/* Serialises terminal writes between the line editor's own redraws
+ * and print_above() calls arriving from other processes. */
+static pthread_mutex_t _sw_term_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ============================================================
  * popen with pid tracking — so we can kill on interrupt
@@ -5108,8 +5122,9 @@ static void _sw_rl_history_push(const char *line) {
 }
 
 /* Redraw the current buffer: clear line, reprint prompt + buf, position cursor.
- * `cursor` is the byte offset within buf where the caret should end up. */
-static void _sw_rl_redraw(const char *prompt, const char *buf, size_t len, size_t cursor) {
+ * `cursor` is the byte offset within buf where the caret should end up.
+ * The _unlocked variant assumes the caller already holds _sw_term_lock. */
+static void _sw_rl_redraw_unlocked(const char *prompt, const char *buf, size_t len, size_t cursor) {
     fputs("\r\x1b[K", stdout);
     if (prompt) fputs(prompt, stdout);
     fwrite(buf, 1, len, stdout);
@@ -5118,6 +5133,23 @@ static void _sw_rl_redraw(const char *prompt, const char *buf, size_t len, size_
         printf("\x1b[%zuD", (size_t)back);
     }
     fflush(stdout);
+}
+
+static void _sw_rl_redraw(const char *prompt, const char *buf, size_t len, size_t cursor) {
+    pthread_mutex_lock(&_sw_term_lock);
+    _sw_rl_redraw_unlocked(prompt, buf, len, cursor);
+    pthread_mutex_unlock(&_sw_term_lock);
+}
+
+/* Clear the published editor state — under the lock so a concurrent
+ * print_above() can't dereference a buffer read_line is about to free. */
+static void _sw_rl_done(void) {
+    pthread_mutex_lock(&_sw_term_lock);
+    _sw_rl.active = 0;
+    _sw_rl.cur_buf = NULL;
+    _sw_rl.cur_len = NULL;
+    _sw_rl.cur_cursor = NULL;
+    pthread_mutex_unlock(&_sw_term_lock);
 }
 
 static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
@@ -5153,15 +5185,24 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
      * flag is set, fall back to append-only behavior. */
     int has_newline = 0;
 
+    /* Publish editor state so print_above() can redraw around output. */
+    pthread_mutex_lock(&_sw_term_lock);
+    _sw_rl.cur_prompt = prompt;
+    _sw_rl.cur_buf = &buf;
+    _sw_rl.cur_len = &len;
+    _sw_rl.cur_cursor = &cursor;
+    _sw_rl.active = 1;
+    pthread_mutex_unlock(&_sw_term_lock);
+
     for (;;) {
         int c = fgetc(stdin);
         if (c == EOF) {
-            if (len == 0) { free(buf); return sw_val_nil(); }
+            if (len == 0) { _sw_rl_done(); free(buf); return sw_val_nil(); }
             break;
         }
         /* Ctrl+D (EOT) on empty line = EOF; otherwise forward-delete. */
         if (c == 4) {
-            if (len == 0) { free(buf); fputc('\n', stdout); fflush(stdout); return sw_val_nil(); }
+            if (len == 0) { _sw_rl_done(); free(buf); fputc('\n', stdout); fflush(stdout); return sw_val_nil(); }
             if (!has_newline && cursor < len) {
                 memmove(buf + cursor, buf + cursor + 1, len - cursor - 1);
                 len--;
@@ -5457,6 +5498,7 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
 
     buf[len] = '\0';
     if (len > 0) _sw_rl_history_push(buf);
+    _sw_rl_done();
     sw_val_t *r = sw_val_string(buf);
     free(buf);
     return r;
@@ -5572,6 +5614,34 @@ static sw_val_t *_builtin_print_inline(sw_val_t **a, int n) {
         sw_val_print(a[i]);
     }
     fflush(stdout);
+    return sw_val_atom("ok");
+}
+
+/* print_above(args...) → 'ok'
+ * Print like print(), but cooperate with an active raw-mode read_line:
+ * wipe the input line, print the text above it, then redraw the input
+ * line (prompt + buffer + caret) below. Lets background processes log
+ * to the terminal without clobbering what the user is mid-typing.
+ * Falls back to a plain newline-terminated print when no line editor
+ * is active. */
+static sw_val_t *_builtin_print_above(sw_val_t **a, int n) {
+    pthread_mutex_lock(&_sw_term_lock);
+    int act = _sw_rl.active;
+    if (act) fputs("\r\x1b[K", stdout);   /* wipe the current input line */
+    for (int i = 0; i < n; i++) {
+        if (i) fputc(' ', stdout);
+        sw_val_print(a[i]);
+    }
+    fputc('\n', stdout);
+    if (act && _sw_rl.cur_buf && *_sw_rl.cur_buf) {
+        _sw_rl_redraw_unlocked(_sw_rl.cur_prompt,
+                               *_sw_rl.cur_buf,
+                               _sw_rl.cur_len ? *_sw_rl.cur_len : 0,
+                               _sw_rl.cur_cursor ? *_sw_rl.cur_cursor : 0);
+    } else {
+        fflush(stdout);
+    }
+    pthread_mutex_unlock(&_sw_term_lock);
     return sw_val_atom("ok");
 }
 
