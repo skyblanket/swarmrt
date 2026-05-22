@@ -134,6 +134,13 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures);
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
 
+/* Process command-line arguments. A compiled program's generated
+ * main() wires argc/argv straight into these (see swarmrt_codegen.c);
+ * the os_args() builtin exposes them to sw as a list of strings.
+ * Zero/NULL when unset — e.g. under the interpreter. */
+extern int    sw_prog_argc;
+extern char **sw_prog_argv;
+
 /* Map constructors */
 sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count);
 sw_val_t *sw_val_map_get(sw_val_t *map, sw_val_t *key);

@@ -196,6 +196,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "ets_new") == 0 || strcmp(name, "ets_put") == 0 ||
            strcmp(name, "ets_get") == 0 || strcmp(name, "ets_delete") == 0 ||
            strcmp(name, "sleep") == 0 || strcmp(name, "getenv") == 0 ||
+           strcmp(name, "os_args") == 0 ||
            strcmp(name, "to_string") == 0 || strcmp(name, "format") == 0 ||
            strcmp(name, "timestamp") == 0 ||
            strcmp(name, "file_write") == 0 || strcmp(name, "file_read") == 0 ||
@@ -1703,7 +1704,9 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              /* Phase 18: terminal introspection */
              strcmp(fname, "term_cols") == 0 ||
              /* Phase 19: interactive picker */
-             strcmp(fname, "read_choice") == 0)
+             strcmp(fname, "read_choice") == 0 ||
+             /* Phase 20: process command-line arguments */
+             strcmp(fname, "os_args") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)
@@ -2612,7 +2615,10 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
     fprintf(f, "}\n\n");
 
     fprintf(f, "int main(int argc, char **argv) {\n");
-    fprintf(f, "    (void)argc; (void)argv;\n");
+    /* Hand argc/argv to the runtime so the os_args() builtin can read
+     * them. Previously discarded — sw programs had no way to see CLI
+     * arguments at all. */
+    fprintf(f, "    sw_prog_argc = argc; sw_prog_argv = argv;\n");
     fprintf(f, "    setvbuf(stdout, NULL, _IONBF, 0);\n");
     /* Scheduler count: honor $SW_SCHEDULERS if set, else one OS thread
      * per online core (BEAM-style). Previously hardcoded to 2, which

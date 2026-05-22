@@ -1260,6 +1260,13 @@ static node_t *par_expr_string(const char *src) {
  * Values
  * ========================================================================= */
 
+/* Command-line arguments — see swarmrt_lang.h. A compiled program's
+ * generated main() assigns these before the runtime starts; os_args()
+ * reads them. Default zero/NULL so the interpreter and tests see an
+ * empty arg list rather than garbage. */
+int    sw_prog_argc = 0;
+char **sw_prog_argv = NULL;
+
 sw_val_t *sw_val_nil(void) {
     sw_val_t *v = calloc(1, sizeof(sw_val_t));
     v->type = SW_VAL_NIL;
@@ -1998,6 +2005,17 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "getenv") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         const char *v = getenv(args[0]->v.str);
         return v ? sw_val_string(v) : sw_val_nil();
+    }
+    if (strcmp(fname, "os_args") == 0) {
+        /* Command-line arguments as a list of strings, argv[0] first.
+         * Empty under the interpreter unless a host populated them. */
+        if (sw_prog_argc <= 0 || !sw_prog_argv) return sw_val_list(NULL, 0);
+        sw_val_t **items = malloc(sizeof(sw_val_t *) * sw_prog_argc);
+        for (int i = 0; i < sw_prog_argc; i++)
+            items[i] = sw_val_string(sw_prog_argv[i] ? sw_prog_argv[i] : "");
+        sw_val_t *r = sw_val_list(items, sw_prog_argc);
+        free(items);
+        return r;
     }
 
     /* === JSON helpers ========================================== */

@@ -222,6 +222,20 @@ static sw_val_t *_builtin_getenv(sw_val_t **a, int n) {
     return v ? sw_val_string(v) : sw_val_nil();
 }
 
+/* os_args() -> list of command-line argument strings (argv[0] first).
+ * sw_prog_argc/argv are filled in by the generated program's main();
+ * see swarmrt_codegen.c. Returns [] when unset. */
+static sw_val_t *_builtin_os_args(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    if (sw_prog_argc <= 0 || !sw_prog_argv) return sw_val_list(NULL, 0);
+    sw_val_t **items = malloc(sizeof(sw_val_t *) * sw_prog_argc);
+    for (int i = 0; i < sw_prog_argc; i++)
+        items[i] = sw_val_string(sw_prog_argv[i] ? sw_prog_argv[i] : "");
+    sw_val_t *r = sw_val_list(items, sw_prog_argc);
+    free(items);
+    return r;
+}
+
 static sw_val_t *_builtin_typeof(sw_val_t **a, int n) {
     if (n < 1 || !a[0]) return sw_val_string("null");
     switch (a[0]->type) {
