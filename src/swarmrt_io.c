@@ -501,6 +501,16 @@ sw_port_t *sw_tcp_listen(const char *addr, uint16_t port) {
 
     set_reuseaddr(fd);
     set_nonblocking(fd);
+#ifndef _WIN32
+    // Close the listening socket in any forked child (shell() / etc.)
+    // so a child can't accidentally accept inherited HTTP connections,
+    // which causes incoming requests to hang. (Without CLOEXEC, the
+    // kernel's accept queue picks ANY process holding the FD.)
+    {
+        int fl = fcntl(fd, F_GETFD, 0);
+        if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+    }
+#endif
 
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof(sin));
