@@ -924,6 +924,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    return sw_val_atom(\"ok\");\n"
         "}\n\n");
 
+
     fprintf(f,
         "static sw_val_t *_builtin_length(sw_val_t **a, int n) {\n"
         "    if (n < 1) return sw_val_int(0);\n"

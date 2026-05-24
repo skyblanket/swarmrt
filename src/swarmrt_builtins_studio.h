@@ -830,6 +830,11 @@ static _sw_rl_state_t _sw_rl = {0};
  * and print_above() calls arriving from other processes. */
 static pthread_mutex_t _sw_term_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Forward decl — defined alongside read_line near the bottom of this
+ * file. Needed up here so shell()'s progress wipe can redraw the
+ * input box back below its output without eating what the user typed. */
+static void _sw_rl_redraw_unlocked(const char *prompt, const char *buf, size_t len, size_t cursor);
+
 /* ============================================================
  * popen with pid tracking — so we can kill on interrupt
  * ============================================================
@@ -3413,15 +3418,45 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
                     while (dlen > 0 && (line_buf[dlen-1]=='\n'||line_buf[dlen-1]=='\r'))
                         line_buf[--dlen] = '\0';
 
-                    fprintf(stdout, "\r\033[K    \033[38;5;240m⎿ %s\033[0m",
-                            line_buf);
-                    fflush(stdout);
+                    /* Input-line-aware: when read_line is engaged we
+                     * lock the terminal, wipe, draw the tail snippet,
+                     * then redraw the input below — so the user's
+                     * typing isn't eaten by progress updates. */
+                    pthread_mutex_lock(&_sw_term_lock);
+                    int _act = _sw_rl.active;
+                    if (_act) {
+                        fputs("\r\033[K", stdout);
+                        fprintf(stdout, "    \033[38;5;240m⎿ %s\033[0m\n",
+                                line_buf);
+                        if (_sw_rl.cur_buf && *_sw_rl.cur_buf) {
+                            _sw_rl_redraw_unlocked(_sw_rl.cur_prompt,
+                                *_sw_rl.cur_buf,
+                                _sw_rl.cur_len ? *_sw_rl.cur_len : 0,
+                                _sw_rl.cur_cursor ? *_sw_rl.cur_cursor : 0);
+                        } else { fflush(stdout); }
+                    } else {
+                        fprintf(stdout, "\r\033[K    \033[38;5;240m⎿ %s\033[0m",
+                                line_buf);
+                        fflush(stdout);
+                    }
+                    pthread_mutex_unlock(&_sw_term_lock);
                 }
             }
         }
     }
-    /* Clear the progress line */
-    if (is_tty) { fputs("\r\033[K", stdout); fflush(stdout); }
+    /* Clear the progress line — and redraw the input box below if the
+     * line editor is mid-read, otherwise the wipe eats the user's typing. */
+    if (is_tty) {
+        pthread_mutex_lock(&_sw_term_lock);
+        fputs("\r\033[K", stdout);
+        if (_sw_rl.active && _sw_rl.cur_buf && *_sw_rl.cur_buf) {
+            _sw_rl_redraw_unlocked(_sw_rl.cur_prompt,
+                *_sw_rl.cur_buf,
+                _sw_rl.cur_len ? *_sw_rl.cur_len : 0,
+                _sw_rl.cur_cursor ? *_sw_rl.cur_cursor : 0);
+        } else { fflush(stdout); }
+        pthread_mutex_unlock(&_sw_term_lock);
+    }
 
     /* Read exit code */
     int status = -1;
