@@ -412,14 +412,23 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `ets_get(t, k)` / `ets_put(t, k, v)` / `ets_delete(t, k)` | basic ops |
 | `ets_list(t)` | list of `{k, v}` tuples |
 | `ets_count(t)` | size |
+| `ets_update_counter(t, k, delta, initial)` | atomic `+= delta`, seeds `initial+delta` if missing; returns new int |
+| `ets_cas(t, k, expected, new)` | compare-and-swap; `'true'` if swapped, `'false'` if mismatch / missing |
+| `ets_take(t, k)` | atomic get-and-delete; returns value or `nil` |
+| `ets_update(t, k, fun)` | reserved — passing `.sw` lambdas to a builtin needs a runtime helper; currently returns `nil`. Use cas/get-put loops for now. |
 
 ### Files
 | | |
 |---|---|
-| `file_read(path)` | full contents as string, or `nil` |
-| `file_write(path, content)` | `'ok'/'error'` |
+| `file_read(path)` | full contents as string, or `nil` (current 1 MB cap) |
+| `file_write(path, content)` | `'ok'/'error'` — not crash-safe; use `file_atomic_write` for state files |
+| `file_atomic_write(path, content)` | writes `path.tmp.<pid>` then `rename(2)` — survives a crash mid-write |
+| `file_rename(src, dst)` | `'ok'/'error'` — wraps `rename(2)` |
+| `file_stat(path)` | `%{size, mtime, mode, is_dir, exists}` map, or `nil` if missing |
+| `file_temp(prefix)` | unique tmp file path via `mkstemp` (`<prefix>XXXXXX`) |
 | `file_exists(path)` | `'true'/'false'` |
 | `file_delete(path)` | `'ok'/'error'` |
+| `file_mkdir(path)` | `'ok'/'error'` |
 | `file_list(dir)` | list of names |
 
 ### JSON

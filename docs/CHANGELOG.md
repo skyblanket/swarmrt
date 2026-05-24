@@ -4,6 +4,48 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-25 — harness primitives + boot-speed parity
+
+Four landings driven by the swarm-code v0.2 hardening pass.
+
+**perf(sw_init):** new `SW_MAX_PROCS` env knob plus spin-wait
+replacement for `usleep(10000)` after scheduler thread-start. Cuts
+swc-binary boot from 36 ms → 25 ms (default), 21 ms with
+`SW_MAX_PROCS=1024`. swarm-code is now at boot parity with goose
+(Rust). Arena ceiling stays at `SWARM_MAX_PROCESSES` (100 k) for
+backward compat; CLI tools that never spawn more than a handful of
+sw processes should set `SW_MAX_PROCS` low.
+
+**feat(builtins):** atomic filesystem primitives.
+- `file_rename(src, dst)` — wraps `rename(2)`
+- `file_stat(path)` — returns `%{size, mtime, mode, is_dir, exists}` or `nil`
+- `file_atomic_write(path, content)` — writes `path.tmp.<pid>` then
+  `rename(2)` to `path` (crash-safe for session journals / cron state)
+- `file_temp(prefix)` — wraps `mkstemp` with `<prefix>XXXXXX`
+
+**feat(ets):** atomic mutation ops on the per-process ETS.
+- `ets_update_counter(t, k, delta, initial)` — atomic `+=`; seeds
+  `initial + delta` if missing. Returns new int as a *fresh* value
+  (no aliasing into earlier callers' bindings).
+- `ets_cas(t, k, expected, new)` — compare-and-swap, `'true'`/`'false'`
+- `ets_take(t, k)` — atomic get-and-delete
+- `ets_update(t, k, fun)` — placeholder; needs a runtime helper to
+  invoke a `.sw` lambda from a C builtin (cas/get-put loops in the
+  meantime)
+
+**test(make):** added `test-core` (alias for the old test-all
+contents) and `test-full` (core + OTP + phase2..10 + search +
+mcp + sws + examples). `test-all` kept as a backward-compat alias
+for `test-core`. CI should gate on `test-full`.
+
+Three of the four were drafted by parallel headless swarm-code -p
+subagents — the first time SwarmRT shipped runtime-level fixes
+proposed by an agent built on top of SwarmRT. ETS counter needed
+two manual bug-fixes after a smoke test (pointer aliasing into
+the entry's value, and missing delta on first-insert).
+
+---
+
 ## Current state — what's in the build
 
 As of `927cb30` (2026-05-20) plus REPL builtin coverage + `eval/` benchmark, the `.sw` language has:

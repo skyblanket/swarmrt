@@ -230,6 +230,17 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 
 Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns (pointer sharing), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+### Runtime env vars
+
+Every `swc`-built binary picks these up at boot — no code changes
+needed.
+
+| Var | Default | Effect |
+|---|---|---|
+| `SW_SCHEDULERS` | CPU count | Number of scheduler threads. `1` for deterministic CLI tools. |
+| `SW_MAX_PROCS` | `100000` | Arena ceiling. Drop to `1024`/`4096` for fast-start CLI binaries — saves ~20 ms boot. Floor of 16. |
+| `SW_QUIET` | unset | Suppress the `[SwarmRT] Arena initialized…` banner on stderr. Set in scripts/CI. |
+
 ---
 
 ## Compiler CLI
