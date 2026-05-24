@@ -262,6 +262,117 @@ void *sw_ets_lookup(sw_ets_tid_t tid, void *key) {
     return NULL;
 }
 
+int64_t sw_ets_update_counter(sw_ets_tid_t tid, void *key, int64_t delta, int64_t initial) {
+    sw_ets_table_t *table = ets_find_table(tid);
+    if (!table) return initial;
+    if (!ets_check_write(table)) return initial;
+
+    uint32_t bucket = ets_hash_key(key);
+    pthread_rwlock_wrlock(&table->rwlock);
+
+    sw_ets_entry_t *e = table->buckets[bucket];
+    while (e) {
+        if (ets_key_eq(e->key, key)) {
+            sw_val_t *val = (sw_val_t *)e->value;
+            if (val && val->type == SW_VAL_INT) {
+                val->v.i += delta;
+                int64_t result = val->v.i;
+                pthread_rwlock_unlock(&table->rwlock);
+                return result;
+            }
+            pthread_rwlock_unlock(&table->rwlock);
+            return initial;
+        }
+        e = e->next;
+    }
+
+    /* Not found — insert initial value */
+    sw_val_t *new_val = sw_val_int(initial);
+    sw_ets_entry_t *entry = (sw_ets_entry_t *)malloc(sizeof(sw_ets_entry_t));
+    if (!entry) { pthread_rwlock_unlock(&table->rwlock); return initial; }
+    entry->key = key;
+    entry->value = new_val;
+    entry->next = table->buckets[bucket];
+    table->buckets[bucket] = entry;
+    table->count++;
+    pthread_rwlock_unlock(&table->rwlock);
+    return initial;
+}
+
+int sw_ets_cas(sw_ets_tid_t tid, void *key, void *expected, void *new_value) {
+    sw_ets_table_t *table = ets_find_table(tid);
+    if (!table) return 0;
+    if (!ets_check_write(table)) return 0;
+
+    uint32_t bucket = ets_hash_key(key);
+    pthread_rwlock_wrlock(&table->rwlock);
+
+    sw_ets_entry_t *e = table->buckets[bucket];
+    while (e) {
+        if (ets_key_eq(e->key, key)) {
+            sw_val_t *cur = (sw_val_t *)e->value;
+            sw_val_t *exp = (sw_val_t *)expected;
+            if (cur && exp && cur->type == exp->type) {
+                int match = 0;
+                switch (cur->type) {
+                    case SW_VAL_INT:    match = (cur->v.i == exp->v.i); break;
+                    case SW_VAL_FLOAT:  match = (cur->v.f == exp->v.f); break;
+                    case SW_VAL_ATOM:
+                    case SW_VAL_STRING: match = cur->v.str && exp->v.str && strcmp(cur->v.str, exp->v.str) == 0; break;
+                    default:            match = (cur == exp); break;
+                }
+                if (match) {
+                    e->value = new_value;
+                    pthread_rwlock_unlock(&table->rwlock);
+                    return 1;
+                }
+            } else if (!cur && !exp) {
+                e->value = new_value;
+                pthread_rwlock_unlock(&table->rwlock);
+                return 1;
+            }
+            pthread_rwlock_unlock(&table->rwlock);
+            return 0;
+        }
+        e = e->next;
+    }
+
+    pthread_rwlock_unlock(&table->rwlock);
+    return 0;
+}
+
+void *sw_ets_take(sw_ets_tid_t tid, void *key) {
+    sw_ets_table_t *table = ets_find_table(tid);
+    if (!table) return NULL;
+    if (!ets_check_write(table)) return NULL;
+
+    uint32_t bucket = ets_hash_key(key);
+    pthread_rwlock_wrlock(&table->rwlock);
+
+    sw_ets_entry_t **pp = &table->buckets[bucket];
+    while (*pp) {
+        if (ets_key_eq((*pp)->key, key)) {
+            sw_ets_entry_t *rm = *pp;
+            void *val = rm->value;
+            *pp = rm->next;
+            free(rm);
+            table->count--;
+            pthread_rwlock_unlock(&table->rwlock);
+            return val;
+        }
+        pp = &(*pp)->next;
+    }
+
+    pthread_rwlock_unlock(&table->rwlock);
+    return NULL;
+}
+
+void *sw_ets_update(sw_ets_tid_t tid, void *key, void *fun) {
+    (void)tid; (void)key; (void)fun;
+    /* Deferred: function-valued builtins require closure capture in C */
+    return NULL;
+}
+
 int sw_ets_delete(sw_ets_tid_t tid, void *key) {
     sw_ets_table_t *table = ets_find_table(tid);
     if (!table) return -1;

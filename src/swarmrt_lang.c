@@ -27,6 +27,7 @@
 #include <sys/wait.h>
 #include <sqlite3.h>
 #include "swarmrt_lang.h"
+#include "swarmrt_ets.h"
 
 /* Weak stubs for runtime functions — allows linking swc without the runtime.
  * These are only called by the interpreter, never by the compiler. */

@@ -30,6 +30,10 @@ void *sw_ets_lookup(sw_ets_tid_t tid, void *key);
 int sw_ets_delete(sw_ets_tid_t tid, void *key);
 int sw_ets_drop(sw_ets_tid_t tid);
 int sw_ets_info_count(sw_ets_tid_t tid);
+int64_t sw_ets_update_counter(sw_ets_tid_t tid, void *key, int64_t delta, int64_t initial);
+int sw_ets_cas(sw_ets_tid_t tid, void *key, void *expected, void *new_value);
+void *sw_ets_take(sw_ets_tid_t tid, void *key);
+void *sw_ets_update(sw_ets_tid_t tid, void *key, void *fun);
 
 /* List all active table IDs, returns count written to out[] */
 int sw_ets_list_tids(uint32_t *out, int max);

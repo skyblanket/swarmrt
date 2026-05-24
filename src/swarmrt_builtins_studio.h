@@ -205,6 +205,102 @@ static sw_val_t *_builtin_ets_delete(sw_val_t **a, int n) {
     return sw_val_atom("ok");
 }
 
+static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
+    if (n < 4 || a[0]->type != SW_VAL_INT || a[2]->type != SW_VAL_INT || a[3]->type != SW_VAL_INT)
+        return sw_val_atom("error");
+    int id = (int)a[0]->v.i;
+    if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_atom("error");
+    _vets_table_t *t = &_vets_tables[id];
+    uint32_t bucket = _vets_hash_val(a[1]);
+    int64_t delta = a[2]->v.i;
+    int64_t initial = a[3]->v.i;
+
+    pthread_rwlock_wrlock(&t->lock);
+    _vets_entry_t *e = t->buckets[bucket];
+    while (e) {
+        if (_vets_key_eq(e->key, a[1])) {
+            if (e->value && e->value->type == SW_VAL_INT) {
+                /* Allocate a NEW int for the entry — mutating the old
+                 * one in place would corrupt any caller still holding
+                 * the previous reference. */
+                int64_t result = e->value->v.i + delta;
+                e->value = sw_val_int(result);
+                pthread_rwlock_unlock(&t->lock);
+                return sw_val_int(result);
+            }
+            pthread_rwlock_unlock(&t->lock);
+            return sw_val_atom("error");
+        }
+        e = e->next;
+    }
+    /* Not found — seed at `initial`, apply `delta`, store the result.
+     * Return a FRESH int (not the entry's value pointer); otherwise a
+     * later update on the same key mutates the caller's earlier
+     * binding. Matches Erlang's update_counter/4 semantics. */
+    int64_t seeded = initial + delta;
+    sw_val_t *stored = sw_val_int(seeded);
+    _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
+    ne->key = a[1]; ne->value = stored; ne->next = t->buckets[bucket];
+    t->buckets[bucket] = ne;
+    pthread_rwlock_unlock(&t->lock);
+    return sw_val_int(seeded);
+}
+
+static sw_val_t *_builtin_ets_cas(sw_val_t **a, int n) {
+    if (n < 4 || a[0]->type != SW_VAL_INT) return sw_val_atom("false");
+    int id = (int)a[0]->v.i;
+    if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_atom("false");
+    _vets_table_t *t = &_vets_tables[id];
+    uint32_t bucket = _vets_hash_val(a[1]);
+
+    pthread_rwlock_wrlock(&t->lock);
+    _vets_entry_t *e = t->buckets[bucket];
+    while (e) {
+        if (_vets_key_eq(e->key, a[1])) {
+            if (_vets_key_eq(e->value, a[2])) {
+                e->value = a[3];
+                pthread_rwlock_unlock(&t->lock);
+                return sw_val_atom("true");
+            }
+            pthread_rwlock_unlock(&t->lock);
+            return sw_val_atom("false");
+        }
+        e = e->next;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return sw_val_atom("false");
+}
+
+static sw_val_t *_builtin_ets_take(sw_val_t **a, int n) {
+    if (n < 2 || a[0]->type != SW_VAL_INT) return sw_val_nil();
+    int id = (int)a[0]->v.i;
+    if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_nil();
+    _vets_table_t *t = &_vets_tables[id];
+    uint32_t bucket = _vets_hash_val(a[1]);
+
+    pthread_rwlock_wrlock(&t->lock);
+    _vets_entry_t **pp = &t->buckets[bucket];
+    while (*pp) {
+        if (_vets_key_eq((*pp)->key, a[1])) {
+            _vets_entry_t *dead = *pp;
+            sw_val_t *val = dead->value;
+            *pp = dead->next;
+            free(dead);
+            pthread_rwlock_unlock(&t->lock);
+            return val ? val : sw_val_nil();
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return sw_val_nil();
+}
+
+static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    /* Deferred: function-valued builtins require closure capture in C */
+    return sw_val_atom("error");
+}
+
 /* === Utilities === */
 
 static sw_val_t *_builtin_sleep(sw_val_t **a, int n) {

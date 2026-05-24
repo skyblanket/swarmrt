@@ -195,6 +195,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "exit_proc") == 0 || strcmp(name, "trap_exit") == 0 ||
            strcmp(name, "ets_new") == 0 || strcmp(name, "ets_put") == 0 ||
            strcmp(name, "ets_get") == 0 || strcmp(name, "ets_delete") == 0 ||
+           strcmp(name, "ets_update_counter") == 0 || strcmp(name, "ets_cas") == 0 ||
+           strcmp(name, "ets_take") == 0 || strcmp(name, "ets_update") == 0 ||
            strcmp(name, "sleep") == 0 || strcmp(name, "getenv") == 0 ||
            strcmp(name, "os_args") == 0 ||
            strcmp(name, "print_above") == 0 ||
@@ -1414,7 +1416,8 @@ static const char *_common_builtins[] = {
     "base64_encode", "base64_decode",
     "json_encode", "json_decode", "json_get", "json_escape",
     "spawn", "self", "send", "register", "whereis",
-    "ets_new", "ets_put", "ets_get", "ets_delete", "ets_list", "ets_count",
+    "ets_new", "ets_put", "ets_get", "ets_delete", "ets_update_counter", "ets_cas",
+    "ets_take", "ets_update", "ets_list", "ets_count",
     "file_read", "file_write", "file_exists", "file_delete", "file_list",
     "file_append", "file_mkdir",
     "file_rename", "file_stat", "file_atomic_write", "file_temp",
@@ -1617,6 +1620,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "exit_proc") == 0 || strcmp(fname, "trap_exit") == 0 ||
              strcmp(fname, "ets_new") == 0 || strcmp(fname, "ets_put") == 0 ||
              strcmp(fname, "ets_get") == 0 || strcmp(fname, "ets_delete") == 0 ||
+             strcmp(fname, "ets_update_counter") == 0 || strcmp(fname, "ets_cas") == 0 ||
+             strcmp(fname, "ets_take") == 0 || strcmp(fname, "ets_update") == 0 ||
              strcmp(fname, "sleep") == 0 || strcmp(fname, "getenv") == 0 ||
              strcmp(fname, "to_string") == 0 || strcmp(fname, "format") == 0 ||
              strcmp(fname, "timestamp") == 0 ||
