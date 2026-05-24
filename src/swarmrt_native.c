@@ -885,8 +885,26 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     g_swarm->num_schedulers = num_schedulers;
     g_swarm->running = 1;
 
-    /* Initialize arena — single mmap, covers everything */
-    if (sw_arena_init(&g_swarm->arena, SWARM_MAX_PROCESSES) != 0) {
+    /* Initialize arena — single mmap, covers everything.
+     *
+     * Default ceiling is SWARM_MAX_PROCESSES (100k slots, ~244MB virtual
+     * mmap + ~8MB of free-list writes). For CLI binaries that never spawn
+     * more than a handful of processes, that pre-allocation is the
+     * dominant boot cost (~20ms on macOS arm64). SW_MAX_PROCS lets a
+     * caller dial the ceiling down for fast-start programs.
+     *
+     * Safe minimum is ~16 — enough room for the supervisor tree most
+     * .sw programs spawn at startup. swarm-code peaks around 50; agent
+     * harnesses doing parallel subagents may want 1024+. Headroom is
+     * cheap (virtual mmap only commits pages touched) so leave the
+     * default high for backward compat. */
+    uint32_t max_procs = SWARM_MAX_PROCESSES;
+    const char *max_procs_env = getenv("SW_MAX_PROCS");
+    if (max_procs_env && *max_procs_env) {
+        long n = strtol(max_procs_env, NULL, 10);
+        if (n >= 16 && n <= (long)SWARM_MAX_PROCESSES) max_procs = (uint32_t)n;
+    }
+    if (sw_arena_init(&g_swarm->arena, max_procs) != 0) {
         free(g_swarm);
         g_swarm = NULL;
         pthread_mutex_unlock(&g_init_lock);
@@ -941,8 +959,31 @@ int sw_init(const char *name, uint32_t num_schedulers) {
 
     pthread_mutex_unlock(&g_init_lock);
 
-    /* Let schedulers start */
-    usleep(10000);
+    /* Wait for schedulers to flip their `active` flag before returning.
+     * Was usleep(10000) — a fixed 10ms padding that dominated boot time
+     * for short-lived CLI binaries. Spin-polling is ~100x faster on the
+     * common case (threads come up in <100us on modern OSes) while
+     * preserving the invariant that the first sw_spawn after sw_init
+     * sees ready schedulers. Falls back to the old 10ms cap if anything
+     * is genuinely stuck. */
+    {
+        int spins = 0;
+        int max_spins = 200;  /* 200 * 50us = 10ms ceiling */
+        int all_ready = 0;
+        while (!all_ready && spins < max_spins) {
+            all_ready = 1;
+            for (uint32_t i = 0; i < num_schedulers; i++) {
+                if (!g_swarm->schedulers[i] || !g_swarm->schedulers[i]->active) {
+                    all_ready = 0;
+                    break;
+                }
+            }
+            if (!all_ready) {
+                usleep(50);
+                spins++;
+            }
+        }
+    }
 
     /* Startup banner — diagnostics, not program output, so it goes to
      * stderr. That keeps stdout clean for programs whose output is
