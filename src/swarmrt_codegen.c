@@ -901,10 +901,27 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "}\n\n");
 
     /* Builtins */
+    /* print() is input-line-aware: when read_line() is engaged (raw-mode
+     * line editor active) we serialise via _sw_term_lock and wipe+redraw
+     * the input line around our output. Same scheme print_above() uses.
+     * Fixes the "input gets clobbered while typing" symptom for any
+     * print() called from a receive handler, background task, or wake
+     * chain — no app-side changes needed. */
     fprintf(f,
         "static sw_val_t *_builtin_print(sw_val_t **a, int n) {\n"
+        "    pthread_mutex_lock(&_sw_term_lock);\n"
+        "    int _act = _sw_rl.active;\n"
+        "    if (_act) fputs(\"\\r\\x1b[K\", stdout);\n"
         "    for (int i = 0; i < n; i++) { if (i) printf(\" \"); sw_val_print(a[i]); }\n"
-        "    printf(\"\\n\"); fflush(stdout); return sw_val_atom(\"ok\");\n"
+        "    printf(\"\\n\");\n"
+        "    if (_act && _sw_rl.cur_buf && *_sw_rl.cur_buf) {\n"
+        "        _sw_rl_redraw_unlocked(_sw_rl.cur_prompt,\n"
+        "                               *_sw_rl.cur_buf,\n"
+        "                               _sw_rl.cur_len ? *_sw_rl.cur_len : 0,\n"
+        "                               _sw_rl.cur_cursor ? *_sw_rl.cur_cursor : 0);\n"
+        "    } else { fflush(stdout); }\n"
+        "    pthread_mutex_unlock(&_sw_term_lock);\n"
+        "    return sw_val_atom(\"ok\");\n"
         "}\n\n");
 
     fprintf(f,
