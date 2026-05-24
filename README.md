@@ -325,7 +325,8 @@ Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x
 
 ```bash
 make test-sw         # sw-language tests (covers builtins, processes, parser fixes)
-make test-all        # the full C-runtime + sw test suite
+make test-all        # backward-compat alias for test-core
+make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search + tools
 ```
 
 `test-sw` runs the `tests/sw/test_*.sw` suite via `tests/sw/run_tests.sh`. It now covers two execution paths:
@@ -360,7 +361,8 @@ Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and tested on macO
 make swc libswarmrt              # compiler + runtime library only (you usually want this)
 make all                         # everything: compiler, library, examples, demos
 make test-sw                     # sw-language tests
-make test-all                    # full test suite
+make test-all                    # backward-compat alias for test-core
+make test-full                   # comprehensive gate (core + OTP + phases + search + tools)
 make clean                       # nuke build artefacts
 ```
 
@@ -403,7 +405,8 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart + a few example programs
 - `make test-sw` — 9 files, **110 compiled + 16 interpreter assertions** (`.sw` language)
-- `make test-phase{2..9}` — **8 C-side runtime test files**, all 100% green: GenServer/Supervisor (phase 2), ETS (phase 3, 15 tests), Agent/App/DynSup (phase 4, 14), StateMachine/ProcessGroup (phase 5, 12), TCP (phase 6, 6), hot reload (phase 7, 5), GC (phase 8, 5), distribution (phase 9, 4)
+- `make test-phase{2..10}` — **9 C-side runtime test files**, all 100% green: GenServer/Supervisor (phase 2), ETS (phase 3, 15 tests), Agent/App/DynSup (phase 4, 14), StateMachine/ProcessGroup (phase 5, 12), TCP (phase 6, 6), hot reload (phase 7, 5), GC (phase 8, 5), distribution (phase 9, 4), language frontend (phase 10)
+- `make test-full` — **comprehensive gate**: core + OTP + phases 2-10 + search + MCP + sws
 - `make stress` — **100 runs total** (50 multi-scheduler + 50 single-scheduler), 80k spawns each, must clear 90% threshold
 
 **Known issues:** one spawn-storm race in the message-send path on Linux x86_64 (single-scheduler reproduces; ~16% crash rate at 80k spawns under stress). Not the original ctx-tear race (closed deterministically in round 5 with a per-slot generation counter + ctx_lock); this one is a heap-corruption-then-strdup pattern in the mailbox/atom-allocator path. Tracked in [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md).

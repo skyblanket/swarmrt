@@ -47,10 +47,11 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 \
+.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
         test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
-        test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-all test-sw benchmark benchmark-native stats \
-        swc libswarmrt example-counter search test-search bench-search sws mcp mcp-wrap
+        test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
+        test-sw benchmark benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
+        sws mcp mcp-wrap examples
 
 all: v1 v2 proc native
 
@@ -180,7 +181,27 @@ h2h: core-objs
 
 test: test-v1 test-v2 test-proc
 
-test-all: test-v1 test-v2 test-proc test-native test-sw
+# Core test gate (what test-all used to be). Kept as a named alias so
+# callers can depend on it without hard-coding the list.
+test-core: test-v1 test-v2 test-proc test-native test-sw
+
+# Backward-compat alias — contributors/scripts that invoke `make test-all`
+# continue to work unchanged.
+test-all: test-core
+
+# Full runtime gate: core tests + OTP + all phase tests + search + tools.
+# This is the target CI and reviewers should run before claiming green.
+test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws
+
+# Compile every example that has a fun main() as a quick smoke-test of
+# the compiler and core runtime across real programs.
+examples: swc libswarmrt
+	@for f in $(EXAMPLES_DIR)/*.sw; do \
+		if grep -q "^fun main()" "$$f"; then \
+			echo "Building $$f..."; \
+			./$(BIN_DIR)/swc build "$$f" -o "$(BIN_DIR)/$$(basename $$f .sw)" --emit-c || exit 1; \
+		fi; \
+	done
 
 # sw-language test suite. Each tests/sw/test_*.sw file is compiled with
 # bin/swc, run, and its summary captured. The driver script aggregates
