@@ -300,6 +300,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "read_line") == 0 ||
            strcmp(name, "print_inline") == 0 ||
            strcmp(name, "sys_exit") == 0 ||
+           strcmp(name, "pid_alive") == 0 ||
            /* Phase 17: LLM streaming */
            strcmp(name, "http_post_stream") == 0 ||
            /* Phase 18: terminal introspection */
@@ -1443,7 +1444,7 @@ static const char *_common_builtins[] = {
     "ws_send", "ws_close", "ws_set_handler",
     "wsc_connect", "wsc_send", "wsc_recv", "wsc_close",
     "chrome_launch", "term_cols", "read_line", "read_char", "read_choice",
-    "sleep", "timestamp", "getenv", "sys_exit", "shell",
+    "sleep", "timestamp", "getenv", "sys_exit", "shell", "pid_alive",
     "random_int", "supervise",
     NULL
 };
@@ -1732,6 +1733,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "read_line") == 0 ||
              strcmp(fname, "print_inline") == 0 ||
              strcmp(fname, "sys_exit") == 0 ||
+             strcmp(fname, "pid_alive") == 0 ||
              /* Phase 17: LLM streaming */
              strcmp(fname, "http_post_stream") == 0 ||
              /* Phase 18: terminal introspection */

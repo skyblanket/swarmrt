@@ -5836,6 +5836,30 @@ static sw_val_t *_builtin_print_above(sw_val_t **a, int n) {
     return sw_val_atom("ok");
 }
 
+/* pid_alive(pid) → 'true' | 'false'
+ * Check whether an OS process is still running. Uses kill(pid, 0) —
+ * no signal sent; just returns 0 if the process exists, non-zero if
+ * it doesn't (or we lack permission). Used by schedulers / supervisors
+ * to back-pressure: don't spawn child N+1 if child N hasn't exited. */
+static sw_val_t *_builtin_pid_alive(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_atom("false");
+    long pid = 0;
+    if (a[0]->type == SW_VAL_INT) pid = (long)a[0]->v.i;
+    else if (a[0]->type == SW_VAL_STRING) pid = atol(a[0]->v.str);
+    else return sw_val_atom("false");
+    if (pid <= 0) return sw_val_atom("false");
+#ifndef _WIN32
+    int r = kill((pid_t)pid, 0);
+    if (r == 0) return sw_val_atom("true");
+    /* EPERM = process exists but we can't signal it. Still alive. */
+    if (errno == EPERM) return sw_val_atom("true");
+    return sw_val_atom("false");
+#else
+    (void)pid;
+    return sw_val_atom("false");
+#endif
+}
+
 /* sys_exit(code?) → never returns
  * Cleanly terminate the process. Essential for CLIs because the
  * runtime's main loop otherwise spins forever waiting for processes. */
