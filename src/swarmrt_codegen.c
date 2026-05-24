@@ -239,6 +239,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "json_encode") == 0 || strcmp(name, "json_decode") == 0 ||
            strcmp(name, "file_exists") == 0 || strcmp(name, "file_list") == 0 ||
            strcmp(name, "file_delete") == 0 || strcmp(name, "file_append") == 0 ||
+           strcmp(name, "file_rename") == 0 || strcmp(name, "file_stat") == 0 ||
+           strcmp(name, "file_atomic_write") == 0 || strcmp(name, "file_temp") == 0 ||
            strcmp(name, "delay") == 0 || strcmp(name, "interval") == 0 ||
            strcmp(name, "llm_complete") == 0 ||
            strcmp(name, "string_split") == 0 || strcmp(name, "string_trim") == 0 ||
@@ -1415,6 +1417,7 @@ static const char *_common_builtins[] = {
     "ets_new", "ets_put", "ets_get", "ets_delete", "ets_list", "ets_count",
     "file_read", "file_write", "file_exists", "file_delete", "file_list",
     "file_append", "file_mkdir",
+    "file_rename", "file_stat", "file_atomic_write", "file_temp",
     "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
     "ws_send", "ws_close", "ws_set_handler",
     "wsc_connect", "wsc_send", "wsc_recv", "wsc_close",
@@ -1647,6 +1650,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "json_encode") == 0 || strcmp(fname, "json_decode") == 0 ||
              strcmp(fname, "file_exists") == 0 || strcmp(fname, "file_list") == 0 ||
              strcmp(fname, "file_delete") == 0 || strcmp(fname, "file_append") == 0 ||
+             strcmp(fname, "file_rename") == 0 || strcmp(fname, "file_stat") == 0 ||
+             strcmp(fname, "file_atomic_write") == 0 || strcmp(fname, "file_temp") == 0 ||
              strcmp(fname, "delay") == 0 || strcmp(fname, "interval") == 0 ||
              strcmp(fname, "llm_complete") == 0 ||
              strcmp(fname, "string_split") == 0 || strcmp(fname, "string_trim") == 0 ||

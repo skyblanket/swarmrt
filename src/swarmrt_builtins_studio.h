@@ -3763,6 +3763,66 @@ static sw_val_t *_builtin_file_append(sw_val_t **a, int n) {
     return sw_val_atom("ok");
 }
 
+/* file_rename(src, dst)  'ok' | 'error' */
+static sw_val_t *_builtin_file_rename(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("error");
+    return sw_val_atom(rename(a[0]->v.str, a[1]->v.str) == 0 ? "ok" : "error");
+}
+
+/* file_stat(path)  %{size, mtime, mode, is_dir, exists} | nil */
+static sw_val_t *_builtin_file_stat(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    struct stat st;
+    if (stat(a[0]->v.str, &st) != 0) return sw_val_nil();
+    sw_val_t *keys[5];
+    sw_val_t *vals[5];
+    keys[0] = sw_val_atom("size");    vals[0] = sw_val_int((int64_t)st.st_size);
+#if defined(__APPLE__)
+    keys[1] = sw_val_atom("mtime");   vals[1] = sw_val_int((int64_t)st.st_mtimespec.tv_sec);
+#else
+    keys[1] = sw_val_atom("mtime");   vals[1] = sw_val_int((int64_t)st.st_mtim.tv_sec);
+#endif
+    keys[2] = sw_val_atom("mode");    vals[2] = sw_val_int((int64_t)(st.st_mode & S_IFMT));
+    keys[3] = sw_val_atom("is_dir");  vals[3] = sw_val_atom(S_ISDIR(st.st_mode) ? "true" : "false");
+    keys[4] = sw_val_atom("exists");  vals[4] = sw_val_atom("true");
+    return sw_val_map_new(keys, vals, 5);
+}
+
+/* file_atomic_write(path, content)  'ok' | 'error' */
+static sw_val_t *_builtin_file_atomic_write(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("error");
+    const char *path = a[0]->v.str;
+    const char *content = a[1]->v.str;
+    size_t plen = strlen(path);
+    char *tmp = (char *)malloc(plen + 32);
+    snprintf(tmp, plen + 32, "%s.tmp.%d", path, (int)getpid());
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) { free(tmp); return sw_val_atom("error"); }
+    size_t wlen = strlen(content);
+    if (fwrite(content, 1, wlen, fp) != wlen) { fclose(fp); swbs_unlink(tmp); free(tmp); return sw_val_atom("error"); }
+    if (fclose(fp) != 0) { swbs_unlink(tmp); free(tmp); return sw_val_atom("error"); }
+    int rc = rename(tmp, path);
+    free(tmp);
+    return sw_val_atom(rc == 0 ? "ok" : "error");
+}
+
+/* file_temp(prefix)  unique tmp file path string */
+static sw_val_t *_builtin_file_temp(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *prefix = a[0]->v.str;
+    size_t plen = strlen(prefix);
+    char *tpl = (char *)malloc(plen + 16);
+    snprintf(tpl, plen + 16, "%sXXXXXX", prefix);
+    int fd = mkstemp(tpl);
+    if (fd < 0) { free(tpl); return sw_val_nil(); }
+    close(fd);
+    sw_val_t *r = sw_val_string(tpl);
+    free(tpl);
+    return r;
+}
+
 /* === Timers: after & every === */
 
 typedef struct { sw_val_t *fn; uint64_t ms; } _timer_closure_t;
