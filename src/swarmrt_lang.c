@@ -206,6 +206,11 @@ static tok_t lnext(lex_t *l) {
         while (lpeek(l) && lpeek(l) != '"' && i < (int)sizeof(t.text) - 2) {
             if (lpeek(l) == '\\') {
                 ladv(l);
+                /* A backslash as the final byte (unterminated string ending
+                 * in '\') would make the next ladv() step past the NUL
+                 * terminator — the lexer is NUL-bounded, so reading beyond
+                 * it is a heap overflow. Stop here instead. */
+                if (!lpeek(l)) break;
                 char esc = ladv(l);
                 switch (esc) {
                     case 'n': t.text[i++] = '\n'; break;

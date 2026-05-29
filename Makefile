@@ -217,6 +217,42 @@ test-injection: swc libswarmrt
 	@./bin/swc build tests/security/shell_injection_test.sw -o /tmp/sw_injection_test
 	@SW_QUIET=1 /tmp/sw_injection_test
 
+# ── Sanitizer / fuzz ─────────────────────────────────────────────────
+# Fuzz the two pure, untrusted-input parsers — sw_lang_parse (every .sw
+# file) and sw_unmarshal (every byte off a remote node). Both are free of
+# the scheduler / asm context-switching, so they're clean under ASAN+UBSAN
+# (a full-runtime ASAN build false-positives on the fiber stack swaps).
+#
+#   make fuzz            — build both standalone + ASAN/UBSAN, replay the
+#                          seed corpus + 20k deterministic mutations each.
+#                          A crash aborts non-zero (CI memory-safety gate).
+#   SW_FUZZ_ITERS=1000000 make fuzz   — longer soak.
+#
+# For coverage-guided libFuzzer use a clang with the fuzzer runtime
+# (Linux clang, or `brew install llvm`): see tests/fuzz/README.md.
+SAN := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-stack-protector -g -O1
+FUZZ_CC ?= clang
+# Runtime sources the harnesses link against (mirror CORE_SRCS; asm is .S).
+FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarmrt_otp.c \
+           $(SRC_DIR)/swarmrt_task.c $(SRC_DIR)/swarmrt_ets.c $(SRC_DIR)/swarmrt_phase4.c \
+           $(SRC_DIR)/swarmrt_phase5.c $(SRC_DIR)/swarmrt_hotload.c $(SRC_DIR)/swarmrt_io.c \
+           $(SRC_DIR)/swarmrt_gc.c $(SRC_DIR)/swarmrt_node.c $(SRC_DIR)/swarmrt_lang.c \
+           $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c
+ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+
+.PHONY: fuzz fuzz-parse fuzz-marshal
+fuzz-parse: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
+	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
+
+fuzz-marshal: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
+	    tests/fuzz/fuzz_marshal.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_marshal $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
+
+fuzz: fuzz-parse fuzz-marshal
+
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
 # run to print `ok 80000`. Requires native Linux x86_64 thread scheduling

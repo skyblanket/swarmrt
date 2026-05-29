@@ -194,33 +194,37 @@ int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
 static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
     if (*pos >= len) return sw_val_nil();
     uint8_t tag = buf[(*pos)++];
+    /* Invariant: *pos <= len here and after every advance below. All
+     * bounds checks are written as `len - *pos < need` (never `*pos + need
+     * > len`) so attacker-controlled length fields can't overflow the
+     * addition and slip a huge memcpy past the check. */
     switch (tag) {
     case SW_MARSHAL_NIL: return sw_val_nil();
     case SW_MARSHAL_INT: {
-        if (*pos + 8 > len) return sw_val_nil();
+        if (len - *pos < 8) return sw_val_nil();
         int64_t i; memcpy(&i, buf + *pos, 8); *pos += 8;
         return sw_val_int(i);
     }
     case SW_MARSHAL_FLOAT: {
-        if (*pos + 8 > len) return sw_val_nil();
+        if (len - *pos < 8) return sw_val_nil();
         double d; memcpy(&d, buf + *pos, 8); *pos += 8;
         return sw_val_float(d);
     }
     case SW_MARSHAL_ATOM: {
-        if (*pos + 2 > len) return sw_val_nil();
+        if (len - *pos < 2) return sw_val_nil();
         uint16_t l; memcpy(&l, buf + *pos, 2); *pos += 2;
-        if (*pos + l > len) return sw_val_nil();
-        char *tmp = (char *)malloc(l + 1);
+        if (l > len - *pos) return sw_val_nil();
+        char *tmp = (char *)malloc((size_t)l + 1);
         memcpy(tmp, buf + *pos, l); tmp[l] = 0; *pos += l;
         sw_val_t *r = sw_val_atom(tmp);
         free(tmp);
         return r;
     }
     case SW_MARSHAL_STRING: {
-        if (*pos + 4 > len) return sw_val_nil();
+        if (len - *pos < 4) return sw_val_nil();
         uint32_t l; memcpy(&l, buf + *pos, 4); *pos += 4;
-        if (*pos + l > len) return sw_val_nil();
-        char *tmp = (char *)malloc(l + 1);
+        if (l > len - *pos) return sw_val_nil();
+        char *tmp = (char *)malloc((size_t)l + 1);
         memcpy(tmp, buf + *pos, l); tmp[l] = 0; *pos += l;
         sw_val_t *r = sw_val_string(tmp);
         free(tmp);
@@ -231,10 +235,10 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
         int is_tuple = (tag == SW_MARSHAL_TUPLE);
         uint32_t c;
         if (is_tuple) {
-            if (*pos + 2 > len) return sw_val_nil();
+            if (len - *pos < 2) return sw_val_nil();
             uint16_t s; memcpy(&s, buf + *pos, 2); *pos += 2; c = s;
         } else {
-            if (*pos + 4 > len) return sw_val_nil();
+            if (len - *pos < 4) return sw_val_nil();
             memcpy(&c, buf + *pos, 4); *pos += 4;
         }
         if (c > 100000) return sw_val_nil(); /* sanity cap */
@@ -246,7 +250,7 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
         return r;
     }
     case SW_MARSHAL_MAP: {
-        if (*pos + 2 > len) return sw_val_nil();
+        if (len - *pos < 2) return sw_val_nil();
         uint16_t c; memcpy(&c, buf + *pos, 2); *pos += 2;
         sw_val_t **k = (sw_val_t **)malloc(sizeof(sw_val_t *) * (c ? c : 1));
         sw_val_t **v = (sw_val_t **)malloc(sizeof(sw_val_t *) * (c ? c : 1));
@@ -259,7 +263,7 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
         return r;
     }
     case SW_MARSHAL_PID: {
-        if (*pos + 8 > len) return sw_val_nil();
+        if (len - *pos < 8) return sw_val_nil();
         uint64_t id; memcpy(&id, buf + *pos, 8); *pos += 8;
         /* Reconstruct as a SW_VAL_REMOTE_PID tagged with the sending
          * node's name. `tls_unmarshal_default_node` is set by
