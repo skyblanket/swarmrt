@@ -191,7 +191,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws
+test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.
@@ -209,11 +209,19 @@ examples: swc libswarmrt
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 
-# Stress: 80k-spawn microbench × 20 runs. Asserts ≥18 print the
-# expected `ok 80000` line. Surfaces the high-process-count arena-slot
-# reuse race (see docs/notes/KNOWN_ISSUES.md). Requires native Linux
-# x86_64 thread scheduling — emulated/serialised setups (Docker on
-# Apple Silicon, valgrind, qemu user-mode) suppress the race.
+# Security regression: the curl-backed HTTP builtins must not pass
+# caller-supplied URLs / headers through a shell. Builds the injection
+# probe and fails if any shell payload executes (canary file appears).
+.PHONY: test-injection
+test-injection: swc libswarmrt
+	@./bin/swc build tests/security/shell_injection_test.sw -o /tmp/sw_injection_test
+	@SW_QUIET=1 /tmp/sw_injection_test
+
+# Stress: 80k-spawn microbench across default scheduler count and
+# SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
+# run to print `ok 80000`. Requires native Linux x86_64 thread scheduling
+# for meaningful scheduler-race coverage; emulated/serialised setups
+# (Docker on Apple Silicon, valgrind, qemu user-mode) are smoke only.
 .PHONY: stress
 stress: swc libswarmrt
 	@./tests/stress/run_stress.sh

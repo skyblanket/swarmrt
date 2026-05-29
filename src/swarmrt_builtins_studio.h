@@ -647,154 +647,6 @@ static sw_val_t *_builtin_json_get(sw_val_t **a, int n) {
  * ============================================================ */
 static sw_val_t *_builtin_http_post(sw_val_t **a, int n);
 
-/* (Implementation moved below — see after _sw_popen_pid_close.) */
-#if 0
-static sw_val_t *_builtin_http_post_OBSOLETE(sw_val_t **a, int n) {
-    if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
-        return sw_val_nil();
-    const char *url = a[0]->v.str, *body = a[2]->v.str;
-
-    /* Build the curl command once — reused across retry attempts. */
-    size_t cmdcap = strlen(body) + strlen(url) + 4096;
-    char *cmd = (char *)malloc(cmdcap);
-    int off = 0;
-    off += snprintf(cmd + off, cmdcap - off,
-        "curl -sS -X POST --connect-timeout 30 --max-time 300");
-
-    sw_val_t *headers = a[1];
-    if (headers && headers->type == SW_VAL_LIST) {
-        for (int i = 0; i < headers->v.tuple.count; i++) {
-            sw_val_t *h = headers->v.tuple.items[i];
-            if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
-                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
-                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
-                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
-        }
-    }
-
-    /* Body via temp file — keeps curl arg list small and avoids
-     * shell-escaping the JSON. */
-    char tmpf[256];
-    snprintf(tmpf, sizeof(tmpf),
-        "%s/sw_http_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
-    FILE *tf = fopen(tmpf, "w");
-    if (tf) { fputs(body, tf); fclose(tf); }
-
-    /* No -o flag — let curl write to its pipe to us. We grow the
-     * response buffer as bytes arrive. */
-    off += snprintf(cmd + off, cmdcap - off,
-        " -d @%s '%s' 2>/dev/null", tmpf, url);
-
-    /* Stdin interrupt watcher — only enabled when stdin is a TTY AND
-     * the line editor has set up raw mode (so ESC arrives as a single
-     * byte without waiting for newline). swarm-code's reader process
-     * triggers _sw_rl_setup on first read_line; from that point on
-     * the terminal stays in raw mode for the rest of the session. */
-    int stdin_fd = -1;
-    if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) stdin_fd = STDIN_FILENO;
-
-    int interrupted = 0;
-    char *resp_buf = NULL;
-    size_t resp_len = 0;
-    size_t resp_cap_local = 65536;
-
-    int delays[] = {0, 5, 15};
-    for (int attempt = 0; attempt < 3 && !interrupted; attempt++) {
-        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
-
-        if (resp_buf) free(resp_buf);
-        resp_buf = (char *)malloc(resp_cap_local);
-        resp_len = 0;
-        resp_buf[0] = 0;
-
-        _sw_popen_pid_t ch = _sw_popen_pid(cmd);
-        if (!ch.fp) continue;
-        int pipe_fd = fileno(ch.fp);
-        int fl = fcntl(pipe_fd, F_GETFL, 0);
-        if (fl >= 0) fcntl(pipe_fd, F_SETFL, fl | O_NONBLOCK);
-
-        char readbuf[4096];
-        int done = 0;
-        while (!done) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(pipe_fd, &rfds);
-            if (stdin_fd >= 0) FD_SET(stdin_fd, &rfds);
-            int max_fd = pipe_fd;
-            if (stdin_fd > max_fd) max_fd = stdin_fd;
-
-            /* 1-second tick so we periodically wake up and could check
-             * additional state in the future (e.g. a sw-side interrupt
-             * flag). For now select blocks until pipe or stdin fires. */
-            struct timeval tv = {1, 0};
-            int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
-            if (ret < 0) {
-                if (errno == EINTR) continue;
-                done = 1;
-                break;
-            }
-
-            if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
-                unsigned char ib;
-                ssize_t nb = read(stdin_fd, &ib, 1);
-                if (nb == 1 && (ib == 0x1b || ib == 0x03)) {
-                    interrupted = 1;
-                    fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
-                    fflush(stdout);
-                    _sw_pkill_close(ch);
-                    ch.fp = NULL; ch.pid = -1;
-                    done = 1;
-                    break;
-                }
-                /* Other keystrokes during the wait: ignore. */
-            }
-
-            if (FD_ISSET(pipe_fd, &rfds)) {
-                ssize_t rn = read(pipe_fd, readbuf, sizeof(readbuf));
-                if (rn < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-                    done = 1; break;
-                }
-                if (rn == 0) { done = 1; break; }   /* EOF */
-                if (resp_len + (size_t)rn + 1 > resp_cap_local) {
-                    while (resp_len + (size_t)rn + 1 > resp_cap_local) resp_cap_local *= 2;
-                    resp_buf = (char *)realloc(resp_buf, resp_cap_local);
-                }
-                memcpy(resp_buf + resp_len, readbuf, rn);
-                resp_len += (size_t)rn;
-                resp_buf[resp_len] = 0;
-            }
-        }
-
-        if (!interrupted && ch.fp) {
-            _sw_popen_pid_close(ch);
-        }
-
-        if (interrupted) break;
-
-        /* Server error or empty body → retry. Otherwise we're done. */
-        if (resp_len > 0 &&
-            strstr(resp_buf, "Internal Server Error") == NULL &&
-            strstr(resp_buf, "\"error\"") == NULL) {
-            break;
-        }
-    }
-
-    swbs_unlink(tmpf);
-    free(cmd);
-
-    if (interrupted) {
-        free(resp_buf);
-        /* Sentinel string the sw caller checks for. Picked to be
-         * impossible to confuse with a real API response. */
-        return sw_val_string("__INTERRUPTED__");
-    }
-
-    sw_val_t *r = sw_val_string(resp_buf);
-    free(resp_buf);
-    return r;
-}
-#endif /* obsolete http_post body wrapped above */
 
 /* ============================================================
  * Line editor state — forward declared here so http_post_stream
@@ -880,6 +732,54 @@ static _sw_popen_pid_t _sw_popen_pid(const char *cmd) {
     r.pid = pid;
 #else
     (void)cmd;
+#endif
+    return r;
+}
+
+/* Like _sw_popen_pid, but execs argv DIRECTLY — no /bin/sh, no command
+ * string. This is the injection-safe path: the URL, headers and any other
+ * caller-supplied strings arrive as literal argv elements, so shell
+ * metacharacters ('`$();|&<>' and embedded quotes) in untrusted input can
+ * never be interpreted. argv must be NULL-terminated; argv[0] is the
+ * program (resolved via PATH by execvp). Child stderr is sent to /dev/null
+ * Child stderr goes to `stderr_path` if non-NULL (callers that want to
+ * surface curl transport errors), else to /dev/null (matching the old
+ * `2>/dev/null`). Returns the same {fp, pid} so _sw_pkill_close /
+ * _sw_popen_pid_close / the select loop all work unchanged. */
+static _sw_popen_pid_t _sw_popen_argv(char *const argv[], const char *stderr_path) {
+    _sw_popen_pid_t r;
+    r.fp = NULL;
+    r.pid = -1;
+#ifndef _WIN32
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return r;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return r;
+    }
+    if (pid == 0) {
+        /* child */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int errfd = stderr_path
+            ? open(stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0600)
+            : open("/dev/null", O_WRONLY);
+        if (errfd >= 0) { dup2(errfd, STDERR_FILENO); close(errfd); }
+        /* Own process group so killpg() on interrupt takes down the
+         * child without signaling us. */
+        setpgid(0, 0);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    /* parent */
+    close(pipefd[1]);
+    r.fp = fdopen(pipefd[0], "r");
+    r.pid = pid;
+#else
+    (void)argv;
 #endif
     return r;
 }
@@ -1132,36 +1032,55 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
         return sw_val_nil();
     const char *url = a[0]->v.str, *body = a[2]->v.str;
 
-    /* Build the curl command once — reused across retry attempts. */
-    size_t cmdcap = strlen(body) + strlen(url) + 4096;
-    char *cmd = (char *)malloc(cmdcap);
-    int off = 0;
-    off += snprintf(cmd + off, cmdcap - off,
-        "curl -sS -X POST --connect-timeout 30 --max-time 300");
-
-    sw_val_t *headers = a[1];
-    if (headers && headers->type == SW_VAL_LIST) {
-        for (int i = 0; i < headers->v.tuple.count; i++) {
-            sw_val_t *h = headers->v.tuple.items[i];
-            if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
-                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
-                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
-                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
-        }
-    }
-
-    /* Body via temp file — keeps curl arg list small and avoids
-     * shell-escaping the JSON. */
+    /* Body via temp file — keeps the JSON out of argv entirely (and out
+     * of any shell). curl reads it with -d @file. */
     char tmpf[256];
     snprintf(tmpf, sizeof(tmpf),
         "%s/sw_http_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
     FILE *tf = fopen(tmpf, "w");
     if (tf) { fputs(body, tf); fclose(tf); }
+    char body_arg[300];
+    snprintf(body_arg, sizeof(body_arg), "@%s", tmpf);
 
-    /* No -o flag — let curl write to its pipe to us so we can stream
-     * into a growable buffer (and bail mid-flight on interrupt). */
-    off += snprintf(cmd + off, cmdcap - off,
-        " -d @%s '%s' 2>/dev/null", tmpf, url);
+    /* Build a curl ARGV — executed via _sw_popen_argv (execvp, no shell).
+     * The URL and header values are caller-supplied and may contain shell
+     * metacharacters; as literal argv elements they can never be
+     * interpreted. (The old path single-quoted them into a /bin/sh string
+     * with no escaping — an embedded quote broke out into the shell.) */
+    sw_val_t *headers = a[1];
+    int nhdr = (headers && headers->type == SW_VAL_LIST) ? headers->v.tuple.count : 0;
+    /* 8 fixed + 2 per header + (-d, body_arg, url) + NULL */
+    char **argv = (char **)malloc(sizeof(char *) * (8 + 2 * nhdr + 3 + 1));
+    char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
+    int argc = 0, nhdr_alloc = 0;
+    argv[argc++] = "curl";
+    argv[argc++] = "-sS";
+    argv[argc++] = "-X";
+    argv[argc++] = "POST";
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = "30";
+    argv[argc++] = "--max-time";
+    argv[argc++] = "300";
+    if (headers && headers->type == SW_VAL_LIST) {
+        for (int i = 0; i < headers->v.tuple.count; i++) {
+            sw_val_t *h = headers->v.tuple.items[i];
+            if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
+                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str) {
+                const char *hk = h->v.tuple.items[0]->v.str;
+                const char *hv = h->v.tuple.items[1]->v.str;
+                size_t hl = strlen(hk) + strlen(hv) + 3;
+                char *hs = (char *)malloc(hl);
+                snprintf(hs, hl, "%s: %s", hk, hv);
+                hdr_strs[nhdr_alloc++] = hs;
+                argv[argc++] = "-H";
+                argv[argc++] = hs;
+            }
+        }
+    }
+    argv[argc++] = "-d";
+    argv[argc++] = body_arg;
+    argv[argc++] = (char *)url;  /* execvp won't modify it */
+    argv[argc] = NULL;
 
     /* Stdin interrupt watcher — only enabled when stdin is a TTY AND
      * the line editor has set up raw mode (so ESC arrives as a single
@@ -1185,7 +1104,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
         resp_len = 0;
         resp_buf[0] = 0;
 
-        _sw_popen_pid_t ch = _sw_popen_pid(cmd);
+        _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
         if (!ch.fp) continue;
         int pipe_fd = fileno(ch.fp);
         int fl = fcntl(pipe_fd, F_GETFL, 0);
@@ -1253,7 +1172,9 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     }
 
     swbs_unlink(tmpf);
-    free(cmd);
+    for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
+    free(hdr_strs);
+    free(argv);
 
     if (interrupted) {
         free(resp_buf);
@@ -1776,11 +1697,9 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     snprintf(err_file, sizeof(err_file), "%s/sw_stream_err_%d_%u.txt",
              sw_tmpdir(), sw_getpid_os(), sw_random_u32());
 
-    /* Build the curl command with headers + -N for unbuffered streaming. */
-    size_t cmdcap = 8192;
-    char *cmd = (char *)malloc(cmdcap);
-    int off = 0;
-    /* --keepalive-time 30: send TCP keepalives so flaky long-distance
+    /* Build a curl ARGV (no shell — url/headers can't inject) with -N for
+     * unbuffered streaming.
+     * --keepalive-time 30: send TCP keepalives so flaky long-distance
      *   routes (api.z.ai, sushi, anything overseas) don't silently drop
      *   an idle stream during long reasoning chains.
      * --retry 2 --retry-delay 1 --retry-connrefused --retry-all-errors:
@@ -1788,26 +1707,58 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      *   does NOT restart an already-streaming response (so safe for
      *   streaming). Catches transient SSL/connect timeouts (curl 28/35).
      * --max-time 1800: hard ceiling at 30 min — long reasoning is fine
-     *   but eventually we want to surface a failure rather than hang. */
-    off += snprintf(cmd + off, cmdcap - off,
-        "curl -sS -N -X POST --connect-timeout 30 --max-time 1800 "
-        "--keepalive-time 30 "
-        "--retry 2 --retry-delay 1 --retry-connrefused --retry-all-errors");
+     *   but eventually we want to surface a failure rather than hang.
+     * curl stderr is redirected to err_file by _sw_popen_argv. */
+    char body_arg[300];
+    snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
+    int nhdr = (headers && headers->type == SW_VAL_LIST) ? headers->v.tuple.count : 0;
+    /* 17 fixed + 2 per header + (--data-binary, body_arg, url) + NULL */
+    char **argv = (char **)malloc(sizeof(char *) * (17 + 2 * nhdr + 3 + 1));
+    char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
+    int argc = 0, nhdr_alloc = 0;
+    argv[argc++] = "curl";
+    argv[argc++] = "-sS";
+    argv[argc++] = "-N";
+    argv[argc++] = "-X";
+    argv[argc++] = "POST";
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = "30";
+    argv[argc++] = "--max-time";
+    argv[argc++] = "1800";
+    argv[argc++] = "--keepalive-time";
+    argv[argc++] = "30";
+    argv[argc++] = "--retry";
+    argv[argc++] = "2";
+    argv[argc++] = "--retry-delay";
+    argv[argc++] = "1";
+    argv[argc++] = "--retry-connrefused";
+    argv[argc++] = "--retry-all-errors";
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
             sw_val_t *h = headers->v.tuple.items[i];
             if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
-                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
-                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
-                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
+                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str) {
+                const char *hk = h->v.tuple.items[0]->v.str;
+                const char *hv = h->v.tuple.items[1]->v.str;
+                size_t hl = strlen(hk) + strlen(hv) + 3;
+                char *hs = (char *)malloc(hl);
+                snprintf(hs, hl, "%s: %s", hk, hv);
+                hdr_strs[nhdr_alloc++] = hs;
+                argv[argc++] = "-H";
+                argv[argc++] = hs;
+            }
         }
     }
-    off += snprintf(cmd + off, cmdcap - off,
-        " --data-binary @%s '%s' 2>%s", body_file, url, err_file);
+    argv[argc++] = "--data-binary";
+    argv[argc++] = body_arg;
+    argv[argc++] = (char *)url;
+    argv[argc] = NULL;
 
-    _sw_popen_pid_t ch = _sw_popen_pid(cmd);
+    _sw_popen_pid_t ch = _sw_popen_argv(argv, err_file);
     FILE *pp = ch.fp;
-    free(cmd);
+    for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
+    free(hdr_strs);
+    free(argv);
     if (!pp) { swbs_unlink(body_file); swbs_unlink(err_file); return sw_val_nil(); }
 
     /* Put the pipe in non-blocking mode so we can tick the spinner while
@@ -3179,33 +3130,53 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
         return sw_val_nil();
     const char *url = a[0]->v.str;
 
-    size_t cmdcap = strlen(url) + 4096;
-    char *cmd = (char *)malloc(cmdcap);
     char outf[256];
     snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json",
              sw_tmpdir(), sw_getpid_os(), sw_random_u32());
 
-    int off = 0;
-    off += snprintf(cmd + off, cmdcap - off,
-        "curl -sS --connect-timeout 30 --max-time 120");
-
+    /* curl ARGV — no shell, so the URL and header values (caller-supplied)
+     * can't inject. Output goes to -o outf, which we then read back. */
+    int nhdr = (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) ? a[1]->v.tuple.count : 0;
+    /* 6 fixed + 2 per header + (url, -o, outf) + NULL */
+    char **argv = (char **)malloc(sizeof(char *) * (6 + 2 * nhdr + 3 + 1));
+    char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
+    int argc = 0, nhdr_alloc = 0;
+    argv[argc++] = "curl";
+    argv[argc++] = "-sS";
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = "30";
+    argv[argc++] = "--max-time";
+    /* note: --max-time value 120 below */
+    argv[argc++] = "120";
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) {
         for (int i = 0; i < a[1]->v.tuple.count; i++) {
             sw_val_t *h = a[1]->v.tuple.items[i];
             if (h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
-                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str)
-                off += snprintf(cmd + off, cmdcap - off, " -H '%s: %s'",
-                    h->v.tuple.items[0]->v.str, h->v.tuple.items[1]->v.str);
+                h->v.tuple.items[0]->v.str && h->v.tuple.items[1]->v.str) {
+                const char *hk = h->v.tuple.items[0]->v.str;
+                const char *hv = h->v.tuple.items[1]->v.str;
+                size_t hl = strlen(hk) + strlen(hv) + 3;
+                char *hs = (char *)malloc(hl);
+                snprintf(hs, hl, "%s: %s", hk, hv);
+                hdr_strs[nhdr_alloc++] = hs;
+                argv[argc++] = "-H";
+                argv[argc++] = hs;
+            }
         }
     }
-    off += snprintf(cmd + off, cmdcap - off, " '%s' -o %s 2>/dev/null", url, outf);
+    argv[argc++] = (char *)url;
+    argv[argc++] = "-o";
+    argv[argc++] = outf;
+    argv[argc] = NULL;
 
     char *resp = NULL;
     size_t resp_len = 0;
     int delays[] = {0, 3, 10};
     for (int attempt = 0; attempt < 3; attempt++) {
         if (delays[attempt] > 0) sw_sleep(delays[attempt]);
-        system(cmd);
+        /* spawn curl (no shell) and wait for it; output lands in outf */
+        _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
+        if (ch.fp) _sw_popen_pid_close(ch);
         FILE *fp = fopen(outf, "r");
         if (!fp) continue;
         size_t cap = 65536;
@@ -3227,7 +3198,9 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
         if (resp_len > 0) { swbs_unlink(outf); break; }
     }
     swbs_unlink(outf);
-    free(cmd);
+    for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
+    free(hdr_strs);
+    free(argv);
     if (!resp) return sw_val_string("");
     sw_val_t *r = sw_val_string(resp);
     free(resp);
