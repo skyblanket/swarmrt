@@ -4,6 +4,39 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-29 — interactive-IO correctness + back-pressure primitive
+
+Three fixes shaken out of long-running interactive sessions in swarm-code.
+
+**fix(codegen):** `receive` clauses now release the matched message
+*before* evaluating the clause body, not after. The deserialized
+pattern bindings are independent values (`deserialize_val` copies out
+of the message), so freeing the mailbox slot early is safe and returns
+mailbox pressure to the allocator one body-evaluation sooner. Applies
+to both guarded and unguarded clauses. All 110 compiled + 16
+interpreter assertions stay green, processes suite included.
+
+**fix(io):** `print()` and `shell()`'s live-progress tail now honour
+the `read_line` line editor. Previously any `print()` fired from a
+receive handler, background tick, or wake chain — and `shell()`'s
+`\r\033[K` progress wipe — wrote straight at the cursor and shoved the
+user's in-flight typing into nonsense. All three sites now take
+`_sw_term_lock`, emit, and redraw the editor's prompt+buf+cursor below
+(the same dance `print_above()` already did). Headless / piped / no-TTY
+paths collapse to the original behaviour — zero overhead when no editor
+is up. Unblocked: usable interactive REPL-style agents that print
+asynchronously while the user is typing.
+
+**feat(builtins):** `pid_alive(pid)` — `kill(pid, 0)` wrapper returning
+`'true'`/`'false'`. Lets schedulers and supervisors back-pressure
+(skip dispatch while the previous child is still running) without
+paying a `shell("kill -0 …")` poll per check. Accepts int or string;
+`EPERM` counts as alive (process exists, we just can't signal it).
+Surfaced by a runaway 5s cron in swarm-code firing new children every
+tick while prior ones were stuck mid-LLM-call.
+
+---
+
 ## 2026-05-25 — harness primitives + boot-speed parity
 
 Four landings driven by the swarm-code v0.2 hardening pass.

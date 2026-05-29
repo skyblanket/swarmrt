@@ -1950,21 +1950,21 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
             fprintf(f, "            if (sw_val_is_truthy(%s)) {\n", guard_res);
             fprintf(f, "              sw_mailbox_remove_msg(%s);\n", cur);
             fprintf(f, "              _matched = 1;\n");
+            fprintf(f, "              sw_msg_release(%s);\n", cur);
             char body_res[32];
             emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
             if (body_res[0])
                 fprintf(f, "              %s = %s;\n", res, body_res);
-            fprintf(f, "              sw_msg_release(%s);\n", cur);
             fprintf(f, "            }\n");
         } else {
             fprintf(f, "            sw_mailbox_remove_msg(%s);\n", cur);
             fprintf(f, "            _matched = 1;\n");
             emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
+            fprintf(f, "            sw_msg_release(%s);\n", cur);
             char body_res[32];
             emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
             if (body_res[0])
                 fprintf(f, "            %s = %s;\n", res, body_res);
-            fprintf(f, "            sw_msg_release(%s);\n", cur);
         }
 
         ctx->ndeclared = saved_ndeclared;

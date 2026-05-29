@@ -1713,7 +1713,10 @@ static sw_val_t *deserialize_val(sw_msg_val_t *m) {
     }
 }
 
-/* Built-in function: print */
+/* Built-in function: print.
+ * The interpreter has no line editor — read_line + _sw_rl live only in
+ * compiled binaries via swarmrt_builtins_studio.h. The codegen-emitted
+ * _builtin_print does the input-line-aware wipe/redraw dance. */
 static sw_val_t *builtin_print(sw_val_t **args, int nargs) {
     for (int i = 0; i < nargs; i++) {
         if (i) printf(" ");

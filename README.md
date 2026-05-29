@@ -5,6 +5,8 @@
 
 **A from-scratch BEAM-shaped runtime for the AI-agent era — written in C, compiled ahead of time, no VM, no GC pauses.**
 
+In plain terms: Erlang's superpower — hundreds of thousands of cheap, crash-isolated processes passing messages, with supervisors that restart the ones that die — but compiled straight to a single native binary. No VM to install, no garbage-collector pauses, boots in milliseconds. The language on top (`sw`) is shaped so an LLM writes it correctly on the first try, because the point is running swarms of AI agents, each one its own process.
+
 ```sw
 module Counter
 export [main, counter]
