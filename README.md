@@ -321,7 +321,7 @@ The [`examples/`](examples/) directory has small focused programs. Each shows on
 | `counter.sw` | Process spawning, send, receive, pattern matching on tuples. |
 | `pingpong.sw` | Bidirectional message passing between two processes. |
 | `lambda.sw` | Anonymous functions and closures. |
-| `mathlib.sw` + `math_test.sw` | Multi-module program with imports. |
+| `multi_main.sw` | Multi-module program — imports `MathLib` (from `mathlib.sw`), calls `factorial` / `sum_list`. |
 | `supervisor.sw` | Restart strategies in action. |
 | `mapreduce.sw` | Spawn a fan-out worker pool and collect results. |
 | `distributed.sw` | Multi-node — start two `swarms` and pass messages over TCP. |
@@ -330,7 +330,7 @@ The [`examples/`](examples/) directory has small focused programs. Each shows on
 | `http_echo.sw` | A working HTTP server in 25 lines — `case` on the path, f-strings for templating. |
 | `llm_agent.sw` | A real LLM-driven agent in 90 lines. Prompt → http_post_stream → parse `<tool>` tags → `case` dispatch → loop. Works against any OpenAI-compatible endpoint. |
 
-Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x`.
+Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x`. (`mathlib.sw` is a library — it has no `main`, so build the importer `multi_main.sw` instead. `math_test.sw` is a test file: run it with `./bin/swc test examples/math_test.sw`.)
 
 ---
 
