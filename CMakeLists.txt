@@ -15,6 +15,20 @@ else()
     set(PLATFORM_LIBS ssl crypto)
 endif()
 
+# SQLite — the db_* builtins (in swarmrt_io / studio builtins) link against
+# libsqlite3. Mirrors the Makefile: on macOS the system header is old, so
+# prefer Homebrew's sqlite3 if it's installed.
+if(APPLE)
+    execute_process(COMMAND brew --prefix sqlite3
+        OUTPUT_VARIABLE BREW_SQLITE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(BREW_SQLITE)
+        include_directories(${BREW_SQLITE}/include)
+        link_directories(${BREW_SQLITE}/lib)
+    endif()
+endif()
+
 # Common flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-function -O2")
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
@@ -39,6 +53,7 @@ set(CORE_SOURCES
     ${SRC_DIR}/swarmrt_node.c
     ${SRC_DIR}/swarmrt_lang.c
     ${SRC_DIR}/swarmrt_http.c
+    ${SRC_DIR}/swarmrt_pdf.c
 )
 
 # swarmrt_native.c needs -fno-stack-protector (processes migrate between
@@ -52,15 +67,18 @@ enable_language(ASM)
 # Static library
 add_library(swarmrt_lib STATIC ${CORE_SOURCES})
 target_include_directories(swarmrt_lib PUBLIC ${SRC_DIR})
-target_link_libraries(swarmrt_lib pthread z ${PLATFORM_LIBS})
+target_link_libraries(swarmrt_lib pthread z sqlite3 m ${PLATFORM_LIBS})
 
 # SwarmRT Compiler (swc)
+# swarmrt_lsp.c defines sw_lsp_main (the `swc lsp` subcommand). It was
+# missing here, so `cmake --build --target swc` failed to link.
 add_executable(swc
     ${SRC_DIR}/swc.c
     ${SRC_DIR}/swarmrt_codegen.c
     ${SRC_DIR}/swarmrt_obfusc.c
     ${SRC_DIR}/swarmrt_repl.c
     ${SRC_DIR}/swarmrt_test.c
+    ${SRC_DIR}/swarmrt_lsp.c
 )
 target_link_libraries(swc swarmrt_lib)
 
