@@ -35,9 +35,17 @@ int main() {
     
     sleep(2);
     printf("Completed: %d/1000\n", completed);
-    
+
     swarm_v2_stats(swarm);
     swarm_v2_shutdown(swarm);
-    
+
+    /* Each of the 1000 processes runs inc_worker exactly once, so a
+     * correct scheduler lands completed == 1000. Anything else (the old
+     * runaway-reschedule bug printed tens of millions) is a failure. */
+    if (completed != 1000) {
+        fprintf(stderr, "FAIL: expected 1000 completions, got %d\n", completed);
+        return 1;
+    }
+    printf("PASS: v2 prototype ran 1000/1000 processes to completion\n");
     return 0;
 }

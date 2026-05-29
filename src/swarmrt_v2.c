@@ -153,14 +153,15 @@ static void *scheduler_loop(void *arg) {
              * Full context switching requires assembly
              */
             p->ctx.func(p->ctx.arg);
-            
-            /* Process yielded or exited */
-            if (p->state == SW_PROC_RUNNING) {
-                /* Still runnable, reschedule */
-                p->state = SW_PROC_RUNNABLE;
-                sw_v2_schedule_me();
-            }
-            
+
+            /* This prototype calls func() directly (no context save) and
+             * sw_v2_yield() is a no-op, so a returned function has run to
+             * completion — there is no resume point. Mark it EXITED.
+             * (The old code left state == RUNNING and rescheduled, so every
+             * worker re-ran thousands of times — that's why test_v2 printed
+             * "Completed: 33613534/1000".) */
+            p->state = SW_PROC_EXITED;
+
             sched->current = NULL;
             tls_current = NULL;
         } else {
