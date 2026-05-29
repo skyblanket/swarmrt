@@ -52,8 +52,8 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
  *   0x05  tuple  (uint16 count + N values)
  *   0x06  list   (uint32 count + N values)
  *   0x07  map    (uint16 count + N key-value pairs)
- *   0x08  pid    (8 bytes pid id — only meaningful on local node; cross-
- *                 node pid routing isn't wired yet — see KNOWN_ISSUES)
+ *   0x08  pid    (8 bytes pid id; receiver annotates it with the sender
+ *                 node so replies can route back over distribution)
  *
  * Multi-byte fields use native byte order; both nodes are assumed to
  * have the same word size and endianness for v1. A version byte can be
@@ -335,16 +335,33 @@ static sw_peer_t *find_peer_by_conn_locked(sw_port_t *conn) {
 }
 
 /* Append bytes to a peer's rx buffer, growing as needed. Single-writer
- * (dist_handler) so no lock needed on the buffer fields themselves. */
-static void peer_rx_append(sw_peer_t *peer, const uint8_t *data, uint32_t len) {
-    if (peer->rx_len + len > peer->rx_cap) {
+ * (dist_handler) so no lock needed on the buffer fields themselves.
+ *
+ * Returns 0 on success, -1 if the append would exceed SW_NODE_MAX_FRAME,
+ * overflow the size arithmetic, or hit an allocation failure. On -1 the
+ * existing buffer is left intact (caller drops the connection's stream).
+ * `data` is untrusted network input, so every size step is bounds-checked
+ * before it can wrap. */
+static int peer_rx_append(sw_peer_t *peer, const uint8_t *data, uint32_t len) {
+    if (len == 0) return 0;
+    /* Reject before `rx_len + len` can overflow uint32 or blow the cap.
+     * Written as subtraction so the RHS can't wrap. */
+    if (len > SW_NODE_MAX_FRAME - peer->rx_len) return -1;
+    uint32_t need = peer->rx_len + len;
+    if (need > peer->rx_cap) {
         uint32_t nc = peer->rx_cap ? peer->rx_cap : 1024;
-        while (nc < peer->rx_len + len) nc *= 2;
-        peer->rx_buf = (uint8_t *)realloc(peer->rx_buf, nc);
+        while (nc < need) {
+            if (nc > SW_NODE_MAX_FRAME / 2) { nc = need; break; } /* no *2 overflow */
+            nc *= 2;
+        }
+        uint8_t *nb = (uint8_t *)realloc(peer->rx_buf, nc);
+        if (!nb) return -1; /* old buffer still valid; caller bails */
+        peer->rx_buf = nb;
         peer->rx_cap = nc;
     }
     memcpy(peer->rx_buf + peer->rx_len, data, len);
     peer->rx_len += len;
+    return 0;
 }
 
 /* Discard `consumed` bytes from the head of the rx buffer. */
@@ -458,8 +475,14 @@ static void handle_remote_data(uint8_t *data, uint32_t len, sw_port_t *conn) {
     void *payload = NULL;
     uint32_t plen = hdr->payload_len;
 
-    if (plen > 0 && len >= sizeof(sw_remote_msg_t) + plen) {
+    /* `plen` comes off the wire untrusted. Cap it, and bounds-check
+     * against the bytes we actually hold using subtraction so
+     * `sizeof(hdr) + plen` can't overflow (len >= sizeof guaranteed by
+     * the early return above). */
+    if (plen > 0 && plen <= SW_NODE_MAX_FRAME &&
+        plen <= len - sizeof(sw_remote_msg_t)) {
         payload = malloc(plen);
+        if (!payload) return; /* OOM — drop this frame rather than deref NULL */
         memcpy(payload, data + sizeof(sw_remote_msg_t), plen);
     }
 
@@ -523,12 +546,26 @@ static void dist_handler(void *arg) {
                  * length-prefixed frame. TCP is a byte stream so the
                  * kernel can hand us multiple frames in one read, or a
                  * frame split across reads. */
-                peer_rx_append(peer, data->data, data->len);
-                while (peer->rx_len >= 4) {
-                    uint32_t msg_len = ntohl(*(uint32_t *)peer->rx_buf);
-                    if (peer->rx_len < 4 + msg_len) break;
-                    handle_remote_data(peer->rx_buf + 4, msg_len, data->port);
-                    peer_rx_consume(peer, 4 + msg_len);
+                if (peer_rx_append(peer, data->data, data->len) != 0) {
+                    /* Oversized / overflowing / OOM append — this stream
+                     * is abusive or we're out of memory. Reset the rx
+                     * buffer so we resync on the next frame boundary
+                     * rather than corrupting state. */
+                    peer->rx_len = 0;
+                } else {
+                    while (peer->rx_len >= 4) {
+                        uint32_t msg_len = ntohl(*(uint32_t *)peer->rx_buf);
+                        /* Reject a frame larger than the ceiling before it
+                         * can wedge the buffer (we'll never accumulate it).
+                         * Drop the stream — a valid peer never sends this. */
+                        if (msg_len > SW_NODE_MAX_FRAME) { peer->rx_len = 0; break; }
+                        /* `rx_len - 4` can't underflow (loop guard >= 4);
+                         * compare via subtraction so `4 + msg_len` never
+                         * overflows. */
+                        if (msg_len > peer->rx_len - 4) break;
+                        handle_remote_data(peer->rx_buf + 4, msg_len, data->port);
+                        peer_rx_consume(peer, 4 + msg_len);
+                    }
                 }
             } else {
                 /* No peer slot (max peers reached) — degrade to the
@@ -536,7 +573,8 @@ static void dist_handler(void *arg) {
                  * isn't dropped. */
                 if (data->len >= 4) {
                     uint32_t msg_len = ntohl(*(uint32_t *)data->data);
-                    if (data->len >= 4 + msg_len) {
+                    if (msg_len <= SW_NODE_MAX_FRAME &&
+                        msg_len <= data->len - 4) {
                         handle_remote_data(data->data + 4, msg_len, data->port);
                     }
                 }

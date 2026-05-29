@@ -46,6 +46,14 @@ const char *sw_node_local_name(void);
 #define SW_NODE_MAX_PEERS 32
 #define SW_TAG_REMOTE_MSG 16
 
+/* Hard ceiling on a single inbound distribution frame (length prefix +
+ * header + payload). A peer is untrusted network input: without this an
+ * adversary can send a 4-byte length prefix claiming ~4 GB and force the
+ * rx buffer to grow without bound (memory-exhaustion DoS), or send a
+ * length near UINT32_MAX to overflow `4 + msg_len` / `sizeof(hdr)+plen`.
+ * 64 MB is far above any legitimate marshalled message. */
+#define SW_NODE_MAX_FRAME (64u * 1024u * 1024u)
+
 /* Node handle */
 typedef struct sw_node {
     char name[SW_NODE_NAME_MAX];
