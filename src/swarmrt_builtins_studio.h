@@ -3503,6 +3503,69 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     return r;
 }
 
+/* exec_argv(cmd, args_list) → {exit_code, stdout}
+ * Like shell() but forks+execs directly — no /bin/sh, no metacharacter risk.
+ * cmd  : string — the executable (resolved via PATH by execvp)
+ * args : sw list of strings — additional arguments (may be empty list)
+ * Returns {exit_code, stdout_string} on success, nil on fork/pipe failure. */
+static sw_val_t *_builtin_exec_argv(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_nil();
+#else
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *cmd = a[0]->v.str;
+
+    /* Collect extra args from the sw list (may be absent or empty). */
+    int nlist = 0;
+    sw_val_t *list = (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) ? a[1] : NULL;
+    if (list) nlist = list->v.tuple.count;
+
+    /* Build NULL-terminated argv: cmd + list_elements + NULL */
+    char **argv = (char **)malloc(sizeof(char *) * (1 + nlist + 1));
+    if (!argv) return sw_val_nil();
+    argv[0] = (char *)cmd;
+    for (int i = 0; i < nlist; i++) {
+        sw_val_t *elem = list->v.tuple.items[i];
+        /* Skip non-string elements silently (treat as empty string). */
+        argv[1 + i] = (elem && elem->type == SW_VAL_STRING) ? elem->v.str : (char *)"";
+    }
+    argv[1 + nlist] = NULL;
+
+    _sw_popen_pid_t pp = _sw_popen_argv(argv, NULL);
+    free(argv); /* child has already exec'd; parent copy safe to free */
+    if (!pp.fp) return sw_val_nil();
+
+    /* Read all stdout into a growable buffer. */
+    size_t cap = 65536, got = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { _sw_popen_pid_close(pp); return sw_val_nil(); }
+    char chunk[8192];
+    size_t rd;
+    while ((rd = fread(chunk, 1, sizeof(chunk), pp.fp)) > 0) {
+        if (got + rd + 1 > cap) {
+            while (got + rd + 1 > cap) cap *= 2;
+            char *tmp = (char *)realloc(buf, cap);
+            if (!tmp) { free(buf); _sw_popen_pid_close(pp); return sw_val_nil(); }
+            buf = tmp;
+        }
+        memcpy(buf + got, chunk, rd);
+        got += rd;
+    }
+    buf[got] = '\0';
+
+    int wstatus = _sw_popen_pid_close(pp);
+    int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+
+    sw_val_t *items[2];
+    items[0] = sw_val_int(exit_code);
+    items[1] = sw_val_string(buf);
+    free(buf);
+    return sw_val_tuple(items, 2);
+#endif
+}
+
 /* === JSON encode: sw_val_t → JSON string === */
 
 static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos);

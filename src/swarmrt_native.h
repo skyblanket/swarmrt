@@ -28,6 +28,16 @@
 #define SWARM_CONTEXT_REDS     2000      /* Reductions per time slice */
 #define SWARM_TIME_SLICE_US    1000      /* 1ms max time slice */
 
+/* === Deadlock watchdog ===
+ * A background thread that wakes every SW_DEADLOCK_MS milliseconds (default
+ * 5000) and checks whether every live non-scheduler process is blocked in
+ * sw_receive with an empty mailbox.  If so it prints a one-line warning to
+ * stderr.  Non-fatal: the runtime keeps running.
+ *
+ * SW_DEADLOCK_DETECT=0   — disable entirely (default: enabled)
+ * SW_DEADLOCK_MS=<n>     — override wake interval in milliseconds
+ */
+
 /* === Process States === */
 typedef enum {
     SW_PROC_FREE = 0,       /* Slot available */
@@ -391,10 +401,10 @@ extern void sw_context_swap(sw_process_t *from, sw_process_t *to);
 void sw_msg_release(sw_msg_t *m);
 
 /* Swap into a context captured in a caller-owned struct rather than read
- * straight from `to->ctx`. Use this on the scheduler → process direction
- * after copying the destination ctx under proc->ctx_lock — the copy
- * eliminates the swap-in / process_init_arena race documented as R2-#4
- * in KNOWN_ISSUES. Saves from->ctx exactly like sw_context_swap. */
+ * straight from `to->ctx`. Use this on the scheduler -> process direction
+ * after copying the destination ctx under proc->ctx_lock; the copy fixed the
+ * historical swap-in / process_init_arena race tracked as R2-#4. Saves
+ * from->ctx exactly like sw_context_swap. */
 extern void sw_context_swap_from_copy(sw_process_t *from,
                                       const sw_context_t *to_ctx);
 extern uint64_t sw_rdtsc(void);

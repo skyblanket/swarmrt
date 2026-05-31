@@ -177,7 +177,10 @@ typedef struct node {
     union {
         /* N_MODULE */
         struct { char name[128]; struct node **funs; int nfuns;
-                 char imports[16][128]; int nimports; } mod;
+                 char imports[16][128]; int nimports;
+                 /* Module-level immutable globals: let x = literal */
+                 struct { char name[128]; struct node *val; } globals[16];
+                 int nglobals; } mod;
         /* N_FUN */
         struct { char name[128]; char params[16][128]; int nparams;
                  struct node *body; struct node *defaults[16]; } fun;

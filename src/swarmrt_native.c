@@ -55,6 +55,107 @@ static __thread sw_process_t *tls_current = NULL;
  * external (non-scheduler) threads. */
 static __thread sw_scheduler_t *tls_spawn_override = NULL;
 
+/* === Deadlock watchdog state === */
+static pthread_t        g_watchdog_thread;
+static volatile int     g_watchdog_stop = 0;
+static int              g_watchdog_enabled = 1;   /* 0 when SW_DEADLOCK_DETECT=0 */
+
+/*
+ * watchdog_thread_fn — wakes periodically and checks for total deadlock.
+ *
+ * A "stuck" process is one that is:
+ *   1. Not SW_PROC_FREE (slot is occupied).
+ *   2. Not one of the runtime's own scheduler sched_proc stubs.
+ *   3. In state SW_PROC_WAITING.
+ *   4. Has an empty mailbox: sig_head == NULL AND priv_head == NULL.
+ *
+ * If every live non-scheduler process meets (3)+(4) we warn once per
+ * interval.  We do NOT warn on an empty swarm (live_count == 0).
+ *
+ * All reads are best-effort — we hold no locks.  A false positive is
+ * possible if a message is in flight at the exact moment we scan; that
+ * is acceptable for a warn-only detector.
+ */
+static void *watchdog_thread_fn(void *arg) {
+    (void)arg;
+
+    /* Read interval from env (milliseconds, default 5000). */
+    unsigned long interval_ms = 5000;
+    const char *ms_env = getenv("SW_DEADLOCK_MS");
+    if (ms_env && *ms_env) {
+        long v = strtol(ms_env, NULL, 10);
+        if (v >= 100) interval_ms = (unsigned long)v;
+    }
+
+    while (!g_watchdog_stop) {
+        /* Sleep in 100 ms chunks so shutdown is responsive. */
+        unsigned long slept = 0;
+        while (slept < interval_ms && !g_watchdog_stop) {
+            unsigned long chunk = interval_ms - slept;
+            if (chunk > 100) chunk = 100;
+            struct timespec ts = { (time_t)(chunk / 1000),
+                                   (long)((chunk % 1000) * 1000000L) };
+            nanosleep(&ts, NULL);
+            slept += chunk;
+        }
+        if (g_watchdog_stop) break;
+
+        sw_swarm_t *sw = g_swarm;
+        if (!sw || !sw->running) continue;
+
+        sw_process_t *slab = (sw_process_t *)sw->arena.proc_slab;
+        if (!slab) continue;
+        uint32_t cap = sw->arena.proc_capacity;
+
+        /* Build a small set of scheduler stub PIDs to exclude. */
+        uint64_t sched_pids[SWARM_MAX_SCHEDULERS];
+        uint32_t nsched = sw->num_schedulers;
+        if (nsched > SWARM_MAX_SCHEDULERS) nsched = SWARM_MAX_SCHEDULERS;
+        for (uint32_t s = 0; s < nsched; s++) {
+            sw_scheduler_t *sc = sw->schedulers[s];
+            sched_pids[s] = sc ? sc->sched_proc.pid : (uint64_t)-1;
+        }
+
+        int live_count  = 0;
+        int stuck_count = 0;
+
+        for (uint32_t i = 0; i < cap; i++) {
+            sw_process_t *p = &slab[i];
+            sw_proc_state_t st = p->state;   /* plain read — best-effort */
+
+            if (st == SW_PROC_FREE) continue;
+
+            /* Skip scheduler internal stub processes. */
+            uint64_t pid = p->pid;
+            int is_sched = 0;
+            for (uint32_t s = 0; s < nsched; s++) {
+                if (pid == sched_pids[s]) { is_sched = 1; break; }
+            }
+            if (is_sched) continue;
+
+            live_count++;
+
+            if (st == SW_PROC_WAITING) {
+                /* Empty mailbox = sig_head NULL and priv_head NULL. */
+                sw_msg_t *sig = (sw_msg_t *)atomic_load_explicit(
+                    &p->mailbox.sig_head, memory_order_acquire);
+                if (!sig && !p->mailbox.priv_head) {
+                    stuck_count++;
+                }
+            }
+        }
+
+        if (live_count > 0 && stuck_count == live_count) {
+            fprintf(stderr,
+                "[swarmrt] WARNING: all %d process%s blocked in receive"
+                " — possible deadlock\n",
+                live_count, live_count == 1 ? "" : "es");
+            fflush(stderr);
+        }
+    }
+    return NULL;
+}
+
 /* === Per-thread freelists (avoid malloc/free on hot path) === */
 #define MSG_FREELIST_MAX 128
 static __thread sw_msg_t *tls_msg_free = NULL;
@@ -782,7 +883,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
 
             /* Context switch to process (runs on process's own stack).
              * sw_safe_swap_into copies ctx under proc->ctx_lock so the
-             * asm reads a stable snapshot — see R5-B in KNOWN_ISSUES. */
+             * asm reads a stable snapshot. */
             if (sw_safe_swap_into(&sched->sched_proc, proc, expected_gen) < 0) {
                 /* Slot was reused between pick and swap — just loop. */
                 tls_current = NULL;
@@ -1012,6 +1113,16 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         sigaction(SIGABRT, &crash_sa, NULL);
     }
 
+    /* Start deadlock watchdog unless SW_DEADLOCK_DETECT=0. */
+    {
+        const char *dd = getenv("SW_DEADLOCK_DETECT");
+        g_watchdog_enabled = !(dd && dd[0] == '0' && dd[1] == '\0');
+        if (g_watchdog_enabled) {
+            g_watchdog_stop = 0;
+            pthread_create(&g_watchdog_thread, NULL, watchdog_thread_fn, NULL);
+        }
+    }
+
     return 0;
 }
 
@@ -1021,6 +1132,13 @@ void sw_shutdown(int swarm_id) {
     if (!g_swarm) return;
 
     g_swarm->running = 0;
+
+    /* Stop deadlock watchdog (if running) before tearing down the arena. */
+    if (g_watchdog_enabled) {
+        g_watchdog_stop = 1;
+        pthread_join(g_watchdog_thread, NULL);
+        g_watchdog_enabled = 0;
+    }
 
     /* Stop all schedulers */
     for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {

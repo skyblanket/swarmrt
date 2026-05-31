@@ -104,6 +104,7 @@ typedef enum {
     TOK_TRY,
     TOK_CATCH,
     TOK_IMPORT,
+    TOK_LET,       /* let — module-level global binding */
     TOK_DOTDOT,    /* .. */
     TOK_BAR,       /* | (single pipe, list cons) */
     TOK_PERCENT,   /* % — binary modulo */
@@ -152,6 +153,7 @@ static struct { const char *w; tok_type_t t; } kw_table[] = {
     {"try",       TOK_TRY},
     {"catch",     TOK_CATCH},
     {"import",    TOK_IMPORT},
+    {"let",       TOK_LET},
     {"true",      TOK_ATOM},
     {"false",     TOK_ATOM},
     {"nil",       TOK_ATOM},
@@ -388,7 +390,9 @@ static void node_free(node_t *n) {
     switch (n->type) {
     case N_MODULE:
         for (int i = 0; i < n->v.mod.nfuns; i++) node_free(n->v.mod.funs[i]);
-        free(n->v.mod.funs); break;
+        free(n->v.mod.funs);
+        for (int i = 0; i < n->v.mod.nglobals; i++) node_free(n->v.mod.globals[i].val);
+        break;
     case N_FUN:
         node_free(n->v.fun.body);
         for (int i = 0; i < n->v.fun.nparams; i++) node_free(n->v.fun.defaults[i]);
@@ -1243,11 +1247,52 @@ static node_t *par_module(par_t *p) {
         par_expect(p, TOK_RBRACKET, "']'");
     }
 
-    /* Functions */
-    while (p->cur.type == TOK_FUN && !p->err) {
-        mod->v.mod.nfuns++;
-        mod->v.mod.funs = realloc(mod->v.mod.funs, sizeof(node_t*) * mod->v.mod.nfuns);
-        mod->v.mod.funs[mod->v.mod.nfuns-1] = par_fun(p);
+    /* Functions and module-level globals (let x = literal) */
+    while ((p->cur.type == TOK_FUN || p->cur.type == TOK_LET) && !p->err) {
+        if (p->cur.type == TOK_LET) {
+            par_adv(p); /* consume 'let' */
+            tok_t gname = par_expect(p, TOK_IDENT, "global name");
+            par_expect(p, TOK_ASSIGN, "'='");
+            /* Only literal RHS allowed at module top-level */
+            node_t *val = NULL;
+            if (p->cur.type == TOK_NUMBER) {
+                tok_t t = par_adv(p);
+                if (strchr(t.text, '.')) {
+                    val = mknode(N_FLOAT, t.line); val->v.fval = t.num_val;
+                } else {
+                    val = mknode(N_INT, t.line); val->v.ival = (int64_t)t.num_val;
+                }
+            } else if (p->cur.type == TOK_STRING) {
+                tok_t t = par_adv(p);
+                val = mknode(N_STRING, t.line);
+                strncpy(val->v.sval, t.text, sizeof(val->v.sval)-1);
+            } else if (p->cur.type == TOK_ATOM) {
+                tok_t t = par_adv(p);
+                val = mknode(N_ATOM, t.line);
+                strncpy(val->v.sval, t.text, sizeof(val->v.sval)-1);
+            } else {
+                snprintf(p->errmsg, sizeof(p->errmsg),
+                    "line %d: module-level 'let' only supports literal values (int, float, string, atom)",
+                    p->cur.line);
+                p->err = 1;
+                break;
+            }
+            if (mod->v.mod.nglobals < 16) {
+                int gi = mod->v.mod.nglobals++;
+                strncpy(mod->v.mod.globals[gi].name, gname.text,
+                        sizeof(mod->v.mod.globals[gi].name)-1);
+                mod->v.mod.globals[gi].val = val;
+            } else {
+                snprintf(p->errmsg, sizeof(p->errmsg),
+                    "line %d: too many module globals (max 16)", gname.line);
+                p->err = 1;
+                node_free(val);
+            }
+        } else {
+            mod->v.mod.nfuns++;
+            mod->v.mod.funs = realloc(mod->v.mod.funs, sizeof(node_t*) * mod->v.mod.nfuns);
+            mod->v.mod.funs[mod->v.mod.nfuns-1] = par_fun(p);
+        }
     }
 
     return mod;
@@ -1828,6 +1873,83 @@ static sw_val_t *builtin_assert_ne(sw_interp_t *interp, sw_val_t **args, int nar
     return sw_val_atom("ok");
 }
 
+/* Built-in: assert_raises(fn, expected_msg)
+ *   fn          — zero-arg sw lambda (SW_VAL_FUN with a body node)
+ *   expected_msg — string that must appear inside the panic/error message
+ *
+ * Pass: fn() triggers interp->error AND error_msg contains expected_msg.
+ * Fail (no panic):   assert_failed set with "expected panic, got none".
+ * Fail (wrong msg):  assert_failed set with "expected '...' in panic msg, got '...'".
+ */
+static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int nargs, int line) {
+    if (nargs < 2) {
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                 "assert_raises requires 2 arguments: fn and expected_msg");
+        return sw_val_atom("error");
+    }
+
+    sw_val_t *fn_val = args[0];
+    const char *expected = (args[1]->type == SW_VAL_STRING || args[1]->type == SW_VAL_ATOM)
+                           ? args[1]->v.str : "";
+
+    if (!fn_val || fn_val->type != SW_VAL_FUN || !fn_val->v.fun.body) {
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                 "assert_raises: first argument must be a zero-arg lambda");
+        return sw_val_atom("error");
+    }
+
+    /* Save current error state so nested assert_raises work correctly. */
+    int saved_error = interp->error;
+    char saved_error_msg[256];
+    memcpy(saved_error_msg, interp->error_msg, sizeof(saved_error_msg));
+
+    /* Clear error so the lambda runs fresh. */
+    interp->error = 0;
+    interp->error_msg[0] = '\0';
+
+    /* Call the lambda body.  Mirrors the dynamic-dispatch closure pattern
+     * (eval N_CALL, "Dynamic dispatch: variable holds a closure"). */
+    node_t *fn_node = (node_t *)fn_val->v.fun.body;
+    sw_env_t *fenv = env_new(fn_val->v.fun.closure_env
+                             ? fn_val->v.fun.closure_env
+                             : interp->global_env);
+    /* Zero-arg lambda — no params to bind. */
+    (void)eval(interp, fn_node->v.fun.body, fenv);
+    env_free(fenv);
+
+    int did_error = interp->error;
+    char actual_msg[256];
+    memcpy(actual_msg, interp->error_msg, sizeof(actual_msg));
+
+    /* Restore outer error state. */
+    interp->error = saved_error;
+    memcpy(interp->error_msg, saved_error_msg, sizeof(interp->error_msg));
+
+    if (!did_error) {
+        /* fn returned normally — expected a panic/error. */
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                 "expected panic containing '%s', but fn did not panic", expected);
+        return sw_val_atom("error");
+    }
+
+    if (expected[0] != '\0' && strstr(actual_msg, expected) == NULL) {
+        /* Panicked with wrong message. */
+        interp->assert_failed = 1;
+        interp->assert_line = line;
+        snprintf(interp->assert_msg, sizeof(interp->assert_msg),
+                 "expected panic containing '%s', got '%s'", expected, actual_msg);
+        return sw_val_atom("error");
+    }
+
+    return sw_val_atom("ok");
+}
+
 /* =========================================================================
  * Extra interpreter/REPL builtins
  *
@@ -1887,9 +2009,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             else fputs("panic", m);
             fclose(m);
         }
-        fprintf(stderr, "panic at line %d: %s\n", line, buf ? buf : "(no message)");
+        /* In the interpreter/test runner, turn panic into a catchable error
+         * so assert_raises() can inspect it.  The message is prefixed with
+         * "panic: " to distinguish it from a bare error() call. */
+        snprintf(interp->error_msg, sizeof(interp->error_msg),
+                 "panic: %s", buf ? buf : "(no message)");
         free(buf);
-        exit(1);
+        interp->error = 1;
+        return sw_val_nil();
     }
     if (strcmp(fname, "expect") == 0 && nargs >= 1) {
         int falsy = (args[0]->type == SW_VAL_NIL) ||
@@ -2129,6 +2256,63 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         /* REPL skips sandbox-exec — just delegates to shell. The compiled
          * path still uses sandbox-exec/firejail. Note this in docs. */
         return interp_extra_builtin(interp, "shell", args, nargs, line);
+    }
+    if (strcmp(fname, "exec_argv") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+#ifdef _WIN32
+        return sw_val_nil();
+#else
+        const char *cmd = args[0]->v.str;
+        int nlist = 0;
+        sw_val_t *lst = (nargs >= 2 && args[1] && args[1]->type == SW_VAL_LIST) ? args[1] : NULL;
+        if (lst) nlist = lst->v.tuple.count;
+        char **argv2 = (char **)malloc(sizeof(char *) * (1 + nlist + 1));
+        if (!argv2) return sw_val_nil();
+        argv2[0] = (char *)cmd;
+        for (int i = 0; i < nlist; i++) {
+            sw_val_t *elem = lst->v.tuple.items[i];
+            argv2[1 + i] = (elem && elem->type == SW_VAL_STRING) ? elem->v.str : (char *)"";
+        }
+        argv2[1 + nlist] = NULL;
+        /* pipe + fork + exec */
+        int pfd[2];
+        if (pipe(pfd) != 0) { free(argv2); return sw_val_nil(); }
+        pid_t pid = fork();
+        if (pid < 0) { close(pfd[0]); close(pfd[1]); free(argv2); return sw_val_nil(); }
+        if (pid == 0) {
+            /* child */
+            close(pfd[0]);
+            dup2(pfd[1], STDOUT_FILENO);
+            dup2(pfd[1], STDERR_FILENO);
+            close(pfd[1]);
+            execvp(argv2[0], argv2);
+            _exit(127);
+        }
+        close(pfd[1]);
+        free(argv2);
+        size_t cap = 65536, got = 0;
+        char *buf = (char *)malloc(cap);
+        if (!buf) { close(pfd[0]); waitpid(pid, NULL, 0); return sw_val_nil(); }
+        char chunk[8192]; ssize_t rd;
+        while ((rd = read(pfd[0], chunk, sizeof(chunk))) > 0) {
+            if (got + (size_t)rd + 1 > cap) {
+                while (got + (size_t)rd + 1 > cap) cap *= 2;
+                char *tmp = (char *)realloc(buf, cap);
+                if (!tmp) { free(buf); close(pfd[0]); waitpid(pid, NULL, 0); return sw_val_nil(); }
+                buf = tmp;
+            }
+            memcpy(buf + got, chunk, (size_t)rd);
+            got += (size_t)rd;
+        }
+        close(pfd[0]);
+        buf[got] = '\0';
+        int wstatus = 0; waitpid(pid, &wstatus, 0);
+        int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+        sw_val_t *items[2];
+        items[0] = sw_val_int(exit_code);
+        items[1] = sw_val_string(buf);
+        free(buf);
+        return sw_val_tuple(items, 2);
+#endif
     }
 
     /* === SQLite ================================================ */
@@ -2420,6 +2604,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
             if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
             if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
+            if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
         }
         return val;
     }
@@ -2604,6 +2789,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
         if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
         if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
 
         /* Extra REPL builtins — bridges the gap to the codegen surface
          * (file_*, db_*, shell, panic, expect, error, etc.). See
@@ -2808,6 +2994,23 @@ sw_interp_t *sw_lang_new(void *module_ast) {
     sw_interp_t *interp = calloc(1, sizeof(sw_interp_t));
     interp->module_ast = module_ast;
     interp->global_env = env_new(NULL);
+    /* Populate module-level globals into global_env so every function
+     * env (child of global_env) sees them via the parent chain. */
+    if (module_ast) {
+        node_t *mod = (node_t *)module_ast;
+        for (int i = 0; i < mod->v.mod.nglobals; i++) {
+            node_t *vn = mod->v.mod.globals[i].val;
+            sw_val_t *sv = NULL;
+            switch (vn->type) {
+                case N_INT:    sv = sw_val_int(vn->v.ival); break;
+                case N_FLOAT:  sv = sw_val_float(vn->v.fval); break;
+                case N_STRING: sv = sw_val_string(vn->v.sval); break;
+                case N_ATOM:   sv = sw_val_atom(vn->v.sval); break;
+                default:       sv = sw_val_nil(); break;
+            }
+            env_set(interp->global_env, mod->v.mod.globals[i].name, sv);
+        }
+    }
     return interp;
 }
 

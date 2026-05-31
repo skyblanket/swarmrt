@@ -31,7 +31,6 @@ module Main
 
 fun main() {
     print("hello, sw")
-    sys_exit(0)
 }
 ```
 
@@ -39,7 +38,7 @@ fun main() {
 swc build hello.sw -o hello && ./hello
 ```
 
-Top-level entry point is `main()` in the module named `Main`. `sys_exit(0)` is required to terminate cleanly — without it the runtime busy-waits in its scheduler loop.
+Top-level entry point is `main()` in the module named `Main`. The program exits cleanly when `main()` returns — no `sys_exit` needed. The codegen wraps `main()` in a `_main_entry` thunk that signals a condition variable on return; the generated C `main` waits on that signal, calls `sw_shutdown(0)`, and returns 0. Use `sys_exit(code)` only when you want to exit with a non-zero status code (e.g. to signal an error to the calling shell).
 
 ---
 
@@ -359,6 +358,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `sleep(ms)` | block this process for ms |
 | `term_cols()` | terminal width via TIOCGWINSZ |
 | `shell(cmd)` | run shell command → `{exit_code, stdout_string}` |
+| `exec_argv(cmd, args)` → `{code, out}` | fork+exec with no shell — safe for user data |
 
 ### Strings
 | | |
@@ -544,6 +544,8 @@ name = expect(map_get(user, 'name'), "user record missing required 'name' field"
 ```
 
 `panic(msg)` prints a red `panic: <msg>` plus the exact `src/Mod.sw:LINE` where it fired AND the full call chain (innermost first), then exits with code 1. Cannot be caught. Use for programmer bugs (impossible states, broken invariants).
+
+In `swc test` files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics (or calls `error()`) with a message containing `expected_msg` — the test runner intercepts the panic before it reaches `exit(1)` so the suite continues.
 
 ```
 panic: hit the bottom
