@@ -9,8 +9,8 @@ pass could verify against a clean SHA.
 This doc consolidates what came out of it. Two reasons to read:
 
 1. **As a user**, you want to know what shape the runtime is in
-   today: what's been hammered on, what's verified end-to-end, what's
-   still open.
+   today: what's been hammered on, what's verified end-to-end, and how
+   unresolved items are tracked.
 
 2. **As a contributor**, the bug stories are mostly small but the
    diagnoses ate a lot of cycles. The pattern of "Heisenbug that
@@ -18,8 +18,9 @@ This doc consolidates what came out of it. Two reasons to read:
    emulated Docker" came up multiple times. The methodology notes
    below save a future contributor from repeating those mistakes.
 
-The remaining open item is documented in
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+No open runtime issue remains from these review rounds. New open items
+belong in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) with a repro and current
+hypothesis.
 
 ---
 
@@ -36,7 +37,7 @@ The remaining open item is documented in
 | **R4** | Same race as R3 | Heavier attempt: 64-slot ring (also failed) |
 | **R5** | TCP framing dropped all but the first frame per read | Per-peer `rx_buf` + drain loop |
 | **R5** | Same race | Per-slot generation counter + `ctx_lock` + new asm (worked for ctx-tear) |
-| **R6** | Different race surfacing on Linux x86_64 spawn-storm | Message envelope leak plugged; CI widened |
+| **R6** | Different race surfacing on Linux x86_64 spawn-storm | Message envelope leak plugged; CI widened; cleared May 29 |
 | **R7** | Codex caught 7 phase tests failing while CI was green | `sw_spawn_link` scheduler pin actually pinning now |
 
 ---
@@ -254,10 +255,11 @@ What round 6 shipped (defensive, not closing):
   of it, and the body's return value can itself be one of those
   bindings.
 
-- **CI stress widened.** 20 → 50 runs, threshold 18 → 45 (90%), and
-  added a `SW_SCHEDULERS=1` variant since single-sched reproduces
-  the new race. Both variants must clear threshold to pass; 50/50
-  alone could let a 50% per-run crash rate squeak through.
+- **CI stress widened, then tightened.** R6 widened 20 -> 50 runs,
+  threshold 18 -> 45 (90%), and added a `SW_SCHEDULERS=1` variant since
+  single-sched reproduced the new race. The May 29 sushi retest later
+  cleared the race and `make stress` is now strict by default: every
+  configured run in both variants must complete.
 
 R6 also closed the round-4 audit items:
 
@@ -345,21 +347,16 @@ Everything CI-gated, every push:
 - README quickstart + a handful of example programs.
 - 110 compiled-language assertions + 16 interpreter assertions
   (9 `.sw` test files).
-- 8 C-side phase test files — **65 tests total, 100% green**.
+- 9 C-side phase test files — **73 tests total, 100% green**.
 - 100 stress runs (50 multi-scheduler + 50 single-scheduler), 80k
-  spawns each, must clear 90% threshold.
+  spawns each, strict by default: every run must complete.
 
-What's still open ([`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)):
+Open known runtime issues ([`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)): none.
 
-- One spawn-storm race in the message-send path on Linux x86_64.
-  Single-scheduler reproduces, so it's not multi-thread ctx tear.
-  Heap-corruption-then-strdup pattern. macOS arm64 + ASan doesn't
-  reproduce.
-- Suspect: interaction between the per-thread `tls_msg_free`
-  freelist and the atom/payload allocator under sustained
-  cross-thread send/receive pressure. Reviewer's recommended next
-  step is helgrind/TSan on Linux x86_64 — needs a reproducible
-  Linux env that the maintainer doesn't currently have access to.
+The previous spawn-storm race was cleared on May 29 with a native Linux
+x86_64 run on `sushi`: 50/50 multi-scheduler and 50/50 single-scheduler
+completed with zero crashes. Any future miss in `make stress` should be
+treated as a regression, not an accepted flake.
 
 What's NOT shipped but flagged by reviewers as future work:
 

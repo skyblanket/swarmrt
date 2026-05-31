@@ -8,6 +8,15 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 Three fixes shaken out of long-running interactive sessions in swarm-code.
 
+**test(stress):** re-tested the 80k-spawn send/receive stress workload
+on `sushi` (Ubuntu 24.04, Linux 6.17, native x86_64, AMD EPYC 9554):
+50/50 default-scheduler runs and 50/50 `SW_SCHEDULERS=1` runs completed
+with zero crashes. The previous spawn-storm race is no longer tracked as
+open. `make stress` now defaults to a strict threshold: all runs in both
+variants must complete. `SW_STRESS_THRESHOLD` remains available for
+exploratory bisects, but CI/reviewer runs should treat any crash as a
+regression.
+
 **fix(codegen):** `receive` clauses now release the matched message
 *before* evaluating the clause body, not after. The deserialized
 pattern bindings are independent values (`deserialize_val` copies out
@@ -161,12 +170,13 @@ per-thread `tls_msg_free` freelist stayed empty and `msg_alloc`
 always missed straight to `malloc`. Exposed `sw_msg_release()` and
 wired it into the codegen so envelopes return to the freelist; the
 payload `sw_val_t` is left alive on purpose since pattern bindings
-alias subparts of it. CI stress widened to 50 runs at 90% threshold
-across both multi- and single-scheduler variants (the round-5 fix
-closed the original race deterministically but a different race in
-the message-send path still fires on Linux x86_64 spawn-storms;
-single-scheduler reproduces, so the multi-only run wasn't catching
-it). Round-4 audit cleanups: `pmap` accepts either arg order like
+alias subparts of it. CI stress initially widened to 50 runs at a 90%
+threshold across both multi- and single-scheduler variants (the
+round-5 fix closed the original race deterministically, while a
+different spawn-storm crash still needed follow-up at the time). The
+May 29 sushi retest later cleared that race and the stress gate is now
+strict: every configured run must complete. Round-4 audit
+cleanups: `pmap` accepts either arg order like
 `map`/`filter`; `map_has_key` matches `map_get`'s atom-vs-string
 fallback; `expect(nil, msg)` now panics (the literal `nil` lexes to
 atom `'nil'`, not `SW_VAL_NIL`, so the previous strict-type check
@@ -191,13 +201,10 @@ tests), 6 (TCP, 6), 7 (hot reload, 5), 8 (GC, 5), 9 (distribution,
 `examples/counter.sw` verbatim so what you see is what `./counter`
 prints (`Count: 8` + `Counter stopped at 8`).
 
-What's still open: one spawn-storm race in the message-send path on
-Linux x86_64 (single-scheduler reproduces; 80k spawn workload, ~16%
-crash rate under stress). Heap-corruption-then-strdup-SIGSEGV
-pattern, not the ctx-tear race. macOS arm64 + ASan doesn't
-reproduce. Documented in KNOWN_ISSUES with the suspect (mailbox/atom
-allocator interaction) and the next investigation step
-(helgrind/TSan on Linux).
+May 29 follow-up: the spawn-storm race no longer reproduces on native
+Linux x86_64 (`sushi`: 50/50 multi-scheduler and 50/50
+single-scheduler completed). It has been removed from open known issues
+and the stress gate is strict by default.
 
 ---
 

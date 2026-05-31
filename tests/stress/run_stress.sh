@@ -1,23 +1,22 @@
 #!/bin/bash
 # tests/stress/run_stress.sh
 #
-# 80k-spawn microbench × N runs. Pass --variant single to also exercise
-# SW_SCHEDULERS=1 — reviewer's round-6 report showed the post-R5-B race
-# reproduces even with a single scheduler, so the multi-scheduler-only
-# variant doesn't catch it. Defaults: 50 runs, threshold 45 (90%).
+# 80k-spawn microbench x N runs. Runs both the default scheduler
+# configuration and SW_SCHEDULERS=1 because previous regressions showed up
+# in different interleavings across those modes. Defaults: 50 runs per
+# variant, strict threshold: every run must complete.
 #
-# Asserts the documented arena/send-path race count stays under
-# threshold. The race is documented in docs/notes/KNOWN_ISSUES.md.
+# Regression gate for the high-process-count spawn/send/receive path.
 #
-# NOTE: requires native Linux x86_64 thread scheduling. The race is
-# suppressed under:
+# NOTE: requires native Linux x86_64 thread scheduling to meaningfully
+# exercise the historical failure mode. These environments are smoke tests
+# only for this specific class of scheduler race:
 #   - Docker Desktop on Apple Silicon (runs x86_64 via qemu user-mode)
 #   - valgrind (serialises thread interleavings)
 #   - any emulated/translated thread schedule
 #
-# On a native amd64 host the race fires reliably above ~62k spawns;
-# below that the runtime is rock-solid. Don't lower N unless you're
-# OK with a green CI light that doesn't actually verify anything.
+# Keep N high. The original bug only surfaced in high-spawn stress and low
+# values can give a green light without exercising the path that matters.
 
 set -u
 SWARMRT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -61,7 +60,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 RUNS=${SW_STRESS_RUNS:-50}
-THRESHOLD=${SW_STRESS_THRESHOLD:-45}
+THRESHOLD=${SW_STRESS_THRESHOLD:-$RUNS}
 
 if [ -t 1 ]; then
     GREEN=$'\e[32m' ; RED=$'\e[31m' ; DIM=$'\e[2m' ; RESET=$'\e[0m'
@@ -69,11 +68,9 @@ else
     GREEN='' ; RED='' ; DIM='' ; RESET=''
 fi
 
-# Run one variant: a label + env for the bench invocation. We run both
-# the default multi-scheduler env and a SW_SCHEDULERS=1 variant because
-# the post-R5-B race (R6-A in KNOWN_ISSUES) reproduces with a single
-# scheduler too — multi-only wouldn't catch it. Each variant tracks its
-# own pass count and fails the script if it crosses the threshold.
+# Run one variant: a label + env for the bench invocation. Each variant
+# tracks its own pass count and fails the script if it misses the required
+# completion threshold.
 run_variant() {
     local label="$1"
     local env_prefix="$2"
@@ -114,10 +111,10 @@ fi
 
 echo ""
 if [ "$failed" -eq 0 ]; then
-    echo "${GREEN}STRESS PASSED${RESET} -- both variants over threshold"
+    echo "${GREEN}STRESS PASSED${RESET} -- both variants met completion threshold"
     exit 0
 else
     echo "${RED}STRESS FAILED${RESET} -- ${failed} variant(s) under threshold"
-    echo "${DIM}see docs/notes/KNOWN_ISSUES.md (R2-#4 / R6-A — spawn-storm race)${RESET}"
+    echo "${DIM}high-spawn regression: rerun on native Linux x86_64 and capture crash output${RESET}"
     exit 1
 fi

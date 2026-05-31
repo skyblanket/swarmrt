@@ -420,11 +420,11 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 - `make test-sw` — 9 files, **110 compiled + 16 interpreter assertions** (`.sw` language)
 - `make test-phase{2..10}` — **9 C-side runtime test files**, all 100% green: GenServer/Supervisor (phase 2), ETS (phase 3, 15 tests), Agent/App/DynSup (phase 4, 14), StateMachine/ProcessGroup (phase 5, 12), TCP (phase 6, 6), hot reload (phase 7, 5), GC (phase 8, 5), distribution (phase 9, 4), language frontend (phase 10)
 - `make test-full` — **comprehensive gate**: core + OTP + phases 2-10 + search + MCP + sws
-- `make stress` — **100 runs total** (50 multi-scheduler + 50 single-scheduler), 80k spawns each, must clear 90% threshold
+- `make stress` — **100 runs total** (50 multi-scheduler + 50 single-scheduler), 80k spawns each, strict by default: every run must complete
 
-**Known issues:** one spawn-storm race in the message-send path on Linux x86_64 (single-scheduler reproduces; ~16% crash rate at 80k spawns under stress). Not the original ctx-tear race (closed deterministically in round 5 with a per-slot generation counter + ctx_lock); this one is a heap-corruption-then-strdup pattern in the mailbox/atom-allocator path. Tracked in [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md).
+**Known issues:** none currently tracked. The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
 
-**Reliability backstory:** the runtime has been through six rounds of external review (Claude web agent + Codex), each filing a markdown report against the latest commit. The full hardening narrative — what each round found, what was fixed, what's still open — is at [docs/notes/REVIEW_HARDENING.md](docs/notes/REVIEW_HARDENING.md).
+**Reliability backstory:** the runtime has been through six rounds of external review (Claude web agent + Codex), each filing a markdown report against the latest commit. The full hardening narrative — what each round found and what was fixed — is at [docs/notes/REVIEW_HARDENING.md](docs/notes/REVIEW_HARDENING.md).
 
 New runtime features land regularly — see [CHANGELOG](docs/CHANGELOG.md). Breaking changes are called out in the changelog and the language reference is the source of truth.
 

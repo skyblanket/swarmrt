@@ -12,7 +12,7 @@
 
 - [ ] `make test-sw` passes
 - [ ] `make test-phase{2..9}` pass
-- [ ] `make stress` clears the 90% threshold (if the change touches the scheduler / arena / mailbox path)
+- [ ] `make stress` completes all runs (if the change touches the scheduler / arena / mailbox path)
 - [ ] Touches the scheduler, arena, or mailbox path? Ordering explained below.
 - [ ] Compiler ↔ interpreter parity kept (new builtins reachable from both)
 - [ ] New runtime behaviour noted in `docs/CHANGELOG.md`

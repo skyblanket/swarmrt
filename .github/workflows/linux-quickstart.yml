@@ -63,9 +63,8 @@ jobs:
           done
 
       - name: Stress test (high-process-count race guard)
-        # Catches the arena-slot reuse race (R2-#4 / R5-B). The
-        # per-slot generation counter + ctx_lock close the deterministic
-        # race; a remaining message-send path race (R6-A in
-        # KNOWN_ISSUES) still fires on Linux x86_64 but the threshold
-        # accommodates it. Goes red if regressions cut into the margin.
+        # Catches regressions in the high-spawn scheduler/mailbox path.
+        # The historical ctx-tear race is closed by per-slot generation
+        # counters + ctx_lock; the later spawn-storm crash cleared on
+        # native Linux x86_64 May 29, so any miss here is a regression.
         run: make stress
