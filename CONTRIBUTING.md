@@ -19,14 +19,23 @@ make swc libswarmrt
 Before opening a PR, run what CI runs:
 
 ```bash
-make test-sw                       # sw-language suite — 110 compiled + 16 interpreter assertions
-for p in 2 3 4 5 6 7 8 9; do make test-phase$p; done   # C-side runtime tests
+make test-sw                       # sw-language suite — 8 compiled files + 1 interpreter file
+for p in 2 3 4 5 6 7 8 9 10; do make test-phase$p; done   # C-side runtime tests (phases 2–10)
 make stress                        # high-process-count race guard (Linux x86_64)
+```
+
+When iterating on a builtin or adding tests under `tests/sw/repl/`, you
+can run a single interpreter-path test directly without rebuilding
+everything:
+
+```bash
+swc test tests/sw/repl/my_test.sw
 ```
 
 The `linux-quickstart` workflow gates every push and PR on all of the
 above. If it's red, the change isn't ready — a red `make test-phase*`
-or a stress run below the 90% threshold blocks merge.
+or a stress run that doesn't achieve 100 % completion (all 50 multi-sched
+and all 50 single-sched runs) blocks merge.
 
 `make clean` removes every build artefact, including the compiled `.sw`
 programs that test targets leave at the repo root.
@@ -64,11 +73,11 @@ programs that test targets leave at the repo root.
 | Docs | `docs/` |
 | Open bugs & design notes | `docs/notes/` |
 
-Known stability issues are tracked in
-[docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md); the external
-review history is in
-[docs/notes/REVIEW_HARDENING.md](docs/notes/REVIEW_HARDENING.md). Both
-are good places to find something to work on.
+There are no open known runtime issues right now
+([docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) tracks them).
+The external review history is in
+[docs/notes/REVIEW_HARDENING.md](docs/notes/REVIEW_HARDENING.md) if you
+want background on past hardening work.
 
 ## License
 

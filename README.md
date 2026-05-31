@@ -160,6 +160,9 @@ Most languages were designed for humans first; LLM ergonomics are a happy accide
 - **Compile-time "did you mean?"** for unknown function names. `unknown function 'strng_length' — did you mean 'string_length'?` Levenshtein over builtins + module funcs.
 - **Loud runtime failures with full stack traces.** `hd([])`, `elem(t, 99)`, `n / 0` panic with `at src/X.sw:N` and the full call chain (`outer → middle → deep`). `expect(value, msg)` is the idiomatic unwrap. `try/catch` for recoverable cases.
 - **A real stdlib in sw, auto-imported.** `import Std` (list / map / string helpers) just works from any project — swc falls back to `<swarmrt>/lib/`. Same goes for `Mcp`, `Embed`, `Vec`, `Prompt`, `Cron`, `Telemetry`.
+- **Module-level `let` globals.** Top-level constant bindings at module scope — `let base_url = "https://api.example.com"` — shared by all functions in the module without threading them as arguments. *(Interpreter / REPL path only; codegen support is not yet wired — compiled binaries resolve the name as an atom. Use a top-of-function `let` binding or a module function returning the constant in compiled code.)*
+- **`exec_argv(cmd, args)` builtin.** Fork+exec with no shell — safe for user-supplied arguments, no injection risk. *(REPL / interpreter path only — not yet available in `swc build` compiled code. Use `shell_sandboxed` for agent tool dispatch in compiled agents.)*
+- **`assert_raises(fn, msg)` builtin.** In `swc test` files, assert that a zero-arg lambda panics (or errors) with a message containing `msg`. The test runner intercepts the panic so the suite continues.
 - **The whole language fits in one document.** SW_LANGUAGE.md is ~600 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
@@ -187,6 +190,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **ETS** | Agent registry, perms cache, conversation memory, todo state. |
 | **`supervise` + `link` + `monitor` + `trap_exit`** | Full OTP fault tolerance from userland. Crash → restart → DOWN messages → `{'EXIT', from, reason}` for trappers. |
 | **Sandboxed shell** | `shell_sandboxed(cmd, opts)` — sandbox-exec on macOS, firejail on Linux. Network blocked by default. |
+| **`exec_argv(cmd, args)`** | Fork+exec without a shell — safe for user-supplied args (no injection risk). Returns `{exit_code, output}`. *(REPL / interpreter only — not in compiled path yet; use `shell_sandboxed` in compiled agents.)* |
 | **`case`** | Tool-call dispatch: `case tool_name { "read" -> ... ; "bash" -> ... ; _ -> ... }`. |
 
 > Hot reload is implemented in the runtime (`sw_module_register` / `sw_module_upgrade`) but is currently only reachable from **C embedders** — there is no `sw`-level builtin yet. See [docs/API_REFERENCE.md §12](docs/API_REFERENCE.md#12-hot-code-reload).
@@ -284,7 +288,7 @@ sw> format("hi {} you are {}", "world", 30)
 "hi world you are 30"
 ```
 
-Variables persist across lines. Multi-line input continues until brackets balance. The REPL uses a tree-walking interpreter and supports the language core, the stdlib, and **most pure-functional builtins**: strings, JSON, maps, formatting, `case`, `try/catch`, files (`file_read/write/exists/list/mkdir`), SQLite (`db_open/exec/query`), one-shot shell (`shell`), `panic`, `expect`, `error`, `sleep`, `random_int`, `getenv`, `string_replace`/`sub`/`truncate`, `map_merge`/`remove`, `json_get`/`escape`, and the `Std`/`Mcp`/`Vec`/`Embed`/`Prompt` modules.
+Variables persist across lines. Multi-line input continues until brackets balance. The REPL uses a tree-walking interpreter and supports the language core, the stdlib, and **most pure-functional builtins**: strings, JSON, maps, formatting, `case`, `try/catch`, files (`file_read/write/exists/list/mkdir`), SQLite (`db_open/exec/query`), one-shot shell (`shell`), `exec_argv`, `panic`, `expect`, `error`, `assert_raises`, `sleep`, `random_int`, `getenv`, `string_replace`/`sub`/`truncate`, `map_merge`/`remove`, `json_get`/`escape`, and the `Std`/`Mcp`/`Vec`/`Embed`/`Prompt` modules.
 
 Process-scheduler primitives (`spawn`, `link`, `monitor`, `send`, `receive`, `trap_exit`, HTTP server, WebSocket, browser automation) still need the compiled path — the REPL doesn't simulate the full scheduler. Hit one of those names and the REPL prints a one-shot hint and returns `nil` instead of dropping through to "undefined function".
 
@@ -418,7 +422,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart + a few example programs
 - `make test-sw` — 9 files, **110 compiled + 16 interpreter assertions** (`.sw` language)
-- `make test-phase{2..10}` — **9 C-side runtime test files**, all 100% green: GenServer/Supervisor (phase 2), ETS (phase 3, 15 tests), Agent/App/DynSup (phase 4, 14), StateMachine/ProcessGroup (phase 5, 12), TCP (phase 6, 6), hot reload (phase 7, 5), GC (phase 8, 5), distribution (phase 9, 4), language frontend (phase 10)
+- `make test-phase{2..10}` — **9 C-side runtime test files, 75 tests total**, all 100% green: GenServer/Supervisor (phase 2, 6 tests), ETS (phase 3, 15 tests), Agent/App/DynSup (phase 4, 14), StateMachine/ProcessGroup (phase 5, 12), TCP (phase 6, 6), hot reload (phase 7, 5), GC (phase 8, 5), distribution (phase 9, 4), language frontend (phase 10, 8); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make test-full` — **comprehensive gate**: core + OTP + phases 2-10 + search + MCP + sws
 - `make stress` — **100 runs total** (50 multi-scheduler + 50 single-scheduler), 80k spawns each, strict by default: every run must complete
 

@@ -1238,6 +1238,8 @@ Decode a JSON string into SwarmRT values.
 | `assert(cond)` | Assert condition is truthy |
 | `assert_eq(a, b)` | Assert `a == b` |
 | `assert_ne(a, b)` | Assert `a != b` |
+| `exec_argv(cmd, args)` | Fork+exec `cmd` with argument list `args` — no shell interpretation. Returns `{exit_code, stdout_string}`. Safe for user-supplied data; prefer over `shell()` when inputs are untrusted. |
+| `assert_raises(fn, msg)` | Assert that zero-arg lambda `fn` panics (or calls `error()`) with a message containing `msg`. The test runner intercepts the panic so the suite continues. Only meaningful inside `swc test` files. |
 
 ### AST Node Types
 

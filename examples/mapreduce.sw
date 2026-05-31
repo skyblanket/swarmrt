@@ -9,8 +9,8 @@ fun main() {
   total = reduce(fun(acc, x) { acc + x }, nums, 0)
   print("reduce sum:", total)
 
-  evens = filter(fun(x) { x * 2 }, nums)
-  print("filter (all truthy):", evens)
+  evens = filter(fun(x) { x mod 2 == 0 }, nums)
+  print("filter (evens only):", evens)
 
   pdoubled = pmap(fun(x) { x * 2 }, nums)
   print("pmap x*2:", pdoubled)

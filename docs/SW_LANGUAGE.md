@@ -68,6 +68,23 @@ result = LLM.chat(messages, opts)
 export [init, navigate, click, screenshot, close]
 ```
 
+### Module-level `let` globals
+
+A module may declare up to 16 named constants at the top level using `let`. These are initialized once at compile time and visible to every function in the module.
+
+```sw
+module Config
+
+let max_retries = 5
+let base_url = "https://api.example.com"
+let default_timeout = 30000
+let service_name = 'my_service'
+```
+
+Supported literal types for module globals: `int`, `float`, `string`, and `atom`. Complex expressions, function calls, and list/map literals are **not** supported at module scope — put those inside `fun init()` or a similar startup function.
+
+Globals are read-only after initialization. Any assignment to a module-global name inside a function creates a local variable that shadows the global for that scope; the global itself is unchanged.
+
 ---
 
 ## 3. Functions
@@ -461,6 +478,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `process_info(pid)` | inspection map |
 | `process_list()` | all live pids |
 | `registered()` | all registered atoms |
+| `pid_alive(os_pid)` | `'true'` if the OS process (integer pid from `subprocess_spawn`) is still running, `'false'` if it has exited. Uses `kill(pid, 0)` — no signal sent. Does **not** take sw actor pids returned by `spawn()`. |
 | `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |
 | `monitor(pid)` → ref | one-way watch; watcher receives `{'DOWN', ref, pid, reason}` on death. `demonitor(ref)` to cancel |
 | `exit_proc(pid, reason)` | targeted exit signal — `'normal'` / `'killed'` / other atom |
@@ -636,8 +654,41 @@ bin/swc build src/main.sw -o bin/program
 
 # Optimised + obfuscated build
 bin/swc build src/main.sw -o bin/program -O --obfusc --strip
+
+# Run a .sw file directly without producing a binary (interpret + JIT)
+bin/swc run my_program.sw
+
+# Run sw interpreter tests (point at a file or directory of test_*.sw files)
+bin/swc test
+
+# Start the Language Server Protocol server (for editor integration)
+bin/swc lsp
 ```
 
-The compiler emits C to `/tmp/swc_<Module>_*.c`, then invokes `cc` linking against `libswarmrt.a`. Errors at the C step now include `#line` directives so they point back at sw source. If swc itself errors at the parse stage, the message includes the sw line directly.
+### `swc build` — ahead-of-time compilation
+
+Emits C to `/tmp/swc_<Module>_*.c`, then invokes `cc` linking against `libswarmrt.a`. Errors at the C step now include `#line` directives so they point back at sw source. If swc itself errors at the parse stage, the message includes the sw line directly.
+
+### `swc run` — direct execution
+
+Interprets and runs a `.sw` file without writing a binary to disk. Useful for scripts and quick iteration. Slower startup than a pre-built binary but avoids the build step entirely.
+
+### `swc test` — test runner
+
+Runs sw test files through the tree-walking interpreter. Point it at a single file or a directory containing `test_*.sw` / `*_test.sw` files. Prints a per-test pass/fail summary. A non-zero exit code means at least one test failed.
+
+```bash
+# Example output
+bin/swc test tests/sw/repl/test_repl_builtins_interp.sw
+#   16 tests, 16 passed (8.9ms)
+```
+
+The broader test suite (`make test-sw`) compiles and runs the 8 files under `tests/sw/` (110 sw assertions total). The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
+
+Inside your own `.sw` test files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics or errors with a message containing `expected_msg`. The test runner intercepts the panic before it hits `exit(1)` so the suite continues running.
+
+### `swc lsp` — language server
+
+Starts a Language Server Protocol server on stdio, compatible with any LSP-aware editor (VS Code, Neovim, Helix, etc.). Provides go-to-definition, hover docs, and diagnostics backed by the tree-sitter grammar.
 
 Don't `rm -rf bin/` in the swarmrt dir — that wipes `bin/swc` and `bin/libswarmrt.a`. Use `make swc libswarmrt` to rebuild after a clean.

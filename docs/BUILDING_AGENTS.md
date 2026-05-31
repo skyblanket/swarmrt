@@ -397,7 +397,7 @@ A real-world agent stack that uses all of this in anger:
 ## When the runtime feels wrong, it's usually because
 
 - **You forgot a base case in your tail-recursive loop.** Stack doesn't grow, but the agent will spin if the recursion's terminating condition is never met. Always `case state { 'done' -> 'bye' ; _ -> agent(new_state) }` or similar.
-- **You're holding state in a global instead of recursing.** sw has no globals. Use the recursion arg, or ETS if it's actually shared. The temptation to reach for a global usually means the design is muddled.
+- **You're holding state in a global instead of recursing.** sw has module-level `let` constants (read-only, declared at the top of a module), but no mutable globals. Use the recursion arg to carry mutable state, or ETS if it's actually shared across processes. The temptation to reach for a global usually means the design is muddled.
 - **You're using `if/else` for what should be `case`.** If you find yourself with `else { if (x) { … } else { if (y) { … } } }`, that's a `case x { … }` waiting to be written.
 - **Your agent's `receive` clauses don't have a catchall.** Unmatched messages stay queued forever — your agent will start growing memory invisibly. Either match exhaustively or end with `_other -> agent(state)`.
 - **You're trying to make a synchronous HTTP call from inside a `receive` arm and it feels off.** It's fine — the process suspends on the syscall, the scheduler runs other processes meanwhile. That's what the runtime is for.

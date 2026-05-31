@@ -152,3 +152,4 @@ The compiler emits C code that calls the runtime API directly:
 - **Generational GC** — per-process heaps with minor/major collection
 - **Distribution** — multi-node TCP message routing with automatic reconnection
 - **Context switching** — ARM64 assembly for register save/restore (~100ns)
+- **Deadlock watchdog** — background thread detects schedulers where all processes are blocked waiting on each other; logs a diagnostic and terminates the stuck processes to prevent indefinite hangs

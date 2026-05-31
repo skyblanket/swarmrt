@@ -4,6 +4,22 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-05-31 — deadlock watchdog + exec_argv + assert_raises + module globals + docs fix
+
+Five features landed together after the post-release hardening pass.
+
+**feat(runtime): deadlock watchdog.** A background thread wakes every `SW_DEADLOCK_MS` milliseconds (default 5000) and checks whether every live non-scheduler process is in `SW_PROC_WAITING` state with an empty mailbox. If so, it prints a one-line warning to stderr (`[swarmrt] WARNING: all N processes blocked in receive — possible deadlock`) and flushes. The check is best-effort (no locks held) so a message in-flight at the exact scan moment can produce a false positive. The watchdog is warn-only — it does not terminate processes. Disable with `SW_DEADLOCK_DETECT=0`; tune the interval with `SW_DEADLOCK_MS=<ms>`.
+
+**feat(builtins): `exec_argv(cmd, args)`.** Fork+exec with no shell — takes a command string and a list of argument strings, builds `argv[]` directly, and returns `{exit_code, stdout_string}`. No shell metacharacter interpretation, no injection surface. Prefer over `shell()` whenever inputs come from user data or tool arguments. Available in both compiled code and the REPL. Documented in SW_LANGUAGE.md and API_REFERENCE.md.
+
+**feat(builtins): `assert_raises(fn, msg)`.** Assert that a zero-arg lambda panics (or calls `error()`) with a message containing `msg`. The `swc test` runner intercepts the panic before it reaches `exit(1)`, records the assertion result, and continues running the suite. Use in `tests/sw/test_*.sw` files alongside `assert_eq` / `assert_ne`. Documented in SW_LANGUAGE.md section 11 and API_REFERENCE.md section 16.
+
+**feat(language): module-level `let` globals.** Modules may now declare up to 16 named constants at the top level using `let`. Initialized once at compile time, read-only thereafter, visible to every function in the module. Supported literal types: `int`, `float`, `string`, `atom`. Complex expressions and collection literals are not supported at module scope — put those in `fun init()`. Any assignment to a module-global name inside a function creates a local shadow; the global itself is unchanged. Documented in SW_LANGUAGE.md section 2.
+
+**docs: remove false `sys_exit(0)` requirement.** SW_LANGUAGE.md section 1 previously implied `sys_exit(0)` was needed at the end of `main()`. Corrected: the runtime exits cleanly when `main()` returns (Go-style cond-var signal → `sw_shutdown(0)`). `sys_exit(code)` is only needed when exiting with a non-zero status to signal an error to the calling shell.
+
+---
+
 ## 2026-05-29 — interactive-IO correctness + back-pressure primitive
 
 Three fixes shaken out of long-running interactive sessions in swarm-code.
@@ -90,13 +106,14 @@ the entry's value, and missing delta on first-insert).
 
 ## Current state — what's in the build
 
-As of `927cb30` (2026-05-20) plus REPL builtin coverage + `eval/` benchmark, the `.sw` language has:
+As of `1e3769a` (2026-05-31), the `.sw` language has:
 
 - **Core:** `module / fun / export / import`, `spawn / send / receive`, `case`, `if / else`, `try / catch`, pattern matching with guards.
 - **Values:** int, float, string, atom (`'ok'`), tuple (`{...}`), list (`[...]`), map (`%{key: val}`), pid, nil, fun. `map_get` treats atom and string keys interchangeably; `++` works on lists too.
 - **Concurrency:** lock-free MPSC mailboxes, selective receive, ETS for shared mutable state. Supervisors (one-for-one / one-for-all / rest-for-one) plus `link`, `unlink`, `monitor`, `demonitor`, `exit_proc`, `trap_exit` — full Erlang fault-tolerance surface from userland sw.
 - **Built-in I/O:** HTTP (server + client + streaming), WebSocket client/server, Chrome DevTools (browser automation), files, JSON, base64, shell (+ `shell_sandboxed` for sandbox-exec / firejail isolation), bidirectional subprocesses (`subprocess_*`), SQLite (`db_open / db_exec / db_query`).
-- **Ergonomics:** f-strings (`f"hi {name}"`), `format("hi {} count {}", n)`, `++` polymorphic, variadic `print`, `;` works in any block, C-reserved words legal as identifiers, `case` for top-level pattern dispatch.
+- **Ergonomics:** f-strings (`f"hi {name}"`), `format("hi {} count {}", n)`, `++` polymorphic, variadic `print`, `;` works in any block, C-reserved words legal as identifiers, `case` for top-level pattern dispatch. Module-level `let` globals (up to 16 literal constants, immutable).
+- **New builtins (2026-05):** `exec_argv(cmd, args)` → `{code, out}` (fork+exec, no shell injection), `pid_alive(pid)` → `'true'`/`'false'`, `print_above(msg)` (non-clobbering print during read_line), `assert_raises(fn, msg)` (test-suite panic assertion), `file_rename/file_stat/file_atomic_write/file_temp` (atomic filesystem primitives), `ets_update_counter/ets_cas/ets_take` (atomic ETS mutation).
 - **Stdlib (lib/, auto-imported from `<swarmrt>/lib/`):**
   - `Std` — list/map/string helpers (range, take, drop, zip, partition, group_by, sort, unique, contains, find, any, all, count, last, init, chunk_every, intersperse, max_by, min_by, sum, product, string_join, string_pad_*, string_repeat, string_indent…)
   - `Prompt` — `{{var}}` template engine (file or string source)
@@ -107,9 +124,9 @@ As of `927cb30` (2026-05-20) plus REPL builtin coverage + `eval/` benchmark, the
   - `Vec` — ETS-backed cosine-similarity vector store
 - **Tooling:** `swc build / emit / repl / test / lsp`, `--target=<triple>` cross-compile (`zig cc` or matching cross-gcc), per-statement `#line` directives, did-you-mean for unknown function names, tree-sitter grammar at `tree-sitter-sw/` for editor highlighting.
 - **Error story:** `panic(msg)` / `expect(value, msg)` for unrecoverable cases, `error(msg)` + `try/catch` for recoverable ones. `hd`/`tl`/`elem`/divzero panic loudly. Panics now print the full **call chain** with `module.fn at src/X.sw:N` per frame.
-- **Runtime:** programs exit when `main()` returns (Go-style). 100K+ concurrent processes per node, ~150ns context switch.
+- **Runtime:** programs exit when `main()` returns (Go-style) — `sys_exit(0)` at end of `main()` is not required. `sys_exit(code)` is only needed for non-zero exit status. 100K+ concurrent processes per node, ~150ns context switch. `SW_MAX_PROCS` env trims the arena ceiling for CLI tools. Deadlock watchdog enabled by default (`SW_DEADLOCK_DETECT=0` to disable, `SW_DEADLOCK_MS` to tune).
 
-Sw test suite is **8 compiled files (110 assertions) + 1 interpreter file (16 assertions)** = 126 total. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
+Sw test suite: **8 compiled `.sw` files (114 assertions) + 1 interpreter file (31 assertions) + 9 C-side phase test files (75 C assertions)**. swarm-code is the canonical real-world consumer; rebuilds clean against every commit.
 
 The `eval/` directory holds an LLM code-gen benchmark: 10 prompts × 3 models (Kimi K2.6 / K2.5 / Moonshot v1) measured pass rate on single-shot generation. See `eval/results/results.md`.
 
@@ -193,11 +210,11 @@ different scheduler" block was a no-op. Children would routinely
 land on the parent's scheduler, get stuck behind the parent's
 `usleep`/blocking-receive, and the test would see 2/3 group members
 instead of 3/3. Fix: separate TLS slot `tls_spawn_override`,
-honoured by `sw_spawn_opts` when non-NULL. After the fix all 8 phase
+honoured by `sw_spawn_opts` when non-NULL. After the fix all 9 phase
 test files pass 100% — phase 2 (GenServer/Supervisor), 3 (ETS, 15
 tests), 4 (Agent/App/DynSup, 14 tests), 5 (StateMachine/PG, 12
 tests), 6 (TCP, 6), 7 (hot reload, 5), 8 (GC, 5), 9 (distribution,
-4). All wired into CI. README example now mirrors
+4), 10 (search + fsindex). All wired into CI. README example now mirrors
 `examples/counter.sw` verbatim so what you see is what `./counter`
 prints (`Count: 8` + `Counter stopped at 8`).
 

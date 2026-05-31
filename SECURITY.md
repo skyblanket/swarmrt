@@ -39,6 +39,5 @@ to contain what it documents.
 ## Known issues
 
 Non-security stability bugs are tracked openly in
-[docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) — for example a
-high-process-count message-send race on Linux x86_64. Those are already
-public; this policy is for *undisclosed* vulnerabilities.
+[docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md). Those are
+already public; this policy is for *undisclosed* vulnerabilities.
