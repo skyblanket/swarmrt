@@ -368,9 +368,49 @@ void *sw_ets_take(sw_ets_tid_t tid, void *key) {
 }
 
 void *sw_ets_update(sw_ets_tid_t tid, void *key, void *fun) {
-    (void)tid; (void)key; (void)fun;
-    /* Deferred: function-valued builtins require closure capture in C */
-    return NULL;
+    sw_ets_table_t *table = ets_find_table(tid);
+    if (!table) return NULL;
+    if (!ets_check_write(table)) return NULL;
+
+    /* `fun` is a sw_val_t* of type SW_VAL_FUN with a compiled cfunc pointer.
+     * AOT-compiled lambdas use the cfunc path; interpreter lambdas use
+     * sw_ets_update() only when dispatched from interp_extra_builtin in
+     * swarmrt_lang.c (which has its own _interp_vets_* tables). */
+    sw_val_t *fn = (sw_val_t *)fun;
+    if (!fn || fn->type != SW_VAL_FUN || !fn->v.fun.cfunc) return NULL;
+
+    uint32_t bucket = ets_hash_key(key);
+
+    /* Read the old value under a read lock. */
+    pthread_rwlock_rdlock(&table->rwlock);
+    sw_val_t *old_val = NULL;
+    sw_ets_entry_t *e = table->buckets[bucket];
+    while (e) {
+        if (ets_key_eq(e->key, key)) { old_val = (sw_val_t *)e->value; break; }
+        e = e->next;
+    }
+    pthread_rwlock_unlock(&table->rwlock);
+
+    if (!old_val) return NULL;  /* key not found */
+
+    /* Call the compiled lambda outside the lock. */
+    sw_val_t *new_val = sw_val_apply(fn, &old_val, 1);
+    if (!new_val) return NULL;
+
+    /* Write the result back under the write lock; re-scan because the lock
+     * was dropped during the function call. */
+    pthread_rwlock_wrlock(&table->rwlock);
+    e = table->buckets[bucket];
+    while (e) {
+        if (ets_key_eq(e->key, key)) {
+            e->value = new_val;
+            pthread_rwlock_unlock(&table->rwlock);
+            return new_val;
+        }
+        e = e->next;
+    }
+    pthread_rwlock_unlock(&table->rwlock);
+    return NULL;  /* key disappeared between read and write */
 }
 
 int sw_ets_delete(sw_ets_tid_t tid, void *key) {

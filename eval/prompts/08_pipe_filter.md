@@ -12,5 +12,6 @@ the result. Print the final sum.
 
 ## Notes
 
-Tests `import Std`, `Std.filter`, `Std.map`, `Std.sum`, and pipe
-composition. Lambdas use `fun(x) { body }`.
+Tests `import Std`, pipe composition, `Std.sum`, and the global
+`filter` / `map` builtins. Note: `filter` and `map` are global (NOT
+`Std.filter`/`Std.map` — those don't exist). Lambdas use `fun(x) { body }`.

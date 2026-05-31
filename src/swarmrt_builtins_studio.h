@@ -296,9 +296,50 @@ static sw_val_t *_builtin_ets_take(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
-    (void)a; (void)n;
-    /* Deferred: function-valued builtins require closure capture in C */
-    return sw_val_atom("error");
+    if (n < 3 || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    int id = (int)a[0]->v.i;
+    if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_atom("error");
+
+    /* Third argument must be a compiled lambda (cfunc pointer).
+     * Interpreter-path lambdas (body AST) are handled by the ETS dispatch
+     * block inside interp_extra_builtin() in swarmrt_lang.c, which has
+     * access to eval().  Here we only ever see AOT-compiled closures. */
+    sw_val_t *fn = a[2];
+    if (!fn || fn->type != SW_VAL_FUN || !fn->v.fun.cfunc) return sw_val_atom("error");
+
+    _vets_table_t *t = &_vets_tables[id];
+    uint32_t bucket = _vets_hash_val(a[1]);
+
+    /* Snapshot the current value under a read lock. */
+    pthread_rwlock_rdlock(&t->lock);
+    sw_val_t *old_val = NULL;
+    _vets_entry_t *e = t->buckets[bucket];
+    while (e) {
+        if (_vets_key_eq(e->key, a[1])) { old_val = e->value; break; }
+        e = e->next;
+    }
+    pthread_rwlock_unlock(&t->lock);
+
+    if (!old_val) return sw_val_atom("error");  /* key not found */
+
+    /* Call the compiled lambda outside any lock. */
+    sw_val_t *new_val = sw_val_apply(fn, &old_val, 1);
+    if (!new_val) return sw_val_atom("error");
+
+    /* Write the result back under write lock; re-scan because lock was
+     * dropped during the function call. */
+    pthread_rwlock_wrlock(&t->lock);
+    e = t->buckets[bucket];
+    while (e) {
+        if (_vets_key_eq(e->key, a[1])) {
+            e->value = new_val;
+            pthread_rwlock_unlock(&t->lock);
+            return new_val;
+        }
+        e = e->next;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return sw_val_atom("error");  /* key disappeared between read and write */
 }
 
 /* === Utilities === */

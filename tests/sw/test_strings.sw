@@ -1,6 +1,6 @@
 module Test_strings
 
-fun assert_eq(name, actual, expected) {
+fun check_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
         print("FAIL " ++ name ++ ": expected " ++ to_string(expected) ++
@@ -9,27 +9,27 @@ fun assert_eq(name, actual, expected) {
     }
 }
 
-fun test_index_of_hit() { assert_eq("index_of_hit", string_index_of("hello world", "world"), 6) }
-fun test_index_of_miss() { assert_eq("index_of_miss", string_index_of("hello", "xyz"), -1) }
-fun test_index_of_empty() { assert_eq("index_of_empty", string_index_of("hello", ""), 0) }
+fun test_index_of_hit() { check_eq("index_of_hit", string_index_of("hello world", "world"), 6) }
+fun test_index_of_miss() { check_eq("index_of_miss", string_index_of("hello", "xyz"), -1) }
+fun test_index_of_empty() { check_eq("index_of_empty", string_index_of("hello", ""), 0) }
 
 fun test_split() {
     parts = string_split("a,b,c", ",")
-    assert_eq("split_count", length(parts), 3)
+    check_eq("split_count", length(parts), 3)
 }
 
-fun test_concat() { assert_eq("concat", "foo" ++ "bar", "foobar") }
+fun test_concat() { check_eq("concat", "foo" ++ "bar", "foobar") }
 
 fun test_base64_roundtrip() {
     src = "the quick brown fox jumps over the lazy dog"
     enc = base64_encode(src)
     dec = base64_decode(enc)
-    assert_eq("base64_roundtrip", dec, src)
+    check_eq("base64_roundtrip", dec, src)
 }
 
 fun test_base64_known() {
     # `hello` → `aGVsbG8=` per RFC 4648
-    assert_eq("base64_known", base64_encode("hello"), "aGVsbG8=")
+    check_eq("base64_known", base64_encode("hello"), "aGVsbG8=")
 }
 
 fun main() {

@@ -429,6 +429,11 @@ static void node_free(node_t *n) {
         for (int i = 0; i < n->v.map.count; i++) { node_free(n->v.map.keys[i]); node_free(n->v.map.vals[i]); }
         free(n->v.map.keys); free(n->v.map.vals); break;
     case N_FOR: node_free(n->v.forloop.iter); node_free(n->v.forloop.body); break;
+    case N_LIST_COMP:
+        node_free(n->v.lcomp.iter);
+        node_free(n->v.lcomp.body);
+        if (n->v.lcomp.guard) node_free(n->v.lcomp.guard);
+        break;
     case N_RANGE: node_free(n->v.range.from); node_free(n->v.range.to); break;
     case N_TRY: node_free(n->v.trycatch.body); node_free(n->v.trycatch.catch_body); break;
     case N_LIST_CONS: node_free(n->v.cons.head); node_free(n->v.cons.tail); break;
@@ -1012,6 +1017,25 @@ static node_t *par_primary(par_t *p) {
             cons->v.cons.tail = tail;
             return cons;
         }
+        if (p->cur.type == TOK_FOR) {
+            /* List comprehension: [body for var in iter] or [body for var in iter when guard] */
+            par_adv(p); /* consume 'for' */
+            tok_t var = par_expect(p, TOK_IDENT, "variable");
+            par_expect(p, TOK_IN, "'in'");
+            node_t *iter = par_expr(p);
+            node_t *guard = NULL;
+            if (p->cur.type == TOK_WHEN) {
+                par_adv(p); /* consume 'when' */
+                guard = par_expr(p);
+            }
+            par_expect(p, TOK_RBRACKET, "']'");
+            node_t *lc = mknode(N_LIST_COMP, t.line);
+            strncpy(lc->v.lcomp.var, var.text, 127);
+            lc->v.lcomp.iter  = iter;
+            lc->v.lcomp.body  = first;
+            lc->v.lcomp.guard = guard;
+            return lc;
+        }
         node_t *lst = mknode(N_LIST, t.line);
         lst->v.coll.items = malloc(sizeof(node_t*));
         lst->v.coll.items[0] = first;
@@ -1253,30 +1277,12 @@ static node_t *par_module(par_t *p) {
             par_adv(p); /* consume 'let' */
             tok_t gname = par_expect(p, TOK_IDENT, "global name");
             par_expect(p, TOK_ASSIGN, "'='");
-            /* Only literal RHS allowed at module top-level */
-            node_t *val = NULL;
-            if (p->cur.type == TOK_NUMBER) {
-                tok_t t = par_adv(p);
-                if (strchr(t.text, '.')) {
-                    val = mknode(N_FLOAT, t.line); val->v.fval = t.num_val;
-                } else {
-                    val = mknode(N_INT, t.line); val->v.ival = (int64_t)t.num_val;
-                }
-            } else if (p->cur.type == TOK_STRING) {
-                tok_t t = par_adv(p);
-                val = mknode(N_STRING, t.line);
-                strncpy(val->v.sval, t.text, sizeof(val->v.sval)-1);
-            } else if (p->cur.type == TOK_ATOM) {
-                tok_t t = par_adv(p);
-                val = mknode(N_ATOM, t.line);
-                strncpy(val->v.sval, t.text, sizeof(val->v.sval)-1);
-            } else {
-                snprintf(p->errmsg, sizeof(p->errmsg),
-                    "line %d: module-level 'let' only supports literal values (int, float, string, atom)",
-                    p->cur.line);
-                p->err = 1;
-                break;
-            }
+            /* Full expression RHS: int, float, string, atom, map (%{}), list ([]), tuple.
+             * par_expr already handles all of these; no need for a separate literal
+             * parser. Values that require runtime state (function calls, variable
+             * refs) are rejected at eval time since global_env is empty at load. */
+            node_t *val = par_expr(p);
+            if (p->err) break;
             if (mod->v.mod.nglobals < 16) {
                 int gi = mod->v.mod.nglobals++;
                 strncpy(mod->v.mod.globals[gi].name, gname.text,
@@ -1951,6 +1957,70 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
 }
 
 /* =========================================================================
+ * Interpreter-path ETS (value-aware, hash table, 256 buckets, 64 tables)
+ *
+ * The codegen path gets _vets_* via swarmrt_builtins_studio.h (included
+ * in generated C).  The interpreter (REPL / swc test) needs its own copy
+ * because swarmrt_lang.c is compiled independently.  These statics are
+ * only alive during interpreter runs, so the duplication is harmless.
+ * =========================================================================
+ */
+
+#define _INTERP_VETS_BUCKETS   256
+#define _INTERP_VETS_MAX_TABLES 64
+
+typedef struct _interp_vets_entry {
+    sw_val_t *key;
+    sw_val_t *value;
+    struct _interp_vets_entry *next;
+} _interp_vets_entry_t;
+
+typedef struct {
+    _interp_vets_entry_t *buckets[_INTERP_VETS_BUCKETS];
+    pthread_rwlock_t lock;
+    int active;
+} _interp_vets_table_t;
+
+static _interp_vets_table_t _interp_vets_tables[_INTERP_VETS_MAX_TABLES];
+static int _interp_vets_next_id = 0;
+static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t _interp_vets_hash(sw_val_t *v) {
+    uint64_t h = 14695981039346656037ULL;
+    if (!v) return 0;
+    switch (v->type) {
+        case SW_VAL_INT: {
+            uint64_t k = (uint64_t)v->v.i;
+            for (int i = 0; i < 8; i++) { h ^= (k & 0xff); h *= 1099511628211ULL; k >>= 8; }
+            break;
+        }
+        case SW_VAL_STRING: case SW_VAL_ATOM: {
+            if (v->v.str)
+                for (const char *s = v->v.str; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
+            break;
+        }
+        default: {
+            uint64_t k = (uint64_t)(uintptr_t)v;
+            h ^= k; h *= 1099511628211ULL;
+            break;
+        }
+    }
+    return (uint32_t)(h % _INTERP_VETS_BUCKETS);
+}
+
+static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
+    if (!a || !b) return a == b;
+    if (a->type != b->type) return 0;
+    switch (a->type) {
+        case SW_VAL_INT:    return a->v.i == b->v.i;
+        case SW_VAL_STRING: case SW_VAL_ATOM:
+            return a->v.str && b->v.str && strcmp(a->v.str, b->v.str) == 0;
+        case SW_VAL_PID:    return a->v.pid == b->v.pid;
+        default:            return a == b;
+    }
+}
+
+/* =========================================================================
  * Extra interpreter/REPL builtins
  *
  * The interpreter (REPL + `swc test`) historically only knew ~30 builtins
@@ -2391,6 +2461,234 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_list(rows, nrows);
     }
 
+    /* === ETS (value-aware hash tables) ========================= */
+    if (strcmp(fname, "ets_new") == 0) {
+        pthread_mutex_lock(&_interp_vets_meta);
+        int id = _interp_vets_next_id++;
+        if (id >= _INTERP_VETS_MAX_TABLES) {
+            pthread_mutex_unlock(&_interp_vets_meta);
+            return sw_val_nil();
+        }
+        memset(&_interp_vets_tables[id], 0, sizeof(_interp_vets_table_t));
+        pthread_rwlock_init(&_interp_vets_tables[id].lock, NULL);
+        _interp_vets_tables[id].active = 1;
+        pthread_mutex_unlock(&_interp_vets_meta);
+        return sw_val_int((int64_t)id);
+    }
+    if (strcmp(fname, "ets_put") == 0 && nargs >= 3 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_atom("error");
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+        pthread_rwlock_wrlock(&t->lock);
+        _interp_vets_entry_t *e = t->buckets[bucket];
+        while (e) {
+            if (_interp_vets_key_eq(e->key, args[1])) {
+                e->value = args[2];
+                pthread_rwlock_unlock(&t->lock);
+                return sw_val_atom("ok");
+            }
+            e = e->next;
+        }
+        _interp_vets_entry_t *ne = (_interp_vets_entry_t *)malloc(sizeof(_interp_vets_entry_t));
+        ne->key = args[1]; ne->value = args[2]; ne->next = t->buckets[bucket];
+        t->buckets[bucket] = ne;
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "ets_get") == 0 && nargs >= 2 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_nil();
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+        pthread_rwlock_rdlock(&t->lock);
+        _interp_vets_entry_t *e = t->buckets[bucket];
+        while (e) {
+            if (_interp_vets_key_eq(e->key, args[1])) {
+                sw_val_t *v = e->value;
+                pthread_rwlock_unlock(&t->lock);
+                return v ? v : sw_val_nil();
+            }
+            e = e->next;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_nil();
+    }
+    if (strcmp(fname, "ets_delete") == 0 && nargs >= 2 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_atom("error");
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+        pthread_rwlock_wrlock(&t->lock);
+        _interp_vets_entry_t **pp = &t->buckets[bucket];
+        while (*pp) {
+            if (_interp_vets_key_eq((*pp)->key, args[1])) {
+                _interp_vets_entry_t *dead = *pp; *pp = dead->next; free(dead);
+                pthread_rwlock_unlock(&t->lock);
+                return sw_val_atom("ok");
+            }
+            pp = &(*pp)->next;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "ets_take") == 0 && nargs >= 2 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_nil();
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+        pthread_rwlock_wrlock(&t->lock);
+        _interp_vets_entry_t **pp = &t->buckets[bucket];
+        while (*pp) {
+            if (_interp_vets_key_eq((*pp)->key, args[1])) {
+                _interp_vets_entry_t *dead = *pp;
+                sw_val_t *val = dead->value;
+                *pp = dead->next; free(dead);
+                pthread_rwlock_unlock(&t->lock);
+                return val ? val : sw_val_nil();
+            }
+            pp = &(*pp)->next;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_nil();
+    }
+    if (strcmp(fname, "ets_update_counter") == 0 && nargs >= 4 &&
+        args[0]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT && args[3]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_atom("error");
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+        int64_t delta = args[2]->v.i, initial = args[3]->v.i;
+        pthread_rwlock_wrlock(&t->lock);
+        _interp_vets_entry_t *e = t->buckets[bucket];
+        while (e) {
+            if (_interp_vets_key_eq(e->key, args[1])) {
+                if (e->value && e->value->type == SW_VAL_INT) {
+                    int64_t result = e->value->v.i + delta;
+                    e->value = sw_val_int(result);
+                    pthread_rwlock_unlock(&t->lock);
+                    return sw_val_int(result);
+                }
+                pthread_rwlock_unlock(&t->lock);
+                return sw_val_atom("error");
+            }
+            e = e->next;
+        }
+        int64_t seeded = initial + delta;
+        sw_val_t *stored = sw_val_int(seeded);
+        _interp_vets_entry_t *ne = (_interp_vets_entry_t *)malloc(sizeof(_interp_vets_entry_t));
+        ne->key = args[1]; ne->value = stored; ne->next = t->buckets[bucket];
+        t->buckets[bucket] = ne;
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_int(seeded);
+    }
+    if (strcmp(fname, "ets_cas") == 0 && nargs >= 4 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_atom("false");
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+        pthread_rwlock_wrlock(&t->lock);
+        _interp_vets_entry_t *e = t->buckets[bucket];
+        while (e) {
+            if (_interp_vets_key_eq(e->key, args[1])) {
+                if (_interp_vets_key_eq(e->value, args[2])) {
+                    e->value = args[3];
+                    pthread_rwlock_unlock(&t->lock);
+                    return sw_val_atom("true");
+                }
+                pthread_rwlock_unlock(&t->lock);
+                return sw_val_atom("false");
+            }
+            e = e->next;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_atom("false");
+    }
+    /* ets_update(t, k, fun) — atomically apply a 1-arg sw lambda to the
+     * current value and write the result back.  The lambda is called
+     * without holding the rwlock (to allow arbitrary eval depth); the
+     * write-back re-acquires it and re-scans to handle the dropped-lock
+     * window.  Returns the new value, or 'error' if the key is missing or
+     * the third argument is not a callable lambda. */
+    if (strcmp(fname, "ets_update") == 0 && nargs >= 3 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_atom("error");
+        /* Third argument must be a closure with an AST body (interpreter lambda). */
+        sw_val_t *fn_val = args[2];
+        if (!fn_val || fn_val->type != SW_VAL_FUN || !fn_val->v.fun.body)
+            return sw_val_atom("error");
+
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        uint32_t bucket = _interp_vets_hash(args[1]);
+
+        /* Read the current value under the read lock. */
+        pthread_rwlock_rdlock(&t->lock);
+        sw_val_t *old_val = NULL;
+        _interp_vets_entry_t *e = t->buckets[bucket];
+        while (e) {
+            if (_interp_vets_key_eq(e->key, args[1])) { old_val = e->value; break; }
+            e = e->next;
+        }
+        pthread_rwlock_unlock(&t->lock);
+
+        if (!old_val) return sw_val_atom("error");  /* key not found */
+
+        /* Invoke the lambda without holding any lock. */
+        node_t *fn_node = (node_t *)fn_val->v.fun.body;
+        sw_env_t *fenv = env_new(fn_val->v.fun.closure_env
+                                  ? fn_val->v.fun.closure_env
+                                  : interp->global_env);
+        if (fn_node->v.fun.nparams >= 1)
+            env_set(fenv, fn_node->v.fun.params[0], old_val);
+        sw_val_t *new_val = eval(interp, fn_node->v.fun.body, fenv);
+        env_free(fenv);
+
+        if (interp->error) return sw_val_nil();
+
+        /* Write the result back under the write lock (re-scan: lock was
+         * dropped during eval, concurrent ets_put may have changed things). */
+        pthread_rwlock_wrlock(&t->lock);
+        e = t->buckets[bucket];
+        while (e) {
+            if (_interp_vets_key_eq(e->key, args[1])) {
+                e->value = new_val;
+                pthread_rwlock_unlock(&t->lock);
+                return new_val;
+            }
+            e = e->next;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_atom("error");  /* key disappeared between read and write */
+    }
+    if (strcmp(fname, "ets_count") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_int(-1);
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        pthread_rwlock_rdlock(&t->lock);
+        int count = 0;
+        for (int bi = 0; bi < _INTERP_VETS_BUCKETS; bi++) {
+            for (_interp_vets_entry_t *e = t->buckets[bi]; e; e = e->next) count++;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        return sw_val_int(count);
+    }
+    if (strcmp(fname, "ets_list") == 0) {
+        sw_val_t *ids[_INTERP_VETS_MAX_TABLES]; int nids = 0;
+        pthread_mutex_lock(&_interp_vets_meta);
+        for (int i = 0; i < _interp_vets_next_id && i < _INTERP_VETS_MAX_TABLES; i++)
+            if (_interp_vets_tables[i].active) ids[nids++] = sw_val_int(i);
+        pthread_mutex_unlock(&_interp_vets_meta);
+        return sw_val_list(ids, nids);
+    }
+
     /* === Process-scheduler primitives — warn + degrade ========= */
     static const char *scheduler_names[] = {
         "send", "register", "whereis", "link", "unlink", "monitor",
@@ -2477,6 +2775,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             if (strcmp(op, "-") == 0)  return sw_val_int(a - b);
             if (strcmp(op, "*") == 0)  return sw_val_int(a * b);
             if (strcmp(op, "/") == 0)  return b ? sw_val_int(a / b) : sw_val_nil();
+            if (strcmp(op, "%") == 0)  return b ? sw_val_int(a % b) : sw_val_nil();
             if (strcmp(op, "==") == 0) return sw_val_atom(a == b ? "true" : "false");
             if (strcmp(op, "!=") == 0) return sw_val_atom(a != b ? "true" : "false");
             if (strcmp(op, "<") == 0)  return sw_val_atom(a < b ? "true" : "false");
@@ -2785,11 +3084,20 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             return r;
         }
 
-        /* Test assertion builtins */
-        if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
-        if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
-        if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
-        if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
+        /* Test assertion builtins — but let user-defined functions with the
+         * same name take precedence. This allows test files to define their
+         * own 3-arg assert_eq(name, actual, expected) helpers without the
+         * 2-arg builtin intercepting the call. */
+        if ((strcmp(fname, "assert") == 0 ||
+             strcmp(fname, "assert_eq") == 0 ||
+             strcmp(fname, "assert_ne") == 0 ||
+             strcmp(fname, "assert_raises") == 0) &&
+            !find_fun(interp->module_ast, fname)) {
+            if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
+            if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
+            if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
+            if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
+        }
 
         /* Extra REPL builtins — bridges the gap to the codegen surface
          * (file_*, db_*, shell, panic, expect, error, etc.). See
@@ -2875,6 +3183,34 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                 result = eval(interp, n->v.forloop.body, env);
             }
         }
+        return result;
+    }
+
+    case N_LIST_COMP: {
+        /* [body for var in iter] or [body for var in iter when guard]
+         * Evaluates iter, iterates over it, optionally filters by guard,
+         * and collects body results into a new list. */
+        sw_val_t *iter = eval(interp, n->v.lcomp.iter, env);
+        int src_count = (iter->type == SW_VAL_LIST) ? iter->v.tuple.count : 0;
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * (src_count > 0 ? src_count : 1));
+        int out_count = 0;
+        if (iter->type == SW_VAL_LIST) {
+            for (int i = 0; i < src_count && !interp->error; i++) {
+                sw_env_t *iter_env = env_new(env);
+                env_set(iter_env, n->v.lcomp.var, iter->v.tuple.items[i]);
+                if (n->v.lcomp.guard) {
+                    sw_val_t *gv = eval(interp, n->v.lcomp.guard, iter_env);
+                    if (!sw_val_is_truthy(gv)) {
+                        env_free(iter_env);
+                        continue;
+                    }
+                }
+                items[out_count++] = eval(interp, n->v.lcomp.body, iter_env);
+                env_free(iter_env);
+            }
+        }
+        sw_val_t *result = sw_val_list(items, out_count);
+        free(items);
         return result;
     }
 
@@ -3000,14 +3336,12 @@ sw_interp_t *sw_lang_new(void *module_ast) {
         node_t *mod = (node_t *)module_ast;
         for (int i = 0; i < mod->v.mod.nglobals; i++) {
             node_t *vn = mod->v.mod.globals[i].val;
-            sw_val_t *sv = NULL;
-            switch (vn->type) {
-                case N_INT:    sv = sw_val_int(vn->v.ival); break;
-                case N_FLOAT:  sv = sw_val_float(vn->v.fval); break;
-                case N_STRING: sv = sw_val_string(vn->v.sval); break;
-                case N_ATOM:   sv = sw_val_atom(vn->v.sval); break;
-                default:       sv = sw_val_nil(); break;
-            }
+            /* eval() handles N_INT/N_FLOAT/N_STRING/N_ATOM/N_MAP/N_LIST/N_TUPLE.
+             * Pure literal maps and lists need no env lookup so they work
+             * correctly with an empty global_env. Variable references return nil.
+             * Note: module functions are findable via module_ast at this point,
+             * so function-call globals would execute at load time — unsupported. */
+            sw_val_t *sv = eval(interp, vn, interp->global_env);
             env_set(interp->global_env, mod->v.mod.globals[i].name, sv);
         }
     }

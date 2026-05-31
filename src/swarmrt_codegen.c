@@ -50,6 +50,11 @@ typedef struct {
     char mod_name[128];
     int tmp_counter;
 
+    /* module-level globals (let x = expr) */
+    char global_names[16][128];
+    int nglobals;
+    int has_globals; /* 1 if nglobals > 0 — used by emit_entry_and_main */
+
     /* current function context */
     char cur_func[128];
     char cur_params[16][128];
@@ -182,6 +187,12 @@ static int is_declared(cg_ctx_t *ctx, const char *name) {
 static void declare_var(cg_ctx_t *ctx, const char *name) {
     if (ctx->ndeclared < 256 && !is_declared(ctx, name))
         strncpy(ctx->declared[ctx->ndeclared++], name, 127);
+}
+
+static int is_global(cg_ctx_t *ctx, const char *name) {
+    for (int i = 0; i < ctx->nglobals; i++)
+        if (strcmp(ctx->global_names[i], name) == 0) return 1;
+    return 0;
 }
 
 static int is_builtin(const char *name) {
@@ -410,6 +421,11 @@ static void scan_spawns(cg_ctx_t *ctx, node_t *n) {
         scan_spawns(ctx, n->v.forloop.iter);
         scan_spawns(ctx, n->v.forloop.body);
         break;
+    case N_LIST_COMP:
+        scan_spawns(ctx, n->v.lcomp.iter);
+        scan_spawns(ctx, n->v.lcomp.body);
+        if (n->v.lcomp.guard) scan_spawns(ctx, n->v.lcomp.guard);
+        break;
     case N_MAP:
         for (int i = 0; i < n->v.map.count; i++) { scan_spawns(ctx, n->v.map.keys[i]); scan_spawns(ctx, n->v.map.vals[i]); }
         break;
@@ -491,6 +507,11 @@ static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
     case N_FOR:
         collect_idents(n->v.forloop.iter, ids, nids, max);
         collect_idents(n->v.forloop.body, ids, nids, max);
+        break;
+    case N_LIST_COMP:
+        collect_idents(n->v.lcomp.iter, ids, nids, max);
+        collect_idents(n->v.lcomp.body, ids, nids, max);
+        if (n->v.lcomp.guard) collect_idents(n->v.lcomp.guard, ids, nids, max);
         break;
     case N_MAP:
         for (int i = 0; i < n->v.map.count; i++) { collect_idents(n->v.map.keys[i], ids, nids, max); collect_idents(n->v.map.vals[i], ids, nids, max); }
@@ -644,6 +665,11 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     case N_FOR:
         scan_lambdas(ctx, n->v.forloop.iter);
         scan_lambdas(ctx, n->v.forloop.body);
+        break;
+    case N_LIST_COMP:
+        scan_lambdas(ctx, n->v.lcomp.iter);
+        scan_lambdas(ctx, n->v.lcomp.body);
+        if (n->v.lcomp.guard) scan_lambdas(ctx, n->v.lcomp.guard);
         break;
     case N_MAP:
         for (int i = 0; i < n->v.map.count; i++) { scan_lambdas(ctx, n->v.map.keys[i]); scan_lambdas(ctx, n->v.map.vals[i]); }
@@ -1099,6 +1125,11 @@ static void emit_forward_decls(cg_ctx_t *ctx, node_t *mod) {
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
         fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
+    }
+    /* Static storage for module-level globals */
+    for (int i = 0; i < mod->v.mod.nglobals; i++) {
+        fprintf(f, "static sw_val_t *_g_%s_%s = NULL;\n",
+                ctx->mod_name, mod->v.mod.globals[i].name);
     }
     fprintf(f, "\n");
 }
@@ -2253,6 +2284,11 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         if (is_declared(ctx, n->v.sval)) {
             /* Known variable — return mangled C-side name. */
             strncpy(out, mangle_for_c(n->v.sval), osz - 1);
+        } else if (is_global(ctx, n->v.sval)) {
+            /* Module-level global (let x = ...) — read from static slot. */
+            char v[32]; fresh_var(ctx, v, sizeof(v));
+            fprintf(f, "    sw_val_t *%s = _g_%s_%s;\n", v, ctx->mod_name, n->v.sval);
+            strncpy(out, v, osz - 1);
         } else if (is_module_func(ctx, n->v.sval)) {
             /* Module function used by-name as a value (e.g. passed in
              * `%{handler: handle_echo}` or stored in a var to call
@@ -2462,6 +2498,53 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         strncpy(out, v, osz - 1);
         break;
     }
+    case N_LIST_COMP: {
+        /* [body for var in iter] or [body for var in iter when guard]
+         * Emits: evaluate iter, allocate scratch array, loop with optional
+         * guard filter, collect body results, build list via sw_val_list. */
+        char iter_var[32];
+        emit_expr(ctx, n->v.lcomp.iter, 0, iter_var, sizeof(iter_var));
+        /* src_count = number of items in the source list */
+        char src_cnt[32]; fresh_var(ctx, src_cnt, sizeof(src_cnt));
+        fprintf(f, "    int %s = (%s->type == SW_VAL_LIST) ? %s->v.tuple.count : 0;\n",
+                src_cnt, iter_var, iter_var);
+        /* scratch array and output counter */
+        char arr[32]; fresh_var(ctx, arr, sizeof(arr));
+        char out_cnt[32]; fresh_var(ctx, out_cnt, sizeof(out_cnt));
+        fprintf(f, "    sw_val_t **%s = malloc(sizeof(sw_val_t*) * (%s > 0 ? %s : 1));\n",
+                arr, src_cnt, src_cnt);
+        fprintf(f, "    int %s = 0;\n", out_cnt);
+        /* loop variable */
+        char idx[32]; fresh_var(ctx, idx, sizeof(idx));
+        fprintf(f, "    for (int %s = 0; %s < %s; %s++) {\n", idx, idx, src_cnt, idx);
+        /* Declare the loop variable fresh inside the for body.
+         * Always emit `sw_val_t *var = ...` rather than relying on
+         * is_declared — the variable is block-scoped to this for body.
+         * Save and restore ndeclared so a second comprehension using the
+         * same var name (e.g. two `[x * 2 for x in ...]`) also gets a
+         * fresh `sw_val_t *x` declaration inside its own loop braces. */
+        int saved_ndecl = ctx->ndeclared;
+        fprintf(f, "    sw_val_t *%s = %s->v.tuple.items[%s];\n",
+                n->v.lcomp.var, iter_var, idx);
+        declare_var(ctx, n->v.lcomp.var);
+        /* optional guard */
+        if (n->v.lcomp.guard) {
+            char gv[32];
+            emit_expr(ctx, n->v.lcomp.guard, 0, gv, sizeof(gv));
+            fprintf(f, "    if (!sw_val_is_truthy(%s)) continue;\n", gv);
+        }
+        /* evaluate body and store */
+        char bv[32];
+        emit_expr(ctx, n->v.lcomp.body, 0, bv, sizeof(bv));
+        fprintf(f, "    %s[%s++] = %s;\n", arr, out_cnt, bv);
+        fprintf(f, "    }\n");
+        ctx->ndeclared = saved_ndecl; /* restore: loop var is block-scoped */
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    sw_val_t *%s = sw_val_list(%s, %s);\n", v, arr, out_cnt);
+        fprintf(f, "    free(%s);\n", arr);
+        strncpy(out, v, osz - 1);
+        break;
+    }
     case N_RANGE: {
         /* Range expression 1..10 -- build a list */
         char start_v[32], end_v[32];
@@ -2554,6 +2637,27 @@ static const char *guess_sw_path(const char *mod_name) {
     return path;
 }
 
+/* Emit a function that initializes module-level globals.
+ * Called once from _main_entry before the user's main(). */
+static void emit_globals_init(cg_ctx_t *ctx, node_t *mod) {
+    FILE *f = ctx->out;
+    if (mod->v.mod.nglobals == 0) return;
+    fprintf(f, "/* === Module globals initializer === */\n");
+    fprintf(f, "static void _sw_init_globals_%s(void) {\n", ctx->mod_name);
+    /* Use emit_expr to evaluate each global's RHS into its static slot.
+     * We need a clean declared-variables context for the temporary vars. */
+    int saved_ndeclared = ctx->ndeclared;
+    ctx->ndeclared = 0;
+    for (int i = 0; i < mod->v.mod.nglobals; i++) {
+        char v[32];
+        emit_expr(ctx, mod->v.mod.globals[i].val, 0, v, sizeof(v));
+        fprintf(f, "    _g_%s_%s = %s;\n", ctx->mod_name,
+                mod->v.mod.globals[i].name, v);
+    }
+    ctx->ndeclared = saved_ndeclared;
+    fprintf(f, "}\n\n");
+}
+
 static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     FILE *f = ctx->out;
 
@@ -2644,6 +2748,8 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
 
     fprintf(f, "static void _main_entry(void *_arg) {\n");
     fprintf(f, "    (void)_arg;\n");
+    if (ctx->has_globals)
+        fprintf(f, "    _sw_init_globals_%s();\n", ctx->mod_name);
     fprintf(f, "    %s_main(NULL, 0);\n", ctx->mod_name);
     fprintf(f, "    pthread_mutex_lock(&_sw_done_lock);\n");
     fprintf(f, "    _sw_done_flag = 1;\n");
@@ -2698,6 +2804,13 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
         ctx.nfuncs++;
     }
 
+    /* Collect module-level global names so is_global() works inside functions. */
+    for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
+        strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
+        ctx.nglobals++;
+    }
+    ctx.has_globals = (ctx.nglobals > 0);
+
     /* Pre-scan for spawn sites and lambdas */
     scan_spawns(&ctx, mod);
     scan_lambdas(&ctx, mod);
@@ -2707,6 +2820,7 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     emit_forward_decls(&ctx, mod);
     emit_spawn_trampolines(&ctx);
     emit_lambda_functions(&ctx);
+    emit_globals_init(&ctx, mod);
 
     fprintf(out, "/* === Functions === */\n");
     for (int i = 0; i < mod->v.mod.nfuns; i++)
@@ -2752,6 +2866,12 @@ int sw_codegen_module(void *ast, FILE *out) {
         ctx.nfuncs++;
     }
 
+    for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
+        strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
+        ctx.nglobals++;
+    }
+    ctx.has_globals = (ctx.nglobals > 0);
+
     scan_spawns(&ctx, mod);
     scan_lambdas(&ctx, mod);
 
@@ -2760,6 +2880,7 @@ int sw_codegen_module(void *ast, FILE *out) {
     emit_forward_decls(&ctx, mod);
     emit_spawn_trampolines(&ctx);
     emit_lambda_functions(&ctx);
+    emit_globals_init(&ctx, mod);
 
     for (int i = 0; i < mod->v.mod.nfuns; i++)
         emit_function(&ctx, mod->v.mod.funs[i]);
@@ -2807,12 +2928,19 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
             ctx.nfuncs++;
         }
 
+        for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
+            strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
+            ctx.nglobals++;
+        }
+        ctx.has_globals = (ctx.nglobals > 0);
+
         scan_spawns(&ctx, mod);
         scan_lambdas(&ctx, mod);
 
         fprintf(out, "\n/* === Module: %s === */\n", ctx.mod_name);
         emit_spawn_trampolines(&ctx);
         emit_lambda_functions(&ctx);
+        emit_globals_init(&ctx, mod);
 
         for (int i = 0; i < mod->v.mod.nfuns; i++)
             emit_function(&ctx, mod->v.mod.funs[i]);
@@ -2827,6 +2955,7 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
     memset(&main_ctx, 0, sizeof(main_ctx));
     main_ctx.out = out;
     strncpy(main_ctx.mod_name, main_mod->v.mod.name, 127);
+    main_ctx.has_globals = (main_mod->v.mod.nglobals > 0);
     emit_entry_and_main(&main_ctx);
 
     if (any_arity_error || any_unknown_fn) return -1;

@@ -28,5 +28,5 @@ FizzBuzz
 ## Notes
 
 Exercises basic control flow, `%` modulo, `print`, and either
-recursion or a counter-driven loop (sw has no `for` — use recursion
-or a Std helper).
+recursion or a `for` loop (`for i in Std.range(1, 16) { ... }` with
+`import Std`). Both approaches are valid.

@@ -37,7 +37,9 @@ typedef enum {
     TOK_WHEN,
     TOK_CASE,
     TOK_END,
-    
+    TOK_FOR,
+    TOK_IN,
+
     /* Operators */
     TOK_ARROW,      /* -> */
     TOK_FARROW,     /* => */
@@ -100,6 +102,8 @@ static struct {
     {"when", TOK_WHEN},
     {"case", TOK_CASE},
     {"end", TOK_END},
+    {"for", TOK_FOR},
+    {"in",  TOK_IN},
     {"true", TOK_ATOM},
     {"false", TOK_ATOM},
     {"nil", TOK_ATOM},
@@ -295,6 +299,7 @@ typedef enum {
     AST_CLAUSE,
     AST_BINARY_OP,
     AST_PIPE,
+    AST_LIST_COMP,
 } ast_type_t;
 
 typedef struct ast_node {
@@ -381,6 +386,13 @@ typedef struct ast_node {
             struct ast_node *value;
             struct ast_node *func;
         } pipe;
+        /* List comprehension */
+        struct {
+            char *var;
+            struct ast_node *iter;
+            struct ast_node *body;
+            struct ast_node *guard; /* NULL if no when-clause */
+        } lcomp;
     } val;
 } ast_node_t;
 
@@ -494,14 +506,39 @@ static ast_node_t *parse_primary(parser_t *parser) {
             ast_node_t *list = new_node(AST_LIST);
             list->val.collection.items = NULL;
             list->val.collection.count = 0;
-            
+
             if (!match(parser, TOK_RBRACKET)) {
-                do {
+                /* Parse the first element (body expression for comprehension) */
+                ast_node_t *first = parse_expr(parser);
+                if (parser->current.type == TOK_FOR) {
+                    /* List comprehension: [body for var in iter] or [...when guard] */
+                    advance_parser(parser); /* consume 'for' */
+                    token_t var_tok = consume(parser, TOK_IDENT, "Expected variable after 'for'");
+                    consume(parser, TOK_IN, "Expected 'in' after variable");
+                    ast_node_t *iter = parse_expr(parser);
+                    ast_node_t *guard = NULL;
+                    if (parser->current.type == TOK_WHEN) {
+                        advance_parser(parser); /* consume 'when' */
+                        guard = parse_expr(parser);
+                    }
+                    consume(parser, TOK_RBRACKET, "Expected ']' after list comprehension");
+                    ast_node_t *lc = new_node(AST_LIST_COMP);
+                    lc->val.lcomp.var = strdup(var_tok.text);
+                    lc->val.lcomp.iter = iter;
+                    lc->val.lcomp.body = first;
+                    lc->val.lcomp.guard = guard;
+                    return lc;
+                }
+                /* Ordinary list literal */
+                list->val.collection.count = 1;
+                list->val.collection.items = malloc(sizeof(ast_node_t *));
+                list->val.collection.items[0] = first;
+                while (match(parser, TOK_COMMA)) {
                     list->val.collection.count++;
                     list->val.collection.items = realloc(list->val.collection.items,
                         sizeof(ast_node_t *) * list->val.collection.count);
                     list->val.collection.items[list->val.collection.count - 1] = parse_expr(parser);
-                } while (match(parser, TOK_COMMA));
+                }
                 consume(parser, TOK_RBRACKET, "Expected ']' after list");
             }
             return list;
@@ -689,7 +726,22 @@ void print_ast(ast_node_t *node, int indent) {
                 print_ast(node->val.collection.items[i], indent + 1);
             }
             break;
-        
+
+        case AST_LIST_COMP:
+            printf("list_comp for %s\n", node->val.lcomp.var);
+            for (int i = 0; i < indent + 1; i++) printf("  ");
+            printf("iter:\n");
+            print_ast(node->val.lcomp.iter, indent + 2);
+            for (int i = 0; i < indent + 1; i++) printf("  ");
+            printf("body:\n");
+            print_ast(node->val.lcomp.body, indent + 2);
+            if (node->val.lcomp.guard) {
+                for (int i = 0; i < indent + 1; i++) printf("  ");
+                printf("guard:\n");
+                print_ast(node->val.lcomp.guard, indent + 2);
+            }
+            break;
+
         default:
             printf("(unknown node type %d)\n", node->type);
             break;
@@ -699,7 +751,21 @@ void print_ast(ast_node_t *node, int indent) {
 /* === Free AST === */
 void free_ast(ast_node_t *node) {
     if (!node) return;
-    
-    /* TODO: recursively free everything */
+
+    switch (node->type) {
+        case AST_LIST_COMP:
+            free(node->val.lcomp.var);
+            free_ast(node->val.lcomp.iter);
+            free_ast(node->val.lcomp.body);
+            if (node->val.lcomp.guard) free_ast(node->val.lcomp.guard);
+            break;
+        case AST_LIST: case AST_TUPLE:
+            for (int i = 0; i < node->val.collection.count; i++)
+                free_ast(node->val.collection.items[i]);
+            free(node->val.collection.items);
+            break;
+        default:
+            break;
+    }
     free(node);
 }

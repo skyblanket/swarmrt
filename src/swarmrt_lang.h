@@ -169,6 +169,8 @@ typedef enum {
     N_MAP, N_FOR, N_RANGE, N_TRY, N_LIST_CONS,
     /* Phase 13: case/match expression — top-level pattern matching */
     N_CASE,
+    /* Phase 14: list comprehension — [expr for x in list] or [...when guard] */
+    N_LIST_COMP,
 } node_type_t;
 
 typedef struct node {
@@ -231,6 +233,9 @@ typedef struct node {
         /* N_CASE — top-level pattern match: case subject { pat -> body ; ... }.
          * Reuses N_CLAUSE for arms (pattern + optional guard + body). */
         struct { struct node *subject; struct node **clauses; int nclauses; } casex;
+        /* N_LIST_COMP — [body for var in iter] or [body for var in iter when guard].
+         * guard is NULL when no `when` clause is present. */
+        struct { char var[128]; struct node *iter; struct node *body; struct node *guard; } lcomp;
     } v;
 } node_t;
 
