@@ -1262,6 +1262,7 @@ typedef struct {
     int  word_len;
     int  word_cols;     /* display columns: ANSI + UTF-8 conts excluded */
     int  word_in_ansi;  /* mid-ANSI-escape while filling word[] */
+    int  rows;          /* physical newlines emitted (incl. soft-wraps) */
 } _sw_stream_state_t;
 
 static int _sw_term_cols(void) {
@@ -1293,6 +1294,52 @@ static sw_val_t *_builtin_term_cols(sw_val_t **a, int n) {
     return sw_val_int((int64_t)_sw_term_cols());
 }
 
+#ifndef _WIN32
+static int _sw_term_rows(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+        return (int)ws.ws_row;
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+        return (int)ws.ws_row;
+    int tty_fd = open("/dev/tty", O_RDONLY);
+    if (tty_fd >= 0) {
+        int row = 0;
+        if (ioctl(tty_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+            row = (int)ws.ws_row;
+        close(tty_fd);
+        if (row > 0) return row;
+    }
+    return 24;
+}
+#else
+static int _sw_term_rows(void) { return 24; }
+#endif
+
+/* sw builtin: term_rows() → int  (number of rows in the current tty) */
+static sw_val_t *_builtin_term_rows(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    return sw_val_int((int64_t)_sw_term_rows());
+}
+
+/* Physical terminal rows the most recent (non-subagent) http_post_stream
+ * emitted for the assistant CONTENT region — set at end-of-stream and read
+ * by the markdown repaint so it clears exactly the streamed prose. Reasoning
+ * is written raw (not through the column-aware emitter) so it is not counted. */
+static int _sw_last_content_rows = 0;
+
+/* Forward decls — these JSON helpers are defined later in the file, but the
+ * streaming SSE escape loops (above their definition) need them to decode
+ * \uXXXX escapes inline. */
+static int _json_parse_hex4(const char **pp);
+static int _utf8_encode(unsigned int cp, char *buf);
+
+/* sw builtin: stream_content_rows() → int  (physical rows the last streamed
+ * assistant content occupied; 0 when none was streamed). */
+static sw_val_t *_builtin_stream_content_rows(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    return sw_val_int((int64_t)_sw_last_content_rows);
+}
+
 static void _sw_stream_init(_sw_stream_state_t *s) {
     int w = _sw_term_cols();
     s->term_w = w;
@@ -1303,6 +1350,7 @@ static void _sw_stream_init(_sw_stream_state_t *s) {
     s->word_len = 0;
     s->word_cols = 0;
     s->word_in_ansi = 0;
+    s->rows = 0;
 }
 
 static void _sw_stream_reset_line(_sw_stream_state_t *s) {
@@ -1334,6 +1382,7 @@ static void _sw_stream_flush_word(_sw_stream_state_t *s) {
     _sw_stream_indent(s);
     if (s->col > 2 && s->col + s->word_cols > s->right_margin) {
         fputs("\n  ", stdout);
+        s->rows++;
         s->col = 2;
     }
     fwrite(s->word, 1, (size_t)s->word_len, stdout);
@@ -1347,6 +1396,7 @@ static void _sw_stream_emit(_sw_stream_state_t *s, char c) {
     if (c == '\n') {
         _sw_stream_flush_word(s);
         fputc('\n', stdout);
+        s->rows++;
         s->col = 0;
         s->line_started = 0;
         return;
@@ -1364,6 +1414,7 @@ static void _sw_stream_emit(_sw_stream_state_t *s, char c) {
         _sw_stream_flush_word(s);
         if (s->col > 2 && s->col >= s->right_margin) {
             fputs("\n  ", stdout);
+            s->rows++;
             s->col = 2;
         } else {
             _sw_stream_indent(s);
@@ -2010,7 +2061,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                 if (rp) {
                     rp += 21;
                     size_t rtok_len = 0;
-                    while (*rp && *rp != '"' && rtok_len < SW_HPS_TOK_CAP - 1) {
+                    while (*rp && *rp != '"' && rtok_len < SW_HPS_TOK_CAP - 4) {
                         if (*rp == '\\' && *(rp + 1)) {
                             char esc = *(rp + 1);
                             switch (esc) {
@@ -2020,6 +2071,30 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                                 case '"': rtok[rtok_len++] = '"'; rp += 2; break;
                                 case '\\': rtok[rtok_len++] = '\\'; rp += 2; break;
                                 case '/': rtok[rtok_len++] = '/'; rp += 2; break;
+                                case 'u': {
+                                    /* \uXXXX — decode to UTF-8 (with surrogate
+                                     * pairs) so accents/em-dashes/CJK/emoji in
+                                     * reasoning don't arrive as literal uXXXX. */
+                                    rp += 2; /* skip backslash + 'u' */
+                                    int cp = _json_parse_hex4(&rp);
+                                    if (cp < 0) { rtok[rtok_len++] = 'u'; break; }
+                                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                                        rp[0] == '\\' && rp[1] == 'u') {
+                                        const char *save = rp;
+                                        rp += 2;
+                                        int low = _json_parse_hex4(&rp);
+                                        if (low >= 0xDC00 && low <= 0xDFFF) {
+                                            unsigned int full = 0x10000 +
+                                                (((unsigned int)(cp - 0xD800)) << 10) +
+                                                (unsigned int)(low - 0xDC00);
+                                            rtok_len += _utf8_encode(full, rtok + rtok_len);
+                                            break;
+                                        }
+                                        rp = save;
+                                    }
+                                    rtok_len += _utf8_encode((unsigned int)cp, rtok + rtok_len);
+                                    break;
+                                }
                                 default: rtok[rtok_len++] = esc; rp += 2; break;
                             }
                         } else {
@@ -2073,7 +2148,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             p += 11;
 
             size_t tok_len = 0;
-            while (*p && *p != '"' && tok_len < SW_HPS_TOK_CAP - 1) {
+            while (*p && *p != '"' && tok_len < SW_HPS_TOK_CAP - 4) {
                 if (*p == '\\' && *(p + 1)) {
                     char esc = *(p + 1);
                     switch (esc) {
@@ -2083,6 +2158,32 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
                         case '"': tok[tok_len++] = '"'; p += 2; break;
                         case '\\': tok[tok_len++] = '\\'; p += 2; break;
                         case '/': tok[tok_len++] = '/'; p += 2; break;
+                        case 'u': {
+                            /* \uXXXX — decode to UTF-8 (with surrogate pairs).
+                             * Without this, non-ASCII content streamed by a
+                             * server that \u-escapes (em-dash, accents, CJK,
+                             * emoji) landed as literal uXXXX in the prose AND
+                             * the stored assistant message. */
+                            p += 2; /* skip backslash + 'u' */
+                            int cp = _json_parse_hex4(&p);
+                            if (cp < 0) { tok[tok_len++] = 'u'; break; }
+                            if (cp >= 0xD800 && cp <= 0xDBFF &&
+                                p[0] == '\\' && p[1] == 'u') {
+                                const char *save = p;
+                                p += 2;
+                                int low = _json_parse_hex4(&p);
+                                if (low >= 0xDC00 && low <= 0xDFFF) {
+                                    unsigned int full = 0x10000 +
+                                        (((unsigned int)(cp - 0xD800)) << 10) +
+                                        (unsigned int)(low - 0xDC00);
+                                    tok_len += _utf8_encode(full, tok + tok_len);
+                                    break;
+                                }
+                                p = save;
+                            }
+                            tok_len += _utf8_encode((unsigned int)cp, tok + tok_len);
+                            break;
+                        }
                         default: tok[tok_len++] = esc; p += 2; break;
                     }
                 } else {
@@ -2211,6 +2312,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         /* Commit the last word — content rarely ends on whitespace,
          * so without this the final word would stay buffered + lost. */
         _sw_stream_flush_word(&stream);
+        /* Record the physical rows the CONTENT region occupied (one more
+         * than the newlines emitted, since the last line has no trailing
+         * emitter newline). The markdown repaint reads this via
+         * stream_content_rows() to clear exactly the streamed prose. */
+        _sw_last_content_rows = stream.rows + 1;
         fputs("\n", stdout);
         fflush(stdout);
     }

@@ -316,6 +316,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "http_post_stream") == 0 ||
            /* Phase 18: terminal introspection */
            strcmp(name, "term_cols") == 0 ||
+           strcmp(name, "term_rows") == 0 ||
+           strcmp(name, "stream_content_rows") == 0 ||
            /* Phase 19: interactive picker */
            strcmp(name, "read_choice") == 0;
 }
@@ -1474,7 +1476,8 @@ static const char *_common_builtins[] = {
     "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
     "ws_send", "ws_close", "ws_set_handler",
     "wsc_connect", "wsc_send", "wsc_recv", "wsc_close",
-    "chrome_launch", "term_cols", "read_line", "read_char", "read_choice",
+    "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
+    "read_line", "read_char", "read_choice",
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "pid_alive",
     "random_int", "supervise",
     NULL
@@ -1769,6 +1772,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "http_post_stream") == 0 ||
              /* Phase 18: terminal introspection */
              strcmp(fname, "term_cols") == 0 ||
+             strcmp(fname, "term_rows") == 0 ||
+             strcmp(fname, "stream_content_rows") == 0 ||
              /* Phase 19: interactive picker */
              strcmp(fname, "read_choice") == 0 ||
              /* Phase 20: process command-line arguments */
