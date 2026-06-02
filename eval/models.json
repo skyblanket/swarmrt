@@ -23,17 +23,38 @@
     },
     {
       "id": "gpt-4.1",
-      "label": "OpenAI GPT-4.1 (frontier-closed)",
-      "endpoint": "https://api.openai.com/v1/chat/completions",
-      "key_env": "OPENAI_API_KEY",
-      "model_field": "gpt-4.1"
+      "label": "OpenAI GPT-4.1 (via OpenRouter)",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "key_env": "OPENROUTER_API_KEY",
+      "model_field": "openai/gpt-4.1"
     },
     {
-      "id": "deepseek-chat",
-      "label": "DeepSeek V4 (open)",
-      "endpoint": "https://api.deepseek.com/v1/chat/completions",
-      "key_env": "DEEPSEEK_API_KEY",
-      "model_field": "deepseek-chat"
+      "id": "claude-sonnet-4.5",
+      "label": "Anthropic Claude Sonnet 4.5 (via OpenRouter)",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "key_env": "OPENROUTER_API_KEY",
+      "model_field": "anthropic/claude-sonnet-4.5"
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "label": "Google Gemini 2.5 Flash (via OpenRouter)",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "key_env": "OPENROUTER_API_KEY",
+      "model_field": "google/gemini-2.5-flash"
+    },
+    {
+      "id": "deepseek-v3.1",
+      "label": "DeepSeek V3.1 (open, via OpenRouter)",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "key_env": "OPENROUTER_API_KEY",
+      "model_field": "deepseek/deepseek-chat-v3.1"
+    },
+    {
+      "id": "qwen-2.5-72b",
+      "label": "Qwen 2.5 72B (open, via OpenRouter)",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "key_env": "OPENROUTER_API_KEY",
+      "model_field": "qwen/qwen-2.5-72b-instruct"
     }
   ]
 }
