@@ -27,7 +27,27 @@
   #include <sys/ioctl.h>
 #endif
 #include "swarmrt_platform.h"
+#include "swarmrt_audio.h"   /* G.711 mu-law / PCM16 / resample (base64 in/out) */
 #include <sqlite3.h>
+
+/* Optional OpenSSL for wss:// (WebSocket-over-TLS) in the WS client.
+ *
+ * On Linux -lssl/-lcrypto are already linked (Makefile + swc.c), so TLS
+ * is on by default there. On macOS the build historically uses Apple
+ * CommonCrypto and does NOT link OpenSSL, so wss is OFF unless the build
+ * opts in with -DSWARMRT_TLS (and links Homebrew openssl@3). When TLS is
+ * unavailable, wsc_connect_tls() still works for ws:// + custom headers
+ * and returns nil for wss:// with a one-line stderr note — additive,
+ * never breaks the build. */
+#ifndef SWARMRT_TLS
+#  ifndef __APPLE__
+#    define SWARMRT_TLS 1
+#  endif
+#endif
+#ifdef SWARMRT_TLS
+#  include <openssl/ssl.h>
+#  include <openssl/err.h>
+#endif
 #ifdef _WIN32
   #include <io.h>
   #include <direct.h>
@@ -6085,6 +6105,11 @@ static sw_val_t *_builtin_sys_exit(sw_val_t **a, int n) {
 typedef struct {
     int fd;
     int used;
+    int is_tls;          /* 1 = traffic goes through SSL */
+#ifdef SWARMRT_TLS
+    SSL     *ssl;
+    SSL_CTX *ctx;
+#endif
 } _sw_wsc_slot_t;
 static _sw_wsc_slot_t _sw_wsc[_SW_WSC_MAX] = {0};
 
@@ -6093,6 +6118,11 @@ static int _sw_wsc_alloc_slot(int fd) {
         if (!_sw_wsc[i].used) {
             _sw_wsc[i].fd = fd;
             _sw_wsc[i].used = 1;
+            _sw_wsc[i].is_tls = 0;
+#ifdef SWARMRT_TLS
+            _sw_wsc[i].ssl = NULL;
+            _sw_wsc[i].ctx = NULL;
+#endif
             return i;
         }
     }
@@ -6101,10 +6131,23 @@ static int _sw_wsc_alloc_slot(int fd) {
 
 static void _sw_wsc_free_slot(int handle) {
     if (handle >= 0 && handle < _SW_WSC_MAX) {
+#ifdef SWARMRT_TLS
+        if (_sw_wsc[handle].ssl) { SSL_shutdown(_sw_wsc[handle].ssl); SSL_free(_sw_wsc[handle].ssl); }
+        if (_sw_wsc[handle].ctx) SSL_CTX_free(_sw_wsc[handle].ctx);
+        _sw_wsc[handle].ssl = NULL;
+        _sw_wsc[handle].ctx = NULL;
+#endif
         _sw_wsc[handle].used = 0;
         _sw_wsc[handle].fd = -1;
+        _sw_wsc[handle].is_tls = 0;
     }
 }
+
+/* Per-slot transport send/recv. The existing _sw_wsc_send_all /
+ * _sw_wsc_recv_all take a bare fd (used during the plaintext handshake);
+ * these slot-aware wrappers route through SSL once a slot is TLS. */
+static int _sw_wsc_slot_send_all(int handle, const void *buf, size_t len);
+static int _sw_wsc_slot_recv_all(int handle, void *buf, size_t len);
 
 /* Local base64 encoder — swarmrt_http.c has its own but it's static.
  * Inlined here so we don't have to relax that file's encapsulation
@@ -6162,6 +6205,50 @@ static int _sw_wsc_recv_all(int fd, void *buf, size_t len) {
         off += (size_t)n;
     }
     return 0;
+}
+
+/* Slot-aware transport. Routes through SSL_write/SSL_read when the slot
+ * is TLS, else falls back to the bare-fd loops above. */
+static int _sw_wsc_slot_send_all(int handle, const void *buf, size_t len) {
+    if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return -1;
+#ifdef SWARMRT_TLS
+    if (_sw_wsc[handle].is_tls && _sw_wsc[handle].ssl) {
+        const char *p = (const char *)buf;
+        size_t off = 0;
+        while (off < len) {
+            int n = SSL_write(_sw_wsc[handle].ssl, p + off, (int)(len - off));
+            if (n <= 0) {
+                int e = SSL_get_error(_sw_wsc[handle].ssl, n);
+                if (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) continue;
+                return -1;
+            }
+            off += (size_t)n;
+        }
+        return 0;
+    }
+#endif
+    return _sw_wsc_send_all(_sw_wsc[handle].fd, buf, len);
+}
+
+static int _sw_wsc_slot_recv_all(int handle, void *buf, size_t len) {
+    if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return -1;
+#ifdef SWARMRT_TLS
+    if (_sw_wsc[handle].is_tls && _sw_wsc[handle].ssl) {
+        char *p = (char *)buf;
+        size_t off = 0;
+        while (off < len) {
+            int n = SSL_read(_sw_wsc[handle].ssl, p + off, (int)(len - off));
+            if (n <= 0) {
+                int e = SSL_get_error(_sw_wsc[handle].ssl, n);
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
+                return -1;
+            }
+            off += (size_t)n;
+        }
+        return 0;
+    }
+#endif
+    return _sw_wsc_recv_all(_sw_wsc[handle].fd, buf, len);
 }
 
 /* wsc_connect(url) — parse ws://host[:port][/path], TCP connect, do
@@ -6249,7 +6336,6 @@ static sw_val_t *_builtin_wsc_send(sw_val_t **a, int n) {
     if (a[0]->type != SW_VAL_INT || a[1]->type != SW_VAL_STRING) return sw_val_atom("error");
     int handle = (int)a[0]->v.i;
     if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_atom("error");
-    int fd = _sw_wsc[handle].fd;
 
     const char *text = a[1]->v.str;
     size_t len = strlen(text);
@@ -6271,7 +6357,7 @@ static sw_val_t *_builtin_wsc_send(sw_val_t **a, int n) {
     for (int i = 0; i < 4; i++) mask[i] = (uint8_t)(rand() & 0xff);
     memcpy(hdr + hlen, mask, 4);
     hlen += 4;
-    if (_sw_wsc_send_all(fd, hdr, (size_t)hlen) < 0) return sw_val_atom("error");
+    if (_sw_wsc_slot_send_all(handle, hdr, (size_t)hlen) < 0) return sw_val_atom("error");
 
     /* Mask payload in 4KB chunks. */
     char chunk[4096];
@@ -6280,7 +6366,7 @@ static sw_val_t *_builtin_wsc_send(sw_val_t **a, int n) {
         size_t cn = len - off;
         if (cn > sizeof(chunk)) cn = sizeof(chunk);
         for (size_t i = 0; i < cn; i++) chunk[i] = text[off + i] ^ mask[(off + i) & 3];
-        if (_sw_wsc_send_all(fd, chunk, cn) < 0) return sw_val_atom("error");
+        if (_sw_wsc_slot_send_all(handle, chunk, cn) < 0) return sw_val_atom("error");
         off += cn;
     }
     return sw_val_atom("ok");
@@ -6298,37 +6384,45 @@ static sw_val_t *_builtin_wsc_recv(sw_val_t **a, int n) {
     int timeout_ms = -1;  /* default: block forever */
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) timeout_ms = (int)a[1]->v.i;
 
-    /* Wait for fd to be readable. */
+    /* Wait for fd to be readable. With TLS, SSL_read may have buffered
+     * record data the kernel select() can't see; if so, skip the wait. */
     if (timeout_ms >= 0) {
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
-        struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        int rv = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (rv <= 0) return sw_val_nil();
+        int have_buffered = 0;
+#ifdef SWARMRT_TLS
+        if (_sw_wsc[handle].is_tls && _sw_wsc[handle].ssl &&
+            SSL_pending(_sw_wsc[handle].ssl) > 0) have_buffered = 1;
+#endif
+        if (!have_buffered) {
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
+            struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+            int rv = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (rv <= 0) return sw_val_nil();
+        }
     }
 
     /* Read frame header: opcode/flags + payload-len byte. */
     uint8_t hdr[2];
-    if (_sw_wsc_recv_all(fd, hdr, 2) < 0) return sw_val_nil();
+    if (_sw_wsc_slot_recv_all(handle, hdr, 2) < 0) return sw_val_nil();
     int opcode = hdr[0] & 0x0f;
     int masked = hdr[1] & 0x80;
     uint64_t plen = hdr[1] & 0x7f;
     if (plen == 126) {
         uint8_t ext[2];
-        if (_sw_wsc_recv_all(fd, ext, 2) < 0) return sw_val_nil();
+        if (_sw_wsc_slot_recv_all(handle, ext, 2) < 0) return sw_val_nil();
         plen = ((uint64_t)ext[0] << 8) | ext[1];
     } else if (plen == 127) {
         uint8_t ext[8];
-        if (_sw_wsc_recv_all(fd, ext, 8) < 0) return sw_val_nil();
+        if (_sw_wsc_slot_recv_all(handle, ext, 8) < 0) return sw_val_nil();
         plen = 0;
         for (int i = 0; i < 8; i++) plen = (plen << 8) | ext[i];
     }
     uint8_t mask[4] = {0};
     if (masked) {
-        if (_sw_wsc_recv_all(fd, mask, 4) < 0) return sw_val_nil();
+        if (_sw_wsc_slot_recv_all(handle, mask, 4) < 0) return sw_val_nil();
     }
     char *payload = (char *)malloc((size_t)plen + 1);
     if (!payload) return sw_val_nil();
-    if (_sw_wsc_recv_all(fd, payload, (size_t)plen) < 0) { free(payload); return sw_val_nil(); }
+    if (_sw_wsc_slot_recv_all(handle, payload, (size_t)plen) < 0) { free(payload); return sw_val_nil(); }
     if (masked) {
         for (uint64_t i = 0; i < plen; i++) payload[i] ^= mask[i & 3];
     }
@@ -6340,16 +6434,27 @@ static sw_val_t *_builtin_wsc_recv(sw_val_t **a, int n) {
     }
     if (opcode == 0x9) {  /* ping → pong with same payload */
         uint8_t ph[2] = {0x8a, 0x80 | (uint8_t)(plen < 126 ? plen : 0)};
-        _sw_wsc_send_all(fd, ph, 2);
+        _sw_wsc_slot_send_all(handle, ph, 2);
         uint8_t pmask[4] = {0,0,0,0};
-        _sw_wsc_send_all(fd, pmask, 4);
-        if (plen > 0 && plen < 126) _sw_wsc_send_all(fd, payload, (size_t)plen);
+        _sw_wsc_slot_send_all(handle, pmask, 4);
+        if (plen > 0 && plen < 126) _sw_wsc_slot_send_all(handle, payload, (size_t)plen);
         free(payload);
         /* Recurse to get the next real frame. */
         return _builtin_wsc_recv(a, n);
     }
+    if (opcode == 0x2) {
+        /* Binary frame → return its raw bytes as a base64 string so sw
+         * can carry NUL-bearing audio without a binary value type. The
+         * tag mirrors the WS-server {ws_binary,...} convention. */
+        char *b64 = _sw_audio_b64_encode((const uint8_t *)payload, (size_t)plen);
+        free(payload);
+        if (!b64) return sw_val_nil();
+        sw_val_t *r = sw_val_string(b64);
+        free(b64);
+        return r;
+    }
     if (opcode != 0x1 && opcode != 0x0) {
-        /* Binary or unknown — return nil for v1. */
+        /* Unknown control frame — return nil. */
         free(payload);
         return sw_val_nil();
     }
@@ -6367,10 +6472,148 @@ static sw_val_t *_builtin_wsc_close(sw_val_t **a, int n) {
     int fd = _sw_wsc[handle].fd;
     /* Best-effort close frame. */
     uint8_t close_frame[6] = {0x88, 0x80, 0x00, 0x00, 0x00, 0x00};
-    _sw_wsc_send_all(fd, close_frame, sizeof(close_frame));
+    _sw_wsc_slot_send_all(handle, close_frame, sizeof(close_frame));
+    _sw_wsc_free_slot(handle);   /* frees SSL/CTX if TLS */
     close(fd);
-    _sw_wsc_free_slot(handle);
     return sw_val_atom("ok");
+}
+
+/* wsc_connect_tls(url, headers_list) — like wsc_connect but:
+ *   (a) accepts wss:// (TLS handshake; default port 443) as well as ws://,
+ *   (b) injects each "Key: Value" string from headers_list into the
+ *       WebSocket upgrade request (e.g. Authorization: Bearer ...).
+ *
+ * Returns an integer handle on success, nil on failure. On a build
+ * without TLS (e.g. macOS without -DSWARMRT_TLS), a wss:// URL returns
+ * nil with a one-line stderr note; ws:// still works fully. */
+static sw_val_t *_builtin_wsc_connect_tls(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    const char *url = a[0]->v.str;
+
+    int want_tls = 0;
+    const char *p = NULL;
+    int default_port = 80;
+    if (strncmp(url, "wss://", 6) == 0) { want_tls = 1; p = url + 6; default_port = 443; }
+    else if (strncmp(url, "ws://", 5) == 0) { want_tls = 0; p = url + 5; default_port = 80; }
+    else return sw_val_nil();
+
+#ifndef SWARMRT_TLS
+    if (want_tls) {
+        fprintf(stderr, "wsc_connect_tls: wss:// requires a TLS build "
+                        "(rebuild with -DSWARMRT_TLS and link openssl); ws:// works.\n");
+        return sw_val_nil();
+    }
+#endif
+
+    char host[256] = {0};
+    int port = default_port;
+    char path[2048] = "/";
+
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    const char *host_end = slash ? slash : (p + strlen(p));
+    if (colon && colon < host_end) {
+        size_t hl = (size_t)(colon - p);
+        if (hl >= sizeof(host)) return sw_val_nil();
+        memcpy(host, p, hl); host[hl] = 0;
+        port = atoi(colon + 1);
+    } else {
+        size_t hl = (size_t)(host_end - p);
+        if (hl >= sizeof(host)) return sw_val_nil();
+        memcpy(host, p, hl); host[hl] = 0;
+    }
+    if (slash) snprintf(path, sizeof(path), "%s", slash);
+
+    /* Resolve + connect TCP. */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;       /* allow IPv6 too */
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return sw_val_nil();
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return sw_val_nil(); }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        close(fd); freeaddrinfo(res); return sw_val_nil();
+    }
+    freeaddrinfo(res);
+
+    /* Allocate a slot up front so the TLS objects have a home. */
+    int handle = _sw_wsc_alloc_slot(fd);
+    if (handle < 0) { close(fd); return sw_val_nil(); }
+
+#ifdef SWARMRT_TLS
+    if (want_tls) {
+        SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+        SSL_CTX_set_default_verify_paths(ctx); /* best-effort; we don't hard-fail verify for MVP */
+        SSL *ssl = SSL_new(ctx);
+        if (!ssl) { SSL_CTX_free(ctx); _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+        SSL_set_fd(ssl, fd);
+        SSL_set_tlsext_host_name(ssl, host);   /* SNI — required at OpenAI's edge */
+        if (SSL_connect(ssl) != 1) {
+            SSL_free(ssl); SSL_CTX_free(ctx);
+            _sw_wsc_free_slot(handle); close(fd); return sw_val_nil();
+        }
+        _sw_wsc[handle].ssl = ssl;
+        _sw_wsc[handle].ctx = ctx;
+        _sw_wsc[handle].is_tls = 1;
+    }
+#endif
+
+    /* Sec-WebSocket-Key. */
+    uint8_t key_raw[16];
+    for (int i = 0; i < 16; i++) key_raw[i] = (uint8_t)(rand() & 0xff);
+    char key_b64[32] = {0};
+    _sw_b64_encode(key_raw, 16, key_b64);
+
+    /* Build the handshake, appending caller headers before the final CRLF. */
+    char req[8192];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n",
+        path, host, port, key_b64);
+    if (rl < 0 || rl >= (int)sizeof(req)) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) {
+        sw_val_t *lst = a[1];
+        for (int i = 0; i < lst->v.tuple.count; i++) {
+            sw_val_t *h = lst->v.tuple.items[i];
+            if (!h || h->type != SW_VAL_STRING) continue;
+            int w = snprintf(req + rl, sizeof(req) - rl, "%s\r\n", h->v.str);
+            if (w < 0 || w >= (int)sizeof(req) - rl) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+            rl += w;
+        }
+    }
+    /* Final blank line. */
+    int w = snprintf(req + rl, sizeof(req) - rl, "\r\n");
+    if (w < 0 || w >= (int)sizeof(req) - rl) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+    rl += w;
+
+    if (_sw_wsc_slot_send_all(handle, req, (size_t)rl) < 0) {
+        _sw_wsc_free_slot(handle); close(fd); return sw_val_nil();
+    }
+
+    /* Read response headers until "\r\n\r\n". */
+    char resp[4096] = {0};
+    size_t rlen = 0;
+    while (rlen < sizeof(resp) - 1) {
+        char one;
+        if (_sw_wsc_slot_recv_all(handle, &one, 1) < 0) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+        resp[rlen++] = one;
+        resp[rlen] = 0;
+        if (rlen >= 4 && memcmp(resp + rlen - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    if (strncmp(resp, "HTTP/1.1 101", 12) != 0) {
+        _sw_wsc_free_slot(handle); close(fd); return sw_val_nil();
+    }
+
+    return sw_val_int(handle);
 }
 
 /* ============================================================
@@ -6532,6 +6775,83 @@ static sw_val_t *_builtin_string_index_of(sw_val_t **a, int n) {
     const char *hit = strstr(hay, needle);
     if (!hit) return sw_val_int(-1);
     return sw_val_int((int64_t)(hit - hay));
+}
+
+/* ================================================================
+ * Audio codecs for native voice agents — G.711 mu-law / PCM16 /
+ * resample. All are base64-in / base64-out so raw (NUL-bearing) PCM
+ * never surfaces to sw (Option B from the voice plan: zero core change).
+ * ================================================================ */
+
+/* audio_ulaw_to_pcm16(b64_ulaw) → b64 little-endian PCM16, or nil. */
+static sw_val_t *_builtin_audio_ulaw_to_pcm16(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    size_t inlen = 0;
+    uint8_t *ulaw = _sw_audio_b64_decode(a[0]->v.str, &inlen);
+    if (!ulaw) return sw_val_nil();
+    size_t pcmlen = 0;
+    uint8_t *pcm = _sw_ulaw_to_pcm16(ulaw, inlen, &pcmlen);
+    free(ulaw);
+    if (!pcm) return sw_val_nil();
+    char *b64 = _sw_audio_b64_encode(pcm, pcmlen);
+    free(pcm);
+    if (!b64) return sw_val_nil();
+    sw_val_t *r = sw_val_string(b64);
+    free(b64);
+    return r;
+}
+
+/* audio_pcm16_to_ulaw(b64_pcm16) → b64 mu-law, or nil. */
+static sw_val_t *_builtin_audio_pcm16_to_ulaw(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    size_t inlen = 0;
+    uint8_t *pcm = _sw_audio_b64_decode(a[0]->v.str, &inlen);
+    if (!pcm) return sw_val_nil();
+    size_t ulen = 0;
+    uint8_t *ulaw = _sw_pcm16_to_ulaw(pcm, inlen, &ulen);
+    free(pcm);
+    if (!ulaw) return sw_val_nil();
+    char *b64 = _sw_audio_b64_encode(ulaw, ulen);
+    free(ulaw);
+    if (!b64) return sw_val_nil();
+    sw_val_t *r = sw_val_string(b64);
+    free(b64);
+    return r;
+}
+
+/* audio_resample(b64_pcm16, from_hz, to_hz) → b64 PCM16 at to_hz, or nil. */
+static sw_val_t *_builtin_audio_resample(sw_val_t **a, int n) {
+    if (n < 3 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_INT ||
+        !a[2] || a[2]->type != SW_VAL_INT) return sw_val_nil();
+    size_t inlen = 0;
+    uint8_t *pcm = _sw_audio_b64_decode(a[0]->v.str, &inlen);
+    if (!pcm) return sw_val_nil();
+    size_t outlen = 0;
+    uint8_t *out = _sw_pcm16_resample(pcm, inlen, (int)a[1]->v.i, (int)a[2]->v.i, &outlen);
+    free(pcm);
+    if (!out) return sw_val_nil();
+    char *b64 = _sw_audio_b64_encode(out, outlen);
+    free(out);
+    if (!b64) return sw_val_nil();
+    sw_val_t *r = sw_val_string(b64);
+    free(b64);
+    return r;
+}
+
+/* ws_send_binary(conn, b64) → 'ok' | 'error' — decode base64 and send as
+ * a WebSocket BINARY frame (server→client). For providers/protocols that
+ * use opcode 0x2 rather than text. */
+static sw_val_t *_builtin_ws_send_binary(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT ||
+        !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("error");
+    int conn_id = (int)a[0]->v.i;
+    size_t blen = 0;
+    uint8_t *bytes = _sw_audio_b64_decode(a[1]->v.str, &blen);
+    if (!bytes) return sw_val_atom("error");
+    int rc = sw_ws_send_binary(conn_id, (const char *)bytes, (uint32_t)blen);
+    free(bytes);
+    return sw_val_atom(rc == 0 ? "ok" : "error");
 }
 
 /* base64_encode(bytes_or_string) → string (no newlines, padded with '=').

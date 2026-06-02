@@ -397,8 +397,18 @@ int main(int argc, char **argv) {
     /* Compile with cc */
     char cmd_buf[2048];
 #ifdef __APPLE__
-    /* macOS links libm via libSystem implicitly; -lm is harmless. */
+    /* macOS links libm via libSystem implicitly; -lm is harmless.
+     * When the host was built with -DSWARMRT_TLS, generated binaries that
+     * call wsc_connect_tls(wss://) also need OpenSSL linked. We pass the
+     * Homebrew openssl@3 prefix that the Makefile used. */
+  #ifdef SWARMRT_TLS
+    const char *extra_libs =
+        "-lsqlite3 -lm "
+        "-L" SWARMRT_OPENSSL_PREFIX "/lib -lssl -lcrypto "
+        "-I" SWARMRT_OPENSSL_PREFIX "/include";
+  #else
     const char *extra_libs = "-lsqlite3 -lm";
+  #endif
 #else
     /* Linux glibc requires explicit -lm — generated C uses fmod() and
      * friends, and ld --as-needed rejects implicit libm dependencies. */
@@ -456,9 +466,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "swc: cross-compiling for %s via `%s`\n", target, cc_cmd);
     }
 
+    /* If the host was built with TLS, the generated C must see -DSWARMRT_TLS
+     * too (the studio header guards wss handshake code on this macro), and on
+     * non-Apple platforms OpenSSL is unconditionally available. */
+#if defined(SWARMRT_TLS) || !defined(__APPLE__)
+    const char *tls_define = "-DSWARMRT_TLS";
+#else
+    const char *tls_define = "";
+#endif
+
     snprintf(cmd_buf, sizeof(cmd_buf),
-        "%s %s %s -fno-stack-protector -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s %s",
-        cc_cmd, arch_flags, optimize ? "-O2" : "-O0 -g",
+        "%s %s %s %s -fno-stack-protector -o %s %s -I%s/src -L%s/bin -lswarmrt -pthread %s %s",
+        cc_cmd, arch_flags, optimize ? "-O2" : "-O0 -g", tls_define,
         out_path, tmppath,
         swc_dir, swc_dir,
         strip ? "-s" : "",

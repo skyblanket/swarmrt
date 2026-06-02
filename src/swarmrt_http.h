@@ -46,6 +46,14 @@ typedef struct {
     /* WebSocket state */
     char                ws_key[128]; /* Sec-WebSocket-Key from upgrade */
     int                 active;      /* 1 = in use, 0 = free slot */
+
+    /* WebSocket fragmentation reassembly (continuation frames, opcode 0x0).
+     * frag_buf accumulates payload across FIN=0 frames; frag_opcode holds
+     * the opcode of the first (0x1 text / 0x2 binary) frame in the run. */
+    uint8_t            *frag_buf;
+    uint32_t            frag_len;
+    uint32_t            frag_cap;
+    int                 frag_opcode; /* 0 = not reassembling */
 } sw_http_conn_t;
 
 /* Bridge state (passed to bridge process) */
@@ -68,6 +76,9 @@ int sw_http_respond_raw(int conn_id, int status, const char *headers, const void
 
 /* Send WebSocket text frame */
 int sw_ws_send_text(int conn_id, const char *data, uint32_t len);
+
+/* Send WebSocket binary frame (opcode 0x2) */
+int sw_ws_send_binary(int conn_id, const char *data, uint32_t len);
 
 /* Close WebSocket connection */
 int sw_ws_close(int conn_id);

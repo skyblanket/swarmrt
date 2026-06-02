@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include "swarmrt_lang.h"
 #include "swarmrt_ets.h"
+#include "swarmrt_audio.h"   /* G.711 / PCM16 / resample for REPL+test parity */
 
 /* Weak stubs for runtime functions — allows linking swc without the runtime.
  * These are only called by the interpreter, never by the compiler. */
@@ -2962,13 +2963,66 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_list(ids, nids);
     }
 
+    /* === base64 (string-oriented, parity with codegen path) =====
+     * NOTE: like the compiled _builtin_base64_*, these treat values as
+     * NUL-terminated C strings, so decoded binary truncates at the first
+     * NUL. This is the documented limitation the voice plan locks in. */
+    if (strcmp(fname, "base64_encode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        char *b64 = _sw_audio_b64_encode((const uint8_t *)args[0]->v.str,
+                                         strlen(args[0]->v.str));
+        if (!b64) return sw_val_string("");
+        sw_val_t *r = sw_val_string(b64); free(b64); return r;
+    }
+    if (strcmp(fname, "base64_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        size_t dlen = 0;
+        uint8_t *raw = _sw_audio_b64_decode(args[0]->v.str, &dlen);
+        if (!raw) return sw_val_nil();
+        /* NUL-terminate; string truncates at first NUL (documented). */
+        char *s = (char *)malloc(dlen + 1);
+        if (!s) { free(raw); return sw_val_nil(); }
+        memcpy(s, raw, dlen); s[dlen] = 0; free(raw);
+        sw_val_t *r = sw_val_string(s); free(s); return r;
+    }
+
+    /* === Audio codecs (base64 in/out, fully binary-safe) ======== */
+    if (strcmp(fname, "audio_ulaw_to_pcm16") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        size_t inlen = 0; uint8_t *ulaw = _sw_audio_b64_decode(args[0]->v.str, &inlen);
+        if (!ulaw) return sw_val_nil();
+        size_t pcmlen = 0; uint8_t *pcm = _sw_ulaw_to_pcm16(ulaw, inlen, &pcmlen);
+        free(ulaw); if (!pcm) return sw_val_nil();
+        char *b64 = _sw_audio_b64_encode(pcm, pcmlen); free(pcm);
+        if (!b64) return sw_val_nil();
+        sw_val_t *r = sw_val_string(b64); free(b64); return r;
+    }
+    if (strcmp(fname, "audio_pcm16_to_ulaw") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        size_t inlen = 0; uint8_t *pcm = _sw_audio_b64_decode(args[0]->v.str, &inlen);
+        if (!pcm) return sw_val_nil();
+        size_t ulen = 0; uint8_t *ulaw = _sw_pcm16_to_ulaw(pcm, inlen, &ulen);
+        free(pcm); if (!ulaw) return sw_val_nil();
+        char *b64 = _sw_audio_b64_encode(ulaw, ulen); free(ulaw);
+        if (!b64) return sw_val_nil();
+        sw_val_t *r = sw_val_string(b64); free(b64); return r;
+    }
+    if (strcmp(fname, "audio_resample") == 0 && nargs >= 3 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
+        size_t inlen = 0; uint8_t *pcm = _sw_audio_b64_decode(args[0]->v.str, &inlen);
+        if (!pcm) return sw_val_nil();
+        size_t outlen = 0;
+        uint8_t *out = _sw_pcm16_resample(pcm, inlen, (int)args[1]->v.i, (int)args[2]->v.i, &outlen);
+        free(pcm); if (!out) return sw_val_nil();
+        char *b64 = _sw_audio_b64_encode(out, outlen); free(out);
+        if (!b64) return sw_val_nil();
+        sw_val_t *r = sw_val_string(b64); free(b64); return r;
+    }
+
     /* === Process-scheduler primitives — warn + degrade ========= */
     static const char *scheduler_names[] = {
         "send", "register", "whereis", "link", "unlink", "monitor",
         "demonitor", "exit_proc", "trap_exit", "supervise",
         "http_listen", "http_respond", "ws_send", "ws_close",
-        "ws_set_handler", "telemetry_emit", "telemetry_subscribe",
+        "ws_set_handler", "ws_send_binary", "telemetry_emit", "telemetry_subscribe",
         "pubsub_broadcast", "pubsub_subscribe", "chrome_launch",
+        "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_close",
         NULL
     };
     for (int i = 0; scheduler_names[i]; i++) {
