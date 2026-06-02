@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
@@ -26,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sqlite3.h>
+#include <pthread.h>
 #include "swarmrt_lang.h"
 #include "swarmrt_ets.h"
 
@@ -1653,9 +1655,20 @@ void sw_val_print(sw_val_t *v) {
  * Environment
  * ========================================================================= */
 
+/* env lifetime: refcounted so closures that capture (escape) an env keep it
+ * alive after the creating call frame returns. env_new returns refcount 1
+ * (the frame's ref) and takes a ref on its parent so the whole scope chain
+ * stays live as long as any descendant or capturing closure references it.
+ * env_free drops one ref and only frees at 0, walking the parent chain. */
+static void env_retain(sw_env_t *e) {
+    if (e) e->refcount++;
+}
+
 static sw_env_t *env_new(sw_env_t *parent) {
     sw_env_t *e = calloc(1, sizeof(sw_env_t));
     e->parent = parent;
+    e->refcount = 1;
+    env_retain(parent);   /* this env keeps its parent alive */
     return e;
 }
 
@@ -1691,19 +1704,25 @@ static sw_val_t *env_get(sw_env_t *e, const char *name) {
     return NULL;
 }
 
+/* Drop one ref. Frees buckets + struct (and releases parent) only at 0, so an
+ * env that an escaping closure still references survives the frame's release. */
 static void env_free(sw_env_t *e) {
-    if (!e) return;
-    for (int i = 0; i < SW_ENV_SLOTS; i++) {
-        sw_env_entry_t *ent = e->buckets[i];
-        while (ent) {
-            sw_env_entry_t *next = ent->next;
-            free(ent->name);
-            /* Don't free val — owned by interpreter or caller */
-            free(ent);
-            ent = next;
+    while (e) {
+        if (--e->refcount > 0) return;     /* still referenced elsewhere */
+        for (int i = 0; i < SW_ENV_SLOTS; i++) {
+            sw_env_entry_t *ent = e->buckets[i];
+            while (ent) {
+                sw_env_entry_t *next = ent->next;
+                free(ent->name);
+                /* Don't free val — owned by interpreter or caller */
+                free(ent);
+                ent = next;
+            }
         }
+        sw_env_t *parent = e->parent;       /* release our ref on parent */
+        free(e);
+        e = parent;                         /* loop instead of recursing */
     }
-    free(e);
 }
 
 /* =========================================================================
@@ -1848,6 +1867,182 @@ static sw_val_t *builtin_print(sw_val_t **args, int nargs) {
 }
 
 /* Built-in function: length */
+/* Raise a catchable runtime panic from inside the interpreter, mirroring
+ * the compiled path's _sw_runtime_panic. The message is stored verbatim
+ * (e.g. "division by zero", "hd: list is empty") so assert_raises() can
+ * substring-match it exactly as it would the compiled panic text, and is
+ * "panic:"-prefixed to match the panic() builtin's error surface. */
+static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, ...) {
+    char msg[200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    (void)line;
+    snprintf(interp->error_msg, sizeof(interp->error_msg), "panic: %s", msg);
+    interp->error = 1;
+}
+
+/* Recursion-depth guard for the tree-walker.
+ *
+ * The interpreter recurses on the native C stack (no TCO — that lives only in
+ * the compiled path, swc build). Deep sw recursion, or even moderate recursion
+ * with deeply-nested expressions in the recursive call, used to blow the C
+ * stack and SEGFAULT (exit 139). Instead of guessing a fixed call-depth limit
+ * (unsafe: per-frame C-stack cost varies wildly with expression nesting), we
+ * measure how close the *actual* C stack is to its limit and raise a clean,
+ * catchable sw-level panic before we run out of room.
+ *
+ * SW_STACK_GUARD_MARGIN is the headroom we refuse to cross: when fewer than
+ * this many bytes remain on the current thread's stack, we stop. 256 KB is
+ * comfortably larger than the deepest single eval()-frame chain plus the C
+ * library frames a panic unwind needs, while still permitting very deep
+ * legitimate recursion on the 8 MB main-thread stack used by `swc test`/repl. */
+#define SW_STACK_GUARD_MARGIN (256 * 1024)
+
+/* Returns 1 if the C stack is within SW_STACK_GUARD_MARGIN of its limit
+ * (i.e. another recursion level is unsafe), else 0. Falls back to "safe"
+ * (0) if the platform can't report stack bounds, in which case the
+ * call-depth counter below remains the backstop. */
+static int interp_stack_near_limit(void) {
+    char probe;                         /* address ~ current stack pointer */
+    uintptr_t sp = (uintptr_t)&probe;
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);   /* highest addr */
+    size_t size = pthread_get_stacksize_np(self);
+    if (!size) return 0;
+    uintptr_t limit = top - size;       /* lowest addr the stack may reach */
+    return sp <= limit + SW_STACK_GUARD_MARGIN;
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) return 0;
+    void *base = NULL; size_t size = 0;
+    int rc = pthread_attr_getstack(&attr, &base, &size);
+    pthread_attr_destroy(&attr);
+    if (rc != 0 || !size) return 0;
+    uintptr_t limit = (uintptr_t)base; /* on Linux base is the LOWEST addr */
+    return sp <= limit + SW_STACK_GUARD_MARGIN;
+#else
+    (void)sp;
+    return 0;                           /* rely on the call-depth backstop */
+#endif
+}
+
+/* Backstop call-depth ceiling for platforms where interp_stack_near_limit()
+ * can't introspect the stack. Generous enough not to clip realistic programs,
+ * low enough to stay under a small (e.g. 1 MB) stack. */
+#define SW_CALL_DEPTH_MAX 1500
+
+/* Check both guards. Raises a clean panic and returns 1 if recursion must
+ * stop; 0 if it is safe to descend one more level. Call sites must NOT
+ * increment call_depth before calling (this reads it as the pre-call depth). */
+static int interp_recursion_blocked(sw_interp_t *interp) {
+    if (interp->error) return 1;
+    if (interp->call_depth >= SW_CALL_DEPTH_MAX || interp_stack_near_limit()) {
+        interp_raise_panic(interp, 0,
+            "interpreter recursion depth exceeded — compile with swc build "
+            "for tail-call optimisation");
+        return 1;
+    }
+    return 0;
+}
+
+/* === JSON encode (interpreter) ============================================
+ * Real JSON, byte-for-byte identical to the compiled runtime's
+ * _json_encode_val (swarmrt_builtins_studio.h): strings quoted+escaped,
+ * nil → null, the true/false/nil atoms → JSON literals, other atoms
+ * quoted (no leading ':'), ints, floats via %.17g, lists/tuples → arrays,
+ * maps → objects. Replaces the old debug-repr "close-enough JSON" stub. */
+static void interp_json_grow(char **buf, size_t *cap, size_t pos, size_t need) {
+    size_t want = pos + need + 8;
+    if (want <= *cap) return;
+    size_t new_cap = *cap ? *cap : 256;
+    while (new_cap < want) new_cap *= 2;
+    *buf = (char *)realloc(*buf, new_cap);
+    *cap = new_cap;
+}
+
+static void interp_json_append(char **buf, size_t *cap, size_t *pos, const char *s) {
+    size_t len = strlen(s);
+    interp_json_grow(buf, cap, *pos, len);
+    memcpy(*buf + *pos, s, len);
+    *pos += len;
+}
+
+static void interp_json_putc(char **buf, size_t *cap, size_t *pos, char c) {
+    interp_json_grow(buf, cap, *pos, 1);
+    (*buf)[(*pos)++] = c;
+}
+
+static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) {
+    if (!v || v->type == SW_VAL_NIL) {
+        interp_json_append(buf, cap, pos, "null");
+    } else if (v->type == SW_VAL_INT) {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.i);
+        interp_json_append(buf, cap, pos, tmp);
+    } else if (v->type == SW_VAL_FLOAT) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+        interp_json_append(buf, cap, pos, tmp);
+    } else if (v->type == SW_VAL_STRING) {
+        interp_json_append(buf, cap, pos, "\"");
+        for (const char *p = v->v.str; *p; p++) {
+            switch (*p) {
+                case '"':  interp_json_append(buf, cap, pos, "\\\""); break;
+                case '\\': interp_json_append(buf, cap, pos, "\\\\"); break;
+                case '\n': interp_json_append(buf, cap, pos, "\\n"); break;
+                case '\r': interp_json_append(buf, cap, pos, "\\r"); break;
+                case '\t': interp_json_append(buf, cap, pos, "\\t"); break;
+                default:
+                    if ((unsigned char)*p < 0x20) {
+                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
+                        interp_json_append(buf, cap, pos, esc);
+                    } else {
+                        interp_json_putc(buf, cap, pos, *p);
+                    }
+            }
+        }
+        interp_json_append(buf, cap, pos, "\"");
+    } else if (v->type == SW_VAL_ATOM) {
+        if (strcmp(v->v.str, "true") == 0) interp_json_append(buf, cap, pos, "true");
+        else if (strcmp(v->v.str, "false") == 0) interp_json_append(buf, cap, pos, "false");
+        else if (strcmp(v->v.str, "nil") == 0) interp_json_append(buf, cap, pos, "null");
+        else {
+            interp_json_append(buf, cap, pos, "\"");
+            interp_json_append(buf, cap, pos, v->v.str);
+            interp_json_append(buf, cap, pos, "\"");
+        }
+    } else if (v->type == SW_VAL_LIST || v->type == SW_VAL_TUPLE) {
+        interp_json_append(buf, cap, pos, "[");
+        for (int i = 0; i < v->v.tuple.count; i++) {
+            if (i > 0) interp_json_append(buf, cap, pos, ",");
+            interp_json_encode_val(v->v.tuple.items[i], buf, cap, pos);
+        }
+        interp_json_append(buf, cap, pos, "]");
+    } else if (v->type == SW_VAL_MAP) {
+        interp_json_append(buf, cap, pos, "{");
+        for (int i = 0; i < v->v.map.count; i++) {
+            if (i > 0) interp_json_append(buf, cap, pos, ",");
+            interp_json_append(buf, cap, pos, "\"");
+            if (v->v.map.keys[i]->type == SW_VAL_STRING ||
+                v->v.map.keys[i]->type == SW_VAL_ATOM)
+                interp_json_append(buf, cap, pos, v->v.map.keys[i]->v.str);
+            else {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.map.keys[i]->v.i);
+                interp_json_append(buf, cap, pos, tmp);
+            }
+            interp_json_append(buf, cap, pos, "\":");
+            interp_json_encode_val(v->v.map.vals[i], buf, cap, pos);
+        }
+        interp_json_append(buf, cap, pos, "}");
+    } else {
+        interp_json_append(buf, cap, pos, "null");
+    }
+}
+
 static sw_val_t *builtin_length(sw_val_t **args, int nargs) {
     if (nargs < 1) return sw_val_int(0);
     sw_val_t *v = args[0];
@@ -1858,26 +2053,39 @@ static sw_val_t *builtin_length(sw_val_t **args, int nargs) {
     return sw_val_int(0);
 }
 
-/* Built-in function: hd (head of list) */
-static sw_val_t *builtin_hd(sw_val_t **args, int nargs) {
-    if (nargs < 1 || args[0]->type != SW_VAL_LIST || args[0]->v.tuple.count == 0)
-        return sw_val_nil();
+/* Built-in function: hd (head of list).
+ * Strict, matching compiled _builtin_hd: panics on non-list / empty list
+ * (was silently returning nil). */
+static sw_val_t *builtin_hd(sw_interp_t *interp, sw_val_t **args, int nargs) {
+    if (nargs < 1 || !args[0]) { interp_raise_panic(interp, 0, "hd: no list given"); return sw_val_nil(); }
+    if (args[0]->type != SW_VAL_LIST) { interp_raise_panic(interp, 0, "hd: not a list (got type %d)", args[0]->type); return sw_val_nil(); }
+    if (args[0]->v.tuple.count == 0) { interp_raise_panic(interp, 0, "hd: list is empty"); return sw_val_nil(); }
     return args[0]->v.tuple.items[0];
 }
 
-/* Built-in function: tl (tail of list) */
-static sw_val_t *builtin_tl(sw_val_t **args, int nargs) {
-    if (nargs < 1 || args[0]->type != SW_VAL_LIST || args[0]->v.tuple.count <= 1)
-        return sw_val_list(NULL, 0);
+/* Built-in function: tl (tail of list).
+ * Strict, matching compiled _builtin_tl: panics on non-list / empty list;
+ * tl of a 1-element list returns [] (Erlang semantics). */
+static sw_val_t *builtin_tl(sw_interp_t *interp, sw_val_t **args, int nargs) {
+    if (nargs < 1 || !args[0]) { interp_raise_panic(interp, 0, "tl: no list given"); return sw_val_nil(); }
+    if (args[0]->type != SW_VAL_LIST) { interp_raise_panic(interp, 0, "tl: not a list (got type %d)", args[0]->type); return sw_val_nil(); }
+    if (args[0]->v.tuple.count == 0) { interp_raise_panic(interp, 0, "tl: list is empty"); return sw_val_nil(); }
+    if (args[0]->v.tuple.count == 1) return sw_val_list(NULL, 0);
     return sw_val_list(args[0]->v.tuple.items + 1, args[0]->v.tuple.count - 1);
 }
 
-/* Built-in function: elem (tuple element access) */
-static sw_val_t *builtin_elem(sw_val_t **args, int nargs) {
-    if (nargs < 2 || args[0]->type != SW_VAL_TUPLE || args[1]->type != SW_VAL_INT)
-        return sw_val_nil();
+/* Built-in function: elem (tuple element access).
+ * Strict, matching compiled _builtin_elem: panics on non-tuple, non-int
+ * index, or out-of-range/negative index (was silently returning nil). */
+static sw_val_t *builtin_elem(sw_interp_t *interp, sw_val_t **args, int nargs) {
+    if (nargs < 2 || !args[0] || !args[1]) { interp_raise_panic(interp, 0, "elem: needs (tuple, index)"); return sw_val_nil(); }
+    if (args[0]->type != SW_VAL_TUPLE) { interp_raise_panic(interp, 0, "elem: not a tuple (got type %d)", args[0]->type); return sw_val_nil(); }
+    if (args[1]->type != SW_VAL_INT) { interp_raise_panic(interp, 0, "elem: index must be int"); return sw_val_nil(); }
     int idx = (int)args[1]->v.i;
-    if (idx < 0 || idx >= args[0]->v.tuple.count) return sw_val_nil();
+    if (idx < 0 || idx >= args[0]->v.tuple.count) {
+        interp_raise_panic(interp, 0, "elem: index %d out of range for %d-tuple", idx, args[0]->v.tuple.count);
+        return sw_val_nil();
+    }
     return args[0]->v.tuple.items[idx];
 }
 
@@ -2806,28 +3014,81 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     }
 
     case N_BINOP: {
-        sw_val_t *left = eval(interp, n->v.binop.left, env);
-        sw_val_t *right = eval(interp, n->v.binop.right, env);
         const char *op = n->v.binop.op;
 
-        /* String concatenation (bounded — no unbounded strcat) */
+        /* Short-circuiting logical operators: evaluate the LEFT operand
+         * first, and only touch the RIGHT when the result is not already
+         * determined.  Matches the compiled path, where `&&`/`||` lower to
+         * C `&&`/`||` and never eagerly evaluate both sides — so
+         * `false && panic(...)` and `true || panic(...)` do NOT fire the
+         * panic. Evaluating both up front (the old behaviour) broke that. */
+        if (strcmp(op, "&&") == 0) {
+            sw_val_t *l = eval(interp, n->v.binop.left, env);
+            if (interp->error) return sw_val_nil();
+            if (!sw_val_is_truthy(l)) return sw_val_atom("false");
+            sw_val_t *r = eval(interp, n->v.binop.right, env);
+            if (interp->error) return sw_val_nil();
+            return sw_val_atom(sw_val_is_truthy(r) ? "true" : "false");
+        }
+        if (strcmp(op, "||") == 0) {
+            sw_val_t *l = eval(interp, n->v.binop.left, env);
+            if (interp->error) return sw_val_nil();
+            if (sw_val_is_truthy(l)) return sw_val_atom("true");
+            sw_val_t *r = eval(interp, n->v.binop.right, env);
+            if (interp->error) return sw_val_nil();
+            return sw_val_atom(sw_val_is_truthy(r) ? "true" : "false");
+        }
+
+        sw_val_t *left = eval(interp, n->v.binop.left, env);
+        sw_val_t *right = eval(interp, n->v.binop.right, env);
+
+        /* `++` is polymorphic, mirroring _op_concat in the compiled
+         * runtime: list ++ list → concatenated list (Erlang-style), and
+         * otherwise string-concat with auto-coercion of int/float/atom/
+         * bool/nil to their printed form. The old version only handled
+         * string+int and silently dropped everything else (turning
+         * list++list into "") — a silent-wrong divergence. */
         if (strcmp(op, "++") == 0) {
+            /* List ++ list — preserve list semantics. */
+            if (left && right &&
+                left->type == SW_VAL_LIST && right->type == SW_VAL_LIST) {
+                int la = left->v.tuple.count, lb = right->v.tuple.count;
+                if (la == 0) return right;
+                if (lb == 0) return left;
+                sw_val_t **items = malloc(sizeof(sw_val_t *) * (la + lb));
+                for (int i = 0; i < la; i++) items[i] = left->v.tuple.items[i];
+                for (int i = 0; i < lb; i++) items[la + i] = right->v.tuple.items[i];
+                sw_val_t *r = sw_val_list(items, la + lb);
+                free(items);
+                return r;
+            }
+            /* String concat with scalar auto-coercion. Atoms render as
+             * their bare text (no leading ':'), bool/nil as true/false/nil,
+             * floats via %g — identical to _op_concat. */
             char buf[4096];
             size_t pos = 0;
             buf[0] = '\0';
-            if (left->type == SW_VAL_STRING && left->v.str) {
-                size_t n = strlen(left->v.str);
-                if (n > sizeof(buf) - pos - 1) n = sizeof(buf) - pos - 1;
-                memcpy(buf + pos, left->v.str, n); pos += n;
-            } else if (left->type == SW_VAL_INT) {
-                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%lld", (long long)left->v.i);
-            }
-            if (right->type == SW_VAL_STRING && right->v.str) {
-                size_t n = strlen(right->v.str);
-                if (n > sizeof(buf) - pos - 1) n = sizeof(buf) - pos - 1;
-                memcpy(buf + pos, right->v.str, n); pos += n;
-            } else if (right->type == SW_VAL_INT) {
-                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%lld", (long long)right->v.i);
+            sw_val_t *operands[2] = { left, right };
+            for (int k = 0; k < 2; k++) {
+                sw_val_t *o = operands[k];
+                size_t avail = sizeof(buf) - pos - 1;
+                if (!o) continue;
+                if (o->type == SW_VAL_STRING && o->v.str) {
+                    size_t n = strlen(o->v.str);
+                    if (n > avail) n = avail;
+                    memcpy(buf + pos, o->v.str, n); pos += n;
+                } else if (o->type == SW_VAL_ATOM && o->v.str) {
+                    size_t n = strlen(o->v.str);
+                    if (n > avail) n = avail;
+                    memcpy(buf + pos, o->v.str, n); pos += n;
+                } else if (o->type == SW_VAL_INT) {
+                    pos += (size_t)snprintf(buf + pos, avail + 1, "%lld", (long long)o->v.i);
+                } else if (o->type == SW_VAL_FLOAT) {
+                    pos += (size_t)snprintf(buf + pos, avail + 1, "%g", o->v.f);
+                } else if (o->type == SW_VAL_NIL) {
+                    pos += (size_t)snprintf(buf + pos, avail + 1, "nil");
+                }
+                if (pos > sizeof(buf) - 1) pos = sizeof(buf) - 1;
             }
             buf[pos] = '\0';
             return sw_val_string(buf);
@@ -2852,8 +3113,16 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             if (strcmp(op, "+") == 0)  return sw_val_int(a + b);
             if (strcmp(op, "-") == 0)  return sw_val_int(a - b);
             if (strcmp(op, "*") == 0)  return sw_val_int(a * b);
-            if (strcmp(op, "/") == 0)  return b ? sw_val_int(a / b) : sw_val_nil();
-            if (strcmp(op, "%") == 0)  return b ? sw_val_int(a % b) : sw_val_nil();
+            if (strcmp(op, "/") == 0) {
+                /* Strict: panics on zero divisor, matching _op_div (was
+                 * silently returning nil → spurious nil cascades). */
+                if (b == 0) { interp_raise_panic(interp, n->line, "division by zero"); return sw_val_nil(); }
+                return sw_val_int(a / b);
+            }
+            if (strcmp(op, "%") == 0) {
+                if (b == 0) { interp_raise_panic(interp, n->line, "modulo by zero"); return sw_val_nil(); }
+                return sw_val_int(a % b);
+            }
             if (strcmp(op, "==") == 0) return sw_val_atom(a == b ? "true" : "false");
             if (strcmp(op, "!=") == 0) return sw_val_atom(a != b ? "true" : "false");
             if (strcmp(op, "<") == 0)  return sw_val_atom(a < b ? "true" : "false");
@@ -2870,7 +3139,24 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             if (strcmp(op, "+") == 0) return sw_val_float(a + b);
             if (strcmp(op, "-") == 0) return sw_val_float(a - b);
             if (strcmp(op, "*") == 0) return sw_val_float(a * b);
-            if (strcmp(op, "/") == 0) return b != 0 ? sw_val_float(a / b) : sw_val_nil();
+            if (strcmp(op, "/") == 0) {
+                /* Strict: matches _op_div, which panics on a zero divisor
+                 * (was silently returning nil). */
+                if (b == 0.0) { interp_raise_panic(interp, n->line, "division by zero"); return sw_val_nil(); }
+                return sw_val_float(a / b);
+            }
+            if (strcmp(op, "%") == 0) {
+                if (b == 0.0) { interp_raise_panic(interp, n->line, "modulo by zero"); return sw_val_nil(); }
+                return sw_val_float(fmod(a, b));
+            }
+            /* Ordering comparisons on float/mixed-numeric operands. The
+             * old block only handled + - * / and let < > <= >= fall through
+             * to `return sw_val_nil()` — a silent-wrong divergence from
+             * _op_cmp, which coerces both to double and compares. */
+            if (strcmp(op, "<") == 0)  return sw_val_atom(a < b  ? "true" : "false");
+            if (strcmp(op, ">") == 0)  return sw_val_atom(a > b  ? "true" : "false");
+            if (strcmp(op, "<=") == 0) return sw_val_atom(a <= b ? "true" : "false");
+            if (strcmp(op, ">=") == 0) return sw_val_atom(a >= b ? "true" : "false");
         }
 
         /* Equality for atoms/strings */
@@ -2968,10 +3254,13 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             /* Look up function in module */
             node_t *fn = find_fun(interp->module_ast, fname);
             if (fn) {
+                if (interp_recursion_blocked(interp)) return sw_val_nil();
                 sw_env_t *fenv = env_new(interp->global_env);
                 for (int i = 0; i < fn->v.fun.nparams && i < nargs; i++)
                     env_set(fenv, fn->v.fun.params[i], args[i]);
+                interp->call_depth++;
                 sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+                interp->call_depth--;
                 env_free(fenv);
                 return r;
             }
@@ -2997,11 +3286,17 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         /* Built-ins */
         if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
         if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
-        if (strcmp(fname, "hd") == 0) return builtin_hd(args, nargs);
-        if (strcmp(fname, "tl") == 0) return builtin_tl(args, nargs);
-        if (strcmp(fname, "elem") == 0) return builtin_elem(args, nargs);
-        if (strcmp(fname, "abs") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT)
-            return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
+        if (strcmp(fname, "hd") == 0) return builtin_hd(interp, args, nargs);
+        if (strcmp(fname, "tl") == 0) return builtin_tl(interp, args, nargs);
+        if (strcmp(fname, "elem") == 0) return builtin_elem(interp, args, nargs);
+        if (strcmp(fname, "abs") == 0 && nargs >= 1) {
+            /* abs handles both int and float (was int-only, so abs(-2.5)
+             * fell through to "undefined function"). */
+            if (args[0]->type == SW_VAL_INT)
+                return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
+            if (args[0]->type == SW_VAL_FLOAT)
+                return sw_val_float(args[0]->v.f < 0 ? -args[0]->v.f : args[0]->v.f);
+        }
         if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
             switch (args[0]->type) {
             case SW_VAL_STRING: return args[0];
@@ -3114,15 +3409,18 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         }
         if (strcmp(fname, "string_length") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
             return sw_val_int((int64_t)strlen(args[0]->v.str));
-        if (strcmp(fname, "json_encode") == 0 && nargs >= 1) {
-            /* Use sw_val_format and call it close-enough JSON for REPL use.
-             * The codegen path's builtin produces canonical JSON; this path
-             * is for quick interactive checks. */
-            char *buf = NULL; size_t blen = 0;
-            FILE *m = open_memstream(&buf, &blen);
-            if (!m) return sw_val_string("");
-            sw_val_format(m, args[0]); fclose(m);
-            sw_val_t *r = sw_val_string(buf ? buf : ""); free(buf); return r;
+        if (strcmp(fname, "json_encode") == 0) {
+            /* Real JSON, matching the compiled runtime's _json_encode_val
+             * exactly (see interp_json_encode_val). The old stub emitted
+             * the value debug-repr (e.g. %{:name: alice}) — invalid JSON. */
+            if (nargs < 1) return sw_val_string("null");
+            char *buf = (char *)malloc(256);
+            size_t cap = 256, pos = 0;
+            interp_json_encode_val(args[0], &buf, &cap, &pos);
+            buf[pos] = '\0';
+            sw_val_t *r = sw_val_string(buf);
+            free(buf);
+            return r;
         }
         if (strcmp(fname, "json_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
             return sw_lang_json_decode(args[0]->v.str);
@@ -3188,6 +3486,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         /* User-defined function in module */
         node_t *fn = find_fun(interp->module_ast, fname);
         if (fn) {
+            if (interp_recursion_blocked(interp)) return sw_val_nil();
             sw_env_t *fenv = env_new(interp->global_env);
             for (int i = 0; i < fn->v.fun.nparams; i++) {
                 if (i < nargs)
@@ -3197,7 +3496,9 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                 else
                     env_set(fenv, fn->v.fun.params[i], sw_val_nil());
             }
+            interp->call_depth++;
             sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+            interp->call_depth--;
             env_free(fenv);
             return r;
         }
@@ -3205,11 +3506,14 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         /* Dynamic dispatch: variable holds a closure */
         sw_val_t *fn_val = env_get(env, fname);
         if (fn_val && fn_val->type == SW_VAL_FUN && fn_val->v.fun.body) {
+            if (interp_recursion_blocked(interp)) return sw_val_nil();
             node_t *fn_node = (node_t *)fn_val->v.fun.body;
             sw_env_t *fenv = env_new(fn_val->v.fun.closure_env ? fn_val->v.fun.closure_env : interp->global_env);
             for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
                 env_set(fenv, fn_node->v.fun.params[i], args[i]);
+            interp->call_depth++;
             sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
+            interp->call_depth--;
             env_free(fenv);
             return r;
         }
@@ -3345,6 +3649,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         v->v.fun.num_params = n->v.fun.nparams;
         v->v.fun.body = n;
         v->v.fun.closure_env = env;
+        env_retain(env);   /* closure escapes its frame: keep captured env alive */
         return v;
     }
 

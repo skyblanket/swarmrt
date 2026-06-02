@@ -84,6 +84,9 @@ typedef struct sw_env_entry {
 struct sw_env {
     sw_env_entry_t *buckets[SW_ENV_SLOTS];
     sw_env_t *parent;
+    int refcount;   /* interpreter env lifetime: frame holds 1 ref, each child
+                       env and each capturing closure holds 1 ref on this env.
+                       Freed only when refcount hits 0 (see env_retain/release). */
 };
 
 /* === Interpreter Context === */
@@ -97,6 +100,7 @@ typedef struct {
     int assert_failed;
     char assert_msg[512];
     int assert_line;
+    int call_depth;   /* interpreter recursion-depth guard (no TCO on C stack) */
 } sw_interp_t;
 
 /* === Public API === */

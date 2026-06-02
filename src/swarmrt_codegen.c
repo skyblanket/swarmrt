@@ -1004,8 +1004,10 @@ static void emit_preamble(cg_ctx_t *ctx) {
 
     fprintf(f,
         "static sw_val_t *_builtin_abs(sw_val_t **a, int n) {\n"
-        "    if (n < 1 || a[0]->type != SW_VAL_INT) return sw_val_nil();\n"
-        "    return sw_val_int(a[0]->v.i < 0 ? -a[0]->v.i : a[0]->v.i);\n"
+        "    if (n < 1) return sw_val_nil();\n"
+        "    if (a[0]->type == SW_VAL_INT) return sw_val_int(a[0]->v.i < 0 ? -a[0]->v.i : a[0]->v.i);\n"
+        "    if (a[0]->type == SW_VAL_FLOAT) return sw_val_float(a[0]->v.f < 0 ? -a[0]->v.f : a[0]->v.f);\n"
+        "    return sw_val_nil();\n"
         "}\n\n");
 
     /* Functional primitives: map, pmap, reduce, filter */
