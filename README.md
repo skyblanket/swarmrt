@@ -428,7 +428,12 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 - `make test-phase$p` for `p` in **2 through 9** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC (phase 8), distribution (phase 9); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 
-**Known issues:** none currently tracked. The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
+**Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
+- **Multi-head cons patterns are unimplemented.** A single head/tail split `[h | t]` works; matching more than one element before the tail (`[a, b | rest]`) is a parse error today.
+- **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
+- **No static type or shape checking** — `sw` is dynamically typed by design. Typos in variable names compile to atoms rather than erroring (e.g. `undefined_var` becomes `:undefined_var`); there is no compile-time catch.
+
+The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
 
 **Reliability backstory:** the runtime has been through six rounds of external review (Claude web agent + Codex), each filing a markdown report against the latest commit. The full hardening narrative — what each round found and what was fixed — is at [docs/notes/REVIEW_HARDENING.md](docs/notes/REVIEW_HARDENING.md).
 

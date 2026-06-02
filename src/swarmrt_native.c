@@ -843,6 +843,42 @@ static int sw_safe_swap_into(sw_process_t *from, sw_process_t *to,
  * SCHEDULER THREAD
  * ============================================================================ */
 
+/*
+ * root_exit_check: If the ROOT entry process (pid 1 — the one the
+ * codegen `main()` spawns to run the user's `main()`) terminates
+ * ABNORMALLY (a panic / uncaught crash, reason != 0), force the whole
+ * program to exit nonzero.
+ *
+ * Why this exists: the codegen `_main_entry` only sets `_sw_done_flag`
+ * (which wakes the blocked C main thread) AFTER the user's main()
+ * RETURNS. On a panic, sw_process_panic is NORETURN — it swaps back to
+ * the scheduler, which tears this process down via process_exit, and the
+ * entry function never returns. So _sw_done_flag is never set and the C
+ * main thread waits on pthread_cond_wait forever — the binary hangs
+ * instead of exiting 1 (contradicting SW_LANGUAGE.md "then exits with
+ * code 1"). The exit(1) at the tail of _sw_runtime_panic is dead code
+ * for the in-process case (the panic helper never returns from
+ * sw_process_panic).
+ *
+ * The fix is scoped tightly to the root process so process isolation is
+ * preserved: a SPAWNED child (pid > 1) panicking still flows through the
+ * normal link / monitor / trap_exit / supervisor machinery in
+ * process_exit, and its parent survives. Only pid 1 going down abnormally
+ * means "the program's main crashed", which is a fatal whole-binary
+ * condition. A normal root exit (reason == 0) is left alone — the C main
+ * thread is already being woken by _sw_done_flag in that case.
+ */
+static void root_exit_check(sw_process_t *proc, int reason) {
+    if (proc && proc->pid == 1 && reason != 0) {
+        /* Trace + panic banner were already printed and flushed by the
+         * panic helper before it swapped back here. Exit nonzero so the
+         * program reports failure instead of hanging. */
+        fflush(stdout);
+        fflush(stderr);
+        exit(1);
+    }
+}
+
 static void scheduler_loop(sw_scheduler_t *sched) {
     tls_scheduler = sched;
 
@@ -870,6 +906,10 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             if (proc->kill_flag) {
                 proc->state = SW_PROC_EXITING;
                 process_exit(proc, proc->exit_reason);
+                /* Force whole-binary exit if the ROOT process died
+                 * abnormally — checked before process_destroy recycles
+                 * the slot (and may not return). */
+                root_exit_check(proc, proc->exit_reason);
                 process_destroy(proc);
                 continue;
             }
@@ -898,6 +938,12 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             if (proc->state == SW_PROC_EXITING) {
                 /* Process finished or killed — clean up */
                 process_exit(proc, proc->exit_reason);
+                /* Force whole-binary exit if the ROOT process (pid 1)
+                 * died abnormally (panic). A normal root exit (reason 0)
+                 * and any non-root exit are left untouched, preserving
+                 * link/monitor/trap_exit isolation. Checked before
+                 * process_destroy recycles the slot. */
+                root_exit_check(proc, proc->exit_reason);
                 process_destroy(proc);
             } else if (proc->state == SW_PROC_RUNNABLE) {
                 /* Process yielded — put back on run queue */
