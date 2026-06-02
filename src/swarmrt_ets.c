@@ -64,6 +64,9 @@ static int ets_key_eq(void *a, void *b) {
         case SW_VAL_FLOAT:  return va->v.f == vb->v.f;
         case SW_VAL_ATOM:
         case SW_VAL_STRING: return va->v.str && vb->v.str && strcmp(va->v.str, vb->v.str) == 0;
+        case SW_VAL_BYTES:  /* NUL-safe: length-first then memcmp */
+            return va->v.bytes.len == vb->v.bytes.len &&
+                   memcmp(va->v.bytes.data, vb->v.bytes.data, va->v.bytes.len) == 0;
         default: return a == b;
     }
 }
@@ -80,6 +83,13 @@ static int ets_key_cmp(void *a, void *b) {
         case SW_VAL_FLOAT:  return (va->v.f < vb->v.f) ? -1 : (va->v.f > vb->v.f ? 1 : 0);
         case SW_VAL_ATOM:
         case SW_VAL_STRING: return strcmp(va->v.str ? va->v.str : "", vb->v.str ? vb->v.str : "");
+        case SW_VAL_BYTES: {
+            size_t n = va->v.bytes.len < vb->v.bytes.len ? va->v.bytes.len : vb->v.bytes.len;
+            int c = n ? memcmp(va->v.bytes.data, vb->v.bytes.data, n) : 0;
+            if (c) return c;
+            return (va->v.bytes.len < vb->v.bytes.len) ? -1
+                 : (va->v.bytes.len > vb->v.bytes.len ?  1 : 0);
+        }
         default: return (a < b) ? -1 : (a > b ? 1 : 0);
     }
 }
@@ -102,6 +112,13 @@ static uint32_t ets_hash_key(void *key) {
         k = 0xcbf29ce484222325ULL;
         for (const char *p = v->v.str; *p; p++) {
             k ^= (uint8_t)*p;
+            k *= 0x100000001b3ULL;
+        }
+    } else if (v && v->type == SW_VAL_BYTES) {
+        /* FNV-1a over the raw buffer (length-bounded, NUL-safe) */
+        k = 0xcbf29ce484222325ULL;
+        for (size_t i = 0; i < v->v.bytes.len; i++) {
+            k ^= v->v.bytes.data[i];
             k *= 0x100000001b3ULL;
         }
     } else {

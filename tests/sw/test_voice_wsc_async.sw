@@ -83,6 +83,18 @@ fun main() {
             sh = wsc_set_handler(h, self())
             fails = fails + assert_eq("wsc_set_handler_ok", sh, 'ok')
 
+            # One-reader guard: a SECOND wsc_set_handler on this handle must
+            # be refused ('error' + stderr note), not silently re-point the
+            # reader or spawn a racing second reader.
+            sh2 = wsc_set_handler(h, self())
+            fails = fails + assert_eq("wsc_set_handler_twice_refused", sh2, 'error')
+
+            # One-reader guard: a blocking wsc_recv on a handle that already
+            # has an async handler must return nil (would be a 2nd reader),
+            # leaving the reader's read path intact.
+            rg = wsc_recv(h, 100)
+            fails = fails + assert_eq("wsc_recv_with_handler_refused", rg, 'nil')
+
             # Frame 1: representative base64 mu-law (8 codes, no NULs).
             p1 = "/4AAVaoRwzw="
             wsc_send(h, p1)
@@ -102,6 +114,6 @@ fun main() {
             fails = fails + assert_eq("wsc_async_close", cl, 'closed')
     }
 
-    if (fails == 0) { print("OK test_voice_wsc_async 4/4") sys_exit(0) }
+    if (fails == 0) { print("OK test_voice_wsc_async 6/6") sys_exit(0) }
     else { print(f"FAIL test_voice_wsc_async {fails} failed") sys_exit(1) }
 }

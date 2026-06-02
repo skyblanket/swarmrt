@@ -69,6 +69,7 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
 #define SW_MARSHAL_LIST   0x06
 #define SW_MARSHAL_MAP    0x07
 #define SW_MARSHAL_PID    0x08
+#define SW_MARSHAL_BYTES  0x09   /* [tag][u32 len][len raw bytes] — binary-clean */
 
 /* Thread-local node name used by unmarsh_val to construct
  * SW_VAL_REMOTE_PID values when it decodes a SW_MARSHAL_PID byte.
@@ -120,6 +121,19 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
         (*buf)[(*pos)++] = SW_MARSHAL_STRING;
         memcpy(*buf + *pos, &len, 4); *pos += 4;
         memcpy(*buf + *pos, v->v.str, len); *pos += len;
+        return 0;
+    }
+    case SW_VAL_BYTES: {
+        /* Mirror STRING but carry the REAL byte length (never strlen — the
+         * buffer may contain NULs). u32 wire field caps at UINT32_MAX; refuse
+         * to truncate a >4GB buffer. */
+        if (v->v.bytes.len > 0xFFFFFFFFu) return -1;
+        uint32_t len = (uint32_t)v->v.bytes.len;
+        marsh_grow(buf, cap, *pos + 1 + 4 + len);
+        (*buf)[(*pos)++] = SW_MARSHAL_BYTES;
+        memcpy(*buf + *pos, &len, 4); *pos += 4;
+        if (len) memcpy(*buf + *pos, v->v.bytes.data, len);
+        *pos += len;
         return 0;
     }
     case SW_VAL_TUPLE:
@@ -228,6 +242,16 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
         memcpy(tmp, buf + *pos, l); tmp[l] = 0; *pos += l;
         sw_val_t *r = sw_val_string(tmp);
         free(tmp);
+        return r;
+    }
+    case SW_MARSHAL_BYTES: {
+        /* Same bounds discipline as STRING (len - *pos < need form), but
+         * NUL-safe: sw_val_bytes copies exactly l bytes, no terminator. */
+        if (len - *pos < 4) return sw_val_nil();
+        uint32_t l; memcpy(&l, buf + *pos, 4); *pos += 4;
+        if (l > len - *pos) return sw_val_nil();
+        sw_val_t *r = sw_val_bytes(buf + *pos, (size_t)l);
+        *pos += l;
         return r;
     }
     case SW_MARSHAL_TUPLE:

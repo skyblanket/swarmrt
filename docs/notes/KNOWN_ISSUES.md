@@ -8,28 +8,6 @@ a repro, impact, and current hypothesis.
 These are genuine limitations, not crashes. Each is reproducible with the
 shipped `bin/swc`.
 
-### Multi-head cons patterns are unimplemented
-
-A single head/tail split works:
-
-```sw
-case xs {
-    [h | t] -> ...   # OK
-}
-```
-
-but splitting off more than one element before the tail is a parse error:
-
-```sw
-case xs {
-    [a, b | rest] -> ...   # Parse error: expected ']', got '|'
-}
-```
-
-**Impact:** you must destructure one element at a time (`[a | rest]`, then
-`[b | rest2]`). **Hypothesis:** the list-pattern parser only handles a single
-element before `|`.
-
 ### Compiled `receive` has no default timeout (interpreter/compiled divergence)
 
 A bare `receive` with no `after` clause blocks forever in a compiled binary
@@ -62,6 +40,16 @@ model), recorded here so the behavior is not a surprise.
 out && ./out`. **Impact:** minor ergonomics gap for quick scripts.
 
 ## Recently cleared
+
+### Multi-head cons patterns are unimplemented
+
+Cleared on 2026-06-03. The list-pattern parser now accepts any number of
+leading heads before the bar, so `[a, b | rest]` (and `[a, b, c | rest]`,
+etc.) parse into a right-nested cons chain `cons(a, cons(b, rest))`. This
+matches a list of length >= 2, binding `a`/`b` to the first two elements
+and `rest` to the remainder — identically in the interpreter and the
+compiler (verified by `tests/sw/test_patterns_codegen.sw`). Construction
+position (`[a, b | rest]` building a list) works too.
 
 ### High-process-count spawn/send stress crash
 

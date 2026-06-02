@@ -121,6 +121,10 @@ static uint32_t _vets_hash_val(sw_val_t *v) {
             for (const char *s = v->v.str; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
             break;
         }
+        case SW_VAL_BYTES: {
+            for (size_t i = 0; i < v->v.bytes.len; i++) { h ^= v->v.bytes.data[i]; h *= 1099511628211ULL; }
+            break;
+        }
         case SW_VAL_TUPLE: {
             for (int i = 0; i < v->v.tuple.count; i++) h ^= _vets_hash_val(v->v.tuple.items[i]) * (i + 1);
             break;
@@ -139,6 +143,9 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
     switch (a->type) {
         case SW_VAL_INT: return a->v.i == b->v.i;
         case SW_VAL_STRING: case SW_VAL_ATOM: return strcmp(a->v.str, b->v.str) == 0;
+        case SW_VAL_BYTES:  /* NUL-safe: length-first then memcmp */
+            return a->v.bytes.len == b->v.bytes.len &&
+                   memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
         case SW_VAL_TUPLE:
             if (a->v.tuple.count != b->v.tuple.count) return 0;
             for (int i = 0; i < a->v.tuple.count; i++)
@@ -405,7 +412,9 @@ static sw_val_t *_builtin_typeof(sw_val_t **a, int n) {
         case SW_VAL_LIST: return sw_val_string("list");
         case SW_VAL_PID: return sw_val_string("pid");
         case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
+        case SW_VAL_FUN: return sw_val_string("fun");
         case SW_VAL_MAP: return sw_val_string("map");
+        case SW_VAL_BYTES: return sw_val_string("bytes");
         default: return sw_val_string("unknown");
     }
 }
@@ -6124,6 +6133,12 @@ typedef struct {
      * be a second reader) — wsc_set_handler owns the read path from then on. */
     sw_process_t   *handler;       /* owner pid to deliver frames to */
     int             reader_running;/* 1 once a reader process is spawned */
+    sw_process_t   *reader_proc;   /* the dedicated reader process — the ONLY
+                                    * caller allowed to drive _builtin_wsc_recv
+                                    * once a handler is set. Lets the recv guard
+                                    * below distinguish the reader's own loop
+                                    * from a stray user wsc_recv (a 2nd reader,
+                                    * which would race the read path). */
 } _sw_wsc_slot_t;
 static _sw_wsc_slot_t _sw_wsc[_SW_WSC_MAX] = {0};
 
@@ -6139,6 +6154,7 @@ static int _sw_wsc_alloc_slot(int fd) {
 #endif
             _sw_wsc[i].handler = NULL;
             _sw_wsc[i].reader_running = 0;
+            _sw_wsc[i].reader_proc = NULL;
             return i;
         }
     }
@@ -6158,6 +6174,7 @@ static void _sw_wsc_free_slot(int handle) {
         _sw_wsc[handle].is_tls = 0;
         _sw_wsc[handle].handler = NULL;
         _sw_wsc[handle].reader_running = 0;
+        _sw_wsc[handle].reader_proc = NULL;
     }
 }
 
@@ -6397,6 +6414,24 @@ static sw_val_t *_builtin_wsc_recv(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_nil();
     int handle = (int)a[0]->v.i;
     if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_nil();
+
+    /* One-reader guard: if this handle has an async handler, its dedicated
+     * reader process owns the read path. A blocking wsc_recv from any OTHER
+     * process would be a second concurrent SSL_read on the same connection
+     * (the documented UB). Refuse it: return nil + a stderr note, leaving the
+     * reader's read path intact. The reader itself (reader_proc) is allowed
+     * through — that's the loop in _sw_wsc_reader_entry. */
+    if (_sw_wsc[handle].reader_running &&
+        sw_self() != _sw_wsc[handle].reader_proc) {
+        fprintf(stderr,
+            "[swarmrt] wsc_recv(handle=%d): this handle has an async handler "
+            "(wsc_set_handler) — its reader owns the read path. Don't also "
+            "call wsc_recv on it (that races the reader). Receive the "
+            "{'wsc_message', %d, data} messages in your mailbox instead.\n",
+            handle, handle);
+        fflush(stderr);
+        return sw_val_nil();
+    }
     int fd = _sw_wsc[handle].fd;
 
     int timeout_ms = -1;  /* default: block forever */
@@ -6555,15 +6590,32 @@ static sw_val_t *_builtin_wsc_set_handler(sw_val_t **a, int n) {
     int handle = (int)a[0]->v.i;
     if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_atom("error");
 
-    _sw_wsc[handle].handler = a[1]->v.pid;
-    if (!_sw_wsc[handle].reader_running) {
-        _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)malloc(sizeof(*ra));
-        if (!ra) return sw_val_atom("error");
-        ra->handle = handle;
-        sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
-        if (!rp) { free(ra); return sw_val_atom("error"); }
-        _sw_wsc[handle].reader_running = 1;
+    /* One-reader guard: a handle gets EXACTLY one async reader for its
+     * lifetime. A second wsc_set_handler would either spawn a second reader
+     * (two threads racing SSL_read on one connection — the documented UB) or
+     * silently re-point `handler` while the first reader keeps delivering to
+     * the old owner. Refuse instead: return a clean sw-level 'error' + a
+     * stderr note so the author sees the misuse rather than a heisenbug. */
+    if (_sw_wsc[handle].reader_running) {
+        fprintf(stderr,
+            "[swarmrt] wsc_set_handler(handle=%d): a handler is already set "
+            "on this handle; ignoring the second call. One wsc handle owns "
+            "exactly one async reader — open a separate wsc_connect if you "
+            "need another reader.\n", handle);
+        fflush(stderr);
+        return sw_val_atom("error");
     }
+
+    _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)malloc(sizeof(*ra));
+    if (!ra) return sw_val_atom("error");
+    ra->handle = handle;
+    sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
+    if (!rp) { free(ra); return sw_val_atom("error"); }
+    /* Record handler + reader BEFORE returning so the wsc_recv guard can
+     * tell the reader's own loop from a stray user wsc_recv. */
+    _sw_wsc[handle].handler = a[1]->v.pid;
+    _sw_wsc[handle].reader_proc = rp;
+    _sw_wsc[handle].reader_running = 1;
     return sw_val_atom("ok");
 }
 
@@ -6952,6 +7004,146 @@ static sw_val_t *_builtin_audio_resample(sw_val_t **a, int n) {
     return r;
 }
 
+/* === SW_VAL_BYTES builtins (length-carrying, NUL-safe byte vectors) ======
+ *
+ * These give sw a real binary value type. Unlike base64_decode (which returns
+ * a NUL-terminated sw string and truncates binary data at the first 0x00),
+ * bytes carry an explicit length and survive embedded NULs. */
+
+/* bytes_from_base64(ascii_b64) → bytes | nil. The NUL-safe twin of
+ * base64_decode: raw bytes are kept in a length-carrying value, not a
+ * NUL-terminated string. */
+static sw_val_t *_builtin_bytes_from_base64(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    size_t dlen = 0;
+    uint8_t *raw = _sw_audio_b64_decode(a[0]->v.str, &dlen);
+    if (!raw) return sw_val_nil();
+    sw_val_t *r = sw_val_bytes(raw, dlen);
+    free(raw);
+    return r;
+}
+
+/* bytes_to_base64(bytes) → ascii_b64 string (always a valid sw string). */
+static sw_val_t *_builtin_bytes_to_base64(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_BYTES) return sw_val_nil();
+    char *b64 = _sw_audio_b64_encode(a[0]->v.bytes.data, a[0]->v.bytes.len);
+    if (!b64) return sw_val_string("");
+    sw_val_t *r = sw_val_string(b64);
+    free(b64);
+    return r;
+}
+
+/* byte_size(bytes) → int. Length in bytes (NOT string_length, which would
+ * stop at the first NUL). Lenient: 0 for non-bytes. */
+static sw_val_t *_builtin_byte_size(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_BYTES) return sw_val_int(0);
+    return sw_val_int((int64_t)a[0]->v.bytes.len);
+}
+
+/* byte_at(bytes, i) → int 0..255. Panics out-of-range, like elem/hd. */
+static sw_val_t *_builtin_byte_at(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_BYTES ||
+        !a[1] || a[1]->type != SW_VAL_INT)
+        _sw_runtime_panic("byte_at: expected (bytes, int)");
+    int64_t i = a[1]->v.i;
+    if (i < 0 || (size_t)i >= a[0]->v.bytes.len)
+        _sw_runtime_panic("byte_at: index out of range (got %lld, size %zu)",
+                          (long long)i, a[0]->v.bytes.len);
+    return sw_val_int((int64_t)a[0]->v.bytes.data[i]);
+}
+
+/* byte_slice(bytes, start, len) → bytes. Clamps len to the end; returns
+ * empty bytes if start is past the end or negative inputs are given. */
+static sw_val_t *_builtin_byte_slice(sw_val_t **a, int n) {
+    if (n < 3 || !a[0] || a[0]->type != SW_VAL_BYTES ||
+        !a[1] || a[1]->type != SW_VAL_INT ||
+        !a[2] || a[2]->type != SW_VAL_INT) return sw_val_nil();
+    size_t total = a[0]->v.bytes.len;
+    int64_t start = a[1]->v.i;
+    int64_t want  = a[2]->v.i;
+    if (start < 0 || want < 0 || (size_t)start >= total)
+        return sw_val_bytes(NULL, 0);
+    size_t avail = total - (size_t)start;
+    size_t take  = ((size_t)want < avail) ? (size_t)want : avail;
+    return sw_val_bytes(a[0]->v.bytes.data + start, take);
+}
+
+/* bytes_concat(a, b) → new bytes a ++ b. */
+static sw_val_t *_builtin_bytes_concat(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_BYTES ||
+        !a[1] || a[1]->type != SW_VAL_BYTES) return sw_val_nil();
+    size_t la = a[0]->v.bytes.len, lb = a[1]->v.bytes.len;
+    size_t tot = la + lb;
+    uint8_t *tmp = (uint8_t *)malloc(tot ? tot : 1);
+    if (la) memcpy(tmp, a[0]->v.bytes.data, la);
+    if (lb) memcpy(tmp + la, a[1]->v.bytes.data, lb);
+    sw_val_t *r = sw_val_bytes(tmp, tot);
+    free(tmp);
+    return r;
+}
+
+/* string_to_bytes(s) → bytes. The chars of s as raw bytes (stops at the sw
+ * string's NUL — fine, the source is itself a NUL-terminated string). */
+static sw_val_t *_builtin_string_to_bytes(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    return sw_val_bytes((const uint8_t *)a[0]->v.str, strlen(a[0]->v.str));
+}
+
+/* bytes_to_string(b) → string. Renders bytes as a string; truncates at the
+ * first embedded NUL BY DESIGN (explicit, opt-in — call only when the data
+ * is known to be text). NUL-free input round-trips losslessly. */
+static sw_val_t *_builtin_bytes_to_string(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_BYTES) return sw_val_nil();
+    size_t len = a[0]->v.bytes.len;
+    char *tmp = (char *)malloc(len + 1);
+    if (len) memcpy(tmp, a[0]->v.bytes.data, len);
+    tmp[len] = 0;
+    sw_val_t *r = sw_val_string(tmp);   /* sw_val_string strdups → stops at NUL */
+    free(tmp);
+    return r;
+}
+
+/* === Bytes-native audio codec twins (no base64 round-trip) ===============
+ * Same _sw_* helpers as the string codecs, but bytes-in / bytes-out so a sw
+ * program can slice / index / hash a PCM frame directly. The string audio_*
+ * builtins stay the zero-copy fast lane for g711 passthrough. */
+
+/* audio_ulaw_to_pcm16_b(ulaw_bytes) → pcm16_bytes | nil. */
+static sw_val_t *_builtin_audio_ulaw_to_pcm16_b(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_BYTES) return sw_val_nil();
+    size_t pcmlen = 0;
+    uint8_t *pcm = _sw_ulaw_to_pcm16(a[0]->v.bytes.data, a[0]->v.bytes.len, &pcmlen);
+    if (!pcm) return sw_val_nil();
+    sw_val_t *r = sw_val_bytes(pcm, pcmlen);
+    free(pcm);
+    return r;
+}
+
+/* audio_pcm16_to_ulaw_b(pcm16_bytes) → ulaw_bytes | nil. */
+static sw_val_t *_builtin_audio_pcm16_to_ulaw_b(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_BYTES) return sw_val_nil();
+    size_t ulen = 0;
+    uint8_t *ulaw = _sw_pcm16_to_ulaw(a[0]->v.bytes.data, a[0]->v.bytes.len, &ulen);
+    if (!ulaw) return sw_val_nil();
+    sw_val_t *r = sw_val_bytes(ulaw, ulen);
+    free(ulaw);
+    return r;
+}
+
+/* audio_resample_b(pcm16_bytes, from_hz, to_hz) → pcm16_bytes | nil. */
+static sw_val_t *_builtin_audio_resample_b(sw_val_t **a, int n) {
+    if (n < 3 || !a[0] || a[0]->type != SW_VAL_BYTES ||
+        !a[1] || a[1]->type != SW_VAL_INT ||
+        !a[2] || a[2]->type != SW_VAL_INT) return sw_val_nil();
+    size_t outlen = 0;
+    uint8_t *out = _sw_pcm16_resample(a[0]->v.bytes.data, a[0]->v.bytes.len,
+                                      (int)a[1]->v.i, (int)a[2]->v.i, &outlen);
+    if (!out) return sw_val_nil();
+    sw_val_t *r = sw_val_bytes(out, outlen);
+    free(out);
+    return r;
+}
+
 /* ws_send_binary(conn, b64) → 'ok' | 'error' — decode base64 and send as
  * a WebSocket BINARY frame (server→client). For providers/protocols that
  * use opcode 0x2 rather than text. */
@@ -7006,7 +7198,7 @@ static sw_val_t *_builtin_base64_decode(sw_val_t **a, int n) {
     size_t out_cap = (slen / 4 + 1) * 3 + 1;
     char *out = (char *)malloc(out_cap);
     size_t out_len = 0;
-    int buf = 0, bits = 0;
+    unsigned int buf = 0; int bits = 0;   /* buf unsigned: base64 sextet accumulator must not signed-shift (UB) */
     for (size_t i = 0; i < slen; i++) {
         unsigned char c = (unsigned char)src[i];
         if (c == '=' || c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;

@@ -32,6 +32,9 @@ typedef enum {
     SW_VAL_MAP,
     SW_VAL_REMOTE_PID,   /* pid that lives on another node — carries node
                             name + pid id; `send` routes via TCP. */
+    SW_VAL_BYTES,        /* length-carrying, NUL-safe byte vector. MUST stay
+                            last in this enum: typeof()'s positional names[]
+                            array in swarmrt_lang.c relies on prefix indices. */
 } sw_val_type_t;
 
 typedef struct sw_val sw_val_t;
@@ -68,6 +71,14 @@ struct sw_val {
             char *node;          /* node name string, owned */
             uint64_t id;         /* remote pid id */
         } rpid;
+        struct {
+            uint8_t *data;       /* owned heap buffer (malloc). May contain
+                                    embedded NUL bytes; NOT NUL-terminated.
+                                    Always a distinct block owned solely by
+                                    this sw_val; len==0 still owns a 1-byte
+                                    block so free()/memcmp() stay unconditional. */
+            size_t   len;        /* exact byte count */
+        } bytes;
     } v;
 };
 
@@ -130,6 +141,9 @@ sw_val_t *sw_val_int(int64_t i);
 sw_val_t *sw_val_float(double f);
 sw_val_t *sw_val_string(const char *s);
 sw_val_t *sw_val_atom(const char *s);
+/* Length-carrying byte vector. Copies `len` bytes from `data` into a fresh
+ * owned block (data may be NULL iff len==0). NUL-safe — never uses strlen. */
+sw_val_t *sw_val_bytes(const uint8_t *data, size_t len);
 sw_val_t *sw_val_pid(sw_process_t *p);
 sw_val_t *sw_val_remote_pid(const char *node, uint64_t id);
 sw_val_t *sw_val_tuple(sw_val_t **items, int count);

@@ -179,6 +179,7 @@ Same patterns work in `receive` arms AND in `case` expressions:
 | `{'tag', x, y}` | a 3-tuple where `'tag'` matches literally; `x` and `y` bind |
 | `{'reply', n} when n > 0` | tuple AND guard; `n` must be positive |
 | `[h \| t]` | list with at least one element; `h` is head, `t` is tail |
+| `[a, b \| rest]` | list with at least two elements; `a`, `b` bind the first two, `rest` is the remainder (any number of leading heads is allowed) |
 | `_anything` | binds to `_anything` — use as catchall |
 
 Variables in patterns *bind*; atoms (single-quoted) match *literally*.

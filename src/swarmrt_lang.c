@@ -1056,6 +1056,44 @@ static node_t *par_primary(par_t *p) {
             cons->v.cons.tail = tail;
             return cons;
         }
+        if (p->cur.type == TOK_COMMA) {
+            /* Could be a plain list `[a, b, c]` OR a multi-element cons
+             * `[a, b | rest]`. Gather the comma-separated heads first; if a
+             * `|` appears before the closing `]`, build a right-nested cons
+             * chain `cons(a, cons(b, rest))` so the existing single-head
+             * N_LIST_CONS machinery (pattern_match / eval / codegen, all of
+             * which recurse on cons.tail) handles arbitrary arity for free.
+             * Otherwise fall through to the plain-list builder below. */
+            node_t **heads = malloc(sizeof(node_t*));
+            heads[0] = first;
+            int nheads = 1;
+            while (par_match(p, TOK_COMMA)) {
+                heads[nheads] = par_expr(p);
+                nheads++;
+                heads = realloc(heads, sizeof(node_t*) * (nheads + 1));
+            }
+            if (p->cur.type == TOK_BAR) {
+                /* Multi-element cons: [a, b, ... | rest] */
+                par_adv(p);
+                node_t *rest = par_expr(p);
+                par_expect(p, TOK_RBRACKET, "']'");
+                node_t *acc = rest;
+                for (int i = nheads - 1; i >= 0; i--) {
+                    node_t *c = mknode(N_LIST_CONS, t.line);
+                    c->v.cons.head = heads[i];
+                    c->v.cons.tail = acc;
+                    acc = c;
+                }
+                free(heads);
+                return acc;
+            }
+            /* Plain list: assemble from the gathered heads. */
+            par_expect(p, TOK_RBRACKET, "']'");
+            node_t *lst = mknode(N_LIST, t.line);
+            lst->v.coll.items = heads;
+            lst->v.coll.count = nheads;
+            return lst;
+        }
         if (p->cur.type == TOK_FOR) {
             /* List comprehension: [body for var in iter] or [body for var in iter when guard] */
             par_adv(p); /* consume 'for' */
@@ -1429,6 +1467,20 @@ sw_val_t *sw_val_atom(const char *s) {
     return v;
 }
 
+/* sw_val_bytes: length-carrying, NUL-safe byte vector. Always copies into a
+ * fresh owned block (like sw_val_string's strdup) so the returned value owns
+ * its bytes outright and sw_val_free can unconditionally free them. We never
+ * malloc(0): len==0 still allocates 1 byte so `data` is non-NULL and
+ * free()/memcmp() need no special-casing. */
+sw_val_t *sw_val_bytes(const uint8_t *data, size_t len) {
+    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    v->type = SW_VAL_BYTES;
+    v->v.bytes.len = len;
+    v->v.bytes.data = malloc(len ? len : 1);
+    if (len && data) memcpy(v->v.bytes.data, data, len);
+    return v;
+}
+
 sw_val_t *sw_val_pid(sw_process_t *p) {
     sw_val_t *v = calloc(1, sizeof(sw_val_t));
     v->type = SW_VAL_PID; v->v.pid = p;
@@ -1563,6 +1615,7 @@ void sw_val_free(sw_val_t *v) {
     case SW_VAL_FUN: /* don't free closure env -- owned by interpreter */ break;
     case SW_VAL_MAP:
         free(v->v.map.keys); free(v->v.map.vals); break;
+    case SW_VAL_BYTES: free(v->v.bytes.data); break;  /* always own a block (len>=1 alloc) */
     default: break;
     }
     free(v);
@@ -1592,6 +1645,11 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
     case SW_VAL_INT: return a->v.i == b->v.i;
     case SW_VAL_FLOAT: return a->v.f == b->v.f;
     case SW_VAL_STRING: case SW_VAL_ATOM: return strcmp(a->v.str, b->v.str) == 0;
+    case SW_VAL_BYTES:  /* NUL-safe: length-first then memcmp, never strcmp.
+                           Bytes are only ever equal to bytes (Erlang keeps
+                           binaries and char-lists distinct). */
+        return a->v.bytes.len == b->v.bytes.len &&
+               memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
     case SW_VAL_PID: return a->v.pid == b->v.pid;
     case SW_VAL_REMOTE_PID:
         return a->v.rpid.id == b->v.rpid.id &&
@@ -1651,6 +1709,17 @@ void sw_val_format(FILE *f, sw_val_t *v) {
             sw_val_format(f, v->v.map.vals[i]);
         }
         fprintf(f, "}"); break;
+    case SW_VAL_BYTES: {
+        /* Erlang-style <<d,d,...>> decimal, bounded so a megabyte of PCM
+         * can't flood a log. Never dumps raw bytes to the terminal. */
+        fprintf(f, "<<");
+        size_t cap = v->v.bytes.len < 64 ? v->v.bytes.len : 64;
+        for (size_t i = 0; i < cap; i++)
+            fprintf(f, i ? ",%u" : "%u", (unsigned)v->v.bytes.data[i]);
+        if (v->v.bytes.len > cap)
+            fprintf(f, ",...(%zu bytes)", v->v.bytes.len);
+        fprintf(f, ">>"); break;
+    }
     default: fprintf(f, "?"); break;
     }
 }
@@ -2046,6 +2115,13 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
             interp_json_encode_val(v->v.map.vals[i], buf, cap, pos);
         }
         interp_json_append(buf, cap, pos, "}");
+    } else if (v->type == SW_VAL_BYTES) {
+        /* JSON has no binary type — emit as a base64 string (matches the
+         * codecs' base64-on-the-wire convention; NUL-safe via real len). */
+        char *b64 = _sw_audio_b64_encode(v->v.bytes.data, v->v.bytes.len);
+        interp_json_append(buf, cap, pos, "\"");
+        if (b64) { interp_json_append(buf, cap, pos, b64); free(b64); }
+        interp_json_append(buf, cap, pos, "\"");
     } else {
         interp_json_append(buf, cap, pos, "null");
     }
@@ -2058,6 +2134,8 @@ static sw_val_t *builtin_length(sw_val_t **args, int nargs) {
         return sw_val_int(v->v.tuple.count);
     if (v->type == SW_VAL_STRING)
         return sw_val_int((int64_t)strlen(v->v.str));
+    if (v->type == SW_VAL_BYTES)
+        return sw_val_int((int64_t)v->v.bytes.len);
     return sw_val_int(0);
 }
 
@@ -2280,6 +2358,10 @@ static uint32_t _interp_vets_hash(sw_val_t *v) {
                 for (const char *s = v->v.str; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
             break;
         }
+        case SW_VAL_BYTES: {
+            for (size_t i = 0; i < v->v.bytes.len; i++) { h ^= v->v.bytes.data[i]; h *= 1099511628211ULL; }
+            break;
+        }
         default: {
             uint64_t k = (uint64_t)(uintptr_t)v;
             h ^= k; h *= 1099511628211ULL;
@@ -2296,6 +2378,9 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
         case SW_VAL_INT:    return a->v.i == b->v.i;
         case SW_VAL_STRING: case SW_VAL_ATOM:
             return a->v.str && b->v.str && strcmp(a->v.str, b->v.str) == 0;
+        case SW_VAL_BYTES:  /* NUL-safe: length-first then memcmp */
+            return a->v.bytes.len == b->v.bytes.len &&
+                   memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
         case SW_VAL_PID:    return a->v.pid == b->v.pid;
         default:            return a == b;
     }
@@ -3022,6 +3107,84 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_string(b64); free(b64); return r;
     }
 
+    /* === SW_VAL_BYTES builtins (NUL-safe; parity with codegen path) === */
+    if (strcmp(fname, "bytes_from_base64") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        size_t dlen = 0; uint8_t *raw = _sw_audio_b64_decode(args[0]->v.str, &dlen);
+        if (!raw) return sw_val_nil();
+        sw_val_t *r = sw_val_bytes(raw, dlen); free(raw); return r;
+    }
+    if (strcmp(fname, "bytes_to_base64") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
+        char *b64 = _sw_audio_b64_encode(args[0]->v.bytes.data, args[0]->v.bytes.len);
+        if (!b64) return sw_val_string("");
+        sw_val_t *r = sw_val_string(b64); free(b64); return r;
+    }
+    if (strcmp(fname, "byte_size") == 0 && nargs >= 1) {
+        if (args[0]->type != SW_VAL_BYTES) return sw_val_int(0);
+        return sw_val_int((int64_t)args[0]->v.bytes.len);
+    }
+    if (strcmp(fname, "byte_at") == 0 && nargs >= 2) {
+        if (args[0]->type != SW_VAL_BYTES || args[1]->type != SW_VAL_INT) {
+            interp_raise_panic(interp, line, "byte_at: expected (bytes, int)");
+            return sw_val_nil();
+        }
+        int64_t i = args[1]->v.i;
+        if (i < 0 || (size_t)i >= args[0]->v.bytes.len) {
+            interp_raise_panic(interp, line, "byte_at: index out of range (got %lld, size %zu)",
+                               (long long)i, args[0]->v.bytes.len);
+            return sw_val_nil();
+        }
+        return sw_val_int((int64_t)args[0]->v.bytes.data[i]);
+    }
+    if (strcmp(fname, "byte_slice") == 0 && nargs >= 3 &&
+        args[0]->type == SW_VAL_BYTES && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
+        size_t total = args[0]->v.bytes.len;
+        int64_t start = args[1]->v.i, want = args[2]->v.i;
+        if (start < 0 || want < 0 || (size_t)start >= total) return sw_val_bytes(NULL, 0);
+        size_t avail = total - (size_t)start;
+        size_t take = ((size_t)want < avail) ? (size_t)want : avail;
+        return sw_val_bytes(args[0]->v.bytes.data + start, take);
+    }
+    if (strcmp(fname, "bytes_concat") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_BYTES && args[1]->type == SW_VAL_BYTES) {
+        size_t la = args[0]->v.bytes.len, lb = args[1]->v.bytes.len, tot = la + lb;
+        uint8_t *tmp = (uint8_t *)malloc(tot ? tot : 1);
+        if (la) memcpy(tmp, args[0]->v.bytes.data, la);
+        if (lb) memcpy(tmp + la, args[1]->v.bytes.data, lb);
+        sw_val_t *r = sw_val_bytes(tmp, tot); free(tmp); return r;
+    }
+    if (strcmp(fname, "string_to_bytes") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        return sw_val_bytes((const uint8_t *)args[0]->v.str, strlen(args[0]->v.str));
+    }
+    if (strcmp(fname, "bytes_to_string") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
+        size_t len = args[0]->v.bytes.len;
+        char *tmp = (char *)malloc(len + 1);
+        if (len) memcpy(tmp, args[0]->v.bytes.data, len);
+        tmp[len] = 0;
+        sw_val_t *r = sw_val_string(tmp); free(tmp); return r;
+    }
+
+    /* === Bytes-native audio codec twins (NUL-safe; parity) ====== */
+    if (strcmp(fname, "audio_ulaw_to_pcm16_b") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
+        size_t pcmlen = 0;
+        uint8_t *pcm = _sw_ulaw_to_pcm16(args[0]->v.bytes.data, args[0]->v.bytes.len, &pcmlen);
+        if (!pcm) return sw_val_nil();
+        sw_val_t *r = sw_val_bytes(pcm, pcmlen); free(pcm); return r;
+    }
+    if (strcmp(fname, "audio_pcm16_to_ulaw_b") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
+        size_t ulen = 0;
+        uint8_t *ulaw = _sw_pcm16_to_ulaw(args[0]->v.bytes.data, args[0]->v.bytes.len, &ulen);
+        if (!ulaw) return sw_val_nil();
+        sw_val_t *r = sw_val_bytes(ulaw, ulen); free(ulaw); return r;
+    }
+    if (strcmp(fname, "audio_resample_b") == 0 && nargs >= 3 &&
+        args[0]->type == SW_VAL_BYTES && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
+        size_t outlen = 0;
+        uint8_t *out = _sw_pcm16_resample(args[0]->v.bytes.data, args[0]->v.bytes.len,
+                                          (int)args[1]->v.i, (int)args[2]->v.i, &outlen);
+        if (!out) return sw_val_nil();
+        sw_val_t *r = sw_val_bytes(out, outlen); free(out); return r;
+    }
+
     /* === Process-scheduler primitives — warn + degrade ========= */
     static const char *scheduler_names[] = {
         "send", "register", "whereis", "link", "unlink", "monitor",
@@ -3509,8 +3672,23 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             return sw_val_list(args[0]->v.map.vals, args[0]->v.map.count);
         }
         if (strcmp(fname, "typeof") == 0 && nargs >= 1) {
-            const char *names[] = {"nil","int","float","string","atom","pid","tuple","list","fun","map"};
-            return sw_val_string(names[args[0]->type < 10 ? args[0]->type : 0]);
+            /* Switch (not a positional array) so it can't drift if the enum
+             * is reordered, and matches the compiled _builtin_typeof exactly. */
+            switch (args[0]->type) {
+            case SW_VAL_NIL:        return sw_val_string("nil");
+            case SW_VAL_INT:        return sw_val_string("int");
+            case SW_VAL_FLOAT:      return sw_val_string("float");
+            case SW_VAL_STRING:     return sw_val_string("string");
+            case SW_VAL_ATOM:       return sw_val_string("atom");
+            case SW_VAL_PID:        return sw_val_string("pid");
+            case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
+            case SW_VAL_TUPLE:      return sw_val_string("tuple");
+            case SW_VAL_LIST:       return sw_val_string("list");
+            case SW_VAL_FUN:        return sw_val_string("fun");
+            case SW_VAL_MAP:        return sw_val_string("map");
+            case SW_VAL_BYTES:      return sw_val_string("bytes");
+            default:                return sw_val_string("unknown");
+            }
         }
         if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST) {
             int cnt = args[0]->v.tuple.count;

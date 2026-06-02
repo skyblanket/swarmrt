@@ -147,9 +147,15 @@ static void *watchdog_thread_fn(void *arg) {
 
         if (live_count > 0 && stuck_count == live_count) {
             fprintf(stderr,
-                "[swarmrt] WARNING: all %d process%s blocked in receive"
-                " — possible deadlock\n",
-                live_count, live_count == 1 ? "" : "es");
+                "[swarmrt] WARNING: all %d process%s blocked in `receive`"
+                " with an empty mailbox for >%lums — possible deadlock.\n"
+                "[swarmrt]   Every live process is waiting for a message"
+                " that no one is sending. Check that a sender exists and"
+                " is reachable (right pid?).\n"
+                "[swarmrt]   If a process may legitimately wait for a"
+                " message that never arrives, give its `receive` a timeout"
+                " clause: `receive { ... after MS { /* on timeout */ } }`.\n",
+                live_count, live_count == 1 ? "" : "es", interval_ms);
             fflush(stderr);
         }
     }

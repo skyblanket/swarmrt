@@ -112,6 +112,45 @@ fun test_shell_echo() {
     assert(string_contains(out, "hello"))
 }
 
+# SW_VAL_BYTES — interpreter-side parity for the bytes builtins. Guards
+# against REPL/codegen drift on the new value type. The "AP8Afw==" vector
+# decodes to [00 FF 00 7F]; as a STRING it would truncate at 0x00 — these
+# assertions prove the bytes type keeps the full length.
+fun test_bytes_builtins() {
+    b = bytes_from_base64("AP8Afw==")
+    assert_eq(typeof(b), "bytes")
+    assert_eq(byte_size(b), 4)               # NOT 0 (string would truncate)
+    assert_eq(byte_at(b, 0), 0)              # the NUL survives
+    assert_eq(byte_at(b, 1), 255)
+    assert_eq(byte_at(b, 2), 0)
+    assert_eq(byte_at(b, 3), 127)
+    assert_eq(bytes_to_base64(b), "AP8Afw==")
+    assert_eq(length(b), 4)                  # length() also bytes-aware
+    # slice + concat
+    mid = byte_slice(b, 1, 2)
+    assert_eq(bytes_to_base64(mid), "/wA=")
+    rejoined = bytes_concat(byte_slice(b, 0, 2), byte_slice(b, 2, 2))
+    assert_eq(bytes_to_base64(rejoined), "AP8Afw==")
+    # whole-value equality
+    assert_eq(b == bytes_from_base64("AP8Afw=="), 'true')
+    assert_eq(b == bytes_from_base64("AAD/fwCAQgE="), 'false')
+    # string bridges (bytes_to_string truncates at NUL by design)
+    assert_eq(byte_size(string_to_bytes("hi")), 2)
+    assert_eq(bytes_to_string(string_to_bytes("hello")), "hello")
+}
+
+fun test_bytes_pcm16_codec_twins() {
+    pcm = bytes_from_base64("AAD/fwCAQgE=")  # 8 bytes, sample 2 low byte is NUL
+    assert_eq(byte_size(pcm), 8)
+    assert_eq(byte_at(pcm, 4), 0)            # 0x8000 low byte survived
+    ulaw = audio_pcm16_to_ulaw_b(pcm)
+    assert_eq(byte_size(ulaw), 4)
+    back = audio_ulaw_to_pcm16_b(ulaw)
+    assert_eq(byte_size(back), 8)
+    up = audio_resample_b(pcm, 8000, 16000)
+    assert_eq(byte_size(up), 16)
+}
+
 fun test_db_roundtrip() {
     db = db_open(":memory:")
     assert(db >= 0)

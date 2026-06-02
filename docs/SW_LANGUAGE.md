@@ -181,7 +181,7 @@ f-strings desugar to `to_string(expr)` + `++` chains under the hood, so they wor
 | `++` | string OR list concat | `"a" ++ "b"`, `[1] ++ [2,3]` |
 | `==` `!=` `<` `<=` `>` `>=` | comparison → `'true' / 'false'` | `n == nil` |
 | `&&` `\|\|` | boolean (truthy semantics) | `(x != nil) && (y > 0)` |
-| `\|` | list cons | `[h \| t]` (in patterns) |
+| `\|` | list cons | `[h \| t]`, `[a, b \| rest]` (patterns + construction) |
 | `\|>` | pipe — `x \|> f(y)` becomes `f(x, y)` | `lines \|> filter(non_blank)` |
 
 Truthiness: `nil`, `'false'`, and `0` are falsy. Everything else is truthy.
@@ -401,6 +401,28 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 |---|---|
 | `base64_encode(s)` | string → base64 string |
 | `base64_decode(s)` | base64 string → string (or `nil` on bad input) |
+
+### Bytes
+A length-carrying, NUL-safe byte vector (`typeof` → `"bytes"`). Unlike a
+string, it survives embedded `0x00` bytes, so it is the right type for raw
+binary (PCM audio, protocol frames). Values come from builtins, never a
+source literal. Equality is by content (`memcmp`); bytes are equal only to
+bytes. `length(b)` and `print`/`to_string` (renders `<<d,d,...>>`) work on
+bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
+
+| | |
+|---|---|
+| `bytes_from_base64(s)` | base64 string → bytes (NUL-safe; `nil` on bad input) |
+| `bytes_to_base64(b)` | bytes → base64 string |
+| `byte_size(b)` | length in bytes (`0` for non-bytes) |
+| `byte_at(b, i)` | byte `0..255` at index `i` (panics out of range) |
+| `byte_slice(b, start, len)` | subrange; `len` clamps to end |
+| `bytes_concat(a, b)` | new bytes `a ++ b` |
+| `string_to_bytes(s)` | string chars → bytes |
+| `bytes_to_string(b)` | bytes → string (truncates at first NUL by design) |
+| `audio_ulaw_to_pcm16_b(b)` | mu-law bytes → PCM16 bytes (codec twin) |
+| `audio_pcm16_to_ulaw_b(b)` | PCM16 bytes → mu-law bytes (codec twin) |
+| `audio_resample_b(b, from, to)` | PCM16 bytes resample (codec twin) |
 
 ### Lists & maps
 | | |

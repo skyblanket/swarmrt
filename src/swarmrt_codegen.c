@@ -295,6 +295,18 @@ static int is_builtin(const char *name) {
            strcmp(name, "string_index_of") == 0 ||
            strcmp(name, "base64_encode") == 0 ||
            strcmp(name, "base64_decode") == 0 ||
+           /* Bytes value type (length-carrying, NUL-safe) */
+           strcmp(name, "bytes_from_base64") == 0 ||
+           strcmp(name, "bytes_to_base64") == 0 ||
+           strcmp(name, "byte_size") == 0 ||
+           strcmp(name, "byte_at") == 0 ||
+           strcmp(name, "byte_slice") == 0 ||
+           strcmp(name, "bytes_concat") == 0 ||
+           strcmp(name, "string_to_bytes") == 0 ||
+           strcmp(name, "bytes_to_string") == 0 ||
+           strcmp(name, "audio_ulaw_to_pcm16_b") == 0 ||
+           strcmp(name, "audio_pcm16_to_ulaw_b") == 0 ||
+           strcmp(name, "audio_resample_b") == 0 ||
            /* Phase 15: Feature Expansion */
            strcmp(name, "query_parse") == 0 ||
            strcmp(name, "http_serve_file") == 0 ||
@@ -971,6 +983,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    if (a[0]->type == SW_VAL_LIST || a[0]->type == SW_VAL_TUPLE)\n"
         "        return sw_val_int(a[0]->v.tuple.count);\n"
         "    if (a[0]->type == SW_VAL_STRING) return sw_val_int((int64_t)strlen(a[0]->v.str));\n"
+        "    if (a[0]->type == SW_VAL_BYTES) return sw_val_int((int64_t)a[0]->v.bytes.len);\n"
         "    if (a[0]->type == SW_VAL_MAP) return sw_val_int(a[0]->v.map.count);\n"
         "    return sw_val_int(0);\n"
         "}\n\n");
@@ -1616,6 +1629,9 @@ static const char *_common_builtins[] = {
     "string_index_of", "string_trim", "string_upper", "string_lower",
     "string_truncate", "strip_html", "clean_json", "is_list", "is_map",
     "base64_encode", "base64_decode",
+    "bytes_from_base64", "bytes_to_base64", "byte_size", "byte_at",
+    "byte_slice", "bytes_concat", "string_to_bytes", "bytes_to_string",
+    "audio_ulaw_to_pcm16_b", "audio_pcm16_to_ulaw_b", "audio_resample_b",
     "json_encode", "json_decode", "json_get", "json_escape",
     "spawn", "self", "send", "register", "whereis",
     "ets_new", "ets_put", "ets_get", "ets_delete", "ets_update_counter", "ets_cas",
@@ -1916,6 +1932,18 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "string_index_of") == 0 ||
              strcmp(fname, "base64_encode") == 0 ||
              strcmp(fname, "base64_decode") == 0 ||
+             /* Bytes value type (length-carrying, NUL-safe) */
+             strcmp(fname, "bytes_from_base64") == 0 ||
+             strcmp(fname, "bytes_to_base64") == 0 ||
+             strcmp(fname, "byte_size") == 0 ||
+             strcmp(fname, "byte_at") == 0 ||
+             strcmp(fname, "byte_slice") == 0 ||
+             strcmp(fname, "bytes_concat") == 0 ||
+             strcmp(fname, "string_to_bytes") == 0 ||
+             strcmp(fname, "bytes_to_string") == 0 ||
+             strcmp(fname, "audio_ulaw_to_pcm16_b") == 0 ||
+             strcmp(fname, "audio_pcm16_to_ulaw_b") == 0 ||
+             strcmp(fname, "audio_resample_b") == 0 ||
              /* Phase 15: Feature Expansion */
              strcmp(fname, "query_parse") == 0 ||
              strcmp(fname, "http_serve_file") == 0 ||

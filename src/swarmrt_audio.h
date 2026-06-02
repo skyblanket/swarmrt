@@ -85,7 +85,7 @@ static uint8_t *_sw_audio_b64_decode(const char *src, size_t *out_len) {
     uint8_t *out = (uint8_t *)malloc(cap);
     if (!out) return NULL;
     size_t olen = 0;
-    int buf = 0, bits = 0;
+    unsigned int buf = 0; int bits = 0;   /* buf unsigned: base64 sextet accumulator must not signed-shift (UB) */
     for (size_t i = 0; i < slen; i++) {
         unsigned char c = (unsigned char)src[i];
         if (c == '=' || c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;

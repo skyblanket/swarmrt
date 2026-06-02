@@ -429,7 +429,6 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
-- **Multi-head cons patterns are unimplemented.** A single head/tail split `[h | t]` works; matching more than one element before the tail (`[a, b | rest]`) is a parse error today.
 - **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
 - **No static type or shape checking** — `sw` is dynamically typed by design. Typos in variable names compile to atoms rather than erroring (e.g. `undefined_var` becomes `:undefined_var`); there is no compile-time catch.
 
