@@ -18,11 +18,13 @@ prose explanations — the harness only consumes code.
    literal `hi {x}`. Use `print(f"hi {x}")` to interpolate, or
    `print(format("hi {}", x))` for positional.
 
-2. **List patterns are fixed-length only.** Supported: `[]`, `[a, b]`,
-   `[a, b, c]`, `_`. **NOT supported:** Erlang-style `[h | t]` or
-   `[h, ...rest]` head/tail destructure. To iterate a list, use
-   `hd(l)` + `tl(l)` recursively, or `map` / `filter` / `reduce`
-   global builtins.
+2. **List patterns: head-tail works, multi-element prefix does not.**
+   Supported: `[]`, fixed-length (`[a]`, `[a, b]`, `[a, b, c]`),
+   `[h | t]` (Erlang head/tail — `h` is the first element, `t` is the
+   rest), and `_`. **NOT supported:** `[a, b | rest]` (multi-element
+   prefix before the `|`) or `[h, ...rest]`. To walk a list you can
+   pattern-match `[h | t]`, or use `hd(l)` + `tl(l)` recursively, or
+   `map` / `filter` / `reduce` global builtins.
 
 3. **No BIF guards.** sw has no `is_integer / is_atom / is_list / is_binary`.
    Use `typeof(x)` which returns one of `"int"`, `"float"`, `"string"`,
@@ -55,10 +57,10 @@ prose explanations — the harness only consumes code.
 A program is one or more modules with one `main()` entry point:
 
 ```sw
-module Hello
+module App
 
 fun main() {
-    print("hello, world")
+    print("ready")
 }
 ```
 
@@ -105,19 +107,26 @@ to collect results.
 ## Guards in case
 
 Guards use `when` after the pattern. The `_` wildcard plus a guard is the
-standard way to match by type (since sw has no `is_integer` etc.):
+standard way to match by type (since sw has no `is_integer` etc.). The
+SHAPE to internalise: literal/empty patterns first, then `_ when
+typeof(x) == "..."` for type dispatch, then tuple binds like `{'tag', v}`,
+then a `_` catchall last. This generic example describes a value — adapt
+the arms and return values to your task:
 
 ```sw
-fun classify(val) {
+fun describe(val) {
     case val {
-        _ when typeof(val) == "int"  -> "int"
-        []                           -> "empty_list"
-        _ when typeof(val) == "list" -> f"list:{length(val)}"
-        {'ok', v}                    -> f"ok:{v}"
-        _                            -> "other"
+        0                              -> "zero"
+        _ when typeof(val) == "float" -> "a float"
+        []                             -> "nothing"
+        {'pair', a, b}                 -> f"pair of {a} and {b}"
+        _                              -> "something else"
     }
 }
 ```
+
+Order matters: arms are tried top-to-bottom, so put specific patterns
+above the `_ when ...` type guards, and the bare `_` catchall last.
 
 Simpler guard example:
 
@@ -135,7 +144,9 @@ fun sign(n) {
 
 - `spawn(fun() { body })` returns a pid; bodies run in a new process
 - `send(pid, msg)` sends; `receive { pat -> body }` blocks
-- `receive { msg -> handle(msg) after 1000 -> 'timeout' }` for timeouts
+- timeouts use an `after MS { body }` clause INSIDE the receive braces,
+  NOT an arrow: `receive { msg -> handle(msg) after 1000 { 'timeout' } }`.
+  The `after` block runs if no message arrives within MS milliseconds.
 - `self()` returns the current pid
 - `link(pid)` / `monitor(pid)` for fault tolerance — `trap_exit('true')`
   converts crashes of linked processes into `{'EXIT', from, reason}`
@@ -144,12 +155,13 @@ fun sign(n) {
 ## Common builtins
 
 - Higher-order: `map(list, fn)`, `filter(list, fn)`, `reduce(fn, list, init)`
+  — note `reduce` takes the function FIRST: `reduce(fun(acc, x) { ... }, list, init)`
 - I/O: `print(x)`, `print_inline(x)`, `read_line()`, `read_choice(opts)`
 - Strings: `string_length`, `string_split(s, sep)`, `string_replace(s, old, new)`,
   `string_sub(s, start, len)`, `string_contains`, `string_starts_with`,
   `string_upper`, `string_lower`, `string_trim`
 - JSON: `json_encode(value)`, `json_decode(string)`, `json_get(str, key)`
-- HTTP: `http_get(url)`, `http_post(url, body, headers)`
+- HTTP: `http_get(url)`, `http_post(url, headers, body)` (headers before body)
 - Files: `file_read`, `file_write`, `file_exists`, `file_list`, `file_mkdir`
 - SQLite: `db_open(path)` → slot; `db_exec(slot, sql)`;
   `db_query(slot, sql, [bindings])` returns list of maps with string keys
@@ -178,80 +190,101 @@ fun sign(n) {
   not `after` — that's reserved)
 - **Prompt** — `Prompt.render(template, vars)` with `{{var}}` slots
 
-# Worked example: sum of a list (f-string + Std.sum)
+# Worked example: f-string interpolation + a Std aggregate
 
 ```sw
-module Main
+module App
 
 import Std
 
 fun main() {
-    xs = [1, 2, 3]
-    total = Std.sum(xs)
-    print(f"sum={total}")
+    prices = [10, 25, 8]
+    print(f"total cost: {Std.sum(prices)}")
 }
 ```
 
-Output: `sum=6`. Note the `f` prefix — without it the output is the
-literal `sum={total}`.
+Output: `total cost: 43`. Note the `f` prefix — without it the output is
+the literal `total cost: {Std.sum(prices)}`. A Std call can go straight
+inside the `{...}`.
 
-# Worked example: stateful actor (spawn + recursive receive + reply)
+# Idiom: stateful actor (spawn + recursive receive + reply)
 
-Pattern for prompt 05 (counter actor). The actor recurses with updated
-state; `{'get', caller}` sends a reply then re-enters the loop.
+The SHAPE of a stateful actor: a top-level `fun` takes the state as an
+argument, `receive`s a message, and tail-calls itself with the updated
+state. A request tagged with the caller's pid (`{tag, caller}`) replies
+with `send(caller, ...)` then loops. This generic example holds a string
+and supports `'set'` / read-back — adapt the messages and state type to
+your task.
 
 ```sw
 module Main
 
-fun counter(n) {
+fun store(value) {
     receive {
-        'incr'          -> counter(n + 1)
-        {'get', caller} -> {
-            send(caller, n)
-            counter(n)
+        {'set', new_value} -> store(new_value)
+        {'read', caller}   -> {
+            send(caller, value)
+            store(value)
         }
     }
 }
 
 fun main() {
-    pid = spawn(fun() { counter(0) })
-    send(pid, 'incr')
-    send(pid, 'incr')
-    send(pid, 'incr')
-    send(pid, {'get', self()})
+    pid = spawn(fun() { store("init") })
+    send(pid, {'set', "hello"})
+    send(pid, {'read', self()})
     receive {
-        count -> print(f"count={count}")
+        v -> print(f"value={v}")
     }
 }
 ```
 
-Key points:
-- `counter(n)` is a top-level fun, NOT a lambda variable. Lambdas cannot
-  self-recurse.
+Key points (these are the load-bearing rules, not the answer):
+- The loop fun (`store`) is a top-level `fun`, NOT a lambda variable.
+  Lambdas cannot self-recurse.
 - `self()` in `main()` returns main's pid so the actor knows where to reply.
-- The actor uses `receive` to wait for the next message each iteration.
+- The actor calls `receive` to wait for the next message each iteration,
+  and tail-calls itself to keep the state alive.
 
-# Worked example: fault tolerance (trap_exit + link + receive EXIT)
+# Idiom: fault tolerance (trap_exit + link + receive EXIT)
+
+The SHAPE: turn on exit-trapping BEFORE linking, link the child, then
+`receive` the synthetic EXIT message instead of dying alongside it. The
+exit signal arrives as the tuple `{'EXIT', from_pid, reason}` in your
+mailbox. This generic example links a worker that crashes and inspects
+the reason — adapt the worker body and what you do on death.
 
 ```sw
 module Main
 
-fun bad() { panic("boom") }
+fun worker() { error("worker failed") }
 
 fun main() {
     trap_exit('true')                    # MUST set before linking
-    pid = spawn(fun() { bad() })
+    pid = spawn(fun() { worker() })
     link(pid)
     receive {
-        {'EXIT', from, reason} -> print("parent_survived")
+        {'EXIT', from, reason} -> print(f"caught exit: {reason}")
     }
 }
 ```
 
-The exit tuple shape is `{'EXIT', from_pid, reason}`. `trap_exit('true')`
-must be set *before* you spawn/link, or the parent dies with the child.
+Notes (the rules, not the answer):
+- The exit tuple is always `{'EXIT', from_pid, reason}` (3 elements).
+- `trap_exit('true')` must be set *before* you spawn/link, or the parent
+  dies with the child instead of trapping the signal.
+- Without trapping, a linked child's abnormal exit cascades and kills the
+  parent. `monitor(pid)` is the one-way alternative; its message is the
+  5-tuple `{'DOWN', ref, 'process', pid, reason}`.
 
-# Worked example: pipe with global builtins (filter + map + Std.sum)
+# Idiom: pipe with global builtins (filter + map + a Std reducer)
+
+The SHAPE: `|>` feeds the left value in as the FIRST argument of the
+call on its right. `filter` and `map` are GLOBAL builtins (not Std), so
+they pipe cleanly; Std reducers like `Std.sum` / `Std.product` /
+`Std.count` also take the list first. This generic chain keeps words
+longer than 3 letters and uppercases them — adapt the predicate,
+transform, and final reducer to your task.
 
 ```sw
 module Main
@@ -259,19 +292,25 @@ module Main
 import Std
 
 fun main() {
-    result = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        |> filter(fun(x) { x % 2 == 0 })
-        |> map(fun(x) { x * x })
-        |> Std.sum()
+    result = ["hi", "world", "ok", "swarm"]
+        |> filter(fun(s) { string_length(s) > 3 })
+        |> map(fun(s) { string_upper(s) })
+        |> Std.string_join(",")
     print(result)
 }
 ```
 
-`filter` and `map` pipe cleanly as global builtins. `Std.sum` is fine
-via pipe. Never write `Std.filter(...)` or `Std.map(...)` — those don't
-exist.
+`filter` and `map` pipe cleanly as global builtins; the trailing Std
+call (here `Std.string_join`) is fine via pipe too. Never write
+`Std.filter(...)` or `Std.map(...)` — those don't exist.
 
-# Worked example: group_by + sort
+# Idiom: group_by + sort
+
+The SHAPE: `Std.group_by(list, key_fn)` returns a map from key → list of
+items; `Std.sort` orders a list; `map_keys` / `map_get` walk the result.
+This generic example buckets words by their first letter and prints each
+bucket in sorted key order — adapt the key function and what you compute
+per bucket (a count, a sum, a join, …) to your task.
 
 ```sw
 module Main
@@ -279,33 +318,34 @@ module Main
 import Std
 
 fun main() {
-    events = json_decode("[{\"t\":\"a\"},{\"t\":\"b\"},{\"t\":\"a\"}]")
-    grouped = Std.group_by(events, fun(e) { map_get(e, "t") })
+    words = ["apple", "avocado", "banana", "cherry", "blueberry"]
+    grouped = Std.group_by(words, fun(w) { string_sub(w, 0, 1) })
     keys = Std.sort(map_keys(grouped))
     Std.each(keys, fun(k) {
-        print(f"{k}: {length(map_get(grouped, k))}")
+        bucket = map_get(grouped, k)
+        print(f"{k} -> {Std.string_join(bucket, \"/\")}")
     })
 }
 ```
 
-# Iteration without `[h | t]`
+# Recursive list iteration
 
-Recursive walk (when `map`/`filter`/`reduce`/`Std.each` don't fit):
+When `map`/`filter`/`reduce`/`Std.each` don't fit, recurse. Two styles —
+`hd`/`tl` with a length check, or a `[h | t]` head/tail pattern in `case`
+(remember: `[h | t]` works, but `[a, b | rest]` does not):
 
 ```sw
-fun sum_list(lst, acc) {
+fun walk(lst, acc) {
     if (length(lst) == 0) { acc }
-    else { sum_list(tl(lst), acc + hd(lst)) }
+    else { walk(tl(lst), acc + hd(lst)) }
 }
 ```
 
-Or with case (the only allowed list patterns are `[]`, fixed-length, `_`):
-
 ```sw
-fun count(lst) {
+fun walk2(lst) {
     case lst {
-        [] -> 0
-        _  -> 1 + count(tl(lst))
+        []       -> 0
+        [h | t]  -> h + walk2(t)
     }
 }
 ```

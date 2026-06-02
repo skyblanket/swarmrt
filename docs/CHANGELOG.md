@@ -4,6 +4,12 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-02 — docs: correct DOWN tuple to shipping 5-tuple
+
+**docs(SW_LANGUAGE): `monitor` DOWN message is a 5-tuple.** SW_LANGUAGE.md documented the monitor down message as a 4-tuple `{'DOWN', ref, pid, reason}`, but the codegen has always emitted the Erlang-shaped 5-tuple `{'DOWN', ref, 'process', pid, reason}` (`emit_receive` in `swarmrt_codegen.c`). Corrected the doc to match the shipping shape rather than changing codegen (lower risk). Down-message handlers must match five elements with `'process'` in the third slot. Unblocks model-written `monitor`/DOWN code that was matching the wrong arity.
+
+---
+
 ## 2026-05-31 — deadlock watchdog + exec_argv + assert_raises + module globals + docs fix
 
 Five features landed together after the post-release hardening pass.

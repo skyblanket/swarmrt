@@ -7,11 +7,11 @@ fun echo_server() {
 
 fun echo_loop() {
   receive {
-    {echo, from, msg} ->
+    {'echo', from, msg} ->
       print("echo server got:", msg)
-      send(from, {reply, msg})
+      send(from, {'reply', msg})
       echo_loop()
-    {stop} ->
+    {'stop'} ->
       print("echo server stopping")
   }
 }

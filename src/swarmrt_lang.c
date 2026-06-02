@@ -119,7 +119,10 @@ typedef enum {
 
 typedef struct {
     tok_type_t type;
-    char text[2048];
+    /* 8192 so multi-KB string literals (e.g. system prompts) survive the
+     * lexer. Must stay >= node_t.sval[] in swarmrt_lang.h, which holds the
+     * parsed literal. By-value buffer (no heap) keeps the fuzzer happy. */
+    char text[8192];
     int line;
     int col;
     double num_val;
@@ -204,6 +207,7 @@ static tok_t lnext(lex_t *l) {
 
     /* Strings */
     if (c == '"') {
+        int start_line = l->line;
         ladv(l); int i = 0;
         while (lpeek(l) && lpeek(l) != '"' && i < (int)sizeof(t.text) - 2) {
             if (lpeek(l) == '\\') {
@@ -227,8 +231,22 @@ static tok_t lnext(lex_t *l) {
             else t.text[i++] = ladv(l);
         }
         t.text[i] = 0;
+        /* If we stopped because the buffer filled (string still open, more
+         * non-quote bytes ahead), emit a CLEAN diagnostic citing the true
+         * start line instead of letting the parser fabricate "expected }"
+         * from the truncated tail. Halt the lexer with TOK_EOF so parsing
+         * stops right after this message rather than cascading. */
+        if (i >= (int)sizeof(t.text) - 2 && lpeek(l) && lpeek(l) != '"') {
+            fprintf(stderr,
+                "Parse error: line %d: string literal exceeds %d bytes \xe2\x80\x94 "
+                "split it with ++ or load it with file_read\n",
+                start_line, (int)sizeof(t.text) - 2);
+            t.type = TOK_EOF; t.text[0] = 0;
+            return t;
+        }
         if (lpeek(l) == '"') ladv(l);
         t.type = TOK_STRING;
+        t.line = start_line;
         return t;
     }
 
@@ -336,6 +354,10 @@ static tok_t lnext(lex_t *l) {
     if (c == '&' && lpeek2(l) == '&') { ladv(l); ladv(l); t.type = TOK_AND; strcpy(t.text, "&&"); return t; }
     if (c == '|' && lpeek2(l) == '|') { ladv(l); ladv(l); t.type = TOK_OR; strcpy(t.text, "||"); return t; }
     if (c == '.' && lpeek2(l) == '.') { ladv(l); ladv(l); t.type = TOK_DOTDOT; strcpy(t.text, ".."); return t; }
+    /* `::` — not a sw operator. Lexed as a single TOK_COLON whose text is
+     * "::" so the parser can give the Elixir/Haskell cons reflex a precise
+     * hint instead of a bare "unexpected ':'". */
+    if (c == ':' && lpeek2(l) == ':') { ladv(l); ladv(l); t.type = TOK_COLON; strcpy(t.text, "::"); return t; }
     /* `%{` is a distinct token from bare `%` — needed so the parser
      * can tell map-literal start (`expr → %{...}`) from binary modulo
      * (`expr % expr`) at statement boundaries. Without this split,
@@ -476,9 +498,14 @@ static int par_match(par_t *p, tok_type_t t) {
 
 static tok_t par_expect(par_t *p, tok_type_t t, const char *msg) {
     if (p->cur.type == t) return par_adv(p);
-    snprintf(p->errmsg, sizeof(p->errmsg), "line %d: expected %s, got '%s'",
-             p->cur.line, msg, p->cur.text);
-    p->err = 1;
+    /* Don't clobber a more specific error already raised upstream (e.g.
+     * the `return <expr>` guard in par_stmt). The first diagnostic is the
+     * one the user needs; a cascading "expected '}'" only adds noise. */
+    if (!p->err) {
+        snprintf(p->errmsg, sizeof(p->errmsg), "line %d: expected %s, got '%s'",
+                 p->cur.line, msg, p->cur.text);
+        p->err = 1;
+    }
     return p->cur;
 }
 
@@ -1007,6 +1034,15 @@ static node_t *par_primary(par_t *p) {
             return lst;
         }
         node_t *first = par_expr(p);
+        /* `[h :: t]` is the Elixir/Haskell cons reflex. sw spells cons with
+         * a single bar: `[h | t]`. Catch it here with a precise hint. */
+        if (p->cur.type == TOK_COLON && strcmp(p->cur.text, "::") == 0) {
+            snprintf(p->errmsg, sizeof(p->errmsg),
+                     "line %d: use | for cons: [head | tail] (sw has no :: operator)",
+                     p->cur.line);
+            p->err = 1;
+            return first;
+        }
         if (p->cur.type == TOK_BAR) {
             /* List cons: [h | t] */
             par_adv(p);
@@ -1067,7 +1103,11 @@ static node_t *par_primary(par_t *p) {
     }
 
     /* Unknown */
-    snprintf(p->errmsg, sizeof(p->errmsg), "line %d: unexpected '%s'", t.line, t.text);
+    if (t.type == TOK_COLON && strcmp(t.text, "::") == 0)
+        snprintf(p->errmsg, sizeof(p->errmsg),
+                 "line %d: use | for cons: [head | tail] (sw has no :: operator)", t.line);
+    else
+        snprintf(p->errmsg, sizeof(p->errmsg), "line %d: unexpected '%s'", t.line, t.text);
     p->err = 1;
     par_adv(p);
     return mknode(N_ATOM, t.line); /* dummy */
@@ -1182,6 +1222,31 @@ static node_t *par_stmt(par_t *p) {
             strncpy(a->v.assign.name, id.text, sizeof(a->v.assign.name)-1);
             a->v.assign.value = par_expr(p);
             return a;
+        }
+        /* Gleam-style guard for the C/JS/Python `return <expr>` reflex.
+         * sw has no `return` keyword — a function's value is its last
+         * expression. We only error on the STATEMENT form `return <expr>`
+         * (return immediately followed by something that starts an
+         * expression). `return` stays a perfectly legal identifier: as a
+         * value (`x = return`), an assignment target (`return = 1`), or a
+         * call (`return(...)`) it falls through untouched. */
+        if (strcmp(id.text, "return") == 0) {
+            tok_t nx = p->cur;
+            int starts_expr =
+                nx.type == TOK_STRING || nx.type == TOK_NUMBER ||
+                nx.type == TOK_IDENT  || nx.type == TOK_ATOM   ||
+                nx.type == TOK_LBRACKET || nx.type == TOK_MAP_OPEN ||
+                nx.type == TOK_FUN    || nx.type == TOK_SELF   ||
+                nx.type == TOK_IF     || nx.type == TOK_CASE   ||
+                nx.type == TOK_MINUS;
+            if (starts_expr) {
+                snprintf(p->errmsg, sizeof(p->errmsg),
+                         "line %d: sw has no `return` \xe2\x80\x94 the last expression "
+                         "in a function is its value (wrap branches so the value falls out)",
+                         id.line);
+                p->err = 1;
+                return mknode(N_INT, id.line);   /* placeholder; parse already failed */
+            }
         }
         /* Backtrack */
         p->lex = save_lex;
@@ -2766,6 +2831,19 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             }
             buf[pos] = '\0';
             return sw_val_string(buf);
+        }
+
+        /* Gleam-style loud error for the Python/JS reflex `"a" + "b"`.
+         * Previously this fell all the way through to `return sw_val_nil()`
+         * — a silent-wrong result. Now it raises a catchable interp error
+         * pointing at the ++ fix, matching the compiled path's panic. */
+        if (strcmp(op, "+") == 0 &&
+            (left->type == SW_VAL_STRING || right->type == SW_VAL_STRING)) {
+            snprintf(interp->error_msg, sizeof(interp->error_msg),
+                     "line %d: cannot use + on text \xe2\x80\x94 use ++ to concatenate "
+                     "(+ is numeric addition; ++ joins strings and lists)", n->line);
+            interp->error = 1;
+            return sw_val_nil();
         }
 
         /* Arithmetic on ints */

@@ -412,7 +412,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `list_append(lst, x)` | new list with x appended |
 | `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
-| `reduce(lst, init, fn)` | foldl |
+| `reduce(fn, lst, init)` | foldl |
 | `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map` |
 | `map_get(m, k)` | value or `nil` |
 | `map_put(m, k, v)` | new map (functional update) |
@@ -480,7 +480,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `registered()` | all registered atoms |
 | `pid_alive(os_pid)` | `'true'` if the OS process (integer pid from `subprocess_spawn`) is still running, `'false'` if it has exited. Uses `kill(pid, 0)` — no signal sent. Does **not** take sw actor pids returned by `spawn()`. |
 | `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |
-| `monitor(pid)` → ref | one-way watch; watcher receives `{'DOWN', ref, pid, reason}` on death. `demonitor(ref)` to cancel |
+| `monitor(pid)` → ref | one-way watch; watcher receives `{'DOWN', ref, 'process', pid, reason}` (5-tuple, Erlang-shaped) on death. `demonitor(ref)` to cancel |
 | `exit_proc(pid, reason)` | targeted exit signal — `'normal'` / `'killed'` / other atom |
 | `trap_exit('true' \| 'false')` | toggle exit-signal trapping; on, exit signals arrive as `{'EXIT', from, reason}` messages |
 | `supervise(strategy, [{name, fn, restart}, …])` | restart-tree supervisor (`'one_for_one'` / `'one_for_all'` / `'rest_for_one'`) |

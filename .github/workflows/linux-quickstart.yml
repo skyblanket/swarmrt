@@ -26,6 +26,14 @@ jobs:
       - name: Build swc + libswarmrt
         run: make swc libswarmrt
 
+      - name: Compile-check every documented sw snippet + example
+        # Tripwire against doc/example drift: every complete ```sw block
+        # in the docs (those with a `module` + `fun main`) and every
+        # runnable examples/*.sw must still compile with this swc. A red
+        # here means a copy-paste-able snippet has rotted out of sync
+        # with the language — fix the snippet (or the compiler).
+        run: bash scripts/check_sw_docs.sh
+
       - name: Run the README quickstart verbatim
         run: |
           ./bin/swc build examples/counter.sw -o counter

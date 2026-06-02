@@ -217,7 +217,9 @@ typedef struct node {
         /* N_FLOAT */
         double fval;
         /* N_STRING, N_ATOM, N_IDENT */
-        char sval[2048];
+        /* 8192 to match tok_t.text[] in swarmrt_lang.c so multi-KB string
+         * literals (system prompts) aren't truncated when copied here. */
+        char sval[8192];
         /* N_TUPLE, N_LIST */
         struct { struct node **items; int count; } coll;
         /* N_MAP */

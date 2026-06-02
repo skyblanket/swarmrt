@@ -319,7 +319,9 @@ static int is_builtin(const char *name) {
            strcmp(name, "term_rows") == 0 ||
            strcmp(name, "stream_content_rows") == 0 ||
            /* Phase 19: interactive picker */
-           strcmp(name, "read_choice") == 0;
+           strcmp(name, "read_choice") == 0 ||
+           /* argv-style exec (no shell) */
+           strcmp(name, "exec_argv") == 0;
 }
 
 static int is_self_call(cg_ctx_t *ctx, node_t *n) {
@@ -793,6 +795,8 @@ static void emit_preamble(cg_ctx_t *ctx) {
     /* Binary operation helpers */
     fprintf(f,
         "static sw_val_t *_op_add(sw_val_t *a, sw_val_t *b) {\n"
+        "    if (a->type == SW_VAL_STRING || b->type == SW_VAL_STRING)\n"
+        "        _sw_runtime_panic(\"cannot use + on text \\xe2\\x80\\x94 use ++ to concatenate (+ is numeric addition; ++ joins strings and lists)\");\n"
         "    if (a->type == SW_VAL_INT && b->type == SW_VAL_INT)\n"
         "        return sw_val_int(a->v.i + b->v.i);\n"
         "    double fa = a->type == SW_VAL_INT ? (double)a->v.i : a->v.f;\n"
@@ -1269,6 +1273,27 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
  * Pattern matching
  * ========================================================================= */
 
+/* Build the C expression that constructs the lookup KEY for a map-pattern
+ * entry, mirroring pattern_match's N_MAP case in swarmrt_lang.c: keys are
+ * literals — atoms (from `name:`), strings, or ints. Writes into `out`;
+ * returns 1 on success, 0 for an unsupported key node (caller must then emit
+ * a never-match condition, exactly as the interpreter `return 0`s). */
+static int emit_map_key_expr(node_t *kn, char *out, size_t osz) {
+    if (kn->type == N_ATOM) {
+        snprintf(out, osz, "sw_val_atom(\"%s\")", kn->v.sval);
+        return 1;
+    } else if (kn->type == N_STRING) {
+        char *esc = c_escape_str(kn->v.sval);
+        snprintf(out, osz, "sw_val_string(\"%s\")", esc);
+        free(esc);
+        return 1;
+    } else if (kn->type == N_INT) {
+        snprintf(out, osz, "sw_val_int(%lldLL)", (long long)kn->v.ival);
+        return 1;
+    }
+    return 0;
+}
+
 static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
     FILE *f = ctx->out;
     (void)ctx;
@@ -1329,14 +1354,53 @@ static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
         fprintf(f, ")");
         break;
     case N_LIST_CONS:
-        /* [h | t] pattern: list with at least 1 element */
+        /* [h | t] pattern: list with at least 1 element, head matches, and
+         * — mirroring pattern_match's N_LIST_CONS in swarmrt_lang.c — the
+         * TAIL (the list minus its head) matches pat->v.cons.tail. Without
+         * the tail recursion `[h | []]` would match any non-empty list and
+         * `[h | [a,b]]` would ignore the tail shape entirely. */
         fprintf(f, "(%s->type == SW_VAL_LIST && %s->v.tuple.count >= 1", val, val);
         /* Check head pattern */
         {
-            char head_item[128];
+            char head_item[512];
             snprintf(head_item, sizeof(head_item), "%s->v.tuple.items[0]", val);
             fprintf(f, " && ");
             emit_pattern_cond(ctx, pat->v.cons.head, head_item);
+        }
+        /* Check tail pattern against the rest-of-list. An IDENT tail (the
+         * common `[h | t]`) always matches, so skip the redundant call to
+         * keep the generated condition lean. */
+        if (pat->v.cons.tail->type != N_IDENT) {
+            char tail_item[512];
+            snprintf(tail_item, sizeof(tail_item),
+                     "sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1)", val, val);
+            fprintf(f, " && ");
+            emit_pattern_cond(ctx, pat->v.cons.tail, tail_item);
+        }
+        fprintf(f, ")");
+        break;
+    case N_MAP:
+        /* %{k: subpat, ...} pattern. Mirrors pattern_match's N_MAP in
+         * swarmrt_lang.c: value must be a map, and for EACH (key, subpat)
+         * the key must be present (sw_val_map_get != nil) AND its looked-up
+         * value must match subpat. A key whose lookup returns nil ⇒ NO match
+         * (we deliberately do NOT distinguish absent-key from present-nil —
+         * sw_val_map_get can't, and diverging re-opens the parity gap). */
+        fprintf(f, "(%s->type == SW_VAL_MAP", val);
+        for (int i = 0; i < pat->v.map.count; i++) {
+            char keyexpr[256];
+            if (!emit_map_key_expr(pat->v.map.keys[i], keyexpr, sizeof(keyexpr))) {
+                /* Unsupported key node: interpreter `return 0`s → never match. */
+                fprintf(f, " && 0");
+                continue;
+            }
+            char lookup[512];
+            snprintf(lookup, sizeof(lookup), "sw_val_map_get(%s, %s)", val, keyexpr);
+            /* Present (non-nil) ... */
+            fprintf(f, " && %s->type != SW_VAL_NIL", lookup);
+            /* ... and the looked-up value matches the sub-pattern. */
+            fprintf(f, " && ");
+            emit_pattern_cond(ctx, pat->v.map.vals[i], lookup);
         }
         fprintf(f, ")");
         break;
@@ -1344,6 +1408,50 @@ static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
         fprintf(f, "1");
         break;
     }
+}
+
+/* Collect every binder name in a pattern (skipping `_`) into `names`.
+ * Used by check_linear_pattern to detect a duplicate binder like {x, x}
+ * before it reaches cc as an opaque "redefinition of 'x'". */
+static void collect_pattern_binders(node_t *pat, const char *names[], int *cnt, int max) {
+    if (!pat || *cnt >= max) return;
+    switch (pat->type) {
+    case N_IDENT:
+        if (strcmp(pat->v.sval, "_") != 0 && *cnt < max)
+            names[(*cnt)++] = pat->v.sval;
+        break;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < pat->v.coll.count; i++)
+            collect_pattern_binders(pat->v.coll.items[i], names, cnt, max);
+        break;
+    case N_LIST_CONS:
+        collect_pattern_binders(pat->v.cons.head, names, cnt, max);
+        collect_pattern_binders(pat->v.cons.tail, names, cnt, max);
+        break;
+    case N_MAP:
+        for (int i = 0; i < pat->v.map.count; i++)
+            collect_pattern_binders(pat->v.map.vals[i], names, cnt, max);
+        break;
+    default: break;
+    }
+}
+
+/* sw patterns are LINEAR: each variable may be bound at most once. A
+ * nonlinear pattern like {x, x} previously leaked a raw cc "redefinition
+ * of 'x'". Detect the duplicate here and emit a Gleam-style hint instead.
+ * Cheap, self-contained pre-pass — no state threaded through the binder. */
+static void check_linear_pattern(cg_ctx_t *ctx, node_t *pat, int line) {
+    const char *names[64];
+    int cnt = 0;
+    collect_pattern_binders(pat, names, &cnt, 64);
+    for (int i = 0; i < cnt; i++)
+        for (int j = i + 1; j < cnt; j++)
+            if (strcmp(names[i], names[j]) == 0) {
+                fprintf(stderr, "swc: src/%s.sw:%d: sw patterns are linear \xe2\x80\x94 '%s' is bound twice; bind once and compare with a guard (when %s == ...)\n",
+                        ctx->mod_name, line, names[i], names[i]);
+                ctx->had_arity_error = 1;
+                return;
+            }
 }
 
 static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
@@ -1363,23 +1471,46 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
         break;
     case N_TUPLE: case N_LIST:
         for (int i = 0; i < pat->v.coll.count; i++) {
-            char item[128];
+            char item[512];
             snprintf(item, sizeof(item), "%s->v.tuple.items[%d]", val, i);
             emit_pattern_bind(ctx, pat->v.coll.items[i], item);
         }
         break;
     case N_LIST_CONS: {
-        char head_item[128];
+        char head_item[512];
         snprintf(head_item, sizeof(head_item), "%s->v.tuple.items[0]", val);
         emit_pattern_bind(ctx, pat->v.cons.head, head_item);
-        /* Bind tail: rest of list */
+        /* Bind through the tail (rest-of-list). For the common IDENT tail
+         * (`[h | t]`) bind it directly; otherwise recurse so nested tail
+         * patterns like `[h | [a, b]]` bind their inner names too. */
         if (pat->v.cons.tail->type == N_IDENT) {
-            fprintf(f, "        sw_val_t *%s = sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1);\n",
-                    mangle_for_c(pat->v.cons.tail->v.sval), val, val);
-            declare_var(ctx, pat->v.cons.tail->v.sval);
+            if (strcmp(pat->v.cons.tail->v.sval, "_") != 0) {
+                fprintf(f, "        sw_val_t *%s = sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1);\n",
+                        mangle_for_c(pat->v.cons.tail->v.sval), val, val);
+                declare_var(ctx, pat->v.cons.tail->v.sval);
+            }
+        } else {
+            char tail_item[512];
+            snprintf(tail_item, sizeof(tail_item),
+                     "sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1)", val, val);
+            emit_pattern_bind(ctx, pat->v.cons.tail, tail_item);
         }
         break;
     }
+    case N_MAP:
+        /* Bind each subpattern against the value at its key, mirroring
+         * pattern_match's N_MAP recursion. By the time we bind, the
+         * condition has already guaranteed the key is present, so the
+         * looked-up value is the matched (non-nil) value. */
+        for (int i = 0; i < pat->v.map.count; i++) {
+            char keyexpr[256];
+            if (!emit_map_key_expr(pat->v.map.keys[i], keyexpr, sizeof(keyexpr)))
+                continue;
+            char lookup[512];
+            snprintf(lookup, sizeof(lookup), "sw_val_map_get(%s, %s)", val, keyexpr);
+            emit_pattern_bind(ctx, pat->v.map.vals[i], lookup);
+        }
+        break;
     default: break;
     }
 }
@@ -1425,8 +1556,18 @@ static void emit_binop(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     emit_expr(ctx, n->v.binop.right, 0, right, sizeof(right));
     fresh_var(ctx, res, sizeof(res));
 
-    if (strcmp(op, "+") == 0)
+    if (strcmp(op, "+") == 0) {
+        /* Gleam-style compile-time error when BOTH operands are string
+         * literals: "a" + "b" is the classic Python/JS reflex. The
+         * runtime guard in _op_add catches the dynamic case; this catches
+         * the obvious literal case before cc even runs. */
+        if (n->v.binop.left->type == N_STRING && n->v.binop.right->type == N_STRING) {
+            fprintf(stderr, "swc: src/%s.sw:%d: cannot use + on text \xe2\x80\x94 use ++ to concatenate (+ is numeric addition; ++ joins strings and lists)\n",
+                    ctx->mod_name, n->line);
+            ctx->had_arity_error = 1;
+        }
         fprintf(f, "    sw_val_t *%s = _op_add(%s, %s);\n", res, left, right);
+    }
     else if (strcmp(op, "-") == 0)
         fprintf(f, "    sw_val_t *%s = _op_sub(%s, %s);\n", res, left, right);
     else if (strcmp(op, "*") == 0)
@@ -1634,6 +1775,20 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         char mod[128], func[128];
         int mlen = (int)(dot - fname);
         strncpy(mod, fname, mlen); mod[mlen] = '\0';
+        /* Gleam-style hint for the `Std.map(...)` / `Std.filter(...)` reflex:
+         * map/filter/reduce/pmap are GLOBAL builtins, not module functions.
+         * Without this the qualified form leaks a raw cc "undeclared function
+         * Std_map". Small hard-coded denylist — not a general per-module export
+         * check. NOTE: `each` is deliberately NOT here — it is a real Std module
+         * function (lib/Std.sw, list-first `each(lst, fn)`), so `Std.each(...)`
+         * must keep compiling. */
+        const char *gf = dot + 1;
+        if (strcmp(gf, "map") == 0 || strcmp(gf, "filter") == 0 ||
+            strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) {
+            fprintf(stderr, "swc: src/%s.sw:%d: %s/filter/reduce are global builtins \xe2\x80\x94 write %s(fn, list), not %s(...)\n",
+                    ctx->mod_name, n->line, gf, gf, fname);
+            ctx->had_unknown_fn = 1;
+        }
         strncpy(func, dot + 1, sizeof(func) - 1);
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, mod, func, arr, nargs);
@@ -1779,7 +1934,9 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              /* Phase 20: process command-line arguments */
              strcmp(fname, "os_args") == 0 ||
              /* Phase 21: input-aware terminal output */
-             strcmp(fname, "print_above") == 0)
+             strcmp(fname, "print_above") == 0 ||
+             /* argv-style exec (no shell) */
+             strcmp(fname, "exec_argv") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)
@@ -1960,6 +2117,7 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     /* Pattern matching clauses */
     for (int i = 0; i < n->v.recv.nclauses; i++) {
         node_t *cl = n->v.recv.clauses[i];
+        check_linear_pattern(ctx, cl->v.clause.pattern, cl->line);
         fprintf(f, "          %sif (", i == 0 ? "" : "} else ");
         emit_pattern_cond(ctx, cl->v.clause.pattern, msg);
         fprintf(f, ") {\n");
@@ -2086,6 +2244,7 @@ static void emit_case(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     int nclauses = n->v.casex.nclauses;
     for (int i = 0; i < nclauses; i++) {
         node_t *cl = n->v.casex.clauses[i];
+        check_linear_pattern(ctx, cl->v.clause.pattern, cl->line);
         int saved_ndeclared = ctx->ndeclared;
         fprintf(f, "        if (");
         emit_pattern_cond(ctx, cl->v.clause.pattern, subj);

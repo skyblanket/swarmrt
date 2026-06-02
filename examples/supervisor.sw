@@ -2,11 +2,11 @@ module Supervisor
 
 fun worker(name, count) {
   receive {
-    {ping, from} ->
+    {'ping', from} ->
       print(name, "pong", count)
-      send(from, {pong, count})
+      send(from, {'pong', count})
       worker(name, count + 1)
-    {stop} ->
+    {'stop'} ->
       print(name, "stopping at", count)
   }
 }
@@ -25,14 +25,14 @@ fun main() {
   print("worker_a:", a)
   print("worker_b:", b)
 
-  send(a, {ping, self()})
+  send(a, {'ping', self()})
   receive {
-    {pong, n} -> print("Got pong from A:", n)
+    {'pong', n} -> print("Got pong from A:", n)
   }
 
-  send(b, {ping, self()})
+  send(b, {'ping', self()})
   receive {
-    {pong, n} -> print("Got pong from B:", n)
+    {'pong', n} -> print("Got pong from B:", n)
   }
 
   sleep(200)
