@@ -20,6 +20,20 @@
       "endpoint": "https://api.moonshot.ai/v1/chat/completions",
       "key_env": "MOONSHOT_KEY",
       "model_field": "moonshot-v1-32k"
+    },
+    {
+      "id": "gpt-4.1",
+      "label": "OpenAI GPT-4.1 (frontier-closed)",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "key_env": "OPENAI_API_KEY",
+      "model_field": "gpt-4.1"
+    },
+    {
+      "id": "deepseek-chat",
+      "label": "DeepSeek V4 (open)",
+      "endpoint": "https://api.deepseek.com/v1/chat/completions",
+      "key_env": "DEEPSEEK_API_KEY",
+      "model_field": "deepseek-chat"
     }
   ]
 }

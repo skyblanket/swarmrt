@@ -8,6 +8,38 @@ program either passes or it doesn't.
 The pitch on the front of the repo is that `sw` is **for AI agents**.
 That claim deserves real numbers — `eval/` is how we measure them.
 
+## Cold cross-vendor eval (drop keys + run)
+
+This eval is **cold** and **cross-vendor**: nothing is pre-wired to a single
+provider, and the system prompt is *de-leaked* — it teaches the language, not
+the answers. To run it you only need to export the API key(s) for whichever
+vendor(s) you want to light up, then run one command. Any model whose key env
+is unset is skipped cleanly; you never need every key.
+
+```bash
+# Export only the vendor(s) you want. Each model in models.json reads its own
+# key from the named env var; an unset key => that model is SKIPped (no call,
+# no cost). Keys are referenced by env only — none are stored in this repo.
+export MOONSHOT_KEY=...        # Kimi K2.6 / K2.5 / moonshot-v1-32k (Moonshot)
+export OPENAI_API_KEY=...      # OpenAI GPT-4.1            (frontier-closed)
+export DEEPSEEK_API_KEY=...    # DeepSeek V4 (deepseek-chat)        (open)
+
+cd eval
+./check_leakage.sh             # gate: fail-closed if the prompt leaks answers
+EVAL_K=5 ./runner.sh           # the eval — 5 samples/cell, pass@1 mean ± stdev
+```
+
+- All vendors are plain **OpenAI chat/completions** drop-ins — the runner sends
+  one standard body to every endpoint; no per-vendor request branch.
+- `EVAL_K` controls samples per (prompt × model) cell — **default 5**; results
+  are reported as **pass@1 = mean ± stdev** across the K draws. `EVAL_K=1` gives
+  the legacy single-shot behavior.
+- The prompt is **de-leaked** and that invariant is enforced by
+  `./check_leakage.sh` (exits nonzero if any task solution appears in
+  `system_prompt.md`). Run it before trusting a result.
+- Add/remove vendors by editing `models.json` (`id`, `label`, `endpoint`,
+  `key_env`, `model_field`). Only OpenAI-compatible endpoints are supported.
+
 ## Layout
 
 ```
@@ -37,13 +69,14 @@ Each prompt file has three sections:
 
 ## How to run
 
-```bash
-# Set keys:
-export OTONOMY_KEY=otonomy-sk-...        # for otonomy-orc/swarm
-export GEMMA_KEY=...                      # for gemma.otonomy.ai
+See **Cold cross-vendor eval** above for the keys and the one command. In
+short: export only the vendor key(s) you want (`MOONSHOT_KEY`,
+`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`), then:
 
+```bash
 cd eval
-./runner.sh                               # runs every prompt × every model
+./check_leakage.sh                        # answer-leakage gate (fail-closed)
+EVAL_K=5 ./runner.sh                       # every prompt × every keyed model
 ./runner.sh prompts/03_*                  # subset
 ```
 
@@ -52,7 +85,8 @@ mirrored into `results/results.md` for easy linking from the README.
 
 ## Methodology
 
-- Single-shot generation per prompt × model.  No multi-turn refinement.
+- K-sampled generation per prompt × model (`EVAL_K`, default 5); reported as
+  pass@1 mean ± stdev.  No multi-turn refinement.
 - LLM output is parsed for a ` ```sw ` block.  If absent, the whole
   response is treated as code (and usually fails).
 - Code is compiled via `swc build` — compile errors count as failures.
@@ -64,9 +98,10 @@ mirrored into `results/results.md` for easy linking from the README.
 ## Scope (current revision)
 
 - 10 prompts, breadth over depth.
-- 3 model endpoints — `kimi-k2.6` (Moonshot, reasoning), `kimi-k2.5`
-  (Moonshot, reasoning, prior version), `moonshot-v1-32k` (Moonshot,
-  non-reasoning baseline).  See `models.json` to add more.
+- 5 model endpoints, cross-vendor, all OpenAI chat/completions drop-ins:
+  `kimi-k2.6` / `kimi-k2.5` / `moonshot-v1-32k` (Moonshot), `gpt-4.1`
+  (OpenAI, frontier-closed), `deepseek-chat` (DeepSeek V4, open).  Each only
+  runs if its `key_env` is set.  See `models.json` to add more.
 - No agent harness, no retries, no tool use.  Pure code-gen.
 
 ## What this measures (and what it doesn't)

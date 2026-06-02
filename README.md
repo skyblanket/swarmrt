@@ -197,7 +197,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 
 **Read more:** [docs/BUILDING_AGENTS.md](docs/BUILDING_AGENTS.md) — the developer-facing guide with the patterns.
 
-**Working example:** [examples/llm_agent.sw](examples/llm_agent.sw) — a real LLM-driven agent in ~90 lines (prompt → http_post_stream → parse tool tags → `case` dispatch → loop). Set `API_KEY` and run; works against any OpenAI-compatible endpoint.
+**Working example:** [examples/llm_agent.sw](examples/llm_agent.sw) — a real LLM-driven agent in ~170 lines (prompt → http_post_stream → parse tool tags → `case` dispatch → loop). Set `API_KEY` and run; works against any OpenAI-compatible endpoint.
 
 **Real-world stack:** [swarm-code](https://github.com/skyblanket/swarm-code) — a terminal coding agent that uses all of the above in anger.
 
@@ -330,9 +330,9 @@ The [`examples/`](examples/) directory has small focused programs. Each shows on
 | `mapreduce.sw` | Spawn a fan-out worker pool and collect results. |
 | `distributed.sw` | Multi-node — start two `swarms` and pass messages over TCP. |
 | `dispatcher.sw` | Studio-pattern actor: tagged messages routed via `case`, state via recursion arg. |
-| `json_pipeline.sw` | JSON load → `case` classify → f-string render. The new ergonomics in 35 lines. |
-| `http_echo.sw` | A working HTTP server in 25 lines — `case` on the path, f-strings for templating. |
-| `llm_agent.sw` | A real LLM-driven agent in 90 lines. Prompt → http_post_stream → parse `<tool>` tags → `case` dispatch → loop. Works against any OpenAI-compatible endpoint. |
+| `json_pipeline.sw` | JSON load → `case` classify → f-string render. The new ergonomics in ~40 lines. |
+| `http_echo.sw` | A working HTTP server in ~35 lines — `case` on the path, f-strings for templating. |
+| `llm_agent.sw` | A real LLM-driven agent in ~170 lines. Prompt → http_post_stream → parse `<tool>` tags → `case` dispatch → loop. Works against any OpenAI-compatible endpoint. |
 
 Compile and run any with `./bin/swc build examples/<name>.sw -o /tmp/x && /tmp/x`. (`mathlib.sw` is a library — it has no `main`, so build the importer `multi_main.sw` instead. `math_test.sw` is a test file: run it with `./bin/swc test examples/math_test.sw`.)
 
@@ -348,8 +348,10 @@ make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search
 
 `test-sw` runs the `tests/sw/test_*.sw` suite via `tests/sw/run_tests.sh`. It now covers two execution paths:
 
-- **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run. ~110 assertions across 8 files.
+- **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run.
 - **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
+
+Together the suite reports `all sw tests passed — 11 files, 133 assertions`.
 
 Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
 
@@ -372,7 +374,7 @@ The point is to surface real gaps — the first baseline run flagged several qui
 
 ## Build
 
-Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and tested on macOS Apple Silicon; Linux support is the intent (pthreads + posix-only APIs) but hasn't been continuously verified.
+Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
 
 ```bash
 make swc libswarmrt              # compiler + runtime library only (you usually want this)
@@ -420,11 +422,11 @@ docs/                      Long-form documentation
 Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; Linux x86_64 builds and runs in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
 
 **What CI gates on, every push:**
-- README quickstart + a few example programs
-- `make test-sw` — 9 files, **110 compiled + 16 interpreter assertions** (`.sw` language)
-- `make test-phase{2..10}` — **9 C-side runtime test files, 75 tests total**, all 100% green: GenServer/Supervisor (phase 2, 6 tests), ETS (phase 3, 15 tests), Agent/App/DynSup (phase 4, 14), StateMachine/ProcessGroup (phase 5, 12), TCP (phase 6, 6), hot reload (phase 7, 5), GC (phase 8, 5), distribution (phase 9, 4), language frontend (phase 10, 8); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
-- `make test-full` — **comprehensive gate**: core + OTP + phases 2-10 + search + MCP + sws
-- `make stress` — **100 runs total** (50 multi-scheduler + 50 single-scheduler), 80k spawns each, strict by default: every run must complete
+- README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
+- `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
+- `make test-sw` — **11 files, 133 assertions** (`.sw` language: compiled + interpreter paths)
+- `make test-phase$p` for `p` in **2 through 9** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC (phase 8), distribution (phase 9); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
+- `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 
 **Known issues:** none currently tracked. The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
 

@@ -332,7 +332,7 @@ clean:
 	# root, plus generated C and debug bundles — build artefacts, not
 	# source (see .gitignore).
 	rm -rf atelier counter_test error_test* ets_test hello_test hello_test_bin* \
-	       import_main integration_test my_test patent_lab research_lab video_studio \
+	       import_main integration_test my_test \
 	       feedback_test wake_test lab_*
 	find . -name '*.gen.c' -delete
 	find . -name '*.dSYM' -prune -exec rm -rf {} +
