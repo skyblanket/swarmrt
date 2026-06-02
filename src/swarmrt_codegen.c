@@ -280,10 +280,16 @@ static int is_builtin(const char *name) {
            strcmp(name, "live_js") == 0 ||
            /* WebSocket CLIENT (CDP / browser control) */
            strcmp(name, "wsc_connect") == 0 ||
+           strcmp(name, "wsc_connect_tls") == 0 ||
            strcmp(name, "wsc_send") == 0 ||
            strcmp(name, "wsc_recv") == 0 ||
            strcmp(name, "wsc_close") == 0 ||
            strcmp(name, "chrome_launch") == 0 ||
+           /* WS binary frames + audio codecs (native voice agents) */
+           strcmp(name, "ws_send_binary") == 0 ||
+           strcmp(name, "audio_ulaw_to_pcm16") == 0 ||
+           strcmp(name, "audio_pcm16_to_ulaw") == 0 ||
+           strcmp(name, "audio_resample") == 0 ||
            /* String + base64 helpers (2026-05-15) */
            strcmp(name, "string_index_of") == 0 ||
            strcmp(name, "base64_encode") == 0 ||
@@ -1617,8 +1623,9 @@ static const char *_common_builtins[] = {
     "file_append", "file_mkdir",
     "file_rename", "file_stat", "file_atomic_write", "file_temp",
     "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
-    "ws_send", "ws_close", "ws_set_handler",
-    "wsc_connect", "wsc_send", "wsc_recv", "wsc_close",
+    "ws_send", "ws_close", "ws_set_handler", "ws_send_binary",
+    "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_close",
+    "audio_ulaw_to_pcm16", "audio_pcm16_to_ulaw", "audio_resample",
     "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
     "read_line", "read_char", "read_choice",
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "pid_alive",
@@ -1893,10 +1900,16 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "live_js") == 0 ||
              /* WebSocket CLIENT (CDP / browser control) */
              strcmp(fname, "wsc_connect") == 0 ||
+             strcmp(fname, "wsc_connect_tls") == 0 ||
              strcmp(fname, "wsc_send") == 0 ||
              strcmp(fname, "wsc_recv") == 0 ||
              strcmp(fname, "wsc_close") == 0 ||
              strcmp(fname, "chrome_launch") == 0 ||
+             /* WS binary frames + audio codecs (native voice agents) */
+             strcmp(fname, "ws_send_binary") == 0 ||
+             strcmp(fname, "audio_ulaw_to_pcm16") == 0 ||
+             strcmp(fname, "audio_pcm16_to_ulaw") == 0 ||
+             strcmp(fname, "audio_resample") == 0 ||
              /* String + base64 helpers */
              strcmp(fname, "string_index_of") == 0 ||
              strcmp(fname, "base64_encode") == 0 ||

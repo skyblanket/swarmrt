@@ -33,6 +33,7 @@
 #endif
 #include "swarmrt_http.h"
 #include "swarmrt_liveview_js.h"
+#include "swarmrt_audio.h"   /* base64 helpers for delivering binary WS frames */
 
 /* === Global Connection Table === */
 
@@ -71,6 +72,10 @@ static void conn_free(int cid) {
     pthread_mutex_lock(&g_http_lock);
     sw_http_conn_t *c = &g_http_conns[cid];
     if (c->buf) { free(c->buf); c->buf = NULL; }
+    if (c->frag_buf) { free(c->frag_buf); c->frag_buf = NULL; }
+    c->frag_len = 0;
+    c->frag_cap = 0;
+    c->frag_opcode = 0;
     c->buf_len = 0;
     c->buf_cap = 0;
     c->active = 0;
@@ -136,11 +141,43 @@ static void ws_do_handshake(int cid) {
 
 /* === WebSocket Frame Parsing (client → server, masked) === */
 
+/* Deliver a fully-assembled WS data message to the connection's handler.
+ *   text   (opcode 0x1) → {'ws_message', cid, text}
+ *   binary (opcode 0x2) → {'ws_binary',  cid, base64(payload)}
+ * Binary payloads are base64-encoded so NUL-bearing bytes survive in a
+ * sw string (sw strings are NUL-terminated; see swarmrt_audio.h). */
+static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint32_t len) {
+    sw_http_conn_t *c = &g_http_conns[cid];
+    if (opcode == 0x2) {
+        char *b64 = _sw_audio_b64_encode(payload, (size_t)len);
+        if (!b64) { c->active = 0; return; }
+        sw_val_t *items[3];
+        items[0] = sw_val_atom("ws_binary");
+        items[1] = sw_val_int(cid);
+        items[2] = sw_val_string(b64);
+        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
+        free(b64);
+    } else {
+        /* text */
+        char *text = (char *)malloc((size_t)len + 1);
+        if (!text) { c->active = 0; return; }
+        memcpy(text, payload, (size_t)len);
+        text[len] = '\0';
+        sw_val_t *items[3];
+        items[0] = sw_val_atom("ws_message");
+        items[1] = sw_val_int(cid);
+        items[2] = sw_val_string(text);
+        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
+        free(text);
+    }
+}
+
 static void ws_try_parse(int cid) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     while (c->buf_len >= 2) {
         uint8_t *p = c->buf;
+        int fin = (p[0] & 0x80) != 0;
         uint8_t opcode = p[0] & 0x0F;
         int masked = (p[1] & 0x80) != 0;
         uint64_t payload_len = p[1] & 0x7F;
@@ -179,19 +216,46 @@ static void ws_try_parse(int cid) {
                 payload[i] ^= mask[i % 4];
         }
 
-        if (opcode == 0x1) {
-            /* Text frame → send ws_message to handler */
-            char *text = (char *)malloc((size_t)payload_len + 1);
-            if (!text) { c->active = 0; return; }  /* OOM — drop connection */
-            memcpy(text, payload, (size_t)payload_len);
-            text[payload_len] = '\0';
+        /* Data frames: text (0x1), binary (0x2), continuation (0x0).
+         * Reassemble fragmented messages (FIN=0 runs) before delivery.
+         * A FIN=1 single frame is the common (non-fragmented) case. */
+        if (opcode == 0x1 || opcode == 0x2 || opcode == 0x0) {
+            int eff_opcode = opcode;
+            if (opcode == 0x0) {
+                /* Continuation — must be part of an in-progress message. */
+                if (c->frag_opcode == 0) {
+                    /* Stray continuation; drop the connection defensively. */
+                    c->active = 0; return;
+                }
+                eff_opcode = c->frag_opcode;
+            }
 
-            sw_val_t *items[3];
-            items[0] = sw_val_atom("ws_message");
-            items[1] = sw_val_int(cid);
-            items[2] = sw_val_string(text);
-            sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
-            free(text);
+            int fragmenting = (c->frag_opcode != 0) || (!fin);
+            if (fragmenting) {
+                /* Append this frame's payload to the reassembly buffer. */
+                if (opcode != 0x0 && c->frag_opcode == 0) c->frag_opcode = opcode;
+                uint32_t need = c->frag_len + (uint32_t)payload_len;
+                if (need > 16 * 1024 * 1024) { c->active = 0; return; }
+                if (need > c->frag_cap) {
+                    uint32_t ncap = c->frag_cap ? c->frag_cap : 4096;
+                    while (ncap < need) ncap *= 2;
+                    uint8_t *nb = (uint8_t *)realloc(c->frag_buf, ncap);
+                    if (!nb) { c->active = 0; return; }
+                    c->frag_buf = nb; c->frag_cap = ncap;
+                }
+                memcpy(c->frag_buf + c->frag_len, payload, (size_t)payload_len);
+                c->frag_len += (uint32_t)payload_len;
+
+                if (fin) {
+                    /* Message complete — deliver and reset. */
+                    ws_deliver_message(cid, eff_opcode, c->frag_buf, c->frag_len);
+                    c->frag_len = 0;
+                    c->frag_opcode = 0;
+                }
+            } else {
+                /* Single, unfragmented frame — deliver directly. */
+                ws_deliver_message(cid, eff_opcode, payload, (uint32_t)payload_len);
+            }
 
         } else if (opcode == 0x8) {
             /* Close frame → notify handler */
@@ -630,6 +694,36 @@ int sw_ws_send_text(int conn_id, const char *data, uint32_t len) {
     uint8_t hdr[10];
     int hdr_len;
     hdr[0] = 0x81; /* FIN + text opcode */
+
+    if (len < 126) {
+        hdr[1] = (uint8_t)len;
+        hdr_len = 2;
+    } else if (len < 65536) {
+        hdr[1] = 126;
+        hdr[2] = (len >> 8) & 0xFF;
+        hdr[3] = len & 0xFF;
+        hdr_len = 4;
+    } else {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++)
+            hdr[2 + i] = (len >> (56 - i * 8)) & 0xFF;
+        hdr_len = 10;
+    }
+
+    sw_tcp_send(c->port, hdr, hdr_len);
+    sw_tcp_send(c->port, data, len);
+    return 0;
+}
+
+int sw_ws_send_binary(int conn_id, const char *data, uint32_t len) {
+    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return -1;
+    sw_http_conn_t *c = &g_http_conns[conn_id];
+    if (!c->active || c->mode != SW_HTTP_MODE_WS || !c->port) return -1;
+
+    /* WebSocket frame header (server → client, no mask), opcode 0x2. */
+    uint8_t hdr[10];
+    int hdr_len;
+    hdr[0] = 0x82; /* FIN + binary opcode */
 
     if (len < 126) {
         hdr[1] = (uint8_t)len;

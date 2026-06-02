@@ -35,6 +35,21 @@ LDFLAGS += -L$(SQLITE_PREFIX)/lib
 endif
 endif
 
+# Optional wss:// (WebSocket-over-TLS) for the WS client (wsc_connect_tls).
+# Linux already links -lssl/-lcrypto so TLS is on by default there. On macOS
+# the build defaults to CommonCrypto and OFF; opt in with `make SWARMRT_TLS=1`
+# (requires Homebrew openssl@3). When OFF, wsc_connect_tls still serves ws://
+# + custom headers and returns nil for wss:// — the build never breaks.
+ifeq ($(shell uname),Darwin)
+ifeq ($(SWARMRT_TLS),1)
+OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null)
+ifneq ($(OPENSSL_PREFIX),)
+CFLAGS  += -DSWARMRT_TLS -DSWARMRT_OPENSSL_PREFIX='"$(OPENSSL_PREFIX)"' -I$(OPENSSL_PREFIX)/include
+LDFLAGS += -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
+endif
+endif
+endif
+
 SRC_DIR = src
 BUILD_DIR = build
 BIN_DIR = bin
