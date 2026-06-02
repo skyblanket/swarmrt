@@ -6110,6 +6110,20 @@ typedef struct {
     SSL     *ssl;
     SSL_CTX *ctx;
 #endif
+    /* --- async push delivery (wsc_set_handler) --------------------------
+     * When a handler is registered, a dedicated reader process blocking-
+     * recvs frames off this slot and sw_send_tagged's them to `handler`
+     * as {'wsc_message', handle, data} / {'wsc_close', handle}, mirroring
+     * the WS server's tagged-message model (src/swarmrt_http.c).
+     *
+     * Concurrency invariant: with a handler set, exactly ONE thread reads
+     * (the reader, via SSL_read in _builtin_wsc_recv) and at most one writes
+     * (wsc_send, via SSL_write). That one-reader/one-writer split is the
+     * full-duplex pattern OpenSSL supports without locking. Callers must NOT
+     * also call blocking wsc_recv on a handle that has a handler (that would
+     * be a second reader) — wsc_set_handler owns the read path from then on. */
+    sw_process_t   *handler;       /* owner pid to deliver frames to */
+    int             reader_running;/* 1 once a reader process is spawned */
 } _sw_wsc_slot_t;
 static _sw_wsc_slot_t _sw_wsc[_SW_WSC_MAX] = {0};
 
@@ -6123,6 +6137,8 @@ static int _sw_wsc_alloc_slot(int fd) {
             _sw_wsc[i].ssl = NULL;
             _sw_wsc[i].ctx = NULL;
 #endif
+            _sw_wsc[i].handler = NULL;
+            _sw_wsc[i].reader_running = 0;
             return i;
         }
     }
@@ -6140,6 +6156,8 @@ static void _sw_wsc_free_slot(int handle) {
         _sw_wsc[handle].used = 0;
         _sw_wsc[handle].fd = -1;
         _sw_wsc[handle].is_tls = 0;
+        _sw_wsc[handle].handler = NULL;
+        _sw_wsc[handle].reader_running = 0;
     }
 }
 
@@ -6464,6 +6482,91 @@ static sw_val_t *_builtin_wsc_recv(sw_val_t **a, int n) {
     return r;
 }
 
+/* === Async push delivery: wsc_set_handler ============================
+ *
+ * The blocking wsc_recv above is great for request/response (CDP), but a
+ * voice bridge needs to `receive` on BOTH its Telnyx WS-server mailbox AND
+ * the OpenAI wsc connection in ONE selective-receive loop — without a poll
+ * tick. wsc_set_handler(handle, pid) registers `pid` as the owner and
+ * spawns a dedicated reader process that blocking-recvs frames off the
+ * connection and sw_send_tagged's each one to `pid`:
+ *
+ *     {'wsc_message', handle, data}   (text, or base64 for binary frames)
+ *     {'wsc_close',   handle}         (once, when the peer/socket closes)
+ *
+ * This mirrors the WS server's tagged-message convention exactly, so a
+ * call process can write a single `receive { {'ws_message',..}; {'wsc_message',..} }`
+ * loop. The reader is one scheduler-managed sw process per wsc handle
+ * (the documented scaling cost — fine for "one OpenAI socket per call").
+ *
+ * Lifetime / teardown: once a handler is set, the reader is the sole owner
+ * of the read path AND of slot teardown. wsc_close() with a reader running
+ * does NOT free the slot directly (that would race the reader's in-flight
+ * recv); it shutdown(2)s the socket, which unblocks the reader's recv ->
+ * recv returns nil -> reader emits {'wsc_close', handle}, frees the slot,
+ * and exits. One reader + one wsc_send writer is the supported OpenSSL
+ * full-duplex pattern (read on one thread, write on another). */
+
+typedef struct { int handle; } _sw_wsc_reader_arg_t;
+
+static void _sw_wsc_reader_entry(void *raw) {
+    _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)raw;
+    int handle = ra->handle;
+    free(ra);
+
+    for (;;) {
+        if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) break;
+        sw_process_t *owner = _sw_wsc[handle].handler;
+        if (!owner) break;
+
+        /* Blocking single-frame read (no timeout). Returns a string on a
+         * text/binary frame, or nil on close/error. Reuses the tested
+         * frame parser + ping/pong handling in _builtin_wsc_recv. */
+        sw_val_t *harg[1]; harg[0] = sw_val_int(handle);
+        sw_val_t *frame = _builtin_wsc_recv(harg, 1);
+
+        if (frame && frame->type == SW_VAL_STRING) {
+            sw_val_t *items[3];
+            items[0] = sw_val_atom("wsc_message");
+            items[1] = sw_val_int(handle);
+            items[2] = frame;   /* the recv'd string value (already owned) */
+            sw_send_tagged(owner, SW_TAG_NONE, sw_val_tuple(items, 3));
+        } else {
+            /* Close / error → notify once and tear the slot down ourselves. */
+            sw_val_t *items[2];
+            items[0] = sw_val_atom("wsc_close");
+            items[1] = sw_val_int(handle);
+            sw_send_tagged(owner, SW_TAG_NONE, sw_val_tuple(items, 2));
+            if (handle >= 0 && handle < _SW_WSC_MAX && _sw_wsc[handle].used) {
+                int fd = _sw_wsc[handle].fd;
+                _sw_wsc_free_slot(handle);   /* frees SSL/CTX if TLS */
+                if (fd >= 0) close(fd);
+            }
+            break;
+        }
+    }
+}
+
+/* wsc_set_handler(handle, pid) — deliver inbound frames to pid's mailbox.
+ * Returns 'ok' on success, 'error' on a bad handle / missing reader. */
+static sw_val_t *_builtin_wsc_set_handler(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    if (!a[1] || a[1]->type != SW_VAL_PID || !a[1]->v.pid) return sw_val_atom("error");
+    int handle = (int)a[0]->v.i;
+    if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) return sw_val_atom("error");
+
+    _sw_wsc[handle].handler = a[1]->v.pid;
+    if (!_sw_wsc[handle].reader_running) {
+        _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)malloc(sizeof(*ra));
+        if (!ra) return sw_val_atom("error");
+        ra->handle = handle;
+        sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
+        if (!rp) { free(ra); return sw_val_atom("error"); }
+        _sw_wsc[handle].reader_running = 1;
+    }
+    return sw_val_atom("ok");
+}
+
 /* wsc_close(handle) — send close frame, close socket, free slot. */
 static sw_val_t *_builtin_wsc_close(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
@@ -6473,6 +6576,16 @@ static sw_val_t *_builtin_wsc_close(sw_val_t **a, int n) {
     /* Best-effort close frame. */
     uint8_t close_frame[6] = {0x88, 0x80, 0x00, 0x00, 0x00, 0x00};
     _sw_wsc_slot_send_all(handle, close_frame, sizeof(close_frame));
+
+    /* If an async reader owns this slot, don't free it out from under the
+     * reader's in-flight recv. shutdown(2) unblocks that recv -> the reader
+     * emits {'wsc_close',handle}, frees the slot, and exits. We return now;
+     * the reader does the teardown. */
+    if (_sw_wsc[handle].reader_running) {
+        shutdown(fd, SHUT_RDWR);
+        return sw_val_atom("ok");
+    }
+
     _sw_wsc_free_slot(handle);   /* frees SSL/CTX if TLS */
     close(fd);
     return sw_val_atom("ok");

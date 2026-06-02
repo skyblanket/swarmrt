@@ -283,6 +283,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "wsc_connect_tls") == 0 ||
            strcmp(name, "wsc_send") == 0 ||
            strcmp(name, "wsc_recv") == 0 ||
+           strcmp(name, "wsc_set_handler") == 0 ||
            strcmp(name, "wsc_close") == 0 ||
            strcmp(name, "chrome_launch") == 0 ||
            /* WS binary frames + audio codecs (native voice agents) */
@@ -1624,7 +1625,7 @@ static const char *_common_builtins[] = {
     "file_rename", "file_stat", "file_atomic_write", "file_temp",
     "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
     "ws_send", "ws_close", "ws_set_handler", "ws_send_binary",
-    "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_close",
+    "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_set_handler", "wsc_close",
     "audio_ulaw_to_pcm16", "audio_pcm16_to_ulaw", "audio_resample",
     "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
     "read_line", "read_char", "read_choice",
@@ -1903,6 +1904,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "wsc_connect_tls") == 0 ||
              strcmp(fname, "wsc_send") == 0 ||
              strcmp(fname, "wsc_recv") == 0 ||
+             strcmp(fname, "wsc_set_handler") == 0 ||
              strcmp(fname, "wsc_close") == 0 ||
              strcmp(fname, "chrome_launch") == 0 ||
              /* WS binary frames + audio codecs (native voice agents) */

@@ -43,11 +43,35 @@ fun echo_loop() {
     }
 }
 
+# Robust connect: the echo_server runs in a *spawned* process, so the
+# listener's bind()/listen() (http_listen → sw_tcp_listen) only happens
+# once the scheduler runs that process. Under CPU load right after a
+# rebuild that can lag well past any fixed sleep, so a single wsc_connect
+# races the bind and gets ECONNREFUSED → nil. Instead of guessing a sleep,
+# we retry the connect with a small backoff until the listener is up.
+# wsc_connect returns nil on a refused connection / failed handshake and an
+# int handle on success, so 'nil' vs _ cleanly drives the loop. With 100
+# attempts × 50 ms backoff the total budget is ~5 s — orders of magnitude
+# more than the bind needs even under load — while a normal run succeeds on
+# the first or second try, keeping the test fast when idle and
+# deterministic when loaded.
+fun connect_retry(url, attempts) {
+    h = wsc_connect(url)
+    case h {
+        'nil' ->
+            if (attempts <= 1) { 'nil' }     # give up — surfaced as a real FAIL
+            else {
+                sleep(50)                    # back off, let the listener bind
+                connect_retry(url, attempts - 1)
+            }
+        _ -> h                               # connected: return the handle
+    }
+}
+
 fun main() {
     spawn(fun() { echo_server() })
-    sleep(200)   # let the listener bind
 
-    h = wsc_connect("ws://127.0.0.1:9099/")
+    h = connect_retry("ws://127.0.0.1:9099/", 100)
     fails = 0
     case h {
         'nil' ->

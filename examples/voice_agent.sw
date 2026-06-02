@@ -93,17 +93,22 @@ fun call_init(conn, stream_id) {
       ws_close(conn)
     _ ->
       wsc_send(oa, Voice.session_update(session_opts()))
+      # Push-deliver OpenAI's frames into THIS process's mailbox as
+      # {'wsc_message', oa, text} / {'wsc_close', oa} — mirroring the WS
+      # server's {'ws_message', conn, text}. No poll loop, no blocking
+      # wsc_recv: both streams now arrive as ordinary mailbox messages.
+      wsc_set_handler(oa, self())
       print(f"[{stream_id}] bridge live")
       bridge(conn, oa, stream_id)
   }
 }
 
-# THE BRIDGE LOOP. Two async streams interleaved in ONE process:
-#   - Telnyx → us arrives as {'ws_message', conn, text} mailbox messages
-#     (pushed by the WS server bridge). We drain those with selective recv.
-#   - OpenAI → us is a client socket we must POLL (wsc_recv). We poll it in
-#     the `after` clause: if no Telnyx frame arrived within 5ms, check OA.
-# This gives fair, low-latency interleaving without threads.
+# THE BRIDGE LOOP. Two async streams interleaved in ONE process, both as
+# mailbox messages — a single selective-receive, no `after` poll tick:
+#   - Telnyx → us  : {'ws_message', conn, text}  (WS server bridge pushes it)
+#   - OpenAI → us  : {'wsc_message', oa, text}    (wsc_set_handler reader pushes it)
+# The runtime blocks the process until EITHER side has a frame, so there's
+# no busy-poll and no added latency on the outbound (OpenAI→Telnyx) leg.
 fun bridge(conn, oa, sid) {
   receive {
     # ----- inbound: caller audio + control from Telnyx -----
@@ -126,31 +131,16 @@ fun bridge(conn, oa, sid) {
       print(f"[{sid}] telnyx socket closed")
       wsc_close(oa)
 
-    # ----- outbound: poll OpenAI, forward its audio to Telnyx -----
-    after 5 {
-      drained = drain_openai(conn, oa, sid, 0)
-      case drained {
-        'closed' -> ws_close(conn)         # OA hung up → end the call
+    # ----- outbound: OpenAI audio/events, pushed to our mailbox -----
+    {'wsc_message', _oa, text} ->
+      done = handle_openai(conn, oa, sid, text)
+      case done {
+        'closed' -> ws_close(conn)           # OA asked us to end the call
         _        -> bridge(conn, oa, sid)
       }
-    }
-  }
-}
-
-# Drain up to a bounded burst of OpenAI frames per tick (so one busy side
-# can't starve the other). Returns 'ok' or 'closed'.
-fun drain_openai(conn, oa, sid, count) {
-  msg = Voice.realtime_poll(oa)             # non-blocking poll
-  case msg {
-    'nil' -> 'ok'                            # nothing pending right now
-    _ ->
-      done = handle_openai(conn, oa, sid, msg)
-      case done {
-        'closed' -> 'closed'
-        _ ->
-          if (count >= 16) { 'ok' }          # burst cap → yield to Telnyx side
-          else { drain_openai(conn, oa, sid, count + 1) }
-      }
+    {'wsc_close', _oa2} ->
+      print(f"[{sid}] openai socket closed")
+      ws_close(conn)                          # OA hung up → end the call
   }
 }
 

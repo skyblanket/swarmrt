@@ -1321,22 +1321,29 @@ static node_t *par_module(par_t *p) {
     mod->v.mod.nfuns = 0;
     mod->v.mod.nimports = 0;
 
-    /* Imports */
-    while (p->cur.type == TOK_IMPORT && !p->err) {
-        par_adv(p);
-        tok_t iname = par_expect(p, TOK_IDENT, "module name");
-        if (mod->v.mod.nimports < 16)
-            strncpy(mod->v.mod.imports[mod->v.mod.nimports++], iname.text, 127);
-    }
-
-    /* Optional export */
-    if (par_match(p, TOK_EXPORT)) {
-        par_expect(p, TOK_LBRACKET, "'['");
-        while (p->cur.type != TOK_RBRACKET && p->cur.type != TOK_EOF) {
+    /* Module-header clauses: imports and exports may appear in ANY order
+     * and may be interleaved. The previous version parsed all imports
+     * first and then at most one export; an `export [...]` placed before
+     * an `import X` left the import (and, worse, every following function
+     * body) unparsed — the function/global loop below starts at the first
+     * unconsumed `import`/`export` and bails immediately, silently
+     * dropping the whole module body. Loop over both clause kinds until
+     * neither appears so order no longer matters. */
+    while ((p->cur.type == TOK_IMPORT || p->cur.type == TOK_EXPORT) && !p->err) {
+        if (p->cur.type == TOK_IMPORT) {
             par_adv(p);
-            par_match(p, TOK_COMMA);
+            tok_t iname = par_expect(p, TOK_IDENT, "module name");
+            if (mod->v.mod.nimports < 16)
+                strncpy(mod->v.mod.imports[mod->v.mod.nimports++], iname.text, 127);
+        } else { /* TOK_EXPORT */
+            par_adv(p);
+            par_expect(p, TOK_LBRACKET, "'['");
+            while (p->cur.type != TOK_RBRACKET && p->cur.type != TOK_EOF) {
+                par_adv(p);
+                par_match(p, TOK_COMMA);
+            }
+            par_expect(p, TOK_RBRACKET, "']'");
         }
-        par_expect(p, TOK_RBRACKET, "']'");
     }
 
     /* Functions and module-level globals (let x = literal) */
@@ -3022,7 +3029,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         "http_listen", "http_respond", "ws_send", "ws_close",
         "ws_set_handler", "ws_send_binary", "telemetry_emit", "telemetry_subscribe",
         "pubsub_broadcast", "pubsub_subscribe", "chrome_launch",
-        "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_close",
+        "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv",
+        "wsc_set_handler", "wsc_close",
         NULL
     };
     for (int i = 0; scheduler_names[i]; i++) {
