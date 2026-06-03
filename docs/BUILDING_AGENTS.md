@@ -290,6 +290,27 @@ Restart types: `'permanent'` (always restart), `'transient'` (restart only on ab
 
 This is the Erlang "let it crash" philosophy. An agent process that hits a panic or an `error()` raise will die; the supervisor catches it and starts a fresh one. State that was in the dead agent is lost (recurse with fresh state on restart) — for state you want to survive crashes, put it in ETS or a file.
 
+### One supervised process per connection
+
+`supervise(...)` fixes its children at start. But an agent usually doesn't know its children up front: a voice agent gets one call at a time but many over its life; a server gets one request per socket. Don't re-`supervise()` per event (it rebuilds the whole tree) and don't `spawn()` bare (an unsupervised crash is silent). Start one **dynamic supervisor** at boot and add a child per event:
+
+```sw
+fun serve(sup) {
+    socket = accept_next()                                   # blocks for the next call/request
+    sup_start_child(sup, {nil, fun() { handle(socket) }, 'temporary'})
+    serve(sup)
+}
+
+fun main() {
+    sup = dyn_supervisor()
+    serve(sup)
+}
+```
+
+`dyn_supervisor()` starts empty and is always `one_for_one` (each child independent). `sup_start_child(sup, {name, fn, restart})` takes the same `{name, fn, restart}` tuple as `supervise` — `name` may be `nil` for anonymous workers — and returns the child's pid (or `nil`). `:temporary` is the right policy for per-connection workers (a dropped call shouldn't be retried); use `:transient` if a crash, not a clean hangup, should reconnect. If a child crash-loops past `max_restarts` within `max_seconds` (default 3 / 5s, tunable via `dyn_supervisor(max_restarts, max_seconds)`), the supervisor kills its children and shuts down — the same circuit breaker as `supervise`, so a runaway child can't restart forever.
+
+Like all process primitives, these run only in compiled binaries (`swc build`). Under the interpreter (`swc run`, `swc test`, the REPL) they warn and return `nil`.
+
 ---
 
 ## Tools that need a browser

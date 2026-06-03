@@ -3780,6 +3780,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     static const char *scheduler_names[] = {
         "send", "register", "whereis", "link", "unlink", "monitor",
         "demonitor", "exit_proc", "trap_exit", "supervise",
+        "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
         "http_listen", "http_respond", "ws_send", "ws_close",
         "ws_set_handler", "ws_send_binary", "ws_request_headers", "ws_request_path",
         "telemetry_emit", "telemetry_subscribe",

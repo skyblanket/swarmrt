@@ -14,6 +14,7 @@
 #include "swarmrt_lang.h"
 #include "swarmrt_ets.h"
 #include "swarmrt_otp.h"
+#include "swarmrt_phase4.h"   /* sw_dynsup_* — DynamicSupervisor (runtime start_child) */
 #include "swarmrt_http.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -2912,6 +2913,91 @@ static sw_val_t *_builtin_supervise(sw_val_t **a, int n) {
     sw_process_t *sup = sw_supervisor_start("sw_sup", &sup_spec);
     /* specs not freed — supervisor holds a shallow copy of the pointer */
     return sup ? sw_val_pid(sup) : sw_val_nil();
+}
+
+/* === DynamicSupervisor (runtime start_child) ===
+ *
+ * A one_for_one supervisor that begins with zero children and accepts new
+ * supervised children at runtime — one per incoming call / request. The
+ * native runtime is sw_dynsup_* (swarmrt_phase4.c, already in the core lib
+ * and fuzz-covered); these builtins are just the sw-level surface, mirroring
+ * _builtin_supervise's child-spec shape exactly:
+ *
+ *   {name, fun() { ... }, :permanent | :temporary | :transient}
+ */
+
+/* dyn_supervisor()                       -> pid (max_restarts=3, max_seconds=5)
+ * dyn_supervisor(max_restarts, max_secs) -> pid
+ * Returns the supervisor pid, or nil on failure. */
+static sw_val_t *_builtin_dyn_supervisor(sw_val_t **a, int n) {
+    sw_dynsup_spec_t spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.max_restarts = 3;
+    spec.max_seconds = 5;
+    spec.max_children = 0; /* unlimited up to SW_DYNSUP_MAX_CHILDREN */
+    if (n >= 1 && a[0] && a[0]->type == SW_VAL_INT) spec.max_restarts = (uint32_t)a[0]->v.i;
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) spec.max_seconds = (uint32_t)a[1]->v.i;
+
+    sw_process_t *sup = sw_dynsup_start("sw_dynsup", &spec);
+    return sup ? sw_val_pid(sup) : sw_val_nil();
+}
+
+/* sup_start_child(sup, {name, fn, restart}) -> child pid | nil
+ * Builds one sw_child_spec_t from the tuple and asks the supervisor to
+ * spawn+monitor it. Same closure contract as supervise(): fn is held by
+ * reference and applied (and re-applied on restart) by the child process. */
+static sw_val_t *_builtin_sup_start_child(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_PID || !a[0]->v.pid) return sw_val_nil();
+    sw_val_t *child = a[1];
+    if (!child || child->type != SW_VAL_TUPLE || child->v.tuple.count < 2) return sw_val_nil();
+
+    sw_val_t *name_v = child->v.tuple.items[0];
+    sw_val_t *fn_v = child->v.tuple.items[1];
+    if (!fn_v || fn_v->type != SW_VAL_FUN) return sw_val_nil();
+
+    sw_child_spec_t spec;
+    memset(&spec, 0, sizeof(spec));
+
+    if (name_v && (name_v->type == SW_VAL_ATOM || name_v->type == SW_VAL_STRING) && name_v->v.str)
+        strncpy(spec.name, name_v->v.str, sizeof(spec.name) - 1);
+    else
+        spec.name[0] = '\0'; /* anonymous */
+
+    _sup_child_closure_t *c = (_sup_child_closure_t *)malloc(sizeof(_sup_child_closure_t));
+    c->fn = fn_v;
+    spec.start_func = _sup_child_entry;
+    spec.start_arg = c;
+    spec.restart = SW_PERMANENT;
+
+    if (child->v.tuple.count >= 3) {
+        sw_val_t *restart_v = child->v.tuple.items[2];
+        if (restart_v && restart_v->type == SW_VAL_ATOM && restart_v->v.str) {
+            if (strcmp(restart_v->v.str, "temporary") == 0) spec.restart = SW_TEMPORARY;
+            else if (strcmp(restart_v->v.str, "transient") == 0) spec.restart = SW_TRANSIENT;
+        }
+    }
+
+    sw_process_t *proc = sw_dynsup_start_child_proc(a[0]->v.pid, &spec);
+    /* spec is copied by value into the supervisor's child node; closure c is
+     * NOT freed — the supervisor re-uses spec.start_arg on every restart, so
+     * freeing it would be a use-after-free on restart. Deliberate small leak,
+     * identical to supervise(). */
+    return proc ? sw_val_pid(proc) : sw_val_nil();
+}
+
+/* sup_terminate_child(sup, child) -> 'ok' | 'error' */
+static sw_val_t *_builtin_sup_terminate_child(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_PID || !a[0]->v.pid ||
+        !a[1] || a[1]->type != SW_VAL_PID || !a[1]->v.pid)
+        return sw_val_atom("error");
+    int rc = sw_dynsup_terminate_child_proc(a[0]->v.pid, a[1]->v.pid);
+    return sw_val_atom(rc == 0 ? "ok" : "error");
+}
+
+/* sup_count_children(sup) -> int */
+static sw_val_t *_builtin_sup_count_children(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_PID || !a[0]->v.pid) return sw_val_int(0);
+    return sw_val_int((int64_t)sw_dynsup_count_children_proc(a[0]->v.pid));
 }
 
 /* === Distributed Nodes === */

@@ -226,6 +226,11 @@ static int is_builtin(const char *name) {
            strcmp(name, "reduce") == 0 || strcmp(name, "filter") == 0 ||
            /* Supervisor */
            strcmp(name, "supervise") == 0 ||
+           /* DynamicSupervisor (runtime start_child) */
+           strcmp(name, "dyn_supervisor") == 0 ||
+           strcmp(name, "sup_start_child") == 0 ||
+           strcmp(name, "sup_terminate_child") == 0 ||
+           strcmp(name, "sup_count_children") == 0 ||
            /* Distributed nodes */
            strcmp(name, "node_start") == 0 || strcmp(name, "node_stop") == 0 ||
            strcmp(name, "node_name") == 0 || strcmp(name, "node_connect") == 0 ||
@@ -1803,6 +1808,7 @@ static const char *_common_builtins[] = {
     "read_line", "read_char", "read_choice",
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "pid_alive",
     "random_int", "supervise",
+    "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
     NULL
 };
 
@@ -2155,7 +2161,12 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              /* Phase 21: input-aware terminal output */
              strcmp(fname, "print_above") == 0 ||
              /* argv-style exec (no shell) */
-             strcmp(fname, "exec_argv") == 0)
+             strcmp(fname, "exec_argv") == 0 ||
+             /* DynamicSupervisor (runtime start_child) */
+             strcmp(fname, "dyn_supervisor") == 0 ||
+             strcmp(fname, "sup_start_child") == 0 ||
+             strcmp(fname, "sup_terminate_child") == 0 ||
+             strcmp(fname, "sup_count_children") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)
