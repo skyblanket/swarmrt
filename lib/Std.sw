@@ -19,7 +19,11 @@ export [
     map_each, map_filter,
     # ---- string ops ----
     string_join, string_pad_left, string_pad_right, string_repeat,
-    string_indent
+    string_indent,
+    # ---- concurrency ----
+    task_stream,
+    # ---- structured output ----
+    json_expect
 ]
 
 # ============================================================
@@ -333,4 +337,282 @@ fun string_indent(s, n) {
 fun _indent_lines(lines, pad, acc) {
     if (length(lines) == 0) { acc }
     else { _indent_lines(tl(lines), pad, list_append(acc, pad ++ hd(lines))) }
+}
+
+# ============================================================
+# CONCURRENCY — bounded parallel fan-out
+# ============================================================
+#
+# task_stream(list, fn, opts) — run fn over every item, AT MOST N at a
+# time, and collect the results IN INPUT ORDER. This is the rate-limited
+# swarm primitive: "run 100 LLM calls, 5 in flight" is
+#
+#     Std.task_stream(prompts, fun(p) { ask_llm(p) },
+#                     %{max_concurrency: 5, timeout_ms: 30000})
+#
+# Each result is TAGGED so the caller can branch on every outcome —
+# task_stream NEVER returns a bare nil (the bug `pmap` has, where a slow
+# item silently becomes nil on its hardcoded 5s wall):
+#
+#     {'ok', value}            — fn(item) returned value
+#     {'error', 'timeout'}     — fn(item) ran past timeout_ms (on_timeout: 'error')
+#     {'error', reason}        — fn(item) crashed; reason is the DOWN reason
+#
+# opts (all optional):
+#   max_concurrency : int  — max workers in flight at once (default: len(list))
+#   timeout_ms      : int  — per-item deadline in ms (default: 0 = no timeout)
+#   on_timeout      : atom — 'error' (default) records {'error','timeout'};
+#                            'keep' leaves the slot open and waits forever
+#                            (timeout disabled for that item)
+#
+# Implementation: pure sw over spawn_monitor + selective receive. The
+# calling process is the coordinator. It keeps at most N workers alive,
+# refilling a slot the instant one finishes. Crashes are caught via the
+# {'DOWN', ref, ...} monitor message (a panicking fn becomes an
+# {'error', reason} cell, not a hang). Timeouts are deadline-driven: the
+# coordinator's `after` is the soonest in-flight deadline, so one slow
+# item can't stall the others.
+fun task_stream(lst, fn, opts) {
+    n = length(lst)
+    if (n == 0) { [] }
+    else {
+        max_c = case map_get(opts, 'max_concurrency') {
+            nil -> n
+            m   -> if (m < 1) { 1 } else { m }
+        }
+        tmo = case map_get(opts, 'timeout_ms') { nil -> 0 ; t -> t }
+        on_tmo = case map_get(opts, 'on_timeout') { nil -> 'error' ; o -> o }
+        # `fn` cannot be closed over across a top-level worker fun, and
+        # spawn only accepts named functions — so we stash fn + each item
+        # in a shared ETS table the worker reads back by index.
+        items = ets_new()                          # idx -> item ; '__fn' -> fn
+        results = ets_new()                        # idx -> tagged result
+        ets_put(items, '__fn', fn)
+        _ts_index(lst, 0, items)
+        coord = self()
+        # Prime the pool: start min(max_c, n) workers for indices 0..k-1.
+        k = _ts_min(max_c, n)
+        in_flight = _ts_start_range(0, k, items, tmo, coord, [])
+        _ts_loop(in_flight, k, n, max_c, items, tmo, on_tmo, coord, results)
+        _ts_collect(0, n, results, [])
+    }
+}
+
+fun _ts_min(a, b) { if (a < b) { a } else { b } }
+
+# Stash each item under its 0-based index.
+fun _ts_index(lst, i, items) {
+    if (length(lst) == 0) { 'ok' }
+    else { ets_put(items, i, hd(lst)) ; _ts_index(tl(lst), i + 1, items) }
+}
+
+# Start workers for indices [from, to) and append their handles to acc.
+fun _ts_start_range(from, to, items, tmo, coord, acc) {
+    if (from >= to) { acc }
+    else { _ts_start_range(from + 1, to, items, tmo, coord,
+                           list_append(acc, _ts_spawn_one(from, items, tmo, coord))) }
+}
+
+# Spawn one monitored worker for index `idx`. Returns {ref, pid, idx, deadline}.
+# deadline is an absolute ms timestamp; 0 means "no timeout".
+fun _ts_spawn_one(idx, items, tmo, coord) {
+    pair = spawn_monitor(_ts_worker(items, idx, coord))
+    pid = elem(pair, 0)
+    ref = elem(pair, 1)
+    deadline = if (tmo > 0) { timestamp() + tmo } else { 0 }
+    {ref, pid, idx, deadline}
+}
+
+# The worker: read fn + item from the shared table, run fn(item) inside a
+# try so a panic becomes {'error', reason} (never a hang), send it home.
+fun _ts_worker(items, idx, coord) {
+    fn = ets_get(items, '__fn')
+    item = ets_get(items, idx)
+    tagged = try { {'ok', fn(item)} } catch e { {'error', e} }
+    send(coord, {'task_done', idx, tagged})
+}
+
+# The coordinator loop. `done` counts recorded results; loop until done==n.
+#   in_flight : [{ref, pid, idx, deadline}, ...] currently-running workers
+#   next_idx  : next undispatched item index
+#   n, max_c  : total items, concurrency cap
+fun _ts_loop(in_flight, next_idx, n, max_c, items, tmo, on_tmo, coord, results) {
+    if (ets_count(results) >= n) { 'ok' }
+    else {
+        wait = _ts_wait_ms(in_flight, tmo, on_tmo)
+        receive {
+            {'task_done', idx, tagged} ->
+                ets_put(results, idx, tagged)
+                rest = _ts_remove_idx(in_flight, idx, [])
+                refilled = _ts_refill(rest, next_idx, n, max_c, items, tmo, coord)
+                _ts_loop(elem(refilled, 0), elem(refilled, 1), n, max_c,
+                         items, tmo, on_tmo, coord, results)
+
+            {'DOWN', ref, _, _, reason} ->
+                # A worker died. If we already recorded its task_done the ref
+                # is gone from in_flight (normal exit) — ignore. Otherwise it
+                # crashed outside the try (or was killed); record the reason.
+                entry = _ts_find_ref(in_flight, ref)
+                case entry {
+                    nil ->
+                        _ts_loop(in_flight, next_idx, n, max_c, items, tmo, on_tmo, coord, results)
+                    e ->
+                        idx = elem(e, 2)
+                        if (ets_get(results, idx) == nil) {
+                            ets_put(results, idx, {'error', reason})
+                        }
+                        rest = _ts_remove_ref(in_flight, ref, [])
+                        refilled = _ts_refill(rest, next_idx, n, max_c, items, tmo, coord)
+                        _ts_loop(elem(refilled, 0), elem(refilled, 1), n, max_c,
+                                 items, tmo, on_tmo, coord, results)
+                }
+
+            after wait {
+                # Deadline reached: time out every expired in-flight worker.
+                now = timestamp()
+                expired = _ts_expired(in_flight, now, [])
+                _ts_timeout_each(expired, results)
+                rest = _ts_keep_unexpired(in_flight, now, [])
+                refilled = _ts_refill(rest, next_idx, n, max_c, items, tmo, coord)
+                _ts_loop(elem(refilled, 0), elem(refilled, 1), n, max_c,
+                         items, tmo, on_tmo, coord, results)
+            }
+        }
+    }
+}
+
+# How long to block on `receive`. With no timeout (tmo<=0) or on_timeout=='keep'
+# we block indefinitely (a huge ms value). Otherwise it's the soonest deadline
+# minus now, floored at 1 so an already-passed deadline fires immediately.
+fun _ts_wait_ms(in_flight, tmo, on_tmo) {
+    if (tmo <= 0 || on_tmo == 'keep') { 86400000 }
+    else {
+        soonest = _ts_soonest_deadline(in_flight, 0)
+        if (soonest == 0) { 86400000 }
+        else { rem = soonest - timestamp() ; if (rem < 1) { 1 } else { rem } }
+    }
+}
+
+fun _ts_soonest_deadline(in_flight, best) {
+    if (length(in_flight) == 0) { best }
+    else {
+        d = elem(hd(in_flight), 3)
+        nb = if (d > 0 && (best == 0 || d < best)) { d } else { best }
+        _ts_soonest_deadline(tl(in_flight), nb)
+    }
+}
+
+# Refill empty slots up to max_c by starting workers for the next indices.
+# Returns {new_in_flight, new_next_idx}.
+fun _ts_refill(in_flight, next_idx, n, max_c, items, tmo, coord) {
+    if (length(in_flight) >= max_c || next_idx >= n) { {in_flight, next_idx} }
+    else {
+        spawned = _ts_spawn_one(next_idx, items, tmo, coord)
+        _ts_refill(list_append(in_flight, spawned), next_idx + 1, n, max_c, items, tmo, coord)
+    }
+}
+
+# Record {'error','timeout'} for each expired worker and kill it.
+fun _ts_timeout_each(expired, results) {
+    if (length(expired) == 0) { 'ok' }
+    else {
+        e = hd(expired)
+        pid = elem(e, 1)
+        idx = elem(e, 2)
+        exit_proc(pid, 'kill')
+        if (ets_get(results, idx) == nil) { ets_put(results, idx, {'error', 'timeout'}) }
+        _ts_timeout_each(tl(expired), results)
+    }
+}
+
+fun _ts_expired(in_flight, now, acc) {
+    if (length(in_flight) == 0) { acc }
+    else {
+        e = hd(in_flight)
+        d = elem(e, 3)
+        na = if (d > 0 && now >= d) { list_append(acc, e) } else { acc }
+        _ts_expired(tl(in_flight), now, na)
+    }
+}
+
+fun _ts_keep_unexpired(in_flight, now, acc) {
+    if (length(in_flight) == 0) { acc }
+    else {
+        e = hd(in_flight)
+        d = elem(e, 3)
+        na = if (d > 0 && now >= d) { acc } else { list_append(acc, e) }
+        _ts_keep_unexpired(tl(in_flight), now, na)
+    }
+}
+
+fun _ts_find_ref(in_flight, ref) {
+    if (length(in_flight) == 0) { nil }
+    else { if (elem(hd(in_flight), 0) == ref) { hd(in_flight) } else { _ts_find_ref(tl(in_flight), ref) } }
+}
+
+fun _ts_remove_ref(in_flight, ref, acc) {
+    if (length(in_flight) == 0) { acc }
+    else {
+        e = hd(in_flight)
+        na = if (elem(e, 0) == ref) { acc } else { list_append(acc, e) }
+        _ts_remove_ref(tl(in_flight), ref, na)
+    }
+}
+
+fun _ts_remove_idx(in_flight, idx, acc) {
+    if (length(in_flight) == 0) { acc }
+    else {
+        e = hd(in_flight)
+        na = if (elem(e, 2) == idx) { acc } else { list_append(acc, e) }
+        _ts_remove_idx(tl(in_flight), idx, na)
+    }
+}
+
+# Collect results 0..n-1 from ETS into an ordered list. Any gap (should
+# never happen) defaults to {'error','missing'} so the return is total —
+# every cell is a {'ok'|'error', _} tuple, never a bare nil.
+fun _ts_collect(i, n, results, acc) {
+    if (i >= n) { acc }
+    else {
+        cell = case ets_get(results, i) { nil -> ({'error', 'missing'}) ; c -> c }
+        _ts_collect(i + 1, n, results, list_append(acc, cell))
+    }
+}
+
+# ============================================================
+# STRUCTURED OUTPUT — decode-and-validate
+# ============================================================
+
+# json_expect(str, opts) — decode JSON and check shape in one step.
+# Returns {'ok', map} only if str is a JSON object that contains every key
+# in opts.required; otherwise {'error', reason}. This is the validate half
+# of the instructor-style "schema -> validate -> retry" loop (Agent.ask_json
+# does the retry). reason is human-readable so it can be fed back to the LLM.
+#
+#   case Std.json_expect(reply, %{required: ['name', 'age']}) {
+#       {'ok', m}      -> use(m)
+#       {'error', why} -> retry_with(why)
+#   }
+fun json_expect(str, opts) {
+    decoded = json_decode(str)
+    if (decoded == nil) { {'error', "invalid JSON"} }
+    # A JSON object's source (after trimming) starts with '{'. We test the
+    # string rather than the decoded value so this works identically in the
+    # compiled and tree-walking (`swc run`) paths.
+    else { if (string_starts_with(string_trim(str), "{") == 'false') { {'error', "expected a JSON object"} }
+    else {
+        required = case map_get(opts, 'required') { nil -> [] ; r -> r }
+        missing = _je_missing(required, decoded, [])
+        if (length(missing) == 0) { {'ok', decoded} }
+        else { {'error', "missing required keys: " ++ string_join(missing, ", ")} }
+    } }
+}
+
+fun _je_missing(required, m, acc) {
+    if (length(required) == 0) { acc }
+    else {
+        k = hd(required)
+        na = if (map_get(m, k) == nil) { list_append(acc, k) } else { acc }
+        _je_missing(tl(required), m, na)
+    }
 }

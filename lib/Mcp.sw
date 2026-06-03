@@ -35,24 +35,42 @@ export [
 # client_start(cmd) → %{handle, next_id} | %{error: msg}
 # Spawns the MCP server subprocess and does the `initialize` handshake.
 fun client_start(cmd) {
+    # The spawn-then-handshake ladder is exactly what `with` is for: each step
+    # returns a tagged {'ok', v} | {'error', why}, and the chain only proceeds
+    # while every step matches {'ok', _}. The single `else` binds the first
+    # failure (whatever {'error', why} arose) and turns it into the error map.
+    # This replaces a nested if/else that LLMs reliably nest wrong.
+    with {'ok', h}      <- spawn_proc(cmd),
+         {'ok', client} <- handshake(%{handle: h, next_id: 1}) {
+        # Handshake ok — send the `initialized` notification (no id, no reply)
+        # and hand back the client with a bumped id.
+        send_notification(client, "notifications/initialized", %{})
+        map_put(client, 'next_id', map_get(client, 'next_id') + 1)
+    } else {
+        {'error', why} -> %{error: why}
+    }
+}
+
+# spawn_proc(cmd) → {'ok', handle} | {'error', msg}
+fun spawn_proc(cmd) {
     h = subprocess_spawn(cmd)
-    if (h < 0) { %{error: f"failed to spawn '{cmd}'"} }
+    if (h < 0) { {'error', f"failed to spawn '{cmd}'"} }
+    else { {'ok', h} }
+}
+
+# handshake(client) → {'ok', client} | {'error', why}. Runs the `initialize`
+# RPC and fails (closing the subprocess) if the server returns an error.
+fun handshake(client) {
+    init_resp = rpc_call(client, "initialize", %{
+        protocolVersion: "2024-11-05",
+        capabilities: %{},
+        clientInfo: %{name: "swarmrt", version: "0.1"}
+    })
+    err = map_get(init_resp, 'error')
+    if (err == nil) { {'ok', client} }
     else {
-        client = %{handle: h, next_id: 1}
-        # Initialize handshake — required before any other call.
-        init_resp = rpc_call(client, "initialize", %{
-            protocolVersion: "2024-11-05",
-            capabilities: %{},
-            clientInfo: %{name: "swarmrt", version: "0.1"}
-        })
-        if (map_get(init_resp, 'error') != nil) {
-            subprocess_close(h)
-            init_resp
-        } else {
-            # Send the `initialized` notification — no id, no response.
-            send_notification(client, "notifications/initialized", %{})
-            map_put(client, 'next_id', map_get(client, 'next_id') + 1)
-        }
+        subprocess_close(map_get(client, 'handle'))
+        {'error', err}
     }
 }
 

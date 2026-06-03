@@ -267,6 +267,45 @@ Same arm-clause shape as `receive` (pattern, optional `when guard`, body). Runs 
 
 This is the structured replacement for nested `if/else` ladders. Use it whenever you'd write `if (x == 'a') { ... } else { if (x == 'b') { ... } else { ... } }`.
 
+### with — happy-path error chains
+
+A fallible pipeline — decode, check, extract, validate, call — is a chain where each step must succeed before the next runs, and *any* failure short-circuits to one place. Nesting `case` for that is verbose and easy to get wrong. `with` is the construct for it (Elixir semantics):
+
+```sw
+with p1 <- e1, p2 <- e2, ... { body } else { other -> handler }
+```
+
+Evaluate `e1` and match it against `p1`; on a match, continue to the next bind; on a *mismatch*, bind the non-matching value to `other` and run the `else` arm. If every bind matches, run `body`. The bound names from each pattern are visible to the later binds and to `body`.
+
+The idiom is for each step to return a tagged result — `{'ok', v}` on success, anything else on failure — and to bind `{'ok', v}`. The first step that isn't `{'ok', _}` lands in the `else` arm, value intact:
+
+```sw
+module WithDemo
+export [main]
+
+fun step(label, v) {
+    if (v < 0) { {'error', label} }
+    else { {'ok', v * 2} }
+}
+
+fun pipeline(a, b) {
+    with {'ok', x} <- step("a", a),
+         {'ok', y} <- step("b", b) {
+        {'ok', x + y}
+    } else {
+        {'error', why} -> f"failed at {why}"
+    }
+}
+
+fun main() {
+    print(pipeline(2, 5))        # => {:ok, 14}
+    print(pipeline(2, 0 - 3))    # => failed at b
+    print(pipeline(0 - 1, 5))    # => failed at a
+}
+```
+
+`with` desugars at parse time into nested `case`, so it has the same pattern-matching power (tuples, maps, lists, literals) and the exact same behavior in `swc run` and a compiled binary. There are no per-bind `when` guards — match a pattern instead. A single bind (`with p <- e { ... } else { o -> ... }`) is fine; it's just a one-arm chain.
+
 ---
 
 ## 8. Processes and message passing
@@ -450,7 +489,7 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
 | `reduce(fn, lst, init)` | foldl |
-| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map` |
+| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap) and silently maps a slow item to `nil` on a fixed ~5s wall.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
 | `map_new()` | new empty map (same as the `%{}` literal) |
 | `map_get(m, k)` | value or `nil` |
 | `map_get(m, k, default)` | 3-arg form: value, or `default` if `k` is absent |

@@ -152,6 +152,7 @@ typedef enum {
 
     /* Operators */
     TOK_ARROW,      /* -> */
+    TOK_LARROW,     /* <- — `with` bind arrow */
     TOK_FARROW,     /* => */
     TOK_PIPE,       /* |> */
     TOK_ASSIGN,     /* = */
@@ -200,6 +201,7 @@ typedef enum {
      * format(template, expr1, expr2, ...). Single token type so we
      * don't have to thread state across multiple lex calls. */
     TOK_FSTRING,
+    TOK_WITH,       /* with — error-chain construct (Elixir-shaped) */
 } tok_type_t;
 
 typedef struct {
@@ -232,6 +234,7 @@ static struct { const char *w; tok_type_t t; } kw_table[] = {
     {"fun",       TOK_FUN},
     {"when",      TOK_WHEN},
     {"case",      TOK_CASE},
+    {"with",      TOK_WITH},
     {"end",       TOK_END},
     {"if",        TOK_IF},
     {"else",      TOK_ELSE},
@@ -434,6 +437,7 @@ static tok_t lnext(lex_t *l) {
     if (c == '=' && lpeek2(l) == '=') { ladv(l); ladv(l); t.type = TOK_EQ; strcpy(t.text, "=="); return t; }
     if (c == '!' && lpeek2(l) == '=') { ladv(l); ladv(l); t.type = TOK_NEQ; strcpy(t.text, "!="); return t; }
     if (c == '<' && lpeek2(l) == '=') { ladv(l); ladv(l); t.type = TOK_LE; strcpy(t.text, "<="); return t; }
+    if (c == '<' && lpeek2(l) == '-') { ladv(l); ladv(l); t.type = TOK_LARROW; strcpy(t.text, "<-"); return t; }
     if (c == '>' && lpeek2(l) == '=') { ladv(l); ladv(l); t.type = TOK_GE; strcpy(t.text, ">="); return t; }
     if (c == '|' && lpeek2(l) == '>') { ladv(l); ladv(l); t.type = TOK_PIPE; strcpy(t.text, "|>"); return t; }
     if (c == '+' && lpeek2(l) == '+') { ladv(l); ladv(l); t.type = TOK_CONCAT; strcpy(t.text, "++"); return t; }
@@ -553,6 +557,81 @@ static void node_free(node_t *n) {
     default: break;
     }
     free(n);
+}
+
+/* Deep-copy an AST subtree. Mirrors node_free's structure exactly (every
+ * child node_free recurses into is dup'd here). Used by the `with` desugar,
+ * which threads a single `else` handler into N generated `case` arms — each
+ * arm needs its OWN copy so the later node_free doesn't double-free a shared
+ * subtree. Leaf scalars (ival/fval/sval and all char[] fields) are carried by
+ * the flat `*out = *n` struct copy; we then re-dup the pointer children. */
+static node_t *node_dup(node_t *n) {
+    if (!n) return NULL;
+    node_t *out = calloc(1, sizeof(node_t));
+    *out = *n;  /* copies scalars + char[] fields + (stale) child pointers */
+    switch (n->type) {
+    case N_MODULE:
+        out->v.mod.funs = malloc(sizeof(node_t*) * (n->v.mod.nfuns ? n->v.mod.nfuns : 1));
+        for (int i = 0; i < n->v.mod.nfuns; i++) out->v.mod.funs[i] = node_dup(n->v.mod.funs[i]);
+        for (int i = 0; i < n->v.mod.nglobals; i++) out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        break;
+    case N_FUN:
+        out->v.fun.body = node_dup(n->v.fun.body);
+        for (int i = 0; i < n->v.fun.nparams; i++) out->v.fun.defaults[i] = node_dup(n->v.fun.defaults[i]);
+        break;
+    case N_BLOCK:
+        out->v.block.stmts = malloc(sizeof(node_t*) * (n->v.block.nstmts ? n->v.block.nstmts : 1));
+        for (int i = 0; i < n->v.block.nstmts; i++) out->v.block.stmts[i] = node_dup(n->v.block.stmts[i]);
+        break;
+    case N_ASSIGN: out->v.assign.value = node_dup(n->v.assign.value); break;
+    case N_CALL:
+        out->v.call.func = node_dup(n->v.call.func);
+        out->v.call.args = malloc(sizeof(node_t*) * (n->v.call.nargs ? n->v.call.nargs : 1));
+        for (int i = 0; i < n->v.call.nargs; i++) out->v.call.args[i] = node_dup(n->v.call.args[i]);
+        break;
+    case N_SPAWN: out->v.spawn.expr = node_dup(n->v.spawn.expr); break;
+    case N_SEND: out->v.send.to = node_dup(n->v.send.to); out->v.send.msg = node_dup(n->v.send.msg); break;
+    case N_RECEIVE:
+        out->v.recv.clauses = malloc(sizeof(node_t*) * (n->v.recv.nclauses ? n->v.recv.nclauses : 1));
+        for (int i = 0; i < n->v.recv.nclauses; i++) out->v.recv.clauses[i] = node_dup(n->v.recv.clauses[i]);
+        out->v.recv.after_body = node_dup(n->v.recv.after_body);
+        out->v.recv.after_expr = node_dup(n->v.recv.after_expr);
+        break;
+    case N_CLAUSE:
+        out->v.clause.pattern = node_dup(n->v.clause.pattern);
+        out->v.clause.guard = node_dup(n->v.clause.guard);
+        out->v.clause.body = node_dup(n->v.clause.body);
+        break;
+    case N_IF: out->v.iff.cond = node_dup(n->v.iff.cond); out->v.iff.then_b = node_dup(n->v.iff.then_b); out->v.iff.else_b = node_dup(n->v.iff.else_b); break;
+    case N_BINOP: out->v.binop.left = node_dup(n->v.binop.left); out->v.binop.right = node_dup(n->v.binop.right); break;
+    case N_UNARY: out->v.unary.operand = node_dup(n->v.unary.operand); break;
+    case N_PIPE: out->v.pipe.val = node_dup(n->v.pipe.val); out->v.pipe.func = node_dup(n->v.pipe.func); break;
+    case N_TUPLE: case N_LIST:
+        out->v.coll.items = malloc(sizeof(node_t*) * (n->v.coll.count ? n->v.coll.count : 1));
+        for (int i = 0; i < n->v.coll.count; i++) out->v.coll.items[i] = node_dup(n->v.coll.items[i]);
+        break;
+    case N_MAP:
+        out->v.map.keys = malloc(sizeof(node_t*) * (n->v.map.count ? n->v.map.count : 1));
+        out->v.map.vals = malloc(sizeof(node_t*) * (n->v.map.count ? n->v.map.count : 1));
+        for (int i = 0; i < n->v.map.count; i++) { out->v.map.keys[i] = node_dup(n->v.map.keys[i]); out->v.map.vals[i] = node_dup(n->v.map.vals[i]); }
+        break;
+    case N_FOR: out->v.forloop.iter = node_dup(n->v.forloop.iter); out->v.forloop.body = node_dup(n->v.forloop.body); break;
+    case N_LIST_COMP:
+        out->v.lcomp.iter = node_dup(n->v.lcomp.iter);
+        out->v.lcomp.body = node_dup(n->v.lcomp.body);
+        out->v.lcomp.guard = node_dup(n->v.lcomp.guard);
+        break;
+    case N_RANGE: out->v.range.from = node_dup(n->v.range.from); out->v.range.to = node_dup(n->v.range.to); break;
+    case N_TRY: out->v.trycatch.body = node_dup(n->v.trycatch.body); out->v.trycatch.catch_body = node_dup(n->v.trycatch.catch_body); break;
+    case N_LIST_CONS: out->v.cons.head = node_dup(n->v.cons.head); out->v.cons.tail = node_dup(n->v.cons.tail); break;
+    case N_CASE:
+        out->v.casex.subject = node_dup(n->v.casex.subject);
+        out->v.casex.clauses = malloc(sizeof(node_t*) * (n->v.casex.nclauses ? n->v.casex.nclauses : 1));
+        for (int i = 0; i < n->v.casex.nclauses; i++) out->v.casex.clauses[i] = node_dup(n->v.casex.clauses[i]);
+        break;
+    default: break;  /* leaf nodes (N_INT/N_FLOAT/N_STRING/N_ATOM/N_IDENT/N_SELF): scalars already copied */
+    }
+    return out;
 }
 
 /* =========================================================================
@@ -896,6 +975,90 @@ static node_t *par_primary(par_t *p) {
         return cx;
     }
 
+    /* `with` error-chain (Elixir-shaped):
+     *
+     *   with p1 <- e1, p2 <- e2, ... { B } else { o -> E }
+     *
+     * Evaluate e1, match p1; on match continue to the next bind, on mismatch
+     * bind the failing value (to `o`) and run the else arm; the happy path
+     * runs B. This is the load-bearing control-flow for fallible multi-step
+     * tool/LLM pipelines (decode → check → extract → validate → call).
+     *
+     * DESUGAR — pure parse-time rewrite into nested `case`, so codegen and the
+     * interpreter need ZERO changes and interp==compiled by construction:
+     *
+     *   case e1 { p1 -> case e2 { p2 -> B ; o -> E } ; o -> E }
+     *
+     * Built inside-out: innermost = case eN { pN -> B ; <else> }, then wrap.
+     * Each generated fallback arm gets its OWN node_dup() of the (o, E) pair
+     * so the AST stays a tree (no shared subtree → no double-free). */
+    if (t.type == TOK_WITH) {
+        par_adv(p);
+        /* Collect binds: pat <- expr (comma-separated). Bounded — a long
+         * with-chain is a code smell; this also keeps the stack arrays flat. */
+        node_t *pats[32]; node_t *exprs[32]; int nbinds = 0;
+        while (1) {
+            if (nbinds >= 32) {
+                if (!p->err) {
+                    snprintf(p->errmsg, sizeof(p->errmsg),
+                             "line %d: too many `with` binds (max 32)", t.line);
+                    p->err = 1;
+                }
+                break;
+            }
+            node_t *pat = par_expr(p);
+            par_expect(p, TOK_LARROW, "'<-'");
+            node_t *ex = par_expr(p);
+            pats[nbinds] = pat; exprs[nbinds] = ex; nbinds++;
+            if (!par_match(p, TOK_COMMA)) break;
+        }
+        par_expect(p, TOK_LBRACE, "'{'");
+        node_t *body = par_block(p);
+        par_expect(p, TOK_RBRACE, "'}'");
+        par_expect(p, TOK_ELSE, "'else'");
+        par_expect(p, TOK_LBRACE, "'{'");
+        /* else arm: a single `o -> E` clause (o binds the non-matching value). */
+        node_t *else_pat = par_expr(p);
+        par_expect(p, TOK_ARROW, "'->'");
+        node_t *else_body = par_block(p);
+        par_expect(p, TOK_RBRACE, "'}'");
+
+        if (p->err) {
+            for (int i = 0; i < nbinds; i++) { node_free(pats[i]); node_free(exprs[i]); }
+            node_free(body); node_free(else_pat); node_free(else_body);
+            return mknode(N_INT, t.line);
+        }
+
+        /* Defensive: an empty bind list (`with { B } else {...}`) is a parse
+         * error upstream (par_expr would have failed on `{`), but guard anyway
+         * so the inside-out loop below always has an inner = B to wrap. */
+        node_t *inner = body;
+        for (int i = nbinds - 1; i >= 0; i--) {
+            node_t *cx = mknode(N_CASE, exprs[i]->line);
+            cx->v.casex.subject = exprs[i];
+            cx->v.casex.nclauses = 2;
+            cx->v.casex.clauses = malloc(sizeof(node_t*) * 2);
+            /* happy arm: pat_i -> inner */
+            node_t *ok = mknode(N_CLAUSE, pats[i]->line);
+            ok->v.clause.pattern = pats[i];
+            ok->v.clause.guard = NULL;
+            ok->v.clause.body = inner;
+            /* fallback arm: o -> E  (fresh copy per level) */
+            node_t *fb = mknode(N_CLAUSE, else_pat->line);
+            fb->v.clause.pattern = node_dup(else_pat);
+            fb->v.clause.guard = NULL;
+            fb->v.clause.body = node_dup(else_body);
+            cx->v.casex.clauses[0] = ok;
+            cx->v.casex.clauses[1] = fb;
+            inner = cx;
+        }
+        /* The originals (else_pat/else_body) were only templates for the
+         * per-level dups — free them. */
+        node_free(else_pat);
+        node_free(else_body);
+        return inner;
+    }
+
     /* Try/catch: try { body } catch e { handler } */
     if (t.type == TOK_TRY) {
         par_adv(p);
@@ -1152,9 +1315,13 @@ static node_t *par_primary(par_t *p) {
             heads[0] = first;
             int nheads = 1;
             while (par_match(p, TOK_COMMA)) {
+                /* grow BEFORE writing — the array holds nheads slots, so
+                 * writing heads[nheads] needs capacity nheads+1 first
+                 * (the pre-grow write was a 1-elem heap-buffer-overflow on
+                 * every 2+ element list literal). */
+                heads = realloc(heads, sizeof(node_t*) * (nheads + 1));
                 heads[nheads] = par_expr(p);
                 nheads++;
-                heads = realloc(heads, sizeof(node_t*) * (nheads + 1));
             }
             if (p->cur.type == TOK_BAR) {
                 /* Multi-element cons: [a, b, ... | rest] */
