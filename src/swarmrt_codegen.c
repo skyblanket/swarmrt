@@ -619,6 +619,135 @@ recur:
     }
 }
 
+static void collect_pattern_binders(node_t *pat, const char *names[], int *cnt, int max);
+
+/* Collect names bound by case-arm / receive-clause PATTERNS anywhere in a
+ * tree, into the same char[][128] form collect_assigned_names uses. These are
+ * lambda-LOCAL bindings (they come into scope inside the body when the arm
+ * matches), so — exactly like N_ASSIGN targets and for-loop vars — they must
+ * NOT be mistaken for free variables to capture from the enclosing scope.
+ *
+ * Without this, `fn(x){ case x { m -> m } }` collected `m` as a referenced
+ * ident (it appears in the arm body) but neither as a param nor an assigned
+ * name, so it leaked into the lambda's capture list — emitting a phantom
+ * `sw_val_t *m = _args[..]` param plus a read of a nonexistent outer `m` at
+ * the call site ("use of undeclared identifier 'm'"). The pattern binder is
+ * the missing local-name source. */
+static void collect_pattern_bound_in_arms(node_t *n, char names[][128],
+                                           int *nnames, int max) {
+    if (!n || *nnames >= max) return;
+    switch (n->type) {
+    case N_CASE:
+        collect_pattern_bound_in_arms(n->v.casex.subject, names, nnames, max);
+        for (int i = 0; i < n->v.casex.nclauses; i++) {
+            node_t *cl = n->v.casex.clauses[i];
+            const char *binders[64];
+            int nb = 0;
+            collect_pattern_binders(cl->v.clause.pattern, binders, &nb, 64);
+            for (int b = 0; b < nb && *nnames < max; b++) {
+                int dup = 0;
+                for (int k = 0; k < *nnames; k++)
+                    if (strcmp(names[k], binders[b]) == 0) { dup = 1; break; }
+                if (!dup) { strncpy(names[*nnames], binders[b], 127); (*nnames)++; }
+            }
+            collect_pattern_bound_in_arms(cl->v.clause.body, names, nnames, max);
+            if (cl->v.clause.guard)
+                collect_pattern_bound_in_arms(cl->v.clause.guard, names, nnames, max);
+        }
+        break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) {
+            node_t *cl = n->v.recv.clauses[i];
+            const char *binders[64];
+            int nb = 0;
+            collect_pattern_binders(cl->v.clause.pattern, binders, &nb, 64);
+            for (int b = 0; b < nb && *nnames < max; b++) {
+                int dup = 0;
+                for (int k = 0; k < *nnames; k++)
+                    if (strcmp(names[k], binders[b]) == 0) { dup = 1; break; }
+                if (!dup) { strncpy(names[*nnames], binders[b], 127); (*nnames)++; }
+            }
+            collect_pattern_bound_in_arms(cl->v.clause.body, names, nnames, max);
+        }
+        if (n->v.recv.after_body)
+            collect_pattern_bound_in_arms(n->v.recv.after_body, names, nnames, max);
+        break;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++)
+            collect_pattern_bound_in_arms(n->v.block.stmts[i], names, nnames, max);
+        break;
+    case N_ASSIGN:
+        collect_pattern_bound_in_arms(n->v.assign.value, names, nnames, max);
+        break;
+    case N_CALL:
+        for (int i = 0; i < n->v.call.nargs; i++)
+            collect_pattern_bound_in_arms(n->v.call.args[i], names, nnames, max);
+        break;
+    case N_BINOP:
+        collect_pattern_bound_in_arms(n->v.binop.left, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.binop.right, names, nnames, max);
+        break;
+    case N_UNARY:
+        collect_pattern_bound_in_arms(n->v.unary.operand, names, nnames, max);
+        break;
+    case N_SEND:
+        collect_pattern_bound_in_arms(n->v.send.to, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.send.msg, names, nnames, max);
+        break;
+    case N_IF:
+        collect_pattern_bound_in_arms(n->v.iff.cond, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.iff.then_b, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.iff.else_b, names, nnames, max);
+        break;
+    case N_PIPE:
+        collect_pattern_bound_in_arms(n->v.pipe.val, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.pipe.func, names, nnames, max);
+        break;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < n->v.coll.count; i++)
+            collect_pattern_bound_in_arms(n->v.coll.items[i], names, nnames, max);
+        break;
+    case N_FOR:
+        collect_pattern_bound_in_arms(n->v.forloop.iter, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.forloop.body, names, nnames, max);
+        break;
+    case N_LIST_COMP:
+        collect_pattern_bound_in_arms(n->v.lcomp.iter, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.lcomp.body, names, nnames, max);
+        if (n->v.lcomp.guard)
+            collect_pattern_bound_in_arms(n->v.lcomp.guard, names, nnames, max);
+        break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) {
+            collect_pattern_bound_in_arms(n->v.map.keys[i], names, nnames, max);
+            collect_pattern_bound_in_arms(n->v.map.vals[i], names, nnames, max);
+        }
+        break;
+    case N_TRY:
+        /* The catch binds an error var (`try {...} catch e {...}`) inside the
+         * body — also a lambda-local, not a capture. */
+        if (n->v.trycatch.err_var[0] && strcmp(n->v.trycatch.err_var, "_") != 0
+            && *nnames < max) {
+            int dup = 0;
+            for (int k = 0; k < *nnames; k++)
+                if (strcmp(names[k], n->v.trycatch.err_var) == 0) { dup = 1; break; }
+            if (!dup) { strncpy(names[*nnames], n->v.trycatch.err_var, 127); (*nnames)++; }
+        }
+        collect_pattern_bound_in_arms(n->v.trycatch.body, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.trycatch.catch_body, names, nnames, max);
+        break;
+    case N_RANGE:
+        collect_pattern_bound_in_arms(n->v.range.from, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.range.to, names, nnames, max);
+        break;
+    case N_LIST_CONS:
+        collect_pattern_bound_in_arms(n->v.cons.head, names, nnames, max);
+        collect_pattern_bound_in_arms(n->v.cons.tail, names, nnames, max);
+        break;
+    default: break;
+    }
+}
+
 static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     if (!n) return;
     /* Anonymous function: N_FUN with empty name */
@@ -640,9 +769,13 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
         int nbody_idents = 0;
         collect_idents(n->v.fun.body, body_idents, &nbody_idents, 64);
 
-        char assigned[32][128];
+        char assigned[64][128];
         int nassigned = 0;
-        collect_assigned_names(n->v.fun.body, assigned, &nassigned, 32);
+        collect_assigned_names(n->v.fun.body, assigned, &nassigned, 64);
+        /* Also treat case-arm / receive-clause / catch pattern bindings as
+         * lambda-locals (see collect_pattern_bound_in_arms): they're bound
+         * inside the body when an arm matches, so they're never captures. */
+        collect_pattern_bound_in_arms(n->v.fun.body, assigned, &nassigned, 64);
 
         li->ncaptures = 0;
         for (int i = 0; i < nbody_idents; i++) {
@@ -2095,11 +2228,19 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     node_t *inner = n->v.spawn.expr;
     int is_monitor = n->v.spawn.monitor;
 
-    /* Lambda form: spawn(fun() { ... }) — evaluate to a sw_val_t fun
-     * value, hand off to a generic trampoline that calls sw_val_apply.
-     * Without this branch the lambda fell through to the "spawn failed"
-     * fallback and silently produced pid 0. */
-    if (inner && inner->type == N_FUN && inner->v.fun.name[0] == '\0') {
+    /* Fun-value form: spawn(fun() { ... }), spawn(f) where `f` is a
+     * closure-valued local/global, or spawn(worker) where `worker` is a
+     * by-name module function. Any inner that ISN'T a direct call
+     * `spawn(worker(args))` is evaluated to a sw_val_t value and handed
+     * off to a generic trampoline that calls sw_val_apply with 0 args.
+     * At runtime the trampoline no-ops on a non-callable value, so a
+     * misuse degrades to an empty process rather than a crash.
+     *
+     * This is what makes `f = fn(){...} ; spawn(f)` work (the form LLMs
+     * write); previously only the inline `spawn(fn(){...})` literal and
+     * `spawn(named_call(...))` were accepted, and a closure-valued local
+     * hit the hard "requires a function call" error below. */
+    if (inner && inner->type != N_CALL) {
         char fn_val[32];
         emit_expr(ctx, inner, 0, fn_val, sizeof(fn_val));
         char pv[32];
@@ -2112,10 +2253,10 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
 
     int sp_id = find_spawn_id(ctx, inner);
     if (sp_id < 0) {
-        /* Non-call, non-lambda — refuse rather than silently returning
-         * pid 0. Tells the user exactly what's wrong instead of letting
-         * them debug a null pid downstream. */
-        fprintf(stderr, "swc: src/%s.sw:%d: %s(...) requires a function call (e.g. `spawn(worker())`) or a lambda (e.g. `spawn(fun() { body })`)\n",
+        /* An N_CALL we never recorded a spawn-site for (e.g. it lives in a
+         * context scan_spawns doesn't walk). Refuse rather than silently
+         * returning pid 0, and point at the working shapes. */
+        fprintf(stderr, "swc: src/%s.sw:%d: %s(...) requires a function call (e.g. `spawn(worker())`), a lambda (e.g. `spawn(fn() { body })`), or a function value (e.g. `f = fn(){...} ; spawn(f)`)\n",
                 ctx->mod_name, n->line, is_monitor ? "spawn_monitor" : "spawn");
         ctx->had_arity_error = 1;
         char res[32];

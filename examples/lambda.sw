@@ -15,4 +15,10 @@ fun main() {
   }
   triple = multiplier(3)
   print("triple(10) =", triple(10))
+
+  # `fn(...) { ... }` is the shorter, interchangeable lambda form. A lambda is
+  # a first-class value usable in any expression position — including directly
+  # as a call argument:
+  doubled = map(fn(x) { x * 2 }, [1, 2, 3])
+  print("map fn(x){x*2} =", to_string(doubled))
 }

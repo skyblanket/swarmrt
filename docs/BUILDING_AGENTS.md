@@ -381,16 +381,15 @@ For agents that need to do something every N seconds / at a specific time:
 module Scheduler
 import Cron
 
-# Pass a NAMED function. An inline `fn() { ... }` literal is not a valid call
-# argument yet — define the work as a function and hand Cron its name.
-fun check_inbox()       { print("checking inbox") }
+# Hand Cron a callback. An inline lambda `fn() { ... }` is a first-class value,
+# so it works directly as the argument — or pass a named function by name when
+# you want to reuse the work elsewhere. Both forms are shown below.
 fun send_daily_report() { print("daily report") }
-fun one_shot()          { print("one-shot timer") }
 
 fun main() {
-    Cron.every(30000, check_inbox)       # every 30 sec
-    Cron.at("09:00", send_daily_report)  # daily at 09:00 local
-    Cron.in_ms(5000, one_shot)           # one-shot in 5 sec
+    Cron.every(30000, fn() { print("checking inbox") })  # every 30 sec, inline lambda
+    Cron.at("09:00", send_daily_report)                  # daily at 09:00 local, named fn
+    Cron.in_ms(5000, fn() { print("one-shot timer") })   # one-shot in 5 sec
 }
 ```
 

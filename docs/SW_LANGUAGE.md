@@ -127,6 +127,21 @@ fun spawn_agent(name, role) {
 }
 ```
 
+### Anonymous functions (lambdas)
+
+An anonymous function is `fun(params) { body }` — or the shorter `fn(params) { body }` (the two are interchangeable). A lambda is a **first-class value** and a primary expression, so it is valid **anywhere an expression is** — as a call argument, a list/map element, a return value, or an assignment RHS:
+
+```sw
+dbl  = fn(x) { x * 2 }            # assignment RHS
+doubled = map(fn(x) { x * 2 }, [1, 2, 3])    # call argument -> [2, 4, 6]
+ops  = [fn(){ 1 }, fn(){ 2 }]     # list element
+m    = %{ inc: fn(x) { x + 1 } }  # map value
+fun adder(n) { fn(x) { x + n } }  # returned from a function
+Cron.every(200, fn() { check_inbox() })     # the common scheduler idiom
+```
+
+`fn` is **not** a reserved word — it is only a lambda when written in the `fn(...) { ... }` shape, so it stays a perfectly good ordinary variable / parameter name (the stdlib uses `fn` as a callback parameter throughout).
+
 ---
 
 ## 4. Values and types
@@ -265,6 +280,16 @@ fun classify(msg) {
 
 Same arm-clause shape as `receive` (pattern, optional `when guard`, body). Runs against an arbitrary value, not the mailbox. Falls through to the next clause if a guard rejects. Returns the body of the first matching arm, or `nil` if nothing matches.
 
+An arm body may be a bare tuple literal — `_ -> {'error', why}` returns the tuple `{'error', why}` directly, no parentheses needed. A `{` after `->` is read as a tuple when it carries a top-level comma (`{a, b}`) and as a statement block when it does not (`{ x = ...; x }`); both forms work, in `receive` arms too:
+
+```sw
+case parse(line) {
+    {'ok', v}    -> {'parsed', v}            # bare tuple result
+    {'error', e} -> { log(e) ; {'error', e} } # block: a statement, then a tuple
+    _            -> {'error', 'unknown'}
+}
+```
+
 This is the structured replacement for nested `if/else` ladders. Use it whenever you'd write `if (x == 'a') { ... } else { if (x == 'b') { ... } else { ... } }`.
 
 ### with — happy-path error chains
@@ -319,7 +344,18 @@ pid = spawn(my_loop(arg1, arg2))   # `my_loop(...)` is the function call shape;
                                     # spawn intercepts and runs in a new process
 ```
 
-`spawn(fn(args))` is the idiom — pass the function call shape, and `spawn` evaluates it in a new process. The outer process gets back the new PID immediately.
+`spawn(my_loop(args))` is the idiom — pass the function call shape, and `spawn` evaluates it in a new process. The outer process gets back the new PID immediately.
+
+`spawn` also accepts a **function value**: an inline lambda, a closure-valued local, or a function by-name. All run with zero arguments in the new process (capture state in the closure):
+
+```sw
+spawn(fn() { worker_loop(0) })   # inline lambda
+job = fn() { do_work() }
+spawn(job)                       # a closure-valued local
+spawn(my_loop)                   # a function by name (runs my_loop())
+```
+
+`spawn_monitor(...)` takes the same shapes and additionally returns `{pid, ref}` so the parent gets a `{'DOWN', ref, ...}` message when the child exits.
 
 ### Identity
 

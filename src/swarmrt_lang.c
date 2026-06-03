@@ -393,7 +393,13 @@ static tok_t lnext(lex_t *l) {
             if (ch == '{') { brace_depth++; t.text[i++] = ladv(l); continue; }
             if (ch == '}') { if (brace_depth > 0) brace_depth--; t.text[i++] = ladv(l); continue; }
             if (ch == '\\') {
-                ladv(l);
+                ladv(l); /* consume '\' */
+                /* A trailing backslash at end-of-source (`f"...\` then NUL)
+                 * must NOT consume the NUL — ladv() advances unconditionally,
+                 * so a second ladv() here would step `pos` PAST the terminator
+                 * and the next lpeek() reads out of bounds (the parse fuzzer
+                 * hits exactly this on a truncated f-string). Stop the scan. */
+                if (!lpeek(l)) break;
                 char esc = ladv(l);
                 switch (esc) {
                     case 'n': t.text[i++] = '\n'; break;
@@ -745,6 +751,124 @@ static node_t *parse_interp_string(const char *text, int line) {
     return result ? result : mknode(N_STRING, line);
 }
 
+/* Parse an anonymous-function tail `( params ) { body }`, with the
+ * introducer keyword (`fun` or `fn`) already consumed and the parser
+ * positioned at the opening `(`. Shared by the `fun` keyword path and
+ * the `fn(params){body}` primary (see par_fn_lambda_ahead). `line` is the
+ * keyword's source line, used for the N_FUN node. */
+static node_t *par_lambda_tail(par_t *p, int line) {
+    par_adv(p); /* ( */
+    node_t *fn = mknode(N_FUN, line);
+    fn->v.fun.name[0] = '\0'; /* empty name = anonymous */
+    fn->v.fun.nparams = 0;
+    if (p->cur.type != TOK_RPAREN) {
+        do {
+            tok_t param = par_expect(p, TOK_IDENT, "parameter");
+            /* params[] is a fixed [16][128] buffer (swarmrt_lang.h). Cap at 16
+             * so a long arg list can't overrun the node — the fuzzer hits this. */
+            if (fn->v.fun.nparams < 16) {
+                strncpy(fn->v.fun.params[fn->v.fun.nparams], param.text, 127);
+                fn->v.fun.nparams++;
+            } else if (!p->err) {
+                snprintf(p->errmsg, sizeof(p->errmsg),
+                         "line %d: too many lambda parameters (max 16)", line);
+                p->err = 1;
+            }
+        } while (par_match(p, TOK_COMMA));
+    }
+    par_expect(p, TOK_RPAREN, "')'");
+    par_expect(p, TOK_LBRACE, "'{'");
+    fn->v.fun.body = par_block(p);
+    par_expect(p, TOK_RBRACE, "'}'");
+    return fn;
+}
+
+/* Speculative lookahead: with the parser positioned just after a bare `fn`
+ * identifier (i.e. p->cur is the token following `fn`), decide whether this
+ * is the lambda shape `fn ( params ) {` rather than a call/identifier named
+ * `fn`. The disambiguator is purely structural: a `(` whose matching `)` is
+ * immediately followed by `{`. This is what lets `fn` remain a perfectly good
+ * variable/parameter name (the stdlib uses `fn` as a callback param all over)
+ * while ALSO making `fn(x){ ... }` a first-class lambda literal in any
+ * expression position. Restores the parser to its entry state before
+ * returning, so it has no side effects. */
+static int par_fn_lambda_ahead(par_t *p) {
+    if (p->cur.type != TOK_LPAREN) return 0;
+    /* Save full lexer + current token; lex_t/tok_t are by-value POD. */
+    lex_t saved_lex = p->lex;
+    tok_t saved_cur = p->cur;
+    int is_lambda = 0;
+    int depth = 0;
+    /* Walk balanced parens using the real tokenizer (handles strings,
+     * comments, nested parens correctly). Bail on EOF. */
+    for (;;) {
+        if (p->cur.type == TOK_EOF) break;
+        if (p->cur.type == TOK_LPAREN) depth++;
+        else if (p->cur.type == TOK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                par_adv(p); /* consume the matching ')' */
+                is_lambda = (p->cur.type == TOK_LBRACE);
+                break;
+            }
+        }
+        par_adv(p);
+    }
+    p->lex = saved_lex;
+    p->cur = saved_cur;
+    return is_lambda;
+}
+
+/* Speculative lookahead: with the parser positioned at a `{` that opens a
+ * case-arm / receive-clause body (after `->`), decide whether that brace is a
+ * TUPLE LITERAL (`{'error', why}`, `{a, b}`) rather than a statement BLOCK
+ * (`{ x = ... ; x }`).
+ *
+ * The disambiguator is unambiguous and conservative: a `{ ... }` is a tuple
+ * iff a comma appears at the TOP LEVEL of this very brace — i.e. at this
+ * brace's depth, with all paren / bracket / inner-brace / map depths zero —
+ * before its matching `}`. A statement block can never carry a top-level
+ * comma (blocks separate statements with `;`/newlines only; any top-level
+ * comma in a block is, and always was, a hard parse error), so this rule is a
+ * pure superset: every input that parses as a block today still does, and the
+ * shape that used to error (`-> {'atom', ...}`) now parses as the tuple the
+ * user clearly meant. `%{...}` map literals and call-arg commas live at deeper
+ * depth and are correctly skipped (TOK_MAP_OPEN opens a brace level too).
+ *
+ * Assumes p->cur is the opening TOK_LBRACE. Restores parser state before
+ * returning, so it has no side effects. */
+static int par_arm_brace_is_tuple(par_t *p) {
+    if (p->cur.type != TOK_LBRACE) return 0;
+    lex_t saved_lex = p->lex;
+    tok_t saved_cur = p->cur;
+    int is_tuple = 0;
+    int brace = 0, paren = 0, bracket = 0;
+    for (;;) {
+        if (p->cur.type == TOK_EOF) break;
+        switch (p->cur.type) {
+        case TOK_LBRACE: case TOK_MAP_OPEN: brace++; break;
+        case TOK_RBRACE:
+            brace--;
+            if (brace == 0) goto done;  /* matched our `}` — no top-level comma */
+            break;
+        case TOK_LPAREN:   paren++;   break;
+        case TOK_RPAREN:   paren--;   break;
+        case TOK_LBRACKET: bracket++; break;
+        case TOK_RBRACKET: bracket--; break;
+        case TOK_COMMA:
+            /* Top level of the brace we opened: this `{...}` is a tuple. */
+            if (brace == 1 && paren == 0 && bracket == 0) { is_tuple = 1; goto done; }
+            break;
+        default: break;
+        }
+        par_adv(p);
+    }
+done:
+    p->lex = saved_lex;
+    p->cur = saved_cur;
+    return is_tuple;
+}
+
 /* Primary expression */
 static node_t *par_primary(par_t *p) {
     tok_t t = p->cur;
@@ -788,6 +912,14 @@ static node_t *par_primary(par_t *p) {
 
     if (t.type == TOK_IDENT) {
         par_adv(p);
+        /* `fn(params){ body }` — a Rust/Gleam-shaped lambda literal, the form
+         * LLMs reach for. `fn` is NOT a reserved keyword (the stdlib uses it as
+         * an ordinary callback parameter name), so we only treat it as a lambda
+         * introducer when the structural lookahead sees `fn ( ... ) {`. Anything
+         * else (`fn`, `fn(x)`) falls through to the normal ident/call path. */
+        if (strcmp(t.text, "fn") == 0 && par_fn_lambda_ahead(p)) {
+            return par_lambda_tail(p, t.line);
+        }
         if (p->cur.type == TOK_DOT) {
             par_adv(p); /* consume . */
             tok_t fname = par_expect(p, TOK_IDENT, "field/function name");
@@ -853,22 +985,7 @@ static node_t *par_primary(par_t *p) {
     if (t.type == TOK_FUN) {
         par_adv(p);
         if (p->cur.type == TOK_LPAREN) {
-            par_adv(p); /* ( */
-            node_t *fn = mknode(N_FUN, t.line);
-            fn->v.fun.name[0] = '\0'; /* empty name = anonymous */
-            fn->v.fun.nparams = 0;
-            if (p->cur.type != TOK_RPAREN) {
-                do {
-                    tok_t param = par_expect(p, TOK_IDENT, "parameter");
-                    strncpy(fn->v.fun.params[fn->v.fun.nparams], param.text, 127);
-                    fn->v.fun.nparams++;
-                } while (par_match(p, TOK_COMMA));
-            }
-            par_expect(p, TOK_RPAREN, "')'");
-            par_expect(p, TOK_LBRACE, "'{'");
-            fn->v.fun.body = par_block(p);
-            par_expect(p, TOK_RBRACE, "'}'");
-            return fn;
+            return par_lambda_tail(p, t.line);
         }
         /* Not anonymous — error in expression context */
         p->err = 1;
@@ -925,9 +1042,17 @@ static node_t *par_primary(par_t *p) {
              * as a tuple literal — that breaks any user who writes
              * `_ -> { x = ... ; x }` expecting an explicit block.
              * No existing code uses `_ -> {tuple}` as a clause body
-             * (users write the tuple bare), so this is purely additive. */
+             * (users write the tuple bare), so this is purely additive.
+             *
+             * BUT a bare TUPLE result (`_ -> {'error', why}`) is the form
+             * LLMs reach for, and it has a top-level comma — which a block
+             * can never have. par_arm_brace_is_tuple distinguishes the two
+             * structurally, so the tuple parses as an expression while the
+             * `{ stmt ; stmt }` block keeps its block parse. */
             node_t *body;
-            if (p->cur.type == TOK_LBRACE) {
+            if (p->cur.type == TOK_LBRACE && par_arm_brace_is_tuple(p)) {
+                body = par_expr(p);   /* tuple literal result */
+            } else if (p->cur.type == TOK_LBRACE) {
                 par_adv(p);  /* consume '{' */
                 body = par_block(p);
                 par_expect(p, TOK_RBRACE, "'}'");
@@ -959,7 +1084,10 @@ static node_t *par_primary(par_t *p) {
                     body->v.block.stmts[body->v.block.nstmts-1] = expr;
                 }
             }
-            if (body->v.block.nstmts == 1) {
+            /* A tuple-literal body is already the expression; only unwrap
+             * single-statement BLOCK bodies (the `body->v.block` union is
+             * valid only for N_BLOCK). */
+            if (body->type == N_BLOCK && body->v.block.nstmts == 1) {
                 cl->v.clause.body = body->v.block.stmts[0];
                 free(body->v.block.stmts);
                 free(body);
@@ -1121,9 +1249,12 @@ static node_t *par_primary(par_t *p) {
             par_expect(p, TOK_ARROW, "'->'");
             /* Body: collect expressions until next clause pattern (expr ->) or }.
              * Special case for leading `{` — see the matching case-arm
-             * comment in par_case for why. */
+             * comment in par_case for why, including the tuple-vs-block
+             * disambiguation (`{'reply', x}` is a tuple result, not a block). */
             node_t *body;
-            if (p->cur.type == TOK_LBRACE) {
+            if (p->cur.type == TOK_LBRACE && par_arm_brace_is_tuple(p)) {
+                body = par_expr(p);   /* tuple literal result */
+            } else if (p->cur.type == TOK_LBRACE) {
                 par_adv(p);  /* consume '{' */
                 body = par_block(p);
                 par_expect(p, TOK_RBRACE, "'}'");
@@ -1152,7 +1283,9 @@ static node_t *par_primary(par_t *p) {
                     body->v.block.stmts[body->v.block.nstmts-1] = expr;
                 }
             }
-            if (body->v.block.nstmts == 1) {
+            /* Only unwrap single-statement BLOCK bodies (union valid only for
+             * N_BLOCK); a tuple-literal body is already the expression. */
+            if (body->type == N_BLOCK && body->v.block.nstmts == 1) {
                 cl->v.clause.body = body->v.block.stmts[0];
                 free(body->v.block.stmts);
                 free(body);
@@ -4229,12 +4362,24 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     }
 
     case N_SPAWN: {
-        /* spawn(func(args)) — for now, limited: we can't easily spawn
-         * an interpreter process. Store the expression result as a pid.
-         * This is a simplified demo — real spawn would need a trampoline. */
-        /* Just evaluate the inner expression and return nil pid for now */
-        sw_val_t *inner = eval(interp, n->v.spawn.expr, env);
-        (void)inner;
+        /* The tree-walking interpreter has no real scheduler, so spawn runs
+         * the work *synchronously* in the current process and returns a nil
+         * pid (the compiled path is the concurrent one). Two inner shapes:
+         *  - spawn(worker(args)) / spawn(fn(){...}) — evaluating the N_CALL /
+         *    inline-lambda-applied expression already runs the body.
+         *  - spawn(f) where `f` is a closure/fun VALUE — evaluating the ident
+         *    only yields the fun; we must apply it (0 args) so its body runs.
+         *    Without this, a closure-valued local spawn silently no-ops here
+         *    while the compiled twin runs it — a parity gap. */
+        node_t *se = n->v.spawn.expr;
+        sw_val_t *inner = eval(interp, se, env);
+        /* interp_apply_fn (not sw_val_apply): interpreter closures carry an
+         * AST body + captured env, not a C cfunc. Only apply when the inner
+         * is a fun VALUE reached as a bare expression (ident / non-call) — a
+         * spawn(worker(args)) N_CALL already ran its body during eval. */
+        if (inner && inner->type == SW_VAL_FUN && inner->v.fun.body &&
+            se && se->type != N_CALL)
+            (void)interp_apply_fn(interp, inner, NULL, 0);
         sw_val_t *pid = sw_val_pid(NULL);
         if (n->v.spawn.monitor) {
             /* spawn_monitor -> {pid, ref}: match the documented/compiled
