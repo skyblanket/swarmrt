@@ -48,7 +48,7 @@ It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter �
 
 It exists because the same workload BEAM was built for in 1986 — *thousands of long-lived, message-passing, partial-failure-tolerant processes* — is exactly what you need when you're running a swarm of AI agents. SwarmRT is the substrate behind [swarm-code](https://github.com/skyblanket/swarm-code) and a growing pile of agent-driven tools.
 
-The language is called **`sw`** and is designed so an LLM can write it correctly on the first try. There's an [`eval/`](eval/) directory that measures this with real numbers: single-shot code-gen against 10 prompts × 3 models, no agent harness, no retries. Latest result: **Kimi K2.6 80%, Kimi K2.5 70%** ([results](eval/results/results.md)).
+The language is called **`sw`** and is designed so an LLM can write it correctly on the first try. There's an [`eval/`](eval/) directory that measures this with real numbers — single-shot code-gen from the docs, no agent harness, no retries. Latest run (de-leaked prompt, 10 tasks, across vendors): **Claude Sonnet 4.5 100%, GPT-4.1 · Gemini 2.5 Flash · Kimi K2.6 all 90%, DeepSeek/Qwen 70%**, against a non-reasoning baseline at 30% ([full per-task table + per-attempt receipts](eval/results/results.md)). It's a small suite (n=10, single-shot, wide error bars), so read it as a floor, not a benchmark — but frontier models that never saw `sw` in training write it correctly first-try from the docs alone, which is the whole point.
 
 ---
 
@@ -363,7 +363,7 @@ The [`eval/`](eval/) directory is an empirical benchmark of how well LLMs write 
 
 ```bash
 export MOONSHOT_KEY=...           # or whichever endpoint's key
-cd eval && ./runner.sh            # 10 prompts × 3 models, ~20 min
+cd eval && ./runner.sh            # 10 prompts × the models in models.json, ~20 min
 ```
 
 Each prompt is a self-contained task with a deterministic stdout check. The runner extracts the LLM's `.sw` from a code fence, compiles it with `swc build`, runs it, and diffs stdout against the prompt's expected output. Per-run results land in `eval/results/<id>/summary.md`; the latest is mirrored to [`eval/results/results.md`](eval/results/results.md).
