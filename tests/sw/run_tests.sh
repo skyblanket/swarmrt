@@ -190,9 +190,11 @@ if [ -d "$INVM_DIR" ]; then
             sed 's/^/    /' "$log"
             continue
         fi
-        # Single scheduler + a 20s alarm: well past the ~instant happy path,
-        # but a deadlock trips the alarm (exit 142) and FAILs.
-        SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 20; exec @ARGV or die' \
+        # Single scheduler + a 60s alarm: the happy path is ~instant, but a real
+        # deadlock hangs forever — so a generous alarm still catches a regression
+        # while tolerating CPU contention (e.g. right after a full rebuild, where
+        # a 20s bound flaked even though the two-server in-VM WS dance was fine).
+        SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 60; exec @ARGV or die' \
             "$bin" >"$log" 2>&1
         rc=$?
         if [ "$rc" -eq 0 ]; then

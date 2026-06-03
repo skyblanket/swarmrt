@@ -1,0 +1,6 @@
+1,2c1,2
+< id=1 name=alice
+< id=2 name=bob
+---
+> id=nil name=nil
+> id=nil name=nil

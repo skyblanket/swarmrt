@@ -1,2 +1,7 @@
 */
 !results.md
+
+# The published run's receipts (program.sw / diff.txt / summary.md) are committed
+# via `git add -f` — see eval/results/20260603_024833/ — so anyone can read exactly
+# what each model wrote. All other artifacts (compiled binaries, curl/run logs, raw
+# responses, runner bookkeeping) and all other run dirs stay ignored.
