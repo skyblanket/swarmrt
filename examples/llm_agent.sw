@@ -105,13 +105,20 @@ fun chat(history, opts) {
     })
     hdrs = [{"Authorization", "Bearer " ++ map_get(opts, 'key')},
             {"Content-Type", "application/json"}]
-    resp = http_post_stream(map_get(opts, 'url'), hdrs, body)
-    if (resp == nil) { nil }
-    else {
-        decoded = json_decode(resp)
-        choices = map_get(decoded, 'choices')
-        if (length(choices) == 0) { nil }
-        else { map_get(map_get(hd(choices), 'message'), 'content') }
+    # http_post_stream returns a TAGGED result the caller branches on:
+    #   {'ok, json}    — success; json is the OpenAI-shaped response string
+    #   {'error, why}  — curl died / non-2xx HTTP / empty-or-unparseable stream
+    # The tag lets us distinguish "model genuinely said nothing" (ok + empty
+    # content) from a real failure (error) so an agent can retry intelligently.
+    case http_post_stream(map_get(opts, 'url'), hdrs, body) {
+        {'error', why} ->
+            print(f"\n[llm error: {why}]")
+            nil
+        {'ok', json} ->
+            decoded = json_decode(json)
+            choices = map_get(decoded, 'choices')
+            if (length(choices) == 0) { nil }
+            else { map_get(map_get(hd(choices), 'message'), 'content') }
     }
 }
 

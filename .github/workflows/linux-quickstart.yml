@@ -34,6 +34,14 @@ jobs:
         # with the language — fix the snippet (or the compiler).
         run: bash scripts/check_sw_docs.sh
 
+      - name: Doctest — documented sw examples must RUN + match their output
+        # One step beyond compile-checking: every complete ```sw block in
+        # the docs that carries `# =>` expected-output markers is compiled,
+        # RUN, and its stdout asserted line-for-line. A red here means a
+        # doc example claims output the language no longer produces — the
+        # "docs lie" tripwire. Fix the example, the marker, or the compiler.
+        run: bash scripts/doctest.sh
+
       - name: Run the README quickstart verbatim
         run: |
           ./bin/swc build examples/counter.sw -o counter

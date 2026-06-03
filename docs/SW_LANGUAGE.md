@@ -30,7 +30,7 @@ This doc is the reference for someone writing sw code today. For the runtime's C
 module Main
 
 fun main() {
-    print("hello, sw")
+    print("hello, sw")   # => hello, sw
 }
 ```
 
@@ -392,7 +392,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `string_upper(s)` / `string_lower(s)` | case |
 | `string_truncate(s, max_len)` | truncate to max_len |
 | `to_string(v)` | any → string (tuples / lists / maps render via the formatter) |
-| `format(template, args...)` | `format("hi {} (#{})", name, n)` — `{}` placeholders, `{{` / `}}` escape |
+| `format(template, args...)` | `format("hi {} ({} req)", name, n)` — positional `{}` placeholders, `{{` / `}}` escape to literal braces. (For inline-expression interpolation use an f-string: `f"hi {name} #{n}"`.) |
 | `strip_html(html)` | tags stripped, entities decoded |
 | `clean_json(s)` | strip code fences and trailing commas |
 
@@ -414,6 +414,7 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 |---|---|
 | `bytes_from_base64(s)` | base64 string → bytes (NUL-safe; `nil` on bad input) |
 | `bytes_to_base64(b)` | bytes → base64 string |
+| `bytes_from_ints(list)` | list of ints `0..255` → bytes (renders `<<72,73>>`) |
 | `byte_size(b)` | length in bytes (`0` for non-bytes) |
 | `byte_at(b, i)` | byte `0..255` at index `i` (panics out of range) |
 | `byte_slice(b, start, len)` | subrange; `len` clamps to end |
@@ -436,13 +437,37 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | `filter(lst, pred)` | keep where pred → truthy |
 | `reduce(fn, lst, init)` | foldl |
 | `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map` |
+| `map_new()` | new empty map (same as the `%{}` literal) |
 | `map_get(m, k)` | value or `nil` |
+| `map_get(m, k, default)` | 3-arg form: value, or `default` if `k` is absent |
 | `map_put(m, k, v)` | new map (functional update) |
 | `map_remove(m, k)` | new map without `k` (returns `m` if absent) |
 | `map_keys(m)` / `map_values(m)` | list of keys / values |
 | `map_merge(m1, m2)` | new map; `m2`'s keys win on collision |
 | `map_has_key(m, k)` | `'true'` / `'false'` |
 | `map_size(m)` | int |
+
+### Numbers & type checks
+| | |
+|---|---|
+| `abs(n)` | absolute value (int or float) |
+| `to_float(n)` | coerce an int to a float (`Math.float(n)` is the friendlier alias) |
+| `ord(s)` | first byte of a string as an int (`ord("A")` → `65`) |
+| `typeof(v)` | type as a string: `"int"`, `"float"`, `"string"`, `"atom"`, `"list"`, `"map"`, `"tuple"`, `"bytes"`, `"pid"`, … |
+| `is_list(v)` | `'true'` / `'false'` |
+| `is_map(v)` | `'true'` / `'false'` |
+
+### Math (`import Math`)
+Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig in radians. `sqrt`/`sin`/`cos`/`pow`/`exp`/`log` return floats; `floor`/`ceil`/`round` return ints. Each accepts an int OR a float.
+
+| | |
+|---|---|
+| `Math.sqrt(x)` `Math.sin(x)` `Math.cos(x)` | libm-backed |
+| `Math.pow(b, e)` `Math.exp(x)` `Math.log(x)` | libm-backed |
+| `Math.floor(x)` `Math.ceil(x)` `Math.round(x)` | → int |
+| `Math.float(x)` | alias for the `to_float` builtin |
+| `Math.pi()` | `3.141592653589793` |
+| `Math.min(a, b)` `Math.max(a, b)` `Math.clamp(x, lo, hi)` | pure-sw helpers |
 
 ### ETS
 | | |
@@ -460,7 +485,9 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | | |
 |---|---|
 | `file_read(path)` | full contents as string, or `nil` (current 1 MB cap) |
+| `file_read_bytes(path)` | full contents as **bytes** (NUL-safe — for binary files), or `nil` |
 | `file_write(path, content)` | `'ok'/'error'` — not crash-safe; use `file_atomic_write` for state files |
+| `file_write_bytes(path, b)` | write a bytes value verbatim; `'ok'/'error'` |
 | `file_atomic_write(path, content)` | writes `path.tmp.<pid>` then `rename(2)` — survives a crash mid-write |
 | `file_rename(src, dst)` | `'ok'/'error'` — wraps `rename(2)` |
 | `file_stat(path)` | `%{size, mtime, mode, is_dir, exists}` map, or `nil` if missing |
@@ -481,9 +508,9 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 |---|---|
 | `http_get(url, headers?)` | GET → response body string. Auto-grows |
 | `http_post(url, headers, body)` | POST → string. **ESC-interruptible**; returns `"__INTERRUPTED__"` on Ctrl-C |
-| `http_post_stream(url, headers, body, opts?)` | streams to stdout incrementally; reasoning channel; ESC interrupt |
+| `http_post_stream(url, headers, body, [pid, name])` | streams to stdout incrementally; reasoning channel; ESC interrupt. Returns a **tagged** result: `{'ok, openai_json}` on success, `{'error, reason}` on curl-failure / non-2xx / empty-or-unparseable stream. Parses both `data: {...}` and `data:{...}` SSE framing |
 | **WS server** (LiveView): `http_listen`, `http_respond`, `ws_send`, `ws_close`, `ws_set_handler`, `live_js` |
-| **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_close(h)` |
+| **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_connect_tls(wss_url)` → handle (TLS `wss://`), `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_set_handler(h, pid)` (deliver frames to a process as messages), `wsc_close(h)` |
 
 ### Browser
 | | |
@@ -520,6 +547,7 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 |---|---|
 | `db_open(path)` → handle | `:memory:` works |
 | `db_exec(h, sql)` | `'ok'` or error string. DDL or no-result statements |
+| `db_exec(h, sql, [args])` | 3-arg form: prepares + **binds** `?` params + steps. Always bind user data this way — never string-interpolate into SQL |
 | `db_query(h, sql, [args])` | `?` parameters; returns list of `%{col: value}` row maps |
 | `db_close(h)` | `'ok'` |
 
@@ -554,6 +582,53 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | `pdf_text(path)` | extract text |
 | `pdf_pages(path)` | int page count |
 | `pdf_meta(path)` | metadata map |
+
+### Verified builtin behavior
+
+This is a runnable doctest — `scripts/doctest.sh` compiles, runs it, and
+asserts each `# =>` line matches the actual stdout, so these claims can
+never silently rot:
+
+```sw
+module BuiltinDemo
+import Math
+export [main]
+
+fun main() {
+    # Numbers & type checks
+    print(abs(0 - 5))                 # => 5
+    print(ord("A"))                   # => 65
+    print(typeof(%{a: 1}))            # => map
+    print(is_list([1, 2]))            # => :true
+    print(is_map([1, 2]))             # => :false
+
+    # Map default + new
+    print(map_get(%{a: 1}, 'b', 99))  # => 99
+    print(map_new())                  # => %{}
+
+    # Bytes from ints
+    print(bytes_from_ints([72, 73]))           # => <<72,73>>
+    print(bytes_to_string(bytes_from_ints([72, 73])))  # => HI
+
+    # ETS list shape is {k, v} tuples
+    t = ets_new()
+    ets_put(t, "a", 1)
+    print(ets_list(t))                # => [{a, 1}]
+    print(ets_count(t))               # => 1
+
+    # Math (import Math)
+    print(Math.sqrt(16))              # => 4
+    print(Math.floor(3.7))            # => 3
+    print(Math.max(2, 9))             # => 9
+
+    # format() uses positional {} placeholders; f-strings interpolate
+    # expressions inline as {expr} (and #{expr}).
+    who = "ada"
+    reqs = 3
+    print(format("hi {} ({} req)", who, reqs))   # => hi ada (3 req)
+    print(f"hi {who} #{reqs}")                    # => hi ada #3
+}
+```
 
 ---
 

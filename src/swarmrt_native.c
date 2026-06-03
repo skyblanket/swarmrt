@@ -60,6 +60,11 @@ static pthread_t        g_watchdog_thread;
 static volatile int     g_watchdog_stop = 0;
 static int              g_watchdog_enabled = 1;   /* 0 when SW_DEADLOCK_DETECT=0 */
 
+/* Defined in swarmrt_io.c. Forward-declared here (rather than pulling in
+ * swarmrt_io.h with its full port/event structs) so the watchdog can ask
+ * the I/O subsystem whether any live port could still wake a process. */
+int sw_io_active_port_count(void);
+
 /*
  * watchdog_thread_fn — wakes periodically and checks for total deadlock.
  *
@@ -145,7 +150,13 @@ static void *watchdog_thread_fn(void *arg) {
             }
         }
 
-        if (live_count > 0 && stuck_count == live_count) {
+        /* Suppress the false positive for processes legitimately parked
+         * on I/O: an idle TCP/HTTP server has every process waiting in
+         * `receive` for the I/O thread to deliver an accept/data event.
+         * That is not a deadlock — a live port can still wake them. */
+        int active_ports = sw_io_active_port_count();
+
+        if (live_count > 0 && stuck_count == live_count && active_ports == 0) {
             fprintf(stderr,
                 "[swarmrt] WARNING: all %d process%s blocked in `receive`"
                 " with an empty mailbox for >%lums — possible deadlock.\n"
@@ -1141,8 +1152,12 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     /* Startup banner — diagnostics, not program output, so it goes to
      * stderr. That keeps stdout clean for programs whose output is
      * piped or captured (e.g. a CLI answering `--version`). Silence it
-     * entirely with SW_QUIET=1. */
-    if (!getenv("SW_QUIET")) {
+     * entirely with SW_QUIET=1 or SW_RUNTIME_QUIET=1. The latter is the
+     * runtime-only knob a headless agent sets in the *built binary's*
+     * environment so the two "[SwarmRT] Arena initialized…" lines never
+     * leak into a captured stream, without having to also be set at
+     * compile time. */
+    if (!getenv("SW_QUIET") && !getenv("SW_RUNTIME_QUIET")) {
         fprintf(stderr, "[SwarmRT] Arena initialized: %zu MB mmap, %u proc slots, %u heap blocks\n",
                g_swarm->arena.size / (1024 * 1024),
                g_swarm->arena.proc_capacity,
@@ -1388,6 +1403,22 @@ sw_process_t *sw_find_by_pid(uint64_t pid) {
     sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
     for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
         if (slab[i].pid == pid && slab[i].state != SW_PROC_EXITING && slab[i].entry)
+            return &slab[i];
+    }
+    return NULL;
+}
+
+/* sw_find_by_pid_any: like sw_find_by_pid but ignores liveness — returns
+ * the slab slot for `pid` even if the process has EXITED, as long as the
+ * slot hasn't been recycled to a new pid. Lets DOWN/EXIT message
+ * synthesis recover the original sw_process_t* so the delivered pid value
+ * compares == the one spawn() returned (which still points at the same
+ * slab address). Returns NULL only if the slot was reclaimed. */
+sw_process_t *sw_find_by_pid_any(uint64_t pid) {
+    if (!g_swarm || pid == 0) return NULL;
+    sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+    for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
+        if (slab[i].pid == pid)
             return &slab[i];
     }
     return NULL;

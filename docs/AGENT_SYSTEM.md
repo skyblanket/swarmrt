@@ -13,7 +13,7 @@ module Hello
 export [main]
 
 fun main() {
-    print("hello, swarm")
+    print("hello, swarm")   # => hello, swarm
 }
 ```
 

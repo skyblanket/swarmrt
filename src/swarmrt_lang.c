@@ -51,6 +51,7 @@ typedef enum {
 
     /* Keywords */
     TOK_SPAWN,
+    TOK_SPAWN_MONITOR,
     TOK_RECEIVE,
     TOK_SEND,
     TOK_AFTER,
@@ -139,6 +140,7 @@ typedef struct {
 } lex_t;
 
 static struct { const char *w; tok_type_t t; } kw_table[] = {
+    {"spawn_monitor", TOK_SPAWN_MONITOR},
     {"spawn",     TOK_SPAWN},
     {"receive",   TOK_RECEIVE},
     {"send",      TOK_SEND},
@@ -831,12 +833,13 @@ static node_t *par_primary(par_t *p) {
         return tc;
     }
 
-    /* Spawn expression */
-    if (t.type == TOK_SPAWN) {
+    /* Spawn expression (spawn / spawn_monitor — same node, monitor flag) */
+    if (t.type == TOK_SPAWN || t.type == TOK_SPAWN_MONITOR) {
         par_adv(p);
         par_expect(p, TOK_LPAREN, "'('");
         node_t *sp = mknode(N_SPAWN, t.line);
         sp->v.spawn.expr = par_expr(p);
+        sp->v.spawn.monitor = (t.type == TOK_SPAWN_MONITOR) ? 1 : 0;
         par_expect(p, TOK_RPAREN, "')'");
         return sp;
     }
@@ -1650,7 +1653,14 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
                            binaries and char-lists distinct). */
         return a->v.bytes.len == b->v.bytes.len &&
                memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
-    case SW_VAL_PID: return a->v.pid == b->v.pid;
+    case SW_VAL_PID:
+        /* Identity is the numeric pid, not the slab pointer: a pid
+         * reconstructed from a {'DOWN',...}/{'EXIT',...} message must
+         * compare == the pid spawn() returned. Both point at the same
+         * slab slot today, but comparing the id keeps them equal even if
+         * one side carries a freshly-resolved pointer. NULL pids (id 0)
+         * only equal other NULL pids. */
+        return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
     case SW_VAL_REMOTE_PID:
         return a->v.rpid.id == b->v.rpid.id &&
                ((a->v.rpid.node == b->v.rpid.node) ||
@@ -2381,7 +2391,8 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
         case SW_VAL_BYTES:  /* NUL-safe: length-first then memcmp */
             return a->v.bytes.len == b->v.bytes.len &&
                    memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
-        case SW_VAL_PID:    return a->v.pid == b->v.pid;
+        case SW_VAL_PID:    /* compare by numeric pid id, see sw_val_equal */
+            return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
         default:            return a == b;
     }
 }
@@ -2414,11 +2425,85 @@ static void _repl_warn_scheduler(const char *name) {
     _repl_scheduler_warned = 1;
 }
 
+/* Invoke an interpreter SW_VAL_FUN value (an AST lambda) with `nargs`
+ * args. The compiled-path sw_val_apply() only handles cfunc closures; this
+ * is its interpreter twin, used by the functional primitives (map/reduce/
+ * filter) below. Returns nil on a non-callable value. */
+static sw_val_t *interp_apply_fn(sw_interp_t *interp, sw_val_t *fn,
+                                 sw_val_t **args, int nargs) {
+    if (!fn || fn->type != SW_VAL_FUN || !fn->v.fun.body) return sw_val_nil();
+    if (interp_recursion_blocked(interp)) return sw_val_nil();
+    node_t *fn_node = (node_t *)fn->v.fun.body;
+    sw_env_t *fenv = env_new(fn->v.fun.closure_env ? fn->v.fun.closure_env
+                                                    : interp->global_env);
+    for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
+        env_set(fenv, fn_node->v.fun.params[i], args[i]);
+    interp->call_depth++;
+    sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
+    interp->call_depth--;
+    env_free(fenv);
+    return r;
+}
+
 /* Returns NULL if `fname` isn't a recognized extra builtin — caller
  * continues to user-fn lookup. */
 static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
                                        sw_val_t **args, int nargs, int line) {
     (void)line;
+
+    /* === Functional primitives (map / reduce / filter) =========
+     * Compiled-path-only prelude builtins until now; the interpreter run
+     * path (`swc run`) needs them too — Std.sum/product/etc. call reduce.
+     * Argument order matches codegen: map accepts (fn,list) or (list,fn);
+     * reduce is (fn, list, acc); filter is (fn, list) or (list, fn). */
+    if (strcmp(fname, "map") == 0 && nargs >= 2) {
+        sw_val_t *fn, *lst;
+        if (args[0] && args[0]->type == SW_VAL_FUN)      { fn = args[0]; lst = args[1]; }
+        else if (args[1] && args[1]->type == SW_VAL_FUN) { lst = args[0]; fn = args[1]; }
+        else { fn = args[0]; lst = args[1]; }
+        if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);
+        int cnt = lst->v.tuple.count;
+        if (cnt == 0) return sw_val_list(NULL, 0);
+        sw_val_t **res = malloc(sizeof(sw_val_t *) * cnt);
+        for (int i = 0; i < cnt; i++) {
+            sw_val_t *arg = lst->v.tuple.items[i];
+            res[i] = interp_apply_fn(interp, fn, &arg, 1);
+        }
+        sw_val_t *r = sw_val_list(res, cnt);
+        free(res);
+        return r;
+    }
+    if (strcmp(fname, "reduce") == 0 && nargs >= 3) {
+        sw_val_t *fn = args[0], *lst = args[1], *acc = args[2];
+        if (!lst || lst->type != SW_VAL_LIST) return acc;
+        for (int i = 0; i < lst->v.tuple.count; i++) {
+            sw_val_t *a2[2] = { acc, lst->v.tuple.items[i] };
+            acc = interp_apply_fn(interp, fn, a2, 2);
+        }
+        return acc;
+    }
+    if (strcmp(fname, "filter") == 0 && nargs >= 2) {
+        sw_val_t *fn, *lst;
+        if (args[0] && args[0]->type == SW_VAL_FUN)      { fn = args[0]; lst = args[1]; }
+        else if (args[1] && args[1]->type == SW_VAL_FUN) { lst = args[0]; fn = args[1]; }
+        else { fn = args[0]; lst = args[1]; }
+        if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);
+        int cnt = lst->v.tuple.count;
+        if (cnt == 0) return sw_val_list(NULL, 0);
+        sw_val_t **res = malloc(sizeof(sw_val_t *) * cnt);
+        int nkeep = 0;
+        for (int i = 0; i < cnt; i++) {
+            sw_val_t *item = lst->v.tuple.items[i];
+            sw_val_t *keep = interp_apply_fn(interp, fn, &item, 1);
+            int truthy = keep && !(keep->type == SW_VAL_NIL) &&
+                         !(keep->type == SW_VAL_ATOM && strcmp(keep->v.str, "false") == 0) &&
+                         !(keep->type == SW_VAL_INT && keep->v.i == 0);
+            if (truthy) res[nkeep++] = item;
+        }
+        sw_val_t *r = sw_val_list(res, nkeep);
+        free(res);
+        return r;
+    }
 
     /* === System ================================================ */
     if (strcmp(fname, "sleep") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
@@ -2550,6 +2635,28 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (!fp) return sw_val_atom("error");
         fwrite(args[1]->v.str, 1, strlen(args[1]->v.str), fp); fclose(fp);
         return sw_val_atom("ok");
+    }
+    /* file_read_bytes(path) → bytes | nil — binary-safe, NUL-preserving,
+     * no 1MB cap (parity with codegen). */
+    if (strcmp(fname, "file_read_bytes") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        FILE *fp = fopen(args[0]->v.str, "rb");
+        if (!fp) return sw_val_nil();
+        fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+        if (sz < 0) { fclose(fp); return sw_val_nil(); }
+        uint8_t *buf = (uint8_t *)malloc((size_t)sz ? (size_t)sz : 1);
+        size_t got = fread(buf, 1, (size_t)sz, fp); fclose(fp);
+        sw_val_t *r = sw_val_bytes(buf, got); free(buf); return r;
+    }
+    /* file_write_bytes(path, bytes) → 'ok' | 'error' — writes exact byte
+     * count of a SW_VAL_BYTES, no truncation (parity with codegen). */
+    if (strcmp(fname, "file_write_bytes") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_BYTES) {
+        FILE *fp = fopen(args[0]->v.str, "wb");
+        if (!fp) return sw_val_atom("error");
+        size_t len = args[1]->v.bytes.len;
+        size_t wr = len ? fwrite(args[1]->v.bytes.data, 1, len, fp) : 0;
+        int ok = (fclose(fp) == 0) && (wr == len);
+        return sw_val_atom(ok ? "ok" : "error");
     }
     if (strcmp(fname, "file_exists") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         struct stat st;
@@ -2778,6 +2885,27 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         int slot = (int)args[0]->v.i;
         if (slot < 0 || slot >= _REPL_SQLITE_MAX || !_repl_sqlite_db[slot])
             return sw_val_atom("error");
+        /* 3-arg overload: db_exec(h, sql, [args]) — prepare + bind + step,
+         * no rows returned (parity with codegen). */
+        if (nargs >= 3 && args[2]->type == SW_VAL_LIST) {
+            sqlite3_stmt *stmt = NULL;
+            if (sqlite3_prepare_v2(_repl_sqlite_db[slot], args[1]->v.str, -1, &stmt, NULL) != SQLITE_OK)
+                return sw_val_string(sqlite3_errmsg(_repl_sqlite_db[slot]));
+            for (int i = 0; i < args[2]->v.tuple.count; i++) {
+                sw_val_t *p = args[2]->v.tuple.items[i];
+                if (p->type == SW_VAL_INT)         sqlite3_bind_int64(stmt, i + 1, p->v.i);
+                else if (p->type == SW_VAL_FLOAT)  sqlite3_bind_double(stmt, i + 1, p->v.f);
+                else if (p->type == SW_VAL_STRING) sqlite3_bind_text(stmt, i + 1, p->v.str, -1, SQLITE_TRANSIENT);
+                else if (p->type == SW_VAL_ATOM)   sqlite3_bind_text(stmt, i + 1, p->v.str, -1, SQLITE_TRANSIENT);
+                else if (p->type == SW_VAL_NIL)    sqlite3_bind_null(stmt, i + 1);
+            }
+            int rc;
+            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) { /* drain */ }
+            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE && rc != SQLITE_OK)
+                return sw_val_string(sqlite3_errmsg(_repl_sqlite_db[slot]));
+            return sw_val_atom("ok");
+        }
         char *err = NULL;
         int rc = sqlite3_exec(_repl_sqlite_db[slot], args[1]->v.str, NULL, NULL, &err);
         if (rc != SQLITE_OK) {
@@ -3047,12 +3175,31 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_int(count);
     }
     if (strcmp(fname, "ets_list") == 0) {
-        sw_val_t *ids[_INTERP_VETS_MAX_TABLES]; int nids = 0;
-        pthread_mutex_lock(&_interp_vets_meta);
-        for (int i = 0; i < _interp_vets_next_id && i < _INTERP_VETS_MAX_TABLES; i++)
-            if (_interp_vets_tables[i].active) ids[nids++] = sw_val_int(i);
-        pthread_mutex_unlock(&_interp_vets_meta);
-        return sw_val_list(ids, nids);
+        /* ets_list(table_id) → list of {key, value} tuples — match the
+         * docs (docs/SW_LANGUAGE.md) and the compiled path. Previously
+         * this ignored its argument and returned the list of active
+         * table IDs, a third divergent behavior. */
+        if (nargs < 1 || !args[0] || args[0]->type != SW_VAL_INT)
+            return sw_val_list(NULL, 0);
+        int id = (int)args[0]->v.i;
+        if (id < 0 || id >= _INTERP_VETS_MAX_TABLES || !_interp_vets_tables[id].active)
+            return sw_val_list(NULL, 0);
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+
+        int cap = 64, cnt = 0;
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        pthread_rwlock_rdlock(&t->lock);
+        for (int bi = 0; bi < _INTERP_VETS_BUCKETS; bi++) {
+            for (_interp_vets_entry_t *e = t->buckets[bi]; e; e = e->next) {
+                if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+                sw_val_t *pair[2] = { e->key, e->value };
+                items[cnt++] = sw_val_tuple(pair, 2);
+            }
+        }
+        pthread_rwlock_unlock(&t->lock);
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
     }
 
     /* === base64 (string-oriented, parity with codegen path) =====
@@ -3161,6 +3308,61 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (len) memcpy(tmp, args[0]->v.bytes.data, len);
         tmp[len] = 0;
         sw_val_t *r = sw_val_string(tmp); free(tmp); return r;
+    }
+    /* bytes_from_ints([n0, n1, ...]) → bytes (each masked 0..255). */
+    if (strcmp(fname, "bytes_from_ints") == 0 && nargs >= 1 && args[0]->type == SW_VAL_LIST) {
+        int cnt = args[0]->v.tuple.count;
+        uint8_t *buf = (uint8_t *)malloc(cnt ? (size_t)cnt : 1);
+        for (int i = 0; i < cnt; i++) {
+            sw_val_t *e = args[0]->v.tuple.items[i];
+            buf[i] = (e && e->type == SW_VAL_INT) ? (uint8_t)(e->v.i & 0xFF) : 0;
+        }
+        sw_val_t *r = sw_val_bytes(buf, (size_t)cnt); free(buf); return r;
+    }
+    /* byte(n) → bytes of length 1 holding n & 0xFF. */
+    if (strcmp(fname, "byte") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        uint8_t b = (uint8_t)(args[0]->v.i & 0xFF);
+        return sw_val_bytes(&b, 1);
+    }
+
+    /* === char codes (parity with codegen) ====================== */
+    if (strcmp(fname, "ord") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        const unsigned char *s = (const unsigned char *)args[0]->v.str;
+        return sw_val_int(s[0] ? (int64_t)s[0] : -1);
+    }
+    if (strcmp(fname, "codepoint_at") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT) {
+        const unsigned char *s = (const unsigned char *)args[0]->v.str;
+        int64_t i = args[1]->v.i;
+        size_t len = strlen((const char *)s);
+        if (i < 0 || (size_t)i >= len) return sw_val_int(-1);
+        return sw_val_int((int64_t)s[i]);
+    }
+
+    /* === Math (libm-backed; parity with codegen) =============== */
+    if ((strcmp(fname, "to_float") == 0 || strcmp(fname, "math_sqrt") == 0 ||
+         strcmp(fname, "math_sin") == 0 || strcmp(fname, "math_cos") == 0 ||
+         strcmp(fname, "math_exp") == 0 || strcmp(fname, "math_log") == 0 ||
+         strcmp(fname, "math_floor") == 0 || strcmp(fname, "math_ceil") == 0 ||
+         strcmp(fname, "math_round") == 0) && nargs >= 1 &&
+        (args[0]->type == SW_VAL_INT || args[0]->type == SW_VAL_FLOAT)) {
+        double x = (args[0]->type == SW_VAL_INT) ? (double)args[0]->v.i : args[0]->v.f;
+        if (strcmp(fname, "to_float") == 0)   return sw_val_float(x);
+        if (strcmp(fname, "math_sqrt") == 0)  return sw_val_float(sqrt(x));
+        if (strcmp(fname, "math_sin") == 0)   return sw_val_float(sin(x));
+        if (strcmp(fname, "math_cos") == 0)   return sw_val_float(cos(x));
+        if (strcmp(fname, "math_exp") == 0)   return sw_val_float(exp(x));
+        if (strcmp(fname, "math_log") == 0)   return sw_val_float(log(x));
+        if (strcmp(fname, "math_floor") == 0) return sw_val_int((int64_t)floor(x));
+        if (strcmp(fname, "math_ceil") == 0)  return sw_val_int((int64_t)ceil(x));
+        if (strcmp(fname, "math_round") == 0) return sw_val_int((int64_t)llround(x));
+    }
+    if (strcmp(fname, "math_pow") == 0 && nargs >= 2 &&
+        (args[0]->type == SW_VAL_INT || args[0]->type == SW_VAL_FLOAT) &&
+        (args[1]->type == SW_VAL_INT || args[1]->type == SW_VAL_FLOAT)) {
+        double base = (args[0]->type == SW_VAL_INT) ? (double)args[0]->v.i : args[0]->v.f;
+        double ex   = (args[1]->type == SW_VAL_INT) ? (double)args[1]->v.i : args[1]->v.f;
+        return sw_val_float(pow(base, ex));
     }
 
     /* === Bytes-native audio codec twins (NUL-safe; parity) ====== */
@@ -3662,7 +3864,12 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             struct timeval tv; gettimeofday(&tv, NULL);
             return sw_val_int((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
         }
-        if (strcmp(fname, "map_get") == 0 && nargs >= 2) return sw_val_map_get(args[0], args[1]);
+        if (strcmp(fname, "map_get") == 0 && nargs >= 2) {
+            sw_val_t *mv = sw_val_map_get(args[0], args[1]);
+            /* 3-arg overload: map_get(m, k, default). */
+            if (nargs >= 3 && (!mv || mv->type == SW_VAL_NIL)) return args[2];
+            return mv;
+        }
         if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);
         if (strcmp(fname, "map_new") == 0) return sw_val_map_new(NULL, NULL, 0);
         if (strcmp(fname, "map_keys") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
@@ -3771,7 +3978,14 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         /* Just evaluate the inner expression and return nil pid for now */
         sw_val_t *inner = eval(interp, n->v.spawn.expr, env);
         (void)inner;
-        return sw_val_pid(NULL);
+        sw_val_t *pid = sw_val_pid(NULL);
+        if (n->v.spawn.monitor) {
+            /* spawn_monitor -> {pid, ref}: match the documented/compiled
+             * shape even though the interpreter has no real scheduler. */
+            sw_val_t *items[2] = { pid, sw_val_int(0) };
+            return sw_val_tuple(items, 2);
+        }
+        return pid;
     }
 
     case N_SEND: {

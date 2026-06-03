@@ -511,13 +511,18 @@ deliver_body:
 static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
-    /* Append to buffer */
-    if (c->buf_len + len > c->buf_cap) {
-        c->buf_cap = (c->buf_len + len) * 2;
+    /* Append to buffer. Reserve one extra byte beyond buf_len so we can
+     * always NUL-terminate: http_try_parse() scans c->buf with sscanf /
+     * strchr / strstr, which over-read past the allocation when an inbound
+     * request exactly fills buf_cap and leaves no terminator (ASAN:
+     * heap-buffer-overflow READ of size N+1 just past the read buffer). */
+    if (c->buf_len + len + 1 > c->buf_cap) {
+        c->buf_cap = (c->buf_len + len + 1) * 2;
         c->buf = (uint8_t *)realloc(c->buf, c->buf_cap);
     }
     memcpy(c->buf + c->buf_len, data, len);
     c->buf_len += len;
+    c->buf[c->buf_len] = '\0'; /* keep the scan buffer C-string safe */
 
     if (c->mode == SW_HTTP_MODE_HTTP) {
         http_try_parse(cid);

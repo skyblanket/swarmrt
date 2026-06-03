@@ -642,3 +642,19 @@ void sw_io_cleanup_owner(sw_process_t *proc) {
         port_remove(to_close[i]);
     }
 }
+
+/* Count ports still capable of delivering an event (SW_PORT_OPEN with a
+ * live owner). The deadlock watchdog calls this: an idle TCP/HTTP server
+ * legitimately parks every process in `receive` with an empty mailbox
+ * while it waits for the I/O thread to deliver an accept/data event, so a
+ * non-zero count means "not deadlocked, just waiting on I/O". */
+int sw_io_active_port_count(void) {
+    if (!g_io_running) return 0;
+    int n = 0;
+    pthread_mutex_lock(&g_ports_lock);
+    for (sw_port_t *p = g_ports; p; p = p->next) {
+        if (p->state == SW_PORT_OPEN && p->owner) n++;
+    }
+    pthread_mutex_unlock(&g_ports_lock);
+    return n;
+}

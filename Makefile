@@ -232,6 +232,18 @@ test-injection: swc libswarmrt
 	@./bin/swc build tests/security/shell_injection_test.sw -o /tmp/sw_injection_test
 	@SW_QUIET=1 /tmp/sw_injection_test
 
+# Doc-truth tripwires.
+#   check-docs : every complete ```sw block in the docs + every runnable
+#                example COMPILES with this swc.
+#   doctest    : every complete ```sw block carrying `# =>` expected-output
+#                markers is COMPILED, RUN, and its stdout asserted line by
+#                line — the "docs lie" guard. Fails non-zero on drift.
+.PHONY: check-docs doctest
+check-docs: swc libswarmrt
+	@bash scripts/check_sw_docs.sh
+doctest: swc libswarmrt
+	@bash scripts/doctest.sh
+
 # ── Sanitizer / fuzz ─────────────────────────────────────────────────
 # Fuzz the two pure, untrusted-input parsers — sw_lang_parse (every .sw
 # file) and sw_unmarshal (every byte off a remote node). Both are free of

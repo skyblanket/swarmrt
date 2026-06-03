@@ -18,7 +18,7 @@
 # out to every sink.
 
 module Telemetry
-export [configure, emit, stdout_sink, file_sink, jsonl_sink, count, names]
+export [configure, emit, flush, stdout_sink, file_sink, jsonl_sink, count, names]
 
 # Public — start the hub, install sinks.
 fun configure(opts) {
@@ -39,6 +39,21 @@ fun emit(name, attrs) {
         stdout_sink_fn(enriched)
     } else {
         send(hub, {'event', enriched})
+    }
+}
+
+# Public — block until every event emitted so far has been fanned out
+# to its sinks. Because the hub processes its mailbox FIFO, a synchronous
+# round-trip is a barrier: when the reply arrives, all earlier {'event'}
+# messages have already been written. Replaces the `sleep(N)` shutdown
+# race hack at call sites. Returns 'ok' (or 'ok' if no hub is running —
+# nothing is queued, so the barrier is trivially satisfied).
+fun flush() {
+    hub = whereis('telemetry_hub')
+    if (hub == nil) { 'ok' }
+    else {
+        send(hub, {'flush', self()})
+        receive { {'flushed', r} -> r }
     }
 }
 
@@ -75,10 +90,9 @@ fun stdout_sink_fn(event) {
 
 fun file_append_event(path, event) {
     line = json_encode(event) ++ "\n"
-    # file_write overwrites; we want append. Read-then-write is OK at
-    # low event volumes; for high volume add a real file_append builtin.
-    existing = case file_read(path) { nil -> "" ; s -> s }
-    file_write(path, existing ++ line)
+    # O(1) append via the file_append builtin — no read-then-write, so
+    # JSONL sinks no longer rewrite the whole file per event (was O(n^2)).
+    file_append(path, line)
 }
 
 # ---- internal hub ----
@@ -93,6 +107,9 @@ fun hub_loop(sinks, total) {
             hub_loop(sinks, total)
         {'names', from} ->
             send(from, {'names', []})   # name registry is a TODO
+            hub_loop(sinks, total)
+        {'flush', from} ->
+            send(from, {'flushed', 'ok'})   # FIFO barrier — see flush()
             hub_loop(sinks, total)
         'stop' -> 'done'
     }

@@ -118,3 +118,15 @@ fun test_abs_float() {
     assert_eq(abs(2.5), 2.5)
     assert_eq(abs(-3), 3)
 }
+
+# === ets_list shape parity (interp must match compiled + docs) ===========
+# Previously the interpreter ignored its argument and returned the list of
+# active table IDs, while compiled returned keys-only — both disagreed with
+# the documented {k, v}-pairs contract. A single-key table keeps the
+# expected list order-independent.
+
+fun test_ets_list_kv_pairs() {
+    t = ets_new()
+    ets_put(t, 'only', 42)
+    assert_eq(ets_list(t), [{'only', 42}])
+}

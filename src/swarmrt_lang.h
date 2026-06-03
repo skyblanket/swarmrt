@@ -210,8 +210,9 @@ typedef struct node {
         struct { char name[128]; struct node *value; } assign;
         /* N_CALL */
         struct { struct node *func; struct node **args; int nargs; } call;
-        /* N_SPAWN */
-        struct { struct node *expr; } spawn;
+        /* N_SPAWN — `monitor` set for spawn_monitor(...) which atomically
+         * spawns + monitors and returns {pid, ref} instead of a bare pid. */
+        struct { struct node *expr; int monitor; } spawn;
         /* N_SEND */
         struct { struct node *to; struct node *msg; } send;
         /* N_RECEIVE */

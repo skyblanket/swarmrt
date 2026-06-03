@@ -99,4 +99,10 @@ void sw_port_controlling_process(sw_port_t *port, sw_process_t *new_owner);
 /* Called by process_exit to close owned ports */
 void sw_io_cleanup_owner(sw_process_t *proc);
 
+/* Count of ports that can still deliver an event to their owner (state
+ * SW_PORT_OPEN). Used by the deadlock watchdog: a process parked in
+ * `receive` while a live port exists is waiting on the I/O thread, not
+ * deadlocked. Cheap, lock-protected; returns 0 if the I/O system is down. */
+int sw_io_active_port_count(void);
+
 #endif /* SWARMRT_IO_H */

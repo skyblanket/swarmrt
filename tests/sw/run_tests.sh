@@ -100,8 +100,73 @@ if [ -d "$INTERP_DIR" ]; then
     echo ""
 fi
 
-total_all_files=$((total_files + interp_files))
-total_all_failed=$((failed_files + interp_failed))
+# === `swc run` end-to-end tests ==========================================
+# Tests under tests/sw/run/ are executed via `swc run <file>` — the
+# documented interpreter run path (import resolution + module merge +
+# main() in the tree-walking interpreter). A test passes if `swc run`
+# exits 0 (the program self-checks and sys_exit(1)s on any failure).
+RUN_DIR="$SWARMRT_ROOT/tests/sw/run"
+run_files=0
+run_failed=0
+if [ -d "$RUN_DIR" ]; then
+    echo "--- swc run (interpreter end-to-end) ---"
+    for sw in "$RUN_DIR"/test_*.sw; do
+        [ -e "$sw" ] || continue
+        run_files=$((run_files + 1))
+        name="$(basename "$sw" .sw)"
+        log="$BUILD_DIR/$name.run.log"
+        if "$SWC" run "$sw" >"$log" 2>&1; then
+            echo "${GREEN}OK${RESET}           $name ${DIM}— $(tail -1 "$log")${RESET}"
+        else
+            run_failed=$((run_failed + 1))
+            echo "${RED}RUN(swc) FAIL${RESET} $name"
+            sed 's/^/    /' "$log"
+        fi
+    done
+    echo ""
+fi
+
+# === Watchdog stderr-clean regressions ===================================
+# Tests under tests/sw/watchdog/ assert on *stderr*, not exit code: a
+# fixture must run to completion WITHOUT the deadlock watchdog printing a
+# spurious "possible deadlock" WARNING. We run each with a small
+# SW_DEADLOCK_MS so the watchdog ticks several times during the idle
+# window, then grep stderr. A warning = FAIL.
+WD_DIR="$SWARMRT_ROOT/tests/sw/watchdog"
+wd_files=0
+wd_failed=0
+if [ -d "$WD_DIR" ]; then
+    echo "--- watchdog (stderr must stay clean) ---"
+    for sw in "$WD_DIR"/*.sw; do
+        [ -e "$sw" ] || continue
+        wd_files=$((wd_files + 1))
+        name="$(basename "$sw" .sw)"
+        bin="$BUILD_DIR/wd_$name"
+        elog="$BUILD_DIR/wd_$name.err"
+        if ! "$SWC" build "$sw" -o "$bin" >"$BUILD_DIR/wd_$name.build" 2>&1; then
+            wd_failed=$((wd_failed + 1))
+            echo "${RED}COMPILE FAIL${RESET} $name"
+            sed 's/^/    /' "$BUILD_DIR/wd_$name.build"
+            continue
+        fi
+        # Fast watchdog; SW_QUIET silences the startup banner so the only
+        # stderr we could see is a warning. perl alarm bounds the run
+        # (macOS has no `timeout`).
+        SW_QUIET=1 SW_DEADLOCK_MS=250 perl -e 'alarm 6; exec @ARGV or die' \
+            "$bin" >"$BUILD_DIR/wd_$name.out" 2>"$elog"
+        if grep -q "possible deadlock" "$elog"; then
+            wd_failed=$((wd_failed + 1))
+            echo "${RED}WATCHDOG FAIL${RESET} $name — spurious deadlock warning:"
+            sed 's/^/    /' "$elog"
+        else
+            echo "${GREEN}OK${RESET}           $name ${DIM}— no spurious deadlock warning${RESET}"
+        fi
+    done
+    echo ""
+fi
+
+total_all_files=$((total_files + interp_files + run_files + wd_files))
+total_all_failed=$((failed_files + interp_failed + run_failed + wd_failed))
 
 if [ "$total_all_failed" -eq 0 ]; then
     echo "${GREEN}all sw tests passed${RESET} — $total_all_files files, $total_assertions assertions"

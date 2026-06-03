@@ -94,14 +94,37 @@ For real interactive usage you want streaming so the user sees tokens as they ar
 ```sw
 # Same shape, but http_post_stream prints tokens to stdout as they
 # arrive, with a Claude-Code-style spinner during dead air, and
-# returns the full response wrapped in OpenAI-shape JSON.
-resp = http_post_stream(url, hdrs, body_with_stream_true)
+# returns a TAGGED result the caller branches on:
+#   {'ok, json}    — success; json is OpenAI-shaped (choices[0].message.*)
+#   {'error, why}  — curl died / non-2xx HTTP / empty-or-unparseable stream
+case http_post_stream(url, hdrs, body_with_stream_true) {
+    {'error', why} -> handle_failure(why)       # retry / surface / give up
+    {'ok', json}   ->
+        decoded = json_decode(json)
+        map_get(map_get(hd(map_get(decoded, 'choices')), 'message'), 'content')
+}
 ```
+
+The tag is the whole point: a bare empty string used to mean *three different
+things* — "the model said nothing", "the SSE stream failed to parse", and
+"curl couldn't connect" — and an agent could not tell them apart to decide
+whether to retry. Now `{'ok, json}` with empty content means the model
+genuinely produced nothing, while `{'error, why}` means a real failure with an
+actionable reason (`"curl exit 7: Connection refused"`, `"HTTP 404: {...}"`,
+`"stream produced no content..."`).
+
+**SSE shape the parser expects.** Each chunk must be a line beginning with
+`data:` followed by an OpenAI-style JSON object. The space after the colon is
+optional (`data: {...}` and `data:{...}` both parse). Content is read from
+`choices[0].delta.content` (streaming) and accumulated across chunks; reasoning
+from `choices[0].delta.reasoning_content`; the stream ends on `data: [DONE]`.
+A server that emits any other framing will come back `{'error, "stream
+produced no content..."}` rather than a silent empty string.
 
 `http_post_stream` also:
 - Detects reasoning-channel models (DeepSeek-R1, GLM-5.1, o1) and renders thinking dim+italic.
-- Accepts ESC / Ctrl-C as a soft interrupt — kills the curl, returns the partial response with a marker the model sees next turn.
-- Knows about token-limit truncation and surface it explicitly.
+- Accepts ESC / Ctrl-C as a soft interrupt — kills the curl, returns `{'ok, partial}` with a marker the model sees next turn (an interrupt is not an error).
+- Knows about token-limit truncation and surfaces it explicitly (still `{'ok, ...}` — the truncated content is real).
 
 ### Multi-agent streaming without TTY interleave
 
@@ -290,7 +313,10 @@ For structured state (conversation history, tasks, telemetry rollups) use SQLite
 ```sw
 db = db_open("./agent.db")
 db_exec(db, "CREATE TABLE IF NOT EXISTS conv (id INTEGER PRIMARY KEY, turn TEXT, role TEXT)")
-db_exec(db, f"INSERT INTO conv (role, turn) VALUES ('user', '{escape(user_input)}')")
+# Always bind values as parameters — never interpolate them into SQL.
+# db_exec(h, sql, [args]) prepares + binds + steps, so user_input can
+# never break out of the string and inject SQL.
+db_exec(db, "INSERT INTO conv (role, turn) VALUES (?, ?)", ["user", user_input])
 rows = db_query(db, "SELECT role, turn FROM conv WHERE id > ?", [last_seen])
 ```
 

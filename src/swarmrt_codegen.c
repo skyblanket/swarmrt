@@ -304,9 +304,22 @@ static int is_builtin(const char *name) {
            strcmp(name, "bytes_concat") == 0 ||
            strcmp(name, "string_to_bytes") == 0 ||
            strcmp(name, "bytes_to_string") == 0 ||
+           strcmp(name, "bytes_from_ints") == 0 ||
+           strcmp(name, "byte") == 0 ||
            strcmp(name, "audio_ulaw_to_pcm16_b") == 0 ||
            strcmp(name, "audio_pcm16_to_ulaw_b") == 0 ||
            strcmp(name, "audio_resample_b") == 0 ||
+           /* Binary-safe file I/O + char codes + math (dogfood primitives) */
+           strcmp(name, "file_read_bytes") == 0 ||
+           strcmp(name, "file_write_bytes") == 0 ||
+           strcmp(name, "ord") == 0 ||
+           strcmp(name, "codepoint_at") == 0 ||
+           strcmp(name, "to_float") == 0 ||
+           strcmp(name, "math_sqrt") == 0 || strcmp(name, "math_sin") == 0 ||
+           strcmp(name, "math_cos") == 0 || strcmp(name, "math_pow") == 0 ||
+           strcmp(name, "math_exp") == 0 || strcmp(name, "math_log") == 0 ||
+           strcmp(name, "math_floor") == 0 || strcmp(name, "math_ceil") == 0 ||
+           strcmp(name, "math_round") == 0 ||
            /* Phase 15: Feature Expansion */
            strcmp(name, "query_parse") == 0 ||
            strcmp(name, "http_serve_file") == 0 ||
@@ -1631,12 +1644,16 @@ static const char *_common_builtins[] = {
     "base64_encode", "base64_decode",
     "bytes_from_base64", "bytes_to_base64", "byte_size", "byte_at",
     "byte_slice", "bytes_concat", "string_to_bytes", "bytes_to_string",
+    "bytes_from_ints", "byte", "ord", "codepoint_at", "to_float",
+    "math_sqrt", "math_sin", "math_cos", "math_pow", "math_exp", "math_log",
+    "math_floor", "math_ceil", "math_round",
     "audio_ulaw_to_pcm16_b", "audio_pcm16_to_ulaw_b", "audio_resample_b",
     "json_encode", "json_decode", "json_get", "json_escape",
     "spawn", "self", "send", "register", "whereis",
     "ets_new", "ets_put", "ets_get", "ets_delete", "ets_update_counter", "ets_cas",
     "ets_take", "ets_update", "ets_list", "ets_count",
-    "file_read", "file_write", "file_exists", "file_delete", "file_list",
+    "file_read", "file_write", "file_read_bytes", "file_write_bytes",
+    "file_exists", "file_delete", "file_list",
     "file_append", "file_mkdir",
     "file_rename", "file_stat", "file_atomic_write", "file_temp",
     "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
@@ -1941,9 +1958,22 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "bytes_concat") == 0 ||
              strcmp(fname, "string_to_bytes") == 0 ||
              strcmp(fname, "bytes_to_string") == 0 ||
+             strcmp(fname, "bytes_from_ints") == 0 ||
+             strcmp(fname, "byte") == 0 ||
              strcmp(fname, "audio_ulaw_to_pcm16_b") == 0 ||
              strcmp(fname, "audio_pcm16_to_ulaw_b") == 0 ||
              strcmp(fname, "audio_resample_b") == 0 ||
+             /* Binary-safe file I/O + char codes + math (dogfood primitives) */
+             strcmp(fname, "file_read_bytes") == 0 ||
+             strcmp(fname, "file_write_bytes") == 0 ||
+             strcmp(fname, "ord") == 0 ||
+             strcmp(fname, "codepoint_at") == 0 ||
+             strcmp(fname, "to_float") == 0 ||
+             strcmp(fname, "math_sqrt") == 0 || strcmp(fname, "math_sin") == 0 ||
+             strcmp(fname, "math_cos") == 0 || strcmp(fname, "math_pow") == 0 ||
+             strcmp(fname, "math_exp") == 0 || strcmp(fname, "math_log") == 0 ||
+             strcmp(fname, "math_floor") == 0 || strcmp(fname, "math_ceil") == 0 ||
+             strcmp(fname, "math_round") == 0 ||
              /* Phase 15: Feature Expansion */
              strcmp(fname, "query_parse") == 0 ||
              strcmp(fname, "http_serve_file") == 0 ||
@@ -2028,9 +2058,31 @@ static void emit_send(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     strncpy(out, msg_var, osz - 1);
 }
 
+/* Wrap a freshly-spawned sw_process_t* (held in C var `proc_var`) into the
+ * sw value `spawn` returns. For plain spawn that's a SW_VAL_PID; for
+ * spawn_monitor it atomically monitors the child and returns {pid, ref}.
+ * Atomic here means the child can't have its slot recycled between spawn
+ * and monitor — we still hold the live sw_process_t*. */
+static void emit_spawn_wrap(cg_ctx_t *ctx, int is_monitor,
+                            const char *proc_var, char *out, int osz) {
+    FILE *f = ctx->out;
+    char res[32];
+    fresh_var(ctx, res, sizeof(res));
+    if (is_monitor) {
+        fprintf(f, "    uint64_t %s_ref = sw_monitor(%s);\n", res, proc_var);
+        fprintf(f, "    sw_val_t *%s_items[2] = { sw_val_pid(%s), sw_val_int((int64_t)%s_ref) };\n",
+                res, proc_var, res);
+        fprintf(f, "    sw_val_t *%s = sw_val_tuple(%s_items, 2);\n", res, res);
+    } else {
+        fprintf(f, "    sw_val_t *%s = sw_val_pid(%s);\n", res, proc_var);
+    }
+    strncpy(out, res, osz - 1);
+}
+
 static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     FILE *f = ctx->out;
     node_t *inner = n->v.spawn.expr;
+    int is_monitor = n->v.spawn.monitor;
 
     /* Lambda form: spawn(fun() { ... }) — evaluate to a sw_val_t fun
      * value, hand off to a generic trampoline that calls sw_val_apply.
@@ -2039,11 +2091,11 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     if (inner && inner->type == N_FUN && inner->v.fun.name[0] == '\0') {
         char fn_val[32];
         emit_expr(ctx, inner, 0, fn_val, sizeof(fn_val));
-        char res[32];
-        fresh_var(ctx, res, sizeof(res));
-        fprintf(f, "    sw_val_t *%s = sw_val_pid(sw_spawn(_sw_lambda_spawn_trampoline, %s));\n",
-                res, fn_val);
-        strncpy(out, res, osz - 1);
+        char pv[32];
+        fresh_var(ctx, pv, sizeof(pv));
+        fprintf(f, "    sw_process_t *%s = sw_spawn(_sw_lambda_spawn_trampoline, %s);\n",
+                pv, fn_val);
+        emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
         return;
     }
 
@@ -2052,8 +2104,8 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         /* Non-call, non-lambda — refuse rather than silently returning
          * pid 0. Tells the user exactly what's wrong instead of letting
          * them debug a null pid downstream. */
-        fprintf(stderr, "swc: src/%s.sw:%d: spawn(...) requires a function call (e.g. `spawn(worker())`) or a lambda (e.g. `spawn(fun() { body })`)\n",
-                ctx->mod_name, n->line);
+        fprintf(stderr, "swc: src/%s.sw:%d: %s(...) requires a function call (e.g. `spawn(worker())`) or a lambda (e.g. `spawn(fun() { body })`)\n",
+                ctx->mod_name, n->line, is_monitor ? "spawn_monitor" : "spawn");
         ctx->had_arity_error = 1;
         char res[32];
         fresh_var(ctx, res, sizeof(res));
@@ -2082,11 +2134,11 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         fprintf(f, "    %s->a%d = %s;\n", sa, i, arg);
     }
 
-    char res[32];
-    fresh_var(ctx, res, sizeof(res));
-    fprintf(f, "    sw_val_t *%s = sw_val_pid(sw_spawn(_%s_sp%d_entry, %s));\n",
-            res, ctx->mod_name, sp_id, sa);
-    strncpy(out, res, osz - 1);
+    char pv[32];
+    fresh_var(ctx, pv, sizeof(pv));
+    fprintf(f, "    sw_process_t *%s = sw_spawn(_%s_sp%d_entry, %s);\n",
+            pv, ctx->mod_name, sp_id, sa);
+    emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
 }
 
 static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
@@ -2145,14 +2197,21 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     fprintf(f, "            sw_val_t *_reason = _sig->reason_str\n");
     fprintf(f, "                ? sw_val_string(_sig->reason_str)\n");
     fprintf(f, "                : sw_val_int((int64_t)_sig->reason);\n");
-    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_int((int64_t)_sig->pid), _reason };\n");
+    /* Deliver the source as a SW_VAL_PID (resolved from the slab,
+     * dead-or-alive) so `{'EXIT', from, _} -> from == some_pid` works.
+     * Previously this was sw_val_int(pid), which never == a spawn() pid. */
+    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_pid(sw_find_by_pid_any(_sig->pid)), _reason };\n");
     fprintf(f, "            %s = sw_val_tuple(_items, 3);\n", msg);
     fprintf(f, "          } else if (%s->tag == SW_TAG_DOWN && %s->payload) {\n", cur, cur);
     fprintf(f, "            sw_signal_t *_sig = (sw_signal_t *)%s->payload;\n", cur);
     fprintf(f, "            sw_val_t *_reason = _sig->reason_str\n");
     fprintf(f, "                ? sw_val_string(_sig->reason_str)\n");
     fprintf(f, "                : sw_val_int((int64_t)_sig->reason);\n");
-    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_int((int64_t)_sig->pid), _reason };\n");
+    /* {'DOWN', ref, 'process', PID, reason}: PID is a real SW_VAL_PID
+     * resolved from the slab (dead-or-alive) so the idiomatic supervisor
+     * pattern `dpid == child_pid` matches. ref stays an int (monitor()
+     * returns an int ref). Previously PID was sw_val_int → always !=. */
+    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_pid(sw_find_by_pid_any(_sig->pid)), _reason };\n");
     fprintf(f, "            %s = sw_val_tuple(_items, 5);\n", msg);
     fprintf(f, "          } else {\n");
     fprintf(f, "            %s = %s->payload ? (sw_val_t *)%s->payload : sw_val_nil();\n",
@@ -2940,7 +2999,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
  * Entry point and main()
  * ========================================================================= */
 
-static void emit_entry_and_main(cg_ctx_t *ctx) {
+/* `init_mods` lists EVERY module (entry + imported) that declared
+ * top-level `let` globals, in the order their initializers must run
+ * (imported modules before the entry module). _main_entry calls each
+ * one's _sw_init_globals_<Mod>() before user main(). Previously only the
+ * entry module's globals were initialized, so an imported module's `let X`
+ * stayed NULL → SIGSEGV the moment the entry used MyMod.X. */
+static void emit_entry_and_main(cg_ctx_t *ctx,
+                                char init_mods[][128], int n_init_mods) {
     FILE *f = ctx->out;
 
     /* Entry: when the user's main() returns, signal the OS-thread main
@@ -2957,8 +3023,10 @@ static void emit_entry_and_main(cg_ctx_t *ctx) {
 
     fprintf(f, "static void _main_entry(void *_arg) {\n");
     fprintf(f, "    (void)_arg;\n");
-    if (ctx->has_globals)
-        fprintf(f, "    _sw_init_globals_%s();\n", ctx->mod_name);
+    /* Initialize module globals for every module that has them — imported
+     * modules first, entry module last (see init_mods ordering). */
+    for (int i = 0; i < n_init_mods; i++)
+        fprintf(f, "    _sw_init_globals_%s();\n", init_mods[i]);
     fprintf(f, "    %s_main(NULL, 0);\n", ctx->mod_name);
     fprintf(f, "    pthread_mutex_lock(&_sw_done_lock);\n");
     fprintf(f, "    _sw_done_flag = 1;\n");
@@ -3035,7 +3103,15 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     for (int i = 0; i < mod->v.mod.nfuns; i++)
         emit_function(&ctx, mod->v.mod.funs[i]);
 
-    emit_entry_and_main(&ctx);
+    /* Single-module: only this module can have globals to init. */
+    char single_init[1][128];
+    int n_single_init = 0;
+    if (ctx.has_globals) {
+        strncpy(single_init[0], ctx.mod_name, 127);
+        single_init[0][127] = '\0';
+        n_single_init = 1;
+    }
+    emit_entry_and_main(&ctx, single_init, n_single_init);
 
     (void)obfuscate; /* handled externally by sw_obfuscate() */
     /* Fail the whole codegen if any call site had an arity mismatch
@@ -3158,14 +3234,40 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
         if (ctx.had_unknown_fn) any_unknown_fn = 1;
     }
 
-    /* Entry point from main module */
+    /* Entry point from main module.
+     *
+     * Collect EVERY module that declared top-level globals so _main_entry
+     * initializes all of them — not just the entry module's. Order:
+     * imported (non-entry) modules first (declaration order), entry module
+     * last. That way an entry-module global RHS can reference an imported
+     * module's already-initialized globals/functions. (Cross-module global
+     * RHS that reaches back into a later-initialized module's globals is an
+     * inherent ordering limitation, same as C static init across TUs.) */
     node_t *main_mod = (node_t *)modules[main_idx];
+    char init_mods[64][128];
+    int n_init_mods = 0;
+    for (int m = 0; m < nmodules && n_init_mods < 64; m++) {
+        if (m == main_idx) continue;
+        node_t *mod = (node_t *)modules[m];
+        if (!mod || mod->type != N_MODULE) continue;
+        if (mod->v.mod.nglobals > 0) {
+            strncpy(init_mods[n_init_mods], mod->v.mod.name, 127);
+            init_mods[n_init_mods][127] = '\0';
+            n_init_mods++;
+        }
+    }
+    if (main_mod->v.mod.nglobals > 0 && n_init_mods < 64) {
+        strncpy(init_mods[n_init_mods], main_mod->v.mod.name, 127);
+        init_mods[n_init_mods][127] = '\0';
+        n_init_mods++;
+    }
+
     cg_ctx_t main_ctx;
     memset(&main_ctx, 0, sizeof(main_ctx));
     main_ctx.out = out;
     strncpy(main_ctx.mod_name, main_mod->v.mod.name, 127);
     main_ctx.has_globals = (main_mod->v.mod.nglobals > 0);
-    emit_entry_and_main(&main_ctx);
+    emit_entry_and_main(&main_ctx, init_mods, n_init_mods);
 
     if (any_arity_error || any_unknown_fn) return -1;
     return 0;

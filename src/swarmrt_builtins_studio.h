@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <math.h>
 #ifndef _WIN32
   #include <sys/select.h>
   #include <sys/ioctl.h>
@@ -151,7 +152,8 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
             for (int i = 0; i < a->v.tuple.count; i++)
                 if (!_vets_key_eq(a->v.tuple.items[i], b->v.tuple.items[i])) return 0;
             return 1;
-        case SW_VAL_PID: return a->v.pid == b->v.pid;
+        case SW_VAL_PID: /* compare by numeric pid id (see sw_val_equal) */
+            return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
         default: return a == b;
     }
 }
@@ -467,6 +469,63 @@ static sw_val_t *_builtin_random_int(sw_val_t **a, int n) {
     return sw_val_int(lo + (int64_t)(sw_random_uniform((uint32_t)(hi - lo + 1))));
 }
 
+/* === Math (libm-backed; -lm is linked) ===================================
+ * Each accepts an int OR float arg (coerced to double) and returns a float,
+ * except the rounding family (floor/ceil/round) which returns an int — the
+ * common case is "give me a whole number back". lib/Math.sw wraps these as
+ * Math.sqrt(x) etc. and adds pure-sw min/max/clamp/pi. */
+static double _sw_to_double(sw_val_t *v) {
+    if (!v) return 0.0;
+    if (v->type == SW_VAL_INT)   return (double)v->v.i;
+    if (v->type == SW_VAL_FLOAT) return v->v.f;
+    return 0.0;
+}
+
+/* to_float(x) → float. int/float → float; nil → 0.0. */
+static sw_val_t *_builtin_to_float(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_float(0.0);
+    return sw_val_float(_sw_to_double(a[0]));
+}
+
+static sw_val_t *_builtin_math_sqrt(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_float(0.0);
+    return sw_val_float(sqrt(_sw_to_double(a[0])));
+}
+static sw_val_t *_builtin_math_sin(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_float(0.0);
+    return sw_val_float(sin(_sw_to_double(a[0])));
+}
+static sw_val_t *_builtin_math_cos(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_float(0.0);
+    return sw_val_float(cos(_sw_to_double(a[0])));
+}
+static sw_val_t *_builtin_math_pow(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || !a[1]) return sw_val_float(0.0);
+    return sw_val_float(pow(_sw_to_double(a[0]), _sw_to_double(a[1])));
+}
+static sw_val_t *_builtin_math_exp(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_float(0.0);
+    return sw_val_float(exp(_sw_to_double(a[0])));
+}
+static sw_val_t *_builtin_math_log(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_float(0.0);
+    return sw_val_float(log(_sw_to_double(a[0])));
+}
+/* floor/ceil/round → int (the value still fits a double exactly for the
+ * magnitudes sw programs use). */
+static sw_val_t *_builtin_math_floor(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_int(0);
+    return sw_val_int((int64_t)floor(_sw_to_double(a[0])));
+}
+static sw_val_t *_builtin_math_ceil(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_int(0);
+    return sw_val_int((int64_t)ceil(_sw_to_double(a[0])));
+}
+static sw_val_t *_builtin_math_round(sw_val_t **a, int n) {
+    if (n < 1 || !a[0]) return sw_val_int(0);
+    return sw_val_int((int64_t)llround(_sw_to_double(a[0])));
+}
+
 /* === String ops === */
 
 static sw_val_t *_builtin_string_contains(sw_val_t **a, int n) {
@@ -535,6 +594,27 @@ static sw_val_t *_builtin_string_length(sw_val_t **a, int n) {
     return sw_val_int((int64_t)strlen(a[0]->v.str));
 }
 
+/* ord(s) → int. The byte value (0..255) of the FIRST byte of s. Empty
+ * string → -1. The char→int primitive tokenizers/hashers reach for. */
+static sw_val_t *_builtin_ord(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
+    const unsigned char *s = (const unsigned char *)a[0]->v.str;
+    return sw_val_int(s[0] ? (int64_t)s[0] : -1);
+}
+
+/* codepoint_at(s, i) → int. The byte value (0..255) at byte index i of s,
+ * or -1 if i is out of range. Byte-level by design — exactly what hashers
+ * and byte-pair tokenizers need; no UTF-8 decoding. */
+static sw_val_t *_builtin_codepoint_at(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_INT) return sw_val_int(-1);
+    const unsigned char *s = (const unsigned char *)a[0]->v.str;
+    int64_t i = a[1]->v.i;
+    size_t len = strlen((const char *)s);
+    if (i < 0 || (size_t)i >= len) return sw_val_int(-1);
+    return sw_val_int((int64_t)s[i]);
+}
+
 static sw_val_t *_builtin_list_append(sw_val_t **a, int n) {
     if (n < 2 || a[0]->type != SW_VAL_LIST) {
         sw_val_t *one = a[1];
@@ -593,6 +673,41 @@ static sw_val_t *_builtin_file_read(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_string(buf);
     free(buf);
     return r;
+}
+
+/* file_read_bytes(path) → bytes | nil. Binary-safe sibling of file_read:
+ * returns a length-carrying SW_VAL_BYTES (survives embedded NULs) and has
+ * no ~1MB cap — the whole file is read. The flagship use-case is PCM/WAV/
+ * protocol frames, which file_read truncates at the first 0x00. */
+static sw_val_t *_builtin_file_read_bytes(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    FILE *fp = fopen(a[0]->v.str, "rb");
+    if (!fp) return sw_val_nil();
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz < 0) { fclose(fp); return sw_val_nil(); }
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz ? (size_t)sz : 1);
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    sw_val_t *r = sw_val_bytes(buf, got);
+    free(buf);
+    return r;
+}
+
+/* file_write_bytes(path, bytes) → 'ok' | 'error'. Binary-safe sibling of
+ * file_write: writes the exact byte count of a SW_VAL_BYTES (NULs and all)
+ * with no truncation. */
+static sw_val_t *_builtin_file_write_bytes(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING ||
+        !a[1] || a[1]->type != SW_VAL_BYTES)
+        return sw_val_atom("error");
+    FILE *fp = fopen(a[0]->v.str, "wb");
+    if (!fp) return sw_val_atom("error");
+    size_t len = a[1]->v.bytes.len;
+    size_t wr = len ? fwrite(a[1]->v.bytes.data, 1, len, fp) : 0;
+    int ok = (fclose(fp) == 0) && (wr == len);
+    return sw_val_atom(ok ? "ok" : "error");
 }
 
 /* === JSON === */
@@ -1758,16 +1873,42 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
     }
 }
 
+/* Build the tagged return for http_post_stream. The result is a 2-tuple
+ * the sw caller can `case`-branch on:
+ *   {'ok,    json}    — success; `json` is the OpenAI-shaped response
+ *                       string (choices[0].message.{content,reasoning_content,
+ *                       tool_calls}, plus usage). Same string the function
+ *                       used to return bare, so existing extract paths work
+ *                       once the caller unwraps the tuple.
+ *   {'error, reason}  — failure; `reason` is a human-readable string
+ *                       (curl exit / non-2xx status + body / parse failure).
+ * Tagging lets an agent distinguish "model said nothing" (ok + empty
+ * content) from "curl died" / "non-2xx" / "stream parse failed" (error),
+ * which were all indistinguishable before. */
+static sw_val_t *_sw_hps_tagged(const char *tag, const char *payload) {
+    sw_val_t *items[2];
+    items[0] = sw_val_atom(tag);
+    items[1] = sw_val_string(payload ? payload : "");
+    return sw_val_tuple(items, 2);
+}
+static sw_val_t *_sw_hps_ok(const char *json)    { return _sw_hps_tagged("ok", json); }
+static sw_val_t *_sw_hps_err(const char *reason) { return _sw_hps_tagged("error", reason); }
+
 /*
- * http_post_stream(url, headers_list, body, [target_pid, name]) → string (full content)
+ * http_post_stream(url, headers_list, body, [target_pid, name]) → tagged tuple
  *
  * POSTs a JSON body with "stream": true to an OpenAI-compatible endpoint,
  * parses the Server-Sent-Events stream token-by-token, prints each
  * delta.content to stdout as it arrives (for visual streaming), and
- * returns the complete accumulated assistant content as a string wrapped
- * in a minimal OpenAI response shape so the existing extract_content
- * path keeps working:
+ * returns a TAGGED 2-tuple the caller branches on:
+ *    {'ok,    "<openai-json>"}   on success
+ *    {'error, "<reason>"}        on curl-failure / non-2xx / parse-failure
+ * The `ok` json keeps the minimal OpenAI response shape so the existing
+ * extract_content path works after unwrapping:
  *    {"choices":[{"message":{"role":"assistant","content":"..."}}]}
+ *
+ * SSE parsing accepts both "data: {...}" and spec-legal "data:{...}"
+ * (the space after the colon is optional per the WHATWG SSE spec).
  *
  * If the optional 4th + 5th args (target_pid, name_string) are supplied,
  * runs in "subagent mode": no stdout, no spinner, no ESC interrupt — every
@@ -1786,7 +1927,7 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
  */
 static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
-        return sw_val_nil();
+        return _sw_hps_err("http_post_stream: bad arguments (need url, headers, body)");
     const char *url = a[0]->v.str;
     sw_val_t *headers = a[1];
     const char *body = a[2]->v.str;
@@ -1806,7 +1947,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     snprintf(body_file, sizeof(body_file), "%s/sw_stream_%d_%u.json",
              sw_tmpdir(), sw_getpid_os(), sw_random_u32());
     FILE *bf = fopen(body_file, "w");
-    if (!bf) return sw_val_nil();
+    if (!bf) return _sw_hps_err("http_post_stream: cannot write request body to temp file");
     fputs(body, bf);
     fclose(bf);
 
@@ -1833,8 +1974,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     char body_arg[300];
     snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
     int nhdr = (headers && headers->type == SW_VAL_LIST) ? headers->v.tuple.count : 0;
-    /* 17 fixed + 2 per header + (--data-binary, body_arg, url) + NULL */
-    char **argv = (char **)malloc(sizeof(char *) * (17 + 2 * nhdr + 3 + 1));
+    /* 19 fixed + 2 per header + (--data-binary, body_arg, url) + NULL.
+     * The "+2" over the prior 17 is the --write-out flag + format below,
+     * which routes the final HTTP status code to stderr (err_file) so we
+     * can detect non-2xx responses without polluting the SSE stdout. */
+    char **argv = (char **)malloc(sizeof(char *) * (19 + 2 * nhdr + 3 + 1));
     char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
     int argc = 0, nhdr_alloc = 0;
     argv[argc++] = "curl";
@@ -1854,6 +1998,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     argv[argc++] = "1";
     argv[argc++] = "--retry-connrefused";
     argv[argc++] = "--retry-all-errors";
+    /* %{stderr} routes the write-out to stderr (curl >= 7.63), which we
+     * already redirect to err_file. We parse "SW_HTTP_CODE:NNN" back out
+     * after the stream closes to branch ok/error on non-2xx statuses. */
+    argv[argc++] = "--write-out";
+    argv[argc++] = "%{stderr}SW_HTTP_CODE:%{http_code}\\n";
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
             sw_val_t *h = headers->v.tuple.items[i];
@@ -1880,7 +2029,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
     free(hdr_strs);
     free(argv);
-    if (!pp) { swbs_unlink(body_file); swbs_unlink(err_file); return sw_val_nil(); }
+    if (!pp) { swbs_unlink(body_file); swbs_unlink(err_file); return _sw_hps_err("http_post_stream: failed to spawn curl"); }
 
     /* Put the pipe in non-blocking mode so we can tick the spinner while
      * waiting for the first byte from the upstream LLM. */
@@ -1954,6 +2103,14 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     char *rtok = (char *)malloc(SW_HPS_TOK_CAP);
     int done = 0;
     const int spinner_tick_ms = 80;
+
+    /* Capture the first chunk of any NON-SSE body (lines that don't begin
+     * with "data:"). When a server returns a non-2xx, the body is usually
+     * a plain JSON error object on stdout rather than an SSE stream — we
+     * surface it as the {'error, reason} payload instead of returning an
+     * empty shell. Bounded; we only need enough to be actionable. */
+    char errbody[1024];
+    size_t errbody_len = 0;
 
     /* Scrape `usage.prompt_tokens` / `completion_tokens` from whichever
      * SSE chunk carries it (transformers-serve emits usage in the final
@@ -2055,8 +2212,36 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             size_t this_line_len = line_len;
             line_len = 0;
 
-            if (this_line_len < 6 || strncmp(line, "data: ", 6) != 0) continue;
-            const char *json = line + 6;
+            /* SSE field parse. The WHATWG spec makes the space after the
+             * colon OPTIONAL: "data: {...}" and "data:{...}" are both legal,
+             * and a single leading space (if present) is stripped. We used
+             * to hard-require the 6-byte "data: " prefix, which silently
+             * dropped every chunk from spec-legal servers that emit
+             * "data:{...}" with no space — the read loop ran but the content
+             * extractor below never fired, returning empty content that was
+             * indistinguishable from "model said nothing". Now we match the
+             * 5-byte "data:" prefix and skip at most one optional space. */
+            if (this_line_len < 5 || strncmp(line, "data:", 5) != 0) {
+                /* Not an SSE data line. Stash it (bounded) as a candidate
+                 * error body — non-2xx responses arrive as a plain JSON
+                 * blob here rather than as "data:" chunks. Skip pure
+                 * blank/separator lines so the error reason stays clean. */
+                if (errbody_len + this_line_len + 1 < sizeof(errbody)) {
+                    const char *src = line;
+                    size_t cpn = this_line_len;
+                    /* trim a trailing newline so multiple lines join readably */
+                    while (cpn > 0 && (src[cpn-1] == '\n' || src[cpn-1] == '\r')) cpn--;
+                    if (cpn > 0) {
+                        memcpy(errbody + errbody_len, src, cpn);
+                        errbody_len += cpn;
+                        errbody[errbody_len++] = ' ';
+                        errbody[errbody_len] = '\0';
+                    }
+                }
+                continue;
+            }
+            const char *json = line + 5;
+            if (*json == ' ') json++;
             if (strncmp(json, "[DONE]", 6) == 0) { done = 1; break; }
 
             /* Opportunistically scrape token counts from any chunk
@@ -2317,6 +2502,23 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         }
     }
 
+    /* EOF — a final line with no trailing newline never hit the per-line
+     * handler in the read loop. For non-2xx responses the JSON error body is
+     * exactly that: a single line with no terminator. Flush it into errbody
+     * (if it isn't an SSE "data:" chunk) so the {'error, ...} reason carries
+     * the server's message instead of "(no response body)". */
+    if (line_len > 0 && !(line_len >= 5 && strncmp(line, "data:", 5) == 0)) {
+        size_t cpn = line_len;
+        while (cpn > 0 && (line[cpn-1] == '\n' || line[cpn-1] == '\r')) cpn--;
+        if (cpn > 0 && errbody_len + cpn + 1 < sizeof(errbody)) {
+            memcpy(errbody + errbody_len, line, cpn);
+            errbody_len += cpn;
+            errbody[errbody_len++] = ' ';
+            errbody[errbody_len] = '\0';
+        }
+    }
+    line_len = 0;
+
     /* EOF — flush whatever is still in the lookahead window. */
     if (spinner_drawn) {
         fputs("\r\x1b[K", stdout);
@@ -2364,39 +2566,82 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     }
     swbs_unlink(body_file);
 
-    /* If curl failed, read its stderr and surface a real error to the
-     * user. This is the difference between "server returned empty"
-     * (confusing) and "curl: (7) Failed to connect to sushi port 8000:
-     * Connection refused" (actionable). */
-    if (curl_exit != 0 && buf_len == 0) {
+    /* Read curl's stderr once. It carries two things now:
+     *   1. transport error text (ECONNREFUSED, NXDOMAIN, TLS, curl 28) and
+     *   2. our "SW_HTTP_CODE:NNN" from --write-out '%{stderr}...'
+     * We parse the status code out and strip that marker line so the
+     * remaining text is just the human-readable transport error (if any). */
+    char errbuf[1024];
+    size_t erlen = 0;
+    {
         FILE *ef = fopen(err_file, "r");
-        char errbuf[1024];
-        size_t erlen = 0;
         if (ef) {
             erlen = fread(errbuf, 1, sizeof(errbuf) - 1, ef);
             fclose(ef);
         }
         errbuf[erlen] = '\0';
-        /* Strip trailing newline for cleaner display. */
-        while (erlen > 0 && (errbuf[erlen - 1] == '\n' || errbuf[erlen - 1] == '\r')) {
-            errbuf[--erlen] = '\0';
+    }
+    int http_code = -1;
+    {
+        char *m = strstr(errbuf, "SW_HTTP_CODE:");
+        if (m) {
+            http_code = (int)strtol(m + 13, NULL, 10);
+            /* Excise the whole "SW_HTTP_CODE:NNN" token (+ trailing newline)
+             * so it never leaks into the user-facing error text. */
+            char *after = m + 13;
+            while (*after >= '0' && *after <= '9') after++;
+            if (*after == '\n') after++;
+            size_t tail = strlen(after);
+            memmove(m, after, tail + 1);
+            erlen = strlen(errbuf);
         }
+    }
+    /* Strip trailing whitespace for cleaner display/return. */
+    while (erlen > 0 && (errbuf[erlen - 1] == '\n' || errbuf[erlen - 1] == '\r' ||
+                         errbuf[erlen - 1] == ' '  || errbuf[erlen - 1] == '\t')) {
+        errbuf[--erlen] = '\0';
+    }
+    swbs_unlink(err_file);
+
+    /* Classify failure. Three error families the agent can branch on:
+     *   - curl_exit != 0           → transport/process failure (conn refused,
+     *                                 DNS, TLS, timeout=28). errbuf has detail.
+     *   - http_code >= 400         → server returned a non-2xx HTTP status;
+     *                                 errbody (non-SSE body) carries the JSON
+     *                                 error object the server sent.
+     *   - buf_len == 0 && no usage → stream parsed but yielded no content AND
+     *     && no tool calls           no tool calls: a parse failure or truly
+     *                                 empty (we treat empty-without-tool-calls
+     *                                 as a parse/empty error so the agent can
+     *                                 retry instead of forwarding a blank turn).
+     * Interrupt and finish_reason="length" are NOT errors — they're partial
+     * successes that carry real (if truncated) content, so they stay {'ok,...}
+     * with the truncation marker appended below. */
+    int is_curl_fail = (curl_exit != 0 && !interrupted);
+    int is_http_fail = (http_code >= 400);
+    const char *fail_reason = NULL;
+    char fail_buf[1280];
+    if (is_curl_fail) {
+        snprintf(fail_buf, sizeof(fail_buf), "curl exit %d: %s", curl_exit,
+                 erlen > 0 ? errbuf : "(no stderr captured — check the URL/endpoint)");
+        fail_reason = fail_buf;
+    } else if (is_http_fail) {
+        snprintf(fail_buf, sizeof(fail_buf), "HTTP %d: %s", http_code,
+                 errbody_len > 0 ? errbody : (erlen > 0 ? errbuf : "(no response body)"));
+        fail_reason = fail_buf;
+    }
+
+    /* Surface curl/HTTP failures on screen as before (visual parity with the
+     * pre-tagged behavior) — the tagged {'error, ...} is what the agent
+     * branches on, but the human still sees the warning inline. */
+    if (fail_reason) {
         if (so.subagent) {
-            char emsg[1100];
-            snprintf(emsg, sizeof(emsg), "[curl exit %d] %s", curl_exit,
-                     erlen > 0 ? errbuf : "(no stderr captured)");
-            _stream_out_send_tagged(so.target, "stream_chunk", so.name, emsg);
+            _stream_out_send_tagged(so.target, "stream_chunk", so.name, fail_reason);
         } else {
-            fprintf(stdout, "\n  \x1b[38;5;208m⚠ curl exited %d\x1b[0m\n", curl_exit);
-            if (erlen > 0) {
-                fprintf(stdout, "  \x1b[38;5;240m%s\x1b[0m\n", errbuf);
-            } else {
-                fprintf(stdout, "  \x1b[38;5;240m(no stderr captured — check the URL/endpoint)\x1b[0m\n");
-            }
+            fprintf(stdout, "\n  \x1b[38;5;208m⚠ %s\x1b[0m\n", fail_reason);
             fflush(stdout);
         }
     }
-    swbs_unlink(err_file);
 
     /* Append a marker the model will see in history if the turn was
      * cut short. Three cases:
@@ -2405,6 +2650,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      *   3. finish_reason="length" → "[Response truncated at max_tokens limit — increase max_tokens and retry]"
      * Claude Code uses similar markers so the model knows the
      * previous response was incomplete. */
+    /* Snapshot whether the stream produced anything real BEFORE we append
+     * any truncation marker (the marker would otherwise mask an empty turn).
+     * "Real" = streamed content OR at least one reassembled tool call. */
+    int produced_output = (buf_len > 0) || (tc_count > 0);
+
     const char *trunc_marker = NULL;
     if (interrupted) {
         trunc_marker = "\n\n[Request interrupted by user]";
@@ -2542,7 +2792,25 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             enc, renc, tc_field);
     }
 
-    sw_val_t *result = sw_val_string(out);
+    /* Decide the tagged return. Precedence:
+     *   1. curl/transport failure   → {'error, "curl exit N: ..."}
+     *   2. non-2xx HTTP status      → {'error, "HTTP NNN: <body>"}
+     *   3. stream parsed but empty  → {'error, "stream produced no content..."}
+     *      (no content AND no tool calls AND not a deliberate interrupt)
+     *   4. otherwise                → {'ok, "<openai-json>"}
+     * An interrupt with no content is still {'ok,...} carrying the
+     * interrupt marker — the caller asked to stop, that's not a failure. */
+    sw_val_t *result;
+    if (fail_reason) {
+        result = _sw_hps_err(fail_reason);
+    } else if (!produced_output && !interrupted) {
+        result = _sw_hps_err(
+            "stream produced no content and no tool calls "
+            "(SSE parse yielded nothing — check the endpoint emits "
+            "OpenAI-shaped 'data: {\"choices\":[{\"delta\":{\"content\":...}}]}' chunks)");
+    } else {
+        result = _sw_hps_ok(out);
+    }
     free(enc);
     free(renc);
     if (tcenc) free(tcenc);
@@ -2824,7 +3092,11 @@ static sw_val_t *_builtin_map_new(sw_val_t **a, int n) {
 /* map_get(map, key) → value or nil */
 static sw_val_t *_builtin_map_get(sw_val_t **a, int n) {
     if (n < 2) return sw_val_nil();
-    return sw_val_map_get(a[0], a[1]);
+    sw_val_t *v = sw_val_map_get(a[0], a[1]);
+    /* 3-arg overload: map_get(m, k, default) → default when the key is
+     * absent (i.e. lookup yields nil). 2-arg form keeps returning nil. */
+    if (n >= 3 && (!v || v->type == SW_VAL_NIL)) return a[2];
+    return v;
 }
 
 /* map_put(map, key, value) → new map with key set */
@@ -3248,6 +3520,24 @@ static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
         return sw_val_atom("error");
     int slot = (int)a[0]->v.i;
     if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+
+    /* 3-arg overload: db_exec(h, sql, [args]) — prepare + bind + step, no
+     * rows returned. Lets writes (INSERT/UPDATE/DELETE) use placeholders
+     * instead of misusing db_query for a side-effecting statement. */
+    if (n >= 3 && a[2] && a[2]->type == SW_VAL_LIST) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(_sw_sqlite_db[slot], a[1]->v.str, -1, &stmt, NULL) != SQLITE_OK)
+            return sw_val_string(sqlite3_errmsg(_sw_sqlite_db[slot]));
+        for (int i = 0; i < a[2]->v.tuple.count; i++)
+            _sw_db_bind(stmt, i + 1, a[2]->v.tuple.items[i]);
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) { /* drain any rows */ }
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE && rc != SQLITE_OK)
+            return sw_val_string(sqlite3_errmsg(_sw_sqlite_db[slot]));
+        return sw_val_atom("ok");
+    }
+
     char *err = NULL;
     int rc = sqlite3_exec(_sw_sqlite_db[slot], a[1]->v.str, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
@@ -5311,7 +5601,10 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
 
 /* === D1: ETS List/Count Builtins === */
 
-/* ets_list(table_id) → list of keys in that table */
+/* ets_list(table_id) → list of {key, value} tuples in that table.
+ * Matches docs/SW_LANGUAGE.md ("all {key, val} as a list") and the
+ * interpreter path. Previously returned keys only, which silently
+ * disagreed with both the docs and the interpreter. */
 static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_list(NULL, 0);
     int id = (int)a[0]->v.i;
@@ -5326,7 +5619,8 @@ static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
         _vets_entry_t *e = t->buckets[b];
         while (e) {
             if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
-            items[cnt++] = e->key;
+            sw_val_t *pair[2] = { e->key, e->value };
+            items[cnt++] = sw_val_tuple(pair, 2);
             e = e->next;
         }
     }
@@ -7101,6 +7395,30 @@ static sw_val_t *_builtin_bytes_to_string(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_string(tmp);   /* sw_val_string strdups → stops at NUL */
     free(tmp);
     return r;
+}
+
+/* bytes_from_ints([n0, n1, ...]) → bytes. Direct byte construction from a
+ * list of ints; each is masked to 0..255. The clean replacement for the
+ * base64-identity hack. nil/empty list → empty bytes. */
+static sw_val_t *_builtin_bytes_from_ints(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_LIST) return sw_val_bytes(NULL, 0);
+    int cnt = a[0]->v.tuple.count;
+    uint8_t *buf = (uint8_t *)malloc(cnt ? (size_t)cnt : 1);
+    for (int i = 0; i < cnt; i++) {
+        sw_val_t *e = a[0]->v.tuple.items[i];
+        buf[i] = (e && e->type == SW_VAL_INT) ? (uint8_t)(e->v.i & 0xFF) : 0;
+    }
+    sw_val_t *r = sw_val_bytes(buf, (size_t)cnt);
+    free(buf);
+    return r;
+}
+
+/* byte(n) → bytes of length 1 holding n & 0xFF. Convenience for building
+ * one-byte protocol frames without bytes_from_ints([n]). */
+static sw_val_t *_builtin_byte(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_bytes(NULL, 0);
+    uint8_t b = (uint8_t)(a[0]->v.i & 0xFF);
+    return sw_val_bytes(&b, 1);
 }
 
 /* === Bytes-native audio codec twins (no base64 round-trip) ===============

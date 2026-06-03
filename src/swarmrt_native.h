@@ -417,6 +417,12 @@ void sw_shutdown(int swarm_id);
 
 /* Process table lookup by PID */
 sw_process_t *sw_find_by_pid(uint64_t pid);
+/* Like sw_find_by_pid but also returns slots for EXITING/dead processes
+ * (any slab slot whose .pid still equals `pid`). Used to reconstruct a
+ * SW_VAL_PID for a process that has already exited (e.g. the pid carried
+ * inside a {'DOWN',...}/{'EXIT',...} message) so it compares == the pid
+ * spawn() handed out. Returns NULL only if the slot was recycled. */
+sw_process_t *sw_find_by_pid_any(uint64_t pid);
 
 /* Process management */
 sw_process_t *sw_spawn(void (*func)(void*), void *arg);

@@ -42,6 +42,7 @@ static void usage(void) {
         "Usage: swc <command> [options] <file.sw>\n\n"
         "Commands:\n"
         "  build    Compile .sw to native binary\n"
+        "  run      Interpret a .sw file (calls main())\n"
         "  emit     Output generated C to stdout\n"
         "  repl     Start interactive REPL\n"
         "  test     Run test_* functions in .sw files\n\n"
@@ -69,6 +70,21 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+/* Silent read — returns NULL without a message. Used when probing import
+ * candidate paths (a miss is expected, not an error). */
+static char *read_file_quiet(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(len + 1);
+    size_t n = fread(buf, 1, len, f);
+    buf[n] = '\0';
+    fclose(f);
+    return buf;
+}
+
 /* Extract module name from AST */
 static const char *get_mod_name(void *ast) {
     node_t *mod = (node_t *)ast;
@@ -82,6 +98,133 @@ static int get_func_names(void *ast, const char **names, int max) {
     for (int i = 0; i < mod->v.mod.nfuns && n < max; i++)
         names[n++] = mod->v.mod.funs[i]->v.fun.name;
     return n;
+}
+
+/* Append `src`'s functions into `dst`. Each imported function is added
+ * under its module-qualified name "Mod.fn" (so `Mod.fn(...)` call sites
+ * resolve in the interpreter, which stores qualified calls as a single
+ * "Mod.fn" identifier) AND, if no function of that bare name already
+ * exists in dst, under its bare name too (so an imported function's body
+ * — which calls its module-siblings unqualified — keeps working). The
+ * main module's own functions are added first, so they win bare-name
+ * collisions. AST nodes are shared, not copied; the dst module owns the
+ * merged funs[] array. */
+static void merge_module_funs(node_t *dst, node_t *src, int qualify) {
+    for (int i = 0; i < src->v.mod.nfuns; i++) {
+        node_t *fn = src->v.mod.funs[i];
+        const char *bare = fn->v.fun.name;
+
+        if (qualify) {
+            /* Qualified copy: a shallow node clone sharing the same body,
+             * but named "Mod.bare". Shallow is safe — the body/params are
+             * read-only during evaluation. */
+            node_t *q = (node_t *)malloc(sizeof(node_t));
+            *q = *fn;
+            snprintf(q->v.fun.name, sizeof(q->v.fun.name), "%s.%s",
+                     src->v.mod.name, bare);
+            dst->v.mod.nfuns++;
+            dst->v.mod.funs = realloc(dst->v.mod.funs,
+                                      sizeof(node_t *) * dst->v.mod.nfuns);
+            dst->v.mod.funs[dst->v.mod.nfuns - 1] = q;
+        }
+
+        /* Bare name — only if not already present (first-wins). */
+        int exists = 0;
+        for (int j = 0; j < dst->v.mod.nfuns; j++)
+            if (strcmp(dst->v.mod.funs[j]->v.fun.name, bare) == 0) { exists = 1; break; }
+        if (!exists) {
+            dst->v.mod.nfuns++;
+            dst->v.mod.funs = realloc(dst->v.mod.funs,
+                                      sizeof(node_t *) * dst->v.mod.nfuns);
+            dst->v.mod.funs[dst->v.mod.nfuns - 1] = fn;
+        }
+    }
+}
+
+/* `swc run <file.sw>` — interpret a .sw program: parse the file, resolve
+ * its `import` declarations from the local dir and the bundled lib/, merge
+ * all functions into one module, build an interpreter, and call main().
+ * The documented interpreter run path (SW_LANGUAGE.md). Returns the
+ * process exit code. */
+static int run_file(const char *path, const char *argv0) {
+    char *source = read_file(path);
+    if (!source) return 1;
+    void *main_ast = sw_lang_parse(source);
+    free(source);
+    if (!main_ast) { fprintf(stderr, "swc: parse failed for %s\n", path); return 1; }
+    node_t *root = (node_t *)main_ast;
+
+    /* swc-binary dir → <root>/lib fallback for stdlib imports. */
+    char swc_dir[256] = ".";
+    char swarmrt_lib[512] = "./lib";
+    {
+        char *sp = strdup(argv0);
+        if (sp) {
+            char *dir = dirname(sp);
+            snprintf(swc_dir, sizeof(swc_dir), "%s", dir);
+            free(sp);
+        }
+        snprintf(swarmrt_lib, sizeof(swarmrt_lib), "%s/../lib", swc_dir);
+    }
+    char input_dir[256] = ".";
+    {
+        char *tmp = strdup(path);
+        if (tmp) { snprintf(input_dir, sizeof(input_dir), "%s", dirname(tmp)); free(tmp); }
+    }
+
+    /* Resolve + merge imports (same lookup order as the build path). */
+    for (int im = 0; im < root->v.mod.nimports; im++) {
+        const char *imp_name = root->v.mod.imports[im];
+        char lower[128];
+        snprintf(lower, sizeof(lower), "%s", imp_name);
+        for (int c = 0; lower[c]; c++)
+            if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
+
+        char imp_path[512];
+        char *imp_source = NULL;
+        const char *roots[2] = { input_dir, swarmrt_lib };
+        for (int r = 0; r < 2 && !imp_source; r++) {
+            snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
+            imp_source = read_file_quiet(imp_path);
+            if (imp_source) break;
+            snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
+            imp_source = read_file_quiet(imp_path);
+        }
+        if (!imp_source) {
+            fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
+                    imp_name, input_dir, swarmrt_lib);
+            continue;
+        }
+        void *imp_ast = sw_lang_parse(imp_source);
+        free(imp_source);
+        if (!imp_ast) {
+            fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
+            continue;
+        }
+        merge_module_funs(root, (node_t *)imp_ast, 1);
+    }
+
+    /* Run main(). */
+    sw_interp_t *interp = sw_lang_new(main_ast);
+    int has_main = 0;
+    for (int i = 0; i < root->v.mod.nfuns; i++)
+        if (strcmp(root->v.mod.funs[i]->v.fun.name, "main") == 0) { has_main = 1; break; }
+    if (!has_main) {
+        fprintf(stderr, "swc: no main() in %s\n", path);
+        sw_lang_free(interp);
+        return 1;
+    }
+    sw_lang_call(interp, "main", NULL, 0);
+    int rc = interp->error ? 1 : 0;
+    if (interp->error)
+        fprintf(stderr, "swc: runtime error: %s\n", interp->error_msg);
+    /* Don't node_free the merged module: its funs[] mixes shared imported
+     * nodes with shallow qualified clones (sharing bodies), so a recursive
+     * free would double-free. Same trade-off the test runner makes — let
+     * process exit reclaim the AST. */
+    interp->module_ast = NULL;
+    sw_lang_free(interp);
+    return rc;
 }
 
 int main(int argc, char **argv) {
@@ -115,6 +258,13 @@ int main(int argc, char **argv) {
                 total_failures += sw_test_run_file(argv[i]);
         }
         return total_failures ? 1 : 0;
+    }
+
+    /* Interpreter run path — `swc run <file.sw>`. Documented in
+     * SW_LANGUAGE.md; previously printed "unknown command 'run'". */
+    if (strcmp(cmd, "run") == 0) {
+        if (argc < 3) { fprintf(stderr, "swc: run needs a .sw file\n"); return 1; }
+        return run_file(argv[2], argv[0]);
     }
 
     if (argc < 3) { usage(); return 1; }
@@ -238,12 +388,18 @@ int main(int argc, char **argv) {
                 char imp_path[512];
                 char *imp_source = NULL;
                 const char *roots[2] = { input_dir, swarmrt_lib };
+                /* Probe candidate paths SILENTLY — a miss on any individual
+                 * candidate is expected (we try CamelCase + lowercase across
+                 * input_dir + stdlib). Only a *total* failure (all four
+                 * candidates missed) is a genuine error, reported below.
+                 * read_file (noisy) would otherwise spam "cannot open
+                 * './Std.sw'" on every SUCCESSFUL stdlib import. */
                 for (int r = 0; r < 2 && !imp_source; r++) {
                     snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
-                    imp_source = read_file(imp_path);
+                    imp_source = read_file_quiet(imp_path);
                     if (imp_source) break;
                     snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
-                    imp_source = read_file(imp_path);
+                    imp_source = read_file_quiet(imp_path);
                 }
                 if (!imp_source) {
                     fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
