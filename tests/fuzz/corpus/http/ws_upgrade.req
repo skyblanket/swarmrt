@@ -1,0 +1,9 @@
+GET /telnyx/media HTTP/1.1
+Host: x:9132
+Upgrade: websocket
+Connection: Upgrade
+Authorization: Bearer tok-123
+X-Test-Header: sig-abc
+Sec-WebSocket-Key: dGhlIHNhbXBsZQ==
+Sec-WebSocket-Version: 13
+

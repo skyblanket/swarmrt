@@ -425,6 +425,20 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | `audio_pcm16_to_ulaw_b(b)` | PCM16 bytes → mu-law bytes (codec twin) |
 | `audio_resample_b(b, from, to)` | PCM16 bytes resample (codec twin) |
 
+### Crypto
+| | |
+|---|---|
+| `ed25519_verify(public_key, signature, message)` | verify an Ed25519 signature → `'true'` / `'false'` (`nil` if this build has no TLS) |
+
+`ed25519_verify` uses OpenSSL's EVP one-shot verify and is gated on the same
+TLS build as `wsc_connect_tls` (auto-on for Linux; macOS opt-in via
+`make SWARMRT_TLS=1`). Without TLS it returns `nil` with a one-line stderr note
+(the caller should fail closed, e.g. reject the webhook). Inputs are flexible:
+`public_key` and `signature` may be raw `bytes` (32 / 64 bytes) **or** base64
+strings (decoded for you — the shape Telnyx delivers a webhook key + signature);
+`message` is the signed bytes, either `bytes` or a string taken verbatim (NOT
+base64). Wrong-length / undecodable input returns `'false'` (never crashes).
+
 ### Lists & maps
 | | |
 |---|---|
@@ -508,8 +522,10 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 |---|---|
 | `http_get(url, headers?)` | GET → response body string. Auto-grows |
 | `http_post(url, headers, body)` | POST → string. **ESC-interruptible**; returns `"__INTERRUPTED__"` on Ctrl-C |
+| `http_request(url, opts)` | **status-aware** request → `%{status: int, body: string, headers: %{lowercased keys}}` on a completed transport (incl. 4xx/5xx — the status is surfaced, not hidden), or `{'error, reason}` if the request never completed. `opts` is a map: `method` (default `"GET"`), `headers` (a `%{name=>value}` MAP **or** a list of `{name, value}` tuples), `body` (string). Unlike `http_post`/`http_get` (body-or-nil, status hidden) it lets a caller tell a 200 from a 4xx/5xx with a body. `http_post`/`http_get` are unchanged |
 | `http_post_stream(url, headers, body, [pid, name])` | streams to stdout incrementally; reasoning channel; ESC interrupt. Returns a **tagged** result: `{'ok, openai_json}` on success, `{'error, reason}` on curl-failure / non-2xx / empty-or-unparseable stream. Parses both `data: {...}` and `data:{...}` SSE framing |
-| **WS server** (LiveView): `http_listen`, `http_respond`, `ws_send`, `ws_close`, `ws_set_handler`, `live_js` |
+| **HTTP/WS server**: `http_listen`, `http_respond`, `ws_send`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `live_js` |
+| `http_listen(port)` delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
 | **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_connect_tls(wss_url)` → handle (TLS `wss://`), `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_set_handler(h, pid)` (deliver frames to a process as messages), `wsc_close(h)` |
 
 ### Browser
@@ -627,6 +643,25 @@ fun main() {
     reqs = 3
     print(format("hi {} ({} req)", who, reqs))   # => hi ada (3 req)
     print(f"hi {who} #{reqs}")                    # => hi ada #3
+}
+```
+
+`http_request(url, opts)` returns a status-aware map (`%{status, body, headers}`)
+on a completed transport, or a tagged `{'error, reason}` when the request never
+completed. This doctest exercises the error path deterministically (a dead port,
+no server, no network), proving the tagged shape — see `tests/sw/test_http_request.sw`
+for the full status + header + body round-trip against a live `http_listen` server:
+
+```sw
+module HttpReqDemo
+export [main]
+
+fun main() {
+    # Port 9 (discard) with nothing listening → transport failure, tagged.
+    case http_request("http://127.0.0.1:9/none", %{method: "GET"}) {
+        {'error', _reason} -> print("transport_error")   # => transport_error
+        resp               -> print(map_get(resp, "status"))
+    }
 }
 ```
 

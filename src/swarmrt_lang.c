@@ -32,6 +32,87 @@
 #include "swarmrt_ets.h"
 #include "swarmrt_audio.h"   /* G.711 / PCM16 / resample for REPL+test parity */
 
+/* ed25519_verify lives in swarmrt_builtins_studio.h for the compiled path, but
+ * the interpreter (this file) doesn't pull in that header. To keep REPL/codegen
+ * parity it gets a self-contained copy here, behind the same SWARMRT_TLS gate
+ * (auto-on for non-Apple, opt-in via `make SWARMRT_TLS=1` on macOS). */
+#ifndef SWARMRT_TLS
+#  ifndef __APPLE__
+#    define SWARMRT_TLS 1
+#  endif
+#endif
+#ifdef SWARMRT_TLS
+#  include <openssl/evp.h>
+/* Coerce a sw value to a malloc'd raw byte buffer (mirrors _sw_ed_coerce_bytes
+ * in swarmrt_builtins_studio.h): SW_VAL_BYTES -> copy; SW_VAL_STRING with
+ * want_b64 -> base64-decode; SW_VAL_STRING without -> the string bytes verbatim.
+ * NULL on type mismatch / decode failure. Caller frees. */
+static uint8_t *_sw_lang_ed_coerce_bytes(sw_val_t *v, int want_b64, size_t *out_len) {
+    *out_len = 0;
+    if (!v) return NULL;
+    if (v->type == SW_VAL_BYTES) {
+        size_t n = v->v.bytes.len;
+        uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+        if (!buf) return NULL;
+        if (n) memcpy(buf, v->v.bytes.data, n);
+        *out_len = n;
+        return buf;
+    }
+    if (v->type == SW_VAL_STRING) {
+        if (want_b64) {
+            size_t n = 0;
+            uint8_t *raw = _sw_audio_b64_decode(v->v.str, &n);
+            if (!raw) return NULL;
+            *out_len = n;
+            return raw;
+        }
+        size_t n = strlen(v->v.str);
+        uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+        if (!buf) return NULL;
+        if (n) memcpy(buf, v->v.str, n);
+        *out_len = n;
+        return buf;
+    }
+    return NULL;
+}
+#endif
+
+/* ed25519_verify(public_key, signature, message) -> 'true'|'false'|nil.
+ * Self-contained interpreter twin of _builtin_ed25519_verify; identical
+ * contract and behavior (see swarmrt_builtins_studio.h for the full doc). */
+static sw_val_t *_sw_lang_ed25519_verify(sw_val_t **args, int nargs) {
+#ifndef SWARMRT_TLS
+    (void)args; (void)nargs;
+    fprintf(stderr, "ed25519_verify: requires a TLS build "
+                    "(rebuild with -DSWARMRT_TLS and link openssl); "
+                    "or shell out to `openssl pkeyutl -verify -rawin`.\n");
+    return sw_val_nil();
+#else
+    if (nargs < 3) return sw_val_atom("false");
+    size_t pk_len = 0, sig_len = 0, msg_len = 0;
+    uint8_t *pk  = _sw_lang_ed_coerce_bytes(args[0], 1, &pk_len);
+    uint8_t *sig = _sw_lang_ed_coerce_bytes(args[1], 1, &sig_len);
+    uint8_t *msg = _sw_lang_ed_coerce_bytes(args[2], 0, &msg_len);
+    sw_val_t *result = sw_val_atom("false");
+    if (pk && sig && msg && pk_len == 32 && sig_len == 64) {
+        EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pk, pk_len);
+        if (pkey) {
+            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+            if (ctx) {
+                if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1) {
+                    int rc = EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len);
+                    if (rc == 1) result = sw_val_atom("true");
+                }
+                EVP_MD_CTX_free(ctx);
+            }
+            EVP_PKEY_free(pkey);
+        }
+    }
+    free(pk); free(sig); free(msg);
+    return result;
+#endif
+}
+
 /* Weak stubs for runtime functions — allows linking swc without the runtime.
  * These are only called by the interpreter, never by the compiler. */
 __attribute__((weak)) void *sw_receive_any(uint64_t t, uint64_t *tag) { (void)t; (void)tag; return NULL; }
@@ -3223,6 +3304,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_string(s); free(s); return r;
     }
 
+    /* === ed25519_verify (TLS-gated, openssl EVP) — REPL/codegen parity ===
+     * Pure function, so it runs identically in the interpreter. Delegates to
+     * the same _builtin_ed25519_verify used by compiled code: 'true'|'false'
+     * under TLS, nil + stderr note without. */
+    if (strcmp(fname, "ed25519_verify") == 0 && nargs >= 3) {
+        return _sw_lang_ed25519_verify(args, nargs);
+    }
+
     /* === Audio codecs (base64 in/out, fully binary-safe) ======== */
     if (strcmp(fname, "audio_ulaw_to_pcm16") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         size_t inlen = 0; uint8_t *ulaw = _sw_audio_b64_decode(args[0]->v.str, &inlen);
@@ -3392,7 +3481,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         "send", "register", "whereis", "link", "unlink", "monitor",
         "demonitor", "exit_proc", "trap_exit", "supervise",
         "http_listen", "http_respond", "ws_send", "ws_close",
-        "ws_set_handler", "ws_send_binary", "telemetry_emit", "telemetry_subscribe",
+        "ws_set_handler", "ws_send_binary", "ws_request_headers", "ws_request_path",
+        "telemetry_emit", "telemetry_subscribe",
         "pubsub_broadcast", "pubsub_subscribe", "chrome_launch",
         "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv",
         "wsc_set_handler", "wsc_close",

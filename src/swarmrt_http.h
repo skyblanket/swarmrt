@@ -47,6 +47,20 @@ typedef struct {
     char                ws_key[128]; /* Sec-WebSocket-Key from upgrade */
     int                 active;      /* 1 = in use, 0 = free slot */
 
+    /* Parsed request headers, delivered to the handler.
+     *  - For plain HTTP: built per request, handed off (by reference) inside
+     *    the {'http_request', ...} tuple, then cleared. When a POST body has
+     *    to be buffered across reads, this map is held here until the body
+     *    completes and the request is dispatched.
+     *  - For a WebSocket upgrade: kept for the lifetime of the connection so
+     *    the handler can query it via ws_request_headers(conn) / the path via
+     *    ws_request_path(conn) (the Origin/Authorization/signature headers the
+     *    UPGRADE request carried).
+     * NULL = no headers captured (yet). Owned by the connection; freed on
+     * dispatch (HTTP) or conn_free (WS). */
+    sw_val_t           *req_headers;
+    char               *req_path;    /* request/upgrade path+query (WS); NULL = none */
+
     /* WebSocket fragmentation reassembly (continuation frames, opcode 0x0).
      * frag_buf accumulates payload across FIN=0 frames; frag_opcode holds
      * the opcode of the first (0x1 text / 0x2 binary) frame in the run. */
@@ -85,6 +99,14 @@ int sw_ws_close(int conn_id);
 
 /* Set WebSocket handler process */
 int sw_ws_set_handler(int conn_id, sw_process_t *handler);
+
+/* Request headers (MAP, lowercased keys) captured from a WS connection's
+ * UPGRADE request — for Origin/Authorization/signature reads on the socket.
+ * Always returns a non-NULL map (empty if none captured). */
+sw_val_t *sw_ws_request_headers(int conn_id);
+
+/* Request path+query from a WS connection's UPGRADE request (""=unknown). */
+const char *sw_ws_request_path(int conn_id);
 
 /* Get embedded LiveView JavaScript */
 const char *sw_liveview_js(void);

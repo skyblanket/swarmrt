@@ -89,6 +89,35 @@ fun ask_llm(prompt) {
 }
 ```
 
+`http_post`/`http_get` return body-or-nil and **hide the HTTP status** — fine for
+"give me the body", but a REST client that has to tell a `200` from a `4xx`/`5xx`
+that *also* carries a body (a Telnyx Call Control error envelope, say) can't. Use
+`http_request(url, opts)` for that: it returns a status-aware map (or `{'error,
+reason}` when the request never completed), without changing `http_post`/`http_get`:
+
+```sw
+# opts: method (default "GET"), headers (a %{k=>v} MAP or a list of {k,v}
+# tuples), body. The response carries the status code + response headers.
+fun dial(to) {
+    body = json_encode(%{to: to, from: getenv("FROM")})
+    opts = %{method: "POST",
+             headers: %{"Authorization" => "Bearer " ++ getenv("TELNYX_KEY"),
+                        "Content-Type"  => "application/json"},
+             body: body}
+    case http_request("https://api.telnyx.com/v2/calls", opts) {
+        {'error', why} -> {'transport_error', why}          # never reached the API
+        resp ->
+            status = map_get(resp, "status")
+            if (status >= 200 && status < 300) { {'ok', map_get(resp, "body")} }
+            else { {'api_error', status, map_get(resp, "body")} }  # 4xx/5xx WITH body
+    }
+}
+```
+
+This is the gap the voice-agent port flagged: with only `http_post` it had to
+*guess* success from the JSON envelope shape (`{"data":...}` == ok); `http_request`
+lets it branch on the real status code instead.
+
 For real interactive usage you want streaming so the user sees tokens as they arrive:
 
 ```sw
@@ -412,7 +441,53 @@ A multi-agent dispatcher with tagged-message routing:
 
 A working HTTP server agents can expose as a tool:
 
-→ **[`examples/http_echo.sw`](../examples/http_echo.sw)** (~25 lines)
+→ **[`examples/http_echo.sw`](../examples/http_echo.sw)** (~30 lines)
+
+### Request shapes — and reading request headers
+
+`http_listen(port)` delivers every request to the calling process (or whichever
+process `ws_set_handler` re-homed the connection to) as one of these messages:
+
+```
+{'http_request', conn, method, path, headers, body}   # plain HTTP
+{'ws_connect',   conn, path}                           # a WS UPGRADE was accepted
+{'ws_message',   conn, text}                           # a WS text frame
+{'ws_binary',    conn, b64}                            # a WS binary frame (base64)
+{'ws_close',     conn}                                 # the WS closed
+```
+
+`headers` is a **MAP with lowercased keys** — so a bearer-token check or a
+webhook-signature read works in-process, regardless of on-the-wire casing:
+
+```sw
+{'http_request', conn, _method, _path, headers, _body} ->
+    case map_get(headers, "authorization") {        # 'token' / "..." both match
+        'nil'                  -> http_respond(conn, 401, [], "missing token\n")
+        "Bearer s3cret"        -> http_respond(conn, 200, [], "ok\n")
+        _                      -> http_respond(conn, 403, [], "bad token\n")
+    }
+```
+
+Duplicate header names collapse to the last value. The map is bounded (≤128
+headers, value ≤4 KB) — a hostile request can't blow it up.
+
+**WebSockets carry their headers on the connection, not the message.** A WS
+UPGRADE's `{'ws_connect', conn, path}` keeps its small 3-tuple shape (so existing
+LiveView handlers are untouched); to read the headers the socket was opened with
+— the `Origin`, an `Authorization`, the Telnyx `telnyx-signature-ed25519` /
+`telnyx-timestamp` — query the connection:
+
+```sw
+{'ws_connect', conn, path} ->
+    hdrs = ws_request_headers(conn)        # MAP, lowercased keys (always a map)
+    origin = map_get(hdrs, "origin")       # CSRF / allow-list check before accept
+    p      = ws_request_path(conn)         # same value as `path`, re-readable
+    ...
+```
+
+`ws_request_headers/1` and `ws_request_path/1` stay valid for the life of the
+socket, so a per-connection process that was handed the socket via
+`ws_set_handler` can still pull them.
 
 A real-world agent stack that uses all of this in anger:
 

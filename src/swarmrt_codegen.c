@@ -216,6 +216,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "file_write") == 0 || strcmp(name, "file_read") == 0 ||
            strcmp(name, "file_mkdir") == 0 ||
            strcmp(name, "http_post") == 0 ||
+           strcmp(name, "http_request") == 0 ||
            strcmp(name, "json_get") == 0 || strcmp(name, "json_escape") == 0 ||
            strcmp(name, "string_contains") == 0 || strcmp(name, "string_replace") == 0 ||
            strcmp(name, "string_sub") == 0 || strcmp(name, "string_length") == 0 ||
@@ -277,6 +278,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "ws_send") == 0 ||
            strcmp(name, "ws_close") == 0 ||
            strcmp(name, "ws_set_handler") == 0 ||
+           strcmp(name, "ws_request_headers") == 0 ||
+           strcmp(name, "ws_request_path") == 0 ||
            strcmp(name, "live_js") == 0 ||
            /* WebSocket CLIENT (CDP / browser control) */
            strcmp(name, "wsc_connect") == 0 ||
@@ -295,6 +298,8 @@ static int is_builtin(const char *name) {
            strcmp(name, "string_index_of") == 0 ||
            strcmp(name, "base64_encode") == 0 ||
            strcmp(name, "base64_decode") == 0 ||
+           /* Ed25519 signature verify (TLS-gated, openssl EVP) */
+           strcmp(name, "ed25519_verify") == 0 ||
            /* Bytes value type (length-carrying, NUL-safe) */
            strcmp(name, "bytes_from_base64") == 0 ||
            strcmp(name, "bytes_to_base64") == 0 ||
@@ -1656,8 +1661,9 @@ static const char *_common_builtins[] = {
     "file_exists", "file_delete", "file_list",
     "file_append", "file_mkdir",
     "file_rename", "file_stat", "file_atomic_write", "file_temp",
-    "http_get", "http_post", "http_post_stream", "http_listen", "http_respond",
+    "http_get", "http_post", "http_request", "http_post_stream", "http_listen", "http_respond",
     "ws_send", "ws_close", "ws_set_handler", "ws_send_binary",
+    "ws_request_headers", "ws_request_path",
     "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_set_handler", "wsc_close",
     "audio_ulaw_to_pcm16", "audio_pcm16_to_ulaw", "audio_resample",
     "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
@@ -1878,6 +1884,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "timestamp") == 0 ||
              strcmp(fname, "file_write") == 0 || strcmp(fname, "file_read") == 0 ||
              strcmp(fname, "file_mkdir") == 0 || strcmp(fname, "http_post") == 0 ||
+             strcmp(fname, "http_request") == 0 ||
              strcmp(fname, "json_get") == 0 || strcmp(fname, "json_escape") == 0 ||
              strcmp(fname, "string_contains") == 0 || strcmp(fname, "string_replace") == 0 ||
              strcmp(fname, "string_sub") == 0 || strcmp(fname, "string_length") == 0 ||
@@ -1931,6 +1938,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "ws_send") == 0 ||
              strcmp(fname, "ws_close") == 0 ||
              strcmp(fname, "ws_set_handler") == 0 ||
+             strcmp(fname, "ws_request_headers") == 0 ||
+             strcmp(fname, "ws_request_path") == 0 ||
              strcmp(fname, "live_js") == 0 ||
              /* WebSocket CLIENT (CDP / browser control) */
              strcmp(fname, "wsc_connect") == 0 ||
@@ -1949,6 +1958,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "string_index_of") == 0 ||
              strcmp(fname, "base64_encode") == 0 ||
              strcmp(fname, "base64_decode") == 0 ||
+             /* Ed25519 signature verify (TLS-gated, openssl EVP) */
+             strcmp(fname, "ed25519_verify") == 0 ||
              /* Bytes value type (length-carrying, NUL-safe) */
              strcmp(fname, "bytes_from_base64") == 0 ||
              strcmp(fname, "bytes_to_base64") == 0 ||

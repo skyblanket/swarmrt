@@ -26,17 +26,21 @@ module VoiceAgent
 import Voice
 
 # ── config ────────────────────────────────────────────────────────────
+# GA `gpt-realtime` wire: NO OpenAI-Beta header, nested session with format
+# OBJECTS. µ-law (audio/pcmu) on both legs → Telnyx PCMU passes straight
+# through, byte-for-byte (zero transcode).
 
-# g711_ulaw 8kHz on both sides → Telnyx PCMU passes straight through.
 fun realtime_opts() {
   o = map_put(map_new(), "model", "gpt-realtime")
-  o = map_put(o, "api_key", getenv("OPENAI_API_KEY"))
-  map_put(o, "format", "g711_ulaw")
+  map_put(o, "api_key", getenv("OPENAI_API_KEY"))
+  # No `beta:` key → GA path: realtime_connect omits the OpenAI-Beta header.
 }
 
 fun session_opts() {
-  o = map_put(map_new(), "format", "g711_ulaw")
-  o = map_put(o, "voice", "alloy")
+  # GA format object for µ-law passthrough; "pcmu" is shorthand for
+  # %{type: "audio/pcmu"} via Voice.audio_format.
+  o = map_put(map_new(), "format", "pcmu")
+  o = map_put(o, "voice", "marin")
   map_put(o, "instructions", "You are a concise, friendly phone agent.")
 }
 
@@ -92,7 +96,7 @@ fun call_init(conn, stream_id) {
       print(f"[{stream_id}] OpenAI connect FAILED")
       ws_close(conn)
     _ ->
-      wsc_send(oa, Voice.session_update(session_opts()))
+      wsc_send(oa, Voice.session_update_ga(session_opts()))
       # Push-deliver OpenAI's frames into THIS process's mailbox as
       # {'wsc_message', oa, text} / {'wsc_close', oa} — mirroring the WS
       # server's {'ws_message', conn, text}. No poll loop, no blocking
@@ -146,8 +150,14 @@ fun bridge(conn, oa, sid) {
 
 fun handle_openai(conn, oa, sid, text) {
   case Voice.openai_type(text) {
+    # GA `gpt-realtime` emits response.output_audio.delta; some revisions emit
+    # response.audio.delta. Accept both so the audio path is version-robust.
+    "response.output_audio.delta" ->
+      b64 = Voice.frame_field(text, "delta")
+      ws_send(conn, Voice.telnyx_media(b64))
+      'ok'
     "response.audio.delta" ->
-      # base64 g711 from OpenAI → Telnyx outbound media (no transcode).
+      # base64 µ-law from OpenAI → Telnyx outbound media (no transcode).
       b64 = Voice.frame_field(text, "delta")
       ws_send(conn, Voice.telnyx_media(b64))
       'ok'

@@ -145,7 +145,12 @@ run_doctest() {
 
     # Trim each actual stdout line for comparison (mirrors marker trim).
     local actual_trimmed="$WORK/dt.actual"
-    sed 's/^[ \t]*//; s/[ \t]*$//' "$out" >"$actual_trimmed"
+    # NOTE: POSIX [[:space:]], not [ \t] — in BSD sed (macOS) a `\t` inside a
+    # bracket expression is the literal chars '\' and 't', so `[ \t]*` would
+    # also strip a leading/trailing 't' (silently eating the first char of an
+    # output line that starts with 't', e.g. "transport_error"). [[:space:]]
+    # matches actual whitespace on both BSD and GNU sed.
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$out" >"$actual_trimmed"
     # The expected file is already trimmed by the awk extractor.
 
     if diff -q "$expect" "$actual_trimmed" >/dev/null 2>&1; then

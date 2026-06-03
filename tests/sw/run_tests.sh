@@ -165,8 +165,56 @@ if [ -d "$WD_DIR" ]; then
     echo ""
 fi
 
-total_all_files=$((total_files + interp_files + run_files + wd_files))
-total_all_failed=$((failed_files + interp_failed + run_failed + wd_failed))
+# === In-VM wsc_connect single-scheduler regressions ======================
+# Tests under tests/sw/invm_wsc/ MUST run with SW_SCHEDULERS=1 — that's the
+# configuration that pinned the in-VM wsc_connect deadlock (a blocking
+# connect()/handshake recv() on the only scheduler thread starved the in-VM WS
+# server that had to complete the handshake). The fix makes connect/handshake
+# yield the scheduler. A regression re-introduces the hang, so we bound each run
+# with a perl alarm (macOS has no `timeout`); a non-zero exit (incl. SIGALRM)
+# is a FAIL.
+INVM_DIR="$SWARMRT_ROOT/tests/sw/invm_wsc"
+invm_files=0
+invm_failed=0
+if [ -d "$INVM_DIR" ]; then
+    echo "--- in-VM wsc_connect (SW_SCHEDULERS=1, must not deadlock) ---"
+    for sw in "$INVM_DIR"/test_*.sw; do
+        [ -e "$sw" ] || continue
+        invm_files=$((invm_files + 1))
+        name="$(basename "$sw" .sw)"
+        bin="$BUILD_DIR/invm_$name"
+        log="$BUILD_DIR/invm_$name.log"
+        if ! "$SWC" build "$sw" -o "$bin" >"$log" 2>&1; then
+            invm_failed=$((invm_failed + 1))
+            echo "${RED}COMPILE FAIL${RESET} $name"
+            sed 's/^/    /' "$log"
+            continue
+        fi
+        # Single scheduler + a 20s alarm: well past the ~instant happy path,
+        # but a deadlock trips the alarm (exit 142) and FAILs.
+        SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 20; exec @ARGV or die' \
+            "$bin" >"$log" 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            summary=$(grep -E '^OK |^FAIL ' "$log" | tail -1)
+            passes=$(grep -c '^PASS ' "$log" || true)
+            total_assertions=$((total_assertions + passes))
+            echo "${GREEN}OK${RESET}           $name ${DIM}— $summary${RESET}"
+        else
+            invm_failed=$((invm_failed + 1))
+            if [ "$rc" -eq 142 ]; then
+                echo "${RED}DEADLOCK${RESET}     $name — timed out (alarm); in-VM wsc_connect hung"
+            else
+                echo "${RED}RUN FAIL${RESET}     $name (exit $rc)"
+            fi
+            sed 's/^/    /' "$log"
+        fi
+    done
+    echo ""
+fi
+
+total_all_files=$((total_files + interp_files + run_files + wd_files + invm_files))
+total_all_failed=$((failed_files + interp_failed + run_failed + wd_failed + invm_failed))
 
 if [ "$total_all_failed" -eq 0 ]; then
     echo "${GREEN}all sw tests passed${RESET} — $total_all_files files, $total_assertions assertions"

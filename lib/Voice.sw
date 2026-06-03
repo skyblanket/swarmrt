@@ -3,34 +3,48 @@
 # Bridges a telephony provider (Telnyx Media Streaming, which connects to
 # a swarmrt WS *server*) to a speech-to-speech model (OpenAI Realtime,
 # reached as a swarmrt WS *client* over wss). The headline trick: if the
-# Realtime session is configured input/output_audio_format = g711_ulaw
-# (8 kHz), Telnyx's PCMU passes straight through with NO transcoding —
-# base64-encoded mu-law stays ASCII end-to-end, so sw never touches raw
-# bytes.
+# Realtime session is configured for µ-law (8 kHz) on both legs, Telnyx's
+# PCMU passes straight through with NO transcoding — base64-encoded mu-law
+# stays ASCII end-to-end, so sw never touches raw bytes.
 #
 # Lookup falls back to <swarmrt-root>/lib/, so `import Voice` works from
 # any project.
 #
-#   ## Typical wiring (see examples/voice_agent.sw)
+#   ## Typical wiring — GA `gpt-realtime` (DEFAULT; see examples/voice_agent.sw)
 #     oa = Voice.realtime_connect(%{
 #            model: "gpt-realtime",
-#            api_key: getenv("OPENAI_API_KEY"),
-#            format: "g711_ulaw"})       # pure passthrough
-#     wsc_send(oa, Voice.session_update(%{format: "g711_ulaw", voice: "alloy",
-#                                         instructions: "..."}))
+#            api_key: getenv("OPENAI_API_KEY")})        # GA: NO OpenAI-Beta header
+#     wsc_send(oa, Voice.session_update_ga(%{
+#            format: %{type: "audio/pcmu"},              # GA format OBJECT
+#            voice: "marin",
+#            instructions: "..."}))                      # pure µ-law passthrough
 #     ...
-#     wsc_send(oa, Voice.realtime_append(b64))         # caller audio → model
-#     ws_send(conn, Voice.telnyx_media(b64))           # model audio → caller
+#     wsc_send(oa, Voice.realtime_append(b64))           # caller audio → model
+#     ws_send(conn, Voice.telnyx_media(b64))             # model audio → caller
+#
+#   ## Legacy beta wiring (only if you must target the old beta wire)
+#     oa = Voice.realtime_connect(%{model: ..., api_key: ...,
+#                                   beta: "realtime=v1"})  # opt back IN to beta
+#     wsc_send(oa, Voice.session_update(%{format: "g711_ulaw", voice: "alloy"}))
+#
+# The Realtime API is now GA: `session.type="realtime"`, `output_modalities`,
+# nested `audio.input`/`audio.output.{format,...}` with format OBJECTS
+# ({"type":"audio/pcmu"} / {"type":"audio/pcm","rate":24000}), and NO
+# `OpenAI-Beta` header. `realtime_connect` therefore defaults to NO beta
+# header, and `session_update_ga` builds the GA-nested session. The legacy
+# beta-flat `session_update` + opt-in `beta:` header are kept for anything
+# still on the old wire.
 #
 # Everything below is pure (string in / string out) EXCEPT realtime_connect,
-# which wraps wsc_connect_tls. No raw-byte handling for the g711 path.
+# which wraps wsc_connect_tls. No raw-byte handling for the µ-law path.
 
 module Voice
 
 export [
     # OpenAI Realtime
     realtime_connect, realtime_poll,
-    session_update, realtime_append, realtime_commit, realtime_cancel,
+    session_update, session_update_ga, audio_format,
+    realtime_append, realtime_commit, realtime_cancel,
     realtime_create_response,
     # Telnyx Media Streaming
     telnyx_media, telnyx_clear, telnyx_mark,
@@ -49,14 +63,30 @@ export [
 #     model    (default "gpt-realtime")
 #     api_key  (required; from getenv("OPENAI_API_KEY"))
 #     url      (override the full wss URL; otherwise built from model)
-#     beta     (default "realtime=v1"; the OpenAI-Beta header value)
+#     beta     (the OpenAI-Beta header value. DEFAULT-OFF for GA: "" / nil =>
+#              the header is OMITTED entirely. The GA `gpt-realtime` interface
+#              explicitly does NOT send OpenAI-Beta. Pass beta:"realtime=v1"
+#              ONLY to opt back in to the old beta wire.)
+#     safety_identifier (optional GA header `openai-safety-identifier`; "" / nil
+#              => omitted)
+#
+# Headers are built additively so the GA path sends just `Authorization`.
 fun realtime_connect(opts) {
     model = opt(opts, "model", "gpt-realtime")
     key   = opt(opts, "api_key", "")
-    beta  = opt(opts, "beta", "realtime=v1")
     url   = opt(opts, "url", f"wss://api.openai.com/v1/realtime?model={model}")
-    headers = [f"Authorization: Bearer {key}", f"OpenAI-Beta: {beta}"]
-    wsc_connect_tls(url, headers)
+    base  = [f"Authorization: Bearer {key}"]
+    # OpenAI-Beta is opt-IN now (GA omits it). Empty/nil => no beta header.
+    hdrs  = case opt(opts, "beta", "") {
+        "" -> base
+        b  -> list_append(base, f"OpenAI-Beta: {b}")
+    }
+    # Optional GA safety identifier.
+    hdrs2 = case opt(opts, "safety_identifier", "") {
+        "" -> hdrs
+        s  -> list_append(hdrs, f"openai-safety-identifier: {s}")
+    }
+    wsc_connect_tls(url, hdrs2)
 }
 
 # realtime_poll(handle) -> text | nil  — non-blocking single-frame poll.
@@ -64,11 +94,122 @@ fun realtime_poll(handle) {
     wsc_recv(handle, 0)
 }
 
-# session.update — pin the audio format on BOTH directions and enable
-# server-side VAD (so the model emits input_audio_buffer.speech_started,
-# our barge-in trigger). `format` is an OPTION, never hardcoded, because
-# the Realtime API shape is still churning (beta-flat "g711_ulaw" vs the
-# GA-nested "audio/pcmu").
+# audio_format(wire[, rate]) -> the GA format OBJECT for session_update_ga.
+#   "pcmu"  -> %{type: "audio/pcmu"}                 (µ-law passthrough, 8 kHz)
+#   "pcm16" -> %{type: "audio/pcm", rate: <rate>}    (linear PCM, default 24 kHz)
+# Anything else is treated as already-an-object and passed through unchanged,
+# so callers can hand a raw %{type: ...} map straight to session_update_ga.
+fun audio_format(wire) { audio_format_rate(wire, 24000) }
+fun audio_format_rate(wire, rate) {
+    case wire {
+        "pcmu"  -> map_put(map_new(), "type", "audio/pcmu")
+        "pcm16" -> map_put(map_put(map_new(), "type", "audio/pcm"), "rate", rate)
+        _       -> wire
+    }
+}
+
+# ── session.update — GA `gpt-realtime` (the DEFAULT, nested shape) ────────────
+#
+# Builds the GA Realtime session contract (NOT the old beta-flat shape). The
+# nesting is load-bearing: a GA session rejects flat input_audio_format /
+# output_audio_format and emits response.output_audio.delta. Shape:
+#   { "type":"session.update",
+#     "session": {
+#       "type":"realtime", "output_modalities":["audio"],
+#       "audio": {
+#         "input":  { "format":{...}, ["transcription":{...},] "turn_detection":{...} },
+#         "output": { "format":{...}, "voice":... } },
+#       "instructions":..., ["tools":[...], "tool_choice":...]
+#       [, "reasoning":{effort}] [, "max_output_tokens":N] } }
+#
+# opts keys (all optional except sensible defaults):
+#   format        GA format object %{type:"audio/pcmu"} | %{type:"audio/pcm",rate:N},
+#                 OR a wire string "pcmu"/"pcm16" (passed through audio_format).
+#                 Default %{type:"audio/pcmu"} (µ-law passthrough).
+#   voice         (default "marin")
+#   instructions  (default a concise phone-agent persona)
+#   turn_detection  "server_vad" | "semantic_vad" (default "server_vad"),
+#                   OR a full map (e.g. %{type:"server_vad", threshold:0.5, ...})
+#                   passed through verbatim.
+#   transcription  caller-speech transcription map %{model, language[, delay]}.
+#                  Omitted entirely if absent ("" / nil). The whisper `delay`
+#                  knob is valid only for *whisper* transcribers — gate it
+#                  yourself, or use transcription:%{model, language} and add
+#                  delay only for whisper.
+#   tools         list of function-tool schemas. Omitted if absent/empty;
+#                 when present, tool_choice defaults to "auto".
+#   tool_choice   override the default "auto" (only used when tools present).
+#   reasoning_effort   model-gated; omitted unless a non-empty string is given.
+#   max_output_tokens  omitted unless > 0.
+fun session_update_ga(opts) {
+    fmt   = audio_format(opt(opts, "format", map_put(map_new(), "type", "audio/pcmu")))
+    voice = opt(opts, "voice", "marin")
+    instr = opt(opts, "instructions", "You are a concise, friendly phone agent.")
+    vad   = ga_turn_detection(opt(opts, "turn_detection", "server_vad"))
+
+    # audio.input — format + turn_detection (+ optional transcription)
+    audio_in = map_put(map_new(), "format", fmt)
+    audio_in = case opt(opts, "transcription", "") {
+        "" -> audio_in
+        tr -> map_put(audio_in, "transcription", tr)
+    }
+    audio_in = map_put(audio_in, "turn_detection", vad)
+
+    # audio.output — format + voice
+    audio_out = map_put(map_put(map_new(), "format", fmt), "voice", voice)
+
+    audio = map_put(map_put(map_new(), "input", audio_in), "output", audio_out)
+
+    sess = map_new()
+    sess = map_put(sess, "type", "realtime")
+    sess = map_put(sess, "output_modalities", ["audio"])
+    sess = map_put(sess, "audio", audio)
+    sess = map_put(sess, "instructions", instr)
+
+    # tools (+ tool_choice) — omitted entirely when absent/empty.
+    tools = opt(opts, "tools", [])
+    sess = case tools {
+        []  -> sess
+        nil -> sess
+        ts  ->
+            s = map_put(sess, "tools", ts)
+            map_put(s, "tool_choice", opt(opts, "tool_choice", "auto"))
+    }
+
+    # Optional, model-gated keys — omitted unless explicitly set (mini rejects
+    # an unknown `reasoning` key; an explicit token cap is opt-in).
+    sess = case opt(opts, "reasoning_effort", "") {
+        "" -> sess
+        ef -> map_put(sess, "reasoning", map_put(map_new(), "effort", ef))
+    }
+    sess = case opt(opts, "max_output_tokens", 0) {
+        0 -> sess
+        n -> map_put(sess, "max_output_tokens", n)
+    }
+
+    json_encode(map_put(map_put(map_new(), "type", "session.update"), "session", sess))
+}
+
+# GA turn-detection. server_vad = silence-timer with tuning; semantic_vad =
+# content-aware. Both emit speech_started, so barge-in works either way. A map
+# argument is passed through verbatim (full control).
+fun ga_turn_detection(mode) {
+    case mode {
+        "server_vad" ->
+            d = map_put(map_new(), "type", "server_vad")
+            d = map_put(d, "threshold", 0.5)
+            d = map_put(d, "prefix_padding_ms", 300)
+            map_put(d, "silence_duration_ms", 200)
+        "semantic_vad" -> map_put(map_new(), "type", "semantic_vad")
+        _ -> mode
+    }
+}
+
+# ── session.update — LEGACY beta-flat (only for the old beta wire) ────────────
+# Pin the audio format on BOTH directions (flat input_audio_format /
+# output_audio_format) and enable server-VAD. Kept for back-compat with agents
+# still on `OpenAI-Beta: realtime=v1`. For GA `gpt-realtime`, use
+# session_update_ga (the nested shape) instead.
 #   opts keys: format (default "g711_ulaw"), voice (default "alloy"),
 #              instructions, vad_threshold (default 0.5)
 fun session_update(opts) {

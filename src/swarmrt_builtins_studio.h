@@ -48,6 +48,7 @@
 #ifdef SWARMRT_TLS
 #  include <openssl/ssl.h>
 #  include <openssl/err.h>
+#  include <openssl/evp.h>   /* EVP_PKEY ED25519 + EVP_DigestVerify (ed25519_verify) */
 #endif
 #ifdef _WIN32
   #include <io.h>
@@ -3673,6 +3674,282 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     return r;
 }
 
+/* ============================================================
+ * http_request(url, opts) → %{status, body, headers} | {'error', reason}
+ * ============================================================
+ *
+ * The status-aware sibling of http_get/http_post. Those return body-or-nil
+ * and HIDE the HTTP status, so a caller can't tell a 200 from a 4xx/5xx that
+ * carries a body (the voice-agent Telnyx REST port had to guess from the JSON
+ * envelope shape — see voice-agent/docs/RUNBOOK.md). http_request wires the
+ * status code AND the response headers through, leaving http_post/http_get
+ * untouched (they're widely used; changing their shape would break callers).
+ *
+ *   url   : string (required)
+ *   opts  : map (optional) with keys —
+ *             method  : string, e.g. "GET"/"POST"/"PUT"/"DELETE" (default GET)
+ *             headers : a MAP {name=>value} OR a list of {name, value} tuples
+ *             body    : string request body (sent via --data-binary)
+ *
+ * Returns a 3-key MAP on a completed transport:
+ *   %{ status:  <int  http status code>,
+ *      body:    <string response body>,
+ *      headers: <map of response headers, keys lowercased> }
+ * or {'error', <reason-string>} when the request never completed (curl could
+ * not be spawned, the host was unreachable, the transfer timed out, …).
+ *
+ * Implementation: one curl invocation via _sw_popen_argv (execvp, no shell —
+ * url/header/method values are literal argv elements, never shell-interpreted).
+ *   -o BODYFILE      response body
+ *   -D HEADERFILE    response header block (status line + headers)
+ *   -w %{http_code}  the numeric status, printed to curl's stdout (we read it)
+ * curl exits 0 on any HTTP response (incl. 4xx/5xx); a non-zero exit / empty
+ * %{http_code} means no response arrived → {'error', ...}.
+ */
+
+/* Lowercase a header NAME in place (matches the request-side convention in
+ * swarmrt_http.c http_parse_headers, so handler and client see the same keys). */
+static void _sw_hr_lower(char *s) {
+    /* ASCII-only, no <ctype.h> — the codegen prelude doesn't include it. */
+    for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32);
+}
+
+/* Parse a curl -D dump (CRLF- or LF-terminated) into a sw MAP. The first line
+ * is the HTTP status line ("HTTP/1.1 418 ...") and is skipped; each remaining
+ * "Name: Value" line becomes a lowercased-name entry. Trailing CR and leading
+ * value spaces are trimmed. A bare blank line ends the block (curl appends one;
+ * with redirects there can be several blocks — last-wins, which is correct). */
+static sw_val_t *_sw_hr_parse_headers(const char *raw) {
+    sw_val_t *m = sw_val_map_new(NULL, NULL, 0);
+    if (!raw) return m;
+    const char *p = raw;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t linelen = eol ? (size_t)(eol - p) : strlen(p);
+        /* Strip a trailing CR. */
+        size_t L = linelen;
+        if (L > 0 && p[L - 1] == '\r') L--;
+        if (L == 0) { /* blank line: end of a header block */
+            if (!eol) break;
+            p = eol + 1;
+            continue;
+        }
+        /* Status line ("HTTP/...") — reset the map so the LAST response block
+         * (after any redirects) is what the caller sees, then skip it. */
+        if (L >= 5 && strncmp(p, "HTTP/", 5) == 0) {
+            m = sw_val_map_new(NULL, NULL, 0);
+        } else {
+            const char *colon = (const char *)memchr(p, ':', L);
+            if (colon) {
+                size_t klen = (size_t)(colon - p);
+                const char *vp = colon + 1;
+                size_t vlen = L - klen - 1;
+                while (vlen > 0 && (*vp == ' ' || *vp == '\t')) { vp++; vlen--; }
+                char *k = (char *)malloc(klen + 1);
+                memcpy(k, p, klen); k[klen] = 0;
+                _sw_hr_lower(k);
+                char *v = (char *)malloc(vlen + 1);
+                memcpy(v, vp, vlen); v[vlen] = 0;
+                sw_val_t *kk = sw_val_string(k);
+                sw_val_t *vv = sw_val_string(v);
+                m = sw_val_map_put(m, kk, vv);
+                free(k); free(v);
+            }
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    return m;
+}
+
+/* Read an entire file into a NUL-terminated heap buffer (caller frees).
+ * *out_len gets the byte length (NUL excluded). Returns NULL on open failure. */
+static char *_sw_hr_slurp(const char *path, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { if (out_len) *out_len = 0; return NULL; }
+    size_t cap = 65536, len = 0;
+    char *buf = (char *)malloc(cap);
+    char chunk[8192];
+    size_t rd;
+    while ((rd = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        if (len + rd + 1 > cap) { while (len + rd + 1 > cap) cap *= 2; buf = (char *)realloc(buf, cap); }
+        memcpy(buf + len, chunk, rd);
+        len += rd;
+    }
+    fclose(fp);
+    buf[len] = 0;
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+static sw_val_t *_sw_hr_error(const char *reason) {
+    sw_val_t *items[2];
+    items[0] = sw_val_atom("error");
+    items[1] = sw_val_string(reason);
+    return sw_val_tuple(items, 2);
+}
+
+static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return _sw_hr_error("http_request: url must be a string");
+    const char *url = a[0]->v.str;
+
+    /* opts (optional map): method / headers / body */
+    sw_val_t *opts = (n >= 2) ? a[1] : NULL;
+    const char *method = "GET";
+    const char *body = NULL;
+    sw_val_t *headers = NULL;   /* MAP or LIST of {k,v} */
+    if (opts && opts->type == SW_VAL_MAP) {
+        sw_val_t *km = sw_val_string("method");
+        sw_val_t *mv = sw_val_map_get(opts, km);
+        if (mv && mv->type == SW_VAL_STRING && mv->v.str[0]) method = mv->v.str;
+        sw_val_t *kb = sw_val_string("body");
+        sw_val_t *bv = sw_val_map_get(opts, kb);
+        if (bv && bv->type == SW_VAL_STRING) body = bv->v.str;
+        sw_val_t *kh = sw_val_string("headers");
+        sw_val_t *hv = sw_val_map_get(opts, kh);
+        if (hv && (hv->type == SW_VAL_MAP || hv->type == SW_VAL_LIST)) headers = hv;
+    }
+
+    /* Temp files: request body, response body, response header dump. */
+    char body_file[256], out_file[256], hdr_file[256];
+    snprintf(body_file, sizeof(body_file), "%s/sw_hr_b_%d_%u",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    snprintf(out_file, sizeof(out_file), "%s/sw_hr_o_%d_%u",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    snprintf(hdr_file, sizeof(hdr_file), "%s/sw_hr_h_%d_%u",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+
+    int have_body = (body != NULL);
+    if (have_body) {
+        FILE *bf = fopen(body_file, "wb");
+        if (!bf) return _sw_hr_error("http_request: cannot write request body");
+        fwrite(body, 1, strlen(body), bf);
+        fclose(bf);
+    }
+    char body_arg[300];
+    snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
+
+    /* Count headers for argv sizing. headers is a MAP or a LIST of {k,v}. */
+    int nhdr = 0;
+    if (headers && headers->type == SW_VAL_MAP)  nhdr = headers->v.map.count;
+    if (headers && headers->type == SW_VAL_LIST) nhdr = headers->v.tuple.count;
+
+    /* fixed: curl -sS -X METHOD --connect-timeout 30 --max-time 300
+     *        -o out -D hdr -w %{http_code} url  → 14 + 2/hdr + (--data-binary,arg) + NULL */
+    char **argv = (char **)malloc(sizeof(char *) * (14 + 2 * nhdr + 2 + 2));
+    char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
+    int argc = 0, nhdr_alloc = 0;
+    argv[argc++] = "curl";
+    argv[argc++] = "-sS";
+    argv[argc++] = "-X";
+    argv[argc++] = (char *)method;
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = "30";
+    argv[argc++] = "--max-time";
+    argv[argc++] = "300";
+    argv[argc++] = "-o";
+    argv[argc++] = out_file;
+    argv[argc++] = "-D";
+    argv[argc++] = hdr_file;
+    argv[argc++] = "-w";
+    argv[argc++] = "%{http_code}";
+    if (headers && headers->type == SW_VAL_MAP) {
+        for (int i = 0; i < headers->v.map.count; i++) {
+            sw_val_t *hk = headers->v.map.keys[i];
+            sw_val_t *hvv = headers->v.map.vals[i];
+            if (hk && hk->type == SW_VAL_STRING && hvv && hvv->type == SW_VAL_STRING) {
+                size_t hl = strlen(hk->v.str) + strlen(hvv->v.str) + 3;
+                char *hs = (char *)malloc(hl);
+                snprintf(hs, hl, "%s: %s", hk->v.str, hvv->v.str);
+                hdr_strs[nhdr_alloc++] = hs;
+                argv[argc++] = "-H";
+                argv[argc++] = hs;
+            }
+        }
+    } else if (headers && headers->type == SW_VAL_LIST) {
+        for (int i = 0; i < headers->v.tuple.count; i++) {
+            sw_val_t *h = headers->v.tuple.items[i];
+            if (h && h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
+                h->v.tuple.items[0]->type == SW_VAL_STRING &&
+                h->v.tuple.items[1]->type == SW_VAL_STRING) {
+                const char *hk = h->v.tuple.items[0]->v.str;
+                const char *hvv = h->v.tuple.items[1]->v.str;
+                size_t hl = strlen(hk) + strlen(hvv) + 3;
+                char *hs = (char *)malloc(hl);
+                snprintf(hs, hl, "%s: %s", hk, hvv);
+                hdr_strs[nhdr_alloc++] = hs;
+                argv[argc++] = "-H";
+                argv[argc++] = hs;
+            }
+        }
+    }
+    if (have_body) {
+        argv[argc++] = "--data-binary";
+        argv[argc++] = body_arg;
+    }
+    argv[argc++] = (char *)url;
+    argv[argc] = NULL;
+
+    /* Spawn curl and read its stdout — the -w %{http_code} string.
+     * Flush our own stdout FIRST: _sw_popen_argv fork()s, and a child that
+     * inherits an unflushed block-buffered stdout buffer can drop/duplicate a
+     * byte of the parent's next write (seen as a missing leading char when
+     * http_request is the program's very first output). Flushing before the
+     * fork makes the parent's buffer state unambiguous across it. */
+    fflush(stdout);
+    char code_buf[64];
+    size_t code_len = 0;
+    code_buf[0] = 0;
+    _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
+    if (ch.fp) {
+        char rb[64];
+        size_t rd;
+        while ((rd = fread(rb, 1, sizeof(rb), ch.fp)) > 0) {
+            for (size_t i = 0; i < rd && code_len + 1 < sizeof(code_buf); i++)
+                code_buf[code_len++] = rb[i];
+        }
+        code_buf[code_len] = 0;
+        _sw_popen_pid_close(ch);
+    }
+
+    /* http_code is a decimal int curl prints last (000 == no response). */
+    long status = strtol(code_buf, NULL, 10);
+
+    /* Read body + header dump regardless (body may exist even on 4xx/5xx). */
+    size_t blen = 0;
+    char *resp_body = _sw_hr_slurp(out_file, &blen);
+    char *resp_hdrs = _sw_hr_slurp(hdr_file, NULL);
+
+    /* Cleanup temp files + argv scratch. */
+    if (have_body) swbs_unlink(body_file);
+    swbs_unlink(out_file);
+    swbs_unlink(hdr_file);
+    for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
+    free(hdr_strs);
+    free(argv);
+
+    /* No spawn / no response code → transport failure. */
+    if (!ch.fp || status <= 0) {
+        free(resp_body);
+        free(resp_hdrs);
+        return _sw_hr_error(code_buf[0] ? "http_request: transport failure"
+                                        : "http_request: curl failed to spawn");
+    }
+
+    /* Build %{status, body, headers}. */
+    sw_val_t *hmap = _sw_hr_parse_headers(resp_hdrs);
+    sw_val_t *keys[3], *vals[3];
+    keys[0] = sw_val_string("status");  vals[0] = sw_val_int((int64_t)status);
+    keys[1] = sw_val_string("body");    vals[1] = sw_val_string(resp_body ? resp_body : "");
+    keys[2] = sw_val_string("headers"); vals[2] = hmap;
+    sw_val_t *r = sw_val_map_new(keys, vals, 3);
+
+    free(resp_body);
+    free(resp_hdrs);
+    return r;
+}
+
 /* === Shell: run command, capture stdout === */
 /* Uses system() + file redirect instead of popen() to avoid fork() in a
  * multi-threaded process.  popen() calls fork() which duplicates only the
@@ -5017,6 +5294,25 @@ static sw_val_t *_builtin_ws_set_handler(sw_val_t **a, int n) {
         !a[1] || a[1]->type != SW_VAL_PID) return sw_val_atom("error");
     int rc = sw_ws_set_handler((int)a[0]->v.i, a[1]->v.pid);
     return sw_val_atom(rc == 0 ? "ok" : "error");
+}
+
+/* ws_request_headers(conn) → %{} — the request-header MAP (lowercased keys)
+ * from the WS UPGRADE request. Lets a WS handler read the Origin /
+ * Authorization / webhook-signature headers the socket was opened with.
+ * Always a map (empty if none); never nil, so map_get is safe. */
+static sw_val_t *_builtin_ws_request_headers(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT)
+        return sw_val_map_new(NULL, NULL, 0);
+    return sw_ws_request_headers((int)a[0]->v.i);
+}
+
+/* ws_request_path(conn) → string — the path+query from the WS UPGRADE
+ * request (""=unknown). The same value arrives in {'ws_connect', conn, path};
+ * this lets a re-homed per-connection process re-read it without plumbing. */
+static sw_val_t *_builtin_ws_request_path(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT)
+        return sw_val_string("");
+    return sw_val_string(sw_ws_request_path((int)a[0]->v.i));
 }
 
 /* live_js() → string containing client-side LiveView JavaScript */
@@ -6536,6 +6832,144 @@ static int _sw_wsc_recv_all(int fd, void *buf, size_t len) {
     return 0;
 }
 
+/* === Scheduler-yielding connect + handshake (in-VM loopback fix) =========
+ *
+ * The plaintext path of wsc_connect / wsc_connect_tls used to do a *blocking*
+ * connect() + a blocking handshake recv() directly on the scheduler thread.
+ * That freezes the thread until the network responds. In production the WS
+ * server is remote, so the response always arrives and the freeze is invisible.
+ * But when the server you're *serving* (http_listen) and the server you're
+ * *dialing* live in the SAME VM, the dial's connect/handshake can starve the
+ * in-VM server's bridge process that must send the 101 — a deadlock that bit
+ * the voice-agent in-VM self-test (its bridge dials an in-VM OpenAI mock).
+ * Repro: tests/sw/test_voice_wsc_invm_loopback.sw under SW_SCHEDULERS=1.
+ *
+ * Fix: drive connect() and the handshake recv() *non-blocking*, calling
+ * sw_yield() between readiness polls so the scheduler can run the in-VM server
+ * (and every other process) on this same OS thread. sw_yield() is a pure
+ * cooperative yield — unlike sw_receive_any() it does NOT touch the process
+ * mailbox, so a bridge process mid-call keeps its queued {'ws_message'} frames.
+ * Blocking mode is restored before returning so wsc_send/wsc_recv behave
+ * exactly as before. The TLS (wss) SSL_connect leg is unchanged — it is only
+ * taken against a remote server, which never deadlocks. */
+
+/* Toggle O_NONBLOCK on a fd. Returns 0 on success, -1 on error. */
+static int _sw_fd_set_nonblock(int fd, int on) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    if (on) fl |= O_NONBLOCK; else fl &= ~O_NONBLOCK;
+    return fcntl(fd, F_SETFL, fl);
+}
+
+/* Yield to the scheduler if we're running inside a sw process, so the in-VM
+ * server can make progress. Outside a process (no current proc) there is no
+ * scheduler to yield to, so fall back to a tiny select() nap to avoid a 100%
+ * busy-spin. */
+static void _sw_wsc_cooperative_pause(int fd, int for_write) {
+    if (sw_self()) {
+        sw_yield();
+        return;
+    }
+    fd_set s; FD_ZERO(&s); FD_SET(fd, &s);
+    struct timeval tv = {0, 2000};  /* 2 ms */
+    if (for_write) select(fd + 1, NULL, &s, NULL, &tv);
+    else           select(fd + 1, &s, NULL, NULL, &tv);
+}
+
+/* Non-blocking connect that yields the scheduler while the TCP handshake is in
+ * flight. fd must already be a fresh SOCK_STREAM socket. Returns 0 connected,
+ * -1 on error/timeout. Leaves the fd in BLOCKING mode on return. */
+static int _sw_wsc_connect_yielding(int fd, const struct sockaddr *addr,
+                                    socklen_t alen, int deadline_ms) {
+    if (_sw_fd_set_nonblock(fd, 1) < 0) {
+        /* Can't go non-blocking — fall back to a plain blocking connect. */
+        return connect(fd, addr, alen) < 0 ? -1 : 0;
+    }
+    int rc = connect(fd, addr, alen);
+    if (rc == 0) { _sw_fd_set_nonblock(fd, 0); return 0; }  /* connected at once */
+    if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+        _sw_fd_set_nonblock(fd, 0);
+        return -1;
+    }
+    uint64_t start = _sw_now_ms();
+    for (;;) {
+        fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
+        struct timeval tv = {0, 0};                    /* poll, don't block */
+        int sel = select(fd + 1, NULL, &wf, NULL, &tv);
+        if (sel > 0 && FD_ISSET(fd, &wf)) {
+            int err = 0; socklen_t el = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err != 0) {
+                _sw_fd_set_nonblock(fd, 0);
+                return -1;
+            }
+            _sw_fd_set_nonblock(fd, 0);
+            return 0;                                  /* connected */
+        }
+        if ((int)(_sw_now_ms() - start) >= deadline_ms) {
+            _sw_fd_set_nonblock(fd, 0);
+            return -1;                                 /* timed out */
+        }
+        _sw_wsc_cooperative_pause(fd, 1);
+    }
+}
+
+/* Read the HTTP upgrade response headers (until "\r\n\r\n") into resp, yielding
+ * the scheduler between non-blocking reads. fd must be connected. Returns the
+ * total bytes read (>0) on success, -1 on error/timeout/close. Leaves the fd in
+ * BLOCKING mode on return. */
+static int _sw_wsc_handshake_recv_yielding(int fd, char *resp, size_t cap,
+                                           int deadline_ms) {
+    if (_sw_fd_set_nonblock(fd, 1) < 0) {
+        /* Fall back to the old blocking header read. */
+        size_t rlen = 0;
+        while (rlen < cap - 1) {
+            ssize_t got = recv(fd, resp + rlen, cap - 1 - rlen, 0);
+            if (got <= 0) return -1;
+            rlen += (size_t)got; resp[rlen] = 0;
+            if (strstr(resp, "\r\n\r\n")) return (int)rlen;
+        }
+        return -1;
+    }
+    size_t rlen = 0;
+    uint64_t start = _sw_now_ms();
+    while (rlen < cap - 1) {
+        ssize_t got = recv(fd, resp + rlen, cap - 1 - rlen, 0);
+        if (got > 0) {
+            rlen += (size_t)got; resp[rlen] = 0;
+            if (strstr(resp, "\r\n\r\n")) { _sw_fd_set_nonblock(fd, 0); return (int)rlen; }
+            continue;
+        }
+        if (got == 0) { _sw_fd_set_nonblock(fd, 0); return -1; }  /* peer closed */
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) { _sw_fd_set_nonblock(fd, 0); return -1; }
+        if ((int)(_sw_now_ms() - start) >= deadline_ms) { _sw_fd_set_nonblock(fd, 0); return -1; }
+        _sw_wsc_cooperative_pause(fd, 0);
+    }
+    _sw_fd_set_nonblock(fd, 0);
+    return -1;  /* response did not fit / no terminator */
+}
+
+/* Wait for `fd` to become readable, yielding the scheduler between polls so an
+ * in-VM WS server (or any sibling process) can run on this OS thread — the same
+ * cooperative model used for connect/handshake. Returns 1 readable, 0 timed out.
+ *   timeout_ms <  0 : wait forever (the async reader's "block until a frame"),
+ *                     still yielding so it never monopolizes the scheduler.
+ *   timeout_ms >= 0 : bounded wait.
+ * Uses select() with a zero timeout purely as a non-blocking readiness probe;
+ * the actual waiting is the sw_yield() in _sw_wsc_cooperative_pause. */
+static int _sw_wsc_wait_readable_yielding(int fd, int timeout_ms) {
+    uint64_t start = _sw_now_ms();
+    for (;;) {
+        fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
+        struct timeval tv = {0, 0};               /* poll, don't block */
+        int rv = select(fd + 1, &rf, NULL, NULL, &tv);
+        if (rv > 0 && FD_ISSET(fd, &rf)) return 1;
+        if (rv < 0 && errno == EINTR) continue;
+        if (timeout_ms >= 0 && (int)(_sw_now_ms() - start) >= timeout_ms) return 0;
+        _sw_wsc_cooperative_pause(fd, 0);
+    }
+}
+
 /* Slot-aware transport. Routes through SSL_write/SSL_read when the slot
  * is TLS, else falls back to the bare-fd loops above. */
 static int _sw_wsc_slot_send_all(int handle, const void *buf, size_t len) {
@@ -6618,7 +7052,9 @@ static sw_val_t *_builtin_wsc_connect(sw_val_t **a, int n) {
     if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return sw_val_nil();
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); return sw_val_nil(); }
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    /* Scheduler-yielding connect: lets an in-VM WS server make progress while
+     * we wait for the TCP handshake (see the helper's comment). */
+    if (_sw_wsc_connect_yielding(fd, res->ai_addr, res->ai_addrlen, 30000) < 0) {
         close(fd); freeaddrinfo(res); return sw_val_nil();
     }
     freeaddrinfo(res);
@@ -6642,15 +7078,11 @@ static sw_val_t *_builtin_wsc_connect(sw_val_t **a, int n) {
         path, host, port, key_b64);
     if (_sw_wsc_send_all(fd, req, (size_t)rl) < 0) { close(fd); return sw_val_nil(); }
 
-    /* Read response headers until "\r\n\r\n". 4KB cap is plenty. */
+    /* Read response headers until "\r\n\r\n", yielding the scheduler between
+     * non-blocking reads so an in-VM server can answer. 4KB cap is plenty. */
     char resp[4096] = {0};
-    size_t rlen = 0;
-    while (rlen < sizeof(resp) - 1) {
-        ssize_t got = recv(fd, resp + rlen, sizeof(resp) - 1 - rlen, 0);
-        if (got <= 0) { close(fd); return sw_val_nil(); }
-        rlen += (size_t)got;
-        resp[rlen] = 0;
-        if (strstr(resp, "\r\n\r\n")) break;
+    if (_sw_wsc_handshake_recv_yielding(fd, resp, sizeof(resp), 30000) < 0) {
+        close(fd); return sw_val_nil();
     }
     if (strncmp(resp, "HTTP/1.1 101", 12) != 0) { close(fd); return sw_val_nil(); }
 
@@ -6728,22 +7160,26 @@ static sw_val_t *_builtin_wsc_recv(sw_val_t **a, int n) {
     }
     int fd = _sw_wsc[handle].fd;
 
-    int timeout_ms = -1;  /* default: block forever */
+    int timeout_ms = -1;  /* default: block forever (the async reader's mode) */
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) timeout_ms = (int)a[1]->v.i;
 
-    /* Wait for fd to be readable. With TLS, SSL_read may have buffered
-     * record data the kernel select() can't see; if so, skip the wait. */
-    if (timeout_ms >= 0) {
+    /* Wait for fd to be readable, YIELDING the scheduler between polls so an
+     * in-VM WS server can produce the very frame we're waiting for (the same
+     * in-VM-loopback fix connect/handshake got). A blocking select() here froze
+     * the scheduler thread, starving the in-VM peer under a single scheduler.
+     *
+     * With TLS, SSL_read may have buffered record data the kernel select()
+     * can't see; if so, skip the wait. The forever case (timeout_ms < 0, used
+     * by the wsc_set_handler reader) also yields, so it never monopolizes the
+     * scheduler. */
+    {
         int have_buffered = 0;
 #ifdef SWARMRT_TLS
         if (_sw_wsc[handle].is_tls && _sw_wsc[handle].ssl &&
             SSL_pending(_sw_wsc[handle].ssl) > 0) have_buffered = 1;
 #endif
         if (!have_buffered) {
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
-            struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-            int rv = select(fd + 1, &rfds, NULL, NULL, &tv);
-            if (rv <= 0) return sw_val_nil();
+            if (_sw_wsc_wait_readable_yielding(fd, timeout_ms) == 0) return sw_val_nil();
         }
     }
 
@@ -6993,7 +7429,10 @@ static sw_val_t *_builtin_wsc_connect_tls(sw_val_t **a, int n) {
     if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return sw_val_nil();
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); return sw_val_nil(); }
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    /* Scheduler-yielding TCP connect (same in-VM-loopback fix as wsc_connect).
+     * The TLS handshake below is unchanged; it's only reached for wss:// against
+     * a remote server, which never deadlocks an in-VM listener. */
+    if (_sw_wsc_connect_yielding(fd, res->ai_addr, res->ai_addrlen, 30000) < 0) {
         close(fd); freeaddrinfo(res); return sw_val_nil();
     }
     freeaddrinfo(res);
@@ -7058,15 +7497,34 @@ static sw_val_t *_builtin_wsc_connect_tls(sw_val_t **a, int n) {
         _sw_wsc_free_slot(handle); close(fd); return sw_val_nil();
     }
 
-    /* Read response headers until "\r\n\r\n". */
+    /* Read response headers until "\r\n\r\n".
+     *
+     * Non-TLS slot (plaintext ws://, including the in-VM loopback mock): read
+     * the headers through the scheduler-yielding bare-fd helper so an in-VM
+     * server can answer — the same deadlock fix wsc_connect got.
+     *
+     * TLS slot (wss://): the bytes are inside the encrypted stream, so we must
+     * go through SSL_read via the slot-aware byte reader. That path is only ever
+     * taken against a remote server, which never deadlocks an in-VM listener, so
+     * the existing blocking read is fine. */
     char resp[4096] = {0};
-    size_t rlen = 0;
-    while (rlen < sizeof(resp) - 1) {
-        char one;
-        if (_sw_wsc_slot_recv_all(handle, &one, 1) < 0) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
-        resp[rlen++] = one;
-        resp[rlen] = 0;
-        if (rlen >= 4 && memcmp(resp + rlen - 4, "\r\n\r\n", 4) == 0) break;
+    int is_tls_slot = 0;
+#ifdef SWARMRT_TLS
+    is_tls_slot = _sw_wsc[handle].is_tls;
+#endif
+    if (!is_tls_slot) {
+        if (_sw_wsc_handshake_recv_yielding(fd, resp, sizeof(resp), 30000) < 0) {
+            _sw_wsc_free_slot(handle); close(fd); return sw_val_nil();
+        }
+    } else {
+        size_t rlen = 0;
+        while (rlen < sizeof(resp) - 1) {
+            char one;
+            if (_sw_wsc_slot_recv_all(handle, &one, 1) < 0) { _sw_wsc_free_slot(handle); close(fd); return sw_val_nil(); }
+            resp[rlen++] = one;
+            resp[rlen] = 0;
+            if (rlen >= 4 && memcmp(resp + rlen - 4, "\r\n\r\n", 4) == 0) break;
+        }
     }
     if (strncmp(resp, "HTTP/1.1 101", 12) != 0) {
         _sw_wsc_free_slot(handle); close(fd); return sw_val_nil();
@@ -7296,6 +7754,109 @@ static sw_val_t *_builtin_audio_resample(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_string(b64);
     free(b64);
     return r;
+}
+
+/* === ed25519_verify (TLS-gated, openssl EVP) =============================
+ *
+ * ed25519_verify(public_key, signature, message) -> 'true' | 'false' | nil
+ *
+ * Verifies an Ed25519 signature with OpenSSL's EVP one-shot verify
+ * (EVP_PKEY ED25519 + EVP_DigestVerify, no separate digest — Ed25519 hashes
+ * internally over SHA-512). Added for Telnyx webhook signature verification,
+ * which the voice-agent port had to fail-closed-stub
+ * (/Users/sky/voice-agent/src/Telnyx.sw): Telnyx signs each webhook Ed25519
+ * over the bytes "{timestamp}|{raw_body}", delivering a base64 signature in
+ * `telnyx-signature-ed25519` and a base64 raw-32-byte portal public key.
+ *
+ * Input contract (matches that real shape; both raw and base64 accepted):
+ *   public_key : a SW_VAL_BYTES of exactly 32 raw bytes, OR a base64 STRING
+ *                that decodes to 32 bytes (Telnyx's portal key — the path the
+ *                webhook code takes).
+ *   signature  : a SW_VAL_BYTES of exactly 64 raw bytes, OR a base64 STRING
+ *                that decodes to 64 bytes (Telnyx's signature header).
+ *   message    : a SW_VAL_BYTES (raw signed bytes), OR a STRING taken as its
+ *                raw bytes verbatim — NOT base64-decoded. For Telnyx this is
+ *                the literal "{timestamp}|{raw_body}" concatenation.
+ *
+ * Returns the atom 'true' on a valid signature, 'false' on an invalid one or
+ * any malformed/wrong-length input (never crashes, fail-closed), and nil on a
+ * build without TLS (openssl) — exactly mirroring wsc_connect_tls's wss:// case
+ * (a one-line stderr note, additive, never breaks a non-TLS build).
+ *
+ * Escape hatch the port can still use without this builtin (documented in the
+ * runbook): shell out to `openssl pkeyutl -verify -pubin -inkey key.pem -rawin
+ * -in msg.bin -sigfile sig.bin`. */
+#ifdef SWARMRT_TLS
+/* Coerce a sw value to a malloc'd raw byte buffer: SW_VAL_BYTES -> copy;
+ * SW_VAL_STRING + want_b64 -> base64-decode; SW_VAL_STRING + !want_b64 ->
+ * the string's bytes verbatim (NUL-terminated content, len = strlen). Returns
+ * NULL on type mismatch / decode failure. Caller frees. */
+static uint8_t *_sw_ed_coerce_bytes(sw_val_t *v, int want_b64, size_t *out_len) {
+    *out_len = 0;
+    if (!v) return NULL;
+    if (v->type == SW_VAL_BYTES) {
+        size_t n = v->v.bytes.len;
+        uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+        if (!buf) return NULL;
+        if (n) memcpy(buf, v->v.bytes.data, n);
+        *out_len = n;
+        return buf;
+    }
+    if (v->type == SW_VAL_STRING) {
+        if (want_b64) {
+            size_t n = 0;
+            uint8_t *raw = _sw_audio_b64_decode(v->v.str, &n);  /* malloc'd */
+            if (!raw) return NULL;
+            *out_len = n;
+            return raw;
+        }
+        size_t n = strlen(v->v.str);
+        uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+        if (!buf) return NULL;
+        if (n) memcpy(buf, v->v.str, n);
+        *out_len = n;
+        return buf;
+    }
+    return NULL;
+}
+#endif
+
+static sw_val_t *_builtin_ed25519_verify(sw_val_t **a, int n) {
+#ifndef SWARMRT_TLS
+    (void)a; (void)n;
+    fprintf(stderr, "ed25519_verify: requires a TLS build "
+                    "(rebuild with -DSWARMRT_TLS and link openssl); "
+                    "or shell out to `openssl pkeyutl -verify -rawin`.\n");
+    return sw_val_nil();
+#else
+    if (n < 3) return sw_val_atom("false");
+    size_t pk_len = 0, sig_len = 0, msg_len = 0;
+    uint8_t *pk  = _sw_ed_coerce_bytes(a[0], 1, &pk_len);   /* key: base64 or raw 32 */
+    uint8_t *sig = _sw_ed_coerce_bytes(a[1], 1, &sig_len);  /* sig: base64 or raw 64 */
+    uint8_t *msg = _sw_ed_coerce_bytes(a[2], 0, &msg_len);  /* msg: verbatim bytes  */
+
+    sw_val_t *result = sw_val_atom("false");
+    /* Ed25519: public key is always 32 bytes, signature always 64. Anything
+     * else is malformed input — fail closed, never hand it to OpenSSL. */
+    if (pk && sig && msg && pk_len == 32 && sig_len == 64) {
+        EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pk, pk_len);
+        if (pkey) {
+            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+            if (ctx) {
+                /* Ed25519 uses a one-shot verify with a NULL digest. */
+                if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1) {
+                    int rc = EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len);
+                    if (rc == 1) result = sw_val_atom("true");
+                    /* rc == 0 -> bad signature (false); rc < 0 -> error (false) */
+                }
+                EVP_MD_CTX_free(ctx);
+            }
+            EVP_PKEY_free(pkey);
+        }
+    }
+    free(pk); free(sig); free(msg);
+    return result;
+#endif
 }
 
 /* === SW_VAL_BYTES builtins (length-carrying, NUL-safe byte vectors) ======

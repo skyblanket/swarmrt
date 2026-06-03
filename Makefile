@@ -267,7 +267,7 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 
-.PHONY: fuzz fuzz-parse fuzz-marshal
+.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http
 fuzz-parse: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
@@ -278,7 +278,15 @@ fuzz-marshal: dirs
 	    tests/fuzz/fuzz_marshal.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_marshal $(LDFLAGS)
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
 
-fuzz: fuzz-parse fuzz-marshal
+# HTTP request-header parser (the headers-to-handler delivery surface).
+# -DSW_FUZZ_HTTP exposes sw_http_fuzz_parse() in swarmrt_http.c (built once,
+# in FUZZ_RT, with the flag applied to the whole single-command compile).
+fuzz-http: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
+	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
+
+fuzz: fuzz-parse fuzz-marshal fuzz-http
 
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every

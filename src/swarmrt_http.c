@@ -59,6 +59,8 @@ static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
             c->content_length = 0;
             c->body_pending = 0;
             c->keep_alive = 1; /* HTTP/1.1 default */
+            c->req_headers = NULL;
+            c->req_path = NULL;
             pthread_mutex_unlock(&g_http_lock);
             return i;
         }
@@ -73,6 +75,11 @@ static void conn_free(int cid) {
     sw_http_conn_t *c = &g_http_conns[cid];
     if (c->buf) { free(c->buf); c->buf = NULL; }
     if (c->frag_buf) { free(c->frag_buf); c->frag_buf = NULL; }
+    /* req_headers is a managed sw_val_t; drop our reference and let the GC
+     * reclaim it (it may also be referenced by a delivered message that the
+     * handler still holds). req_path is a plain heap string we own. */
+    c->req_headers = NULL;
+    if (c->req_path) { free(c->req_path); c->req_path = NULL; }
     c->frag_len = 0;
     c->frag_cap = 0;
     c->frag_opcode = 0;
@@ -302,6 +309,74 @@ static uint8_t *find_header_end(uint8_t *buf, uint32_t len) {
     return NULL;
 }
 
+/* Bound the header parse — this is a classic overflow surface, so every
+ * count/length is capped and the temporaries are stack arrays we never
+ * write past. A request that exceeds these limits simply gets a truncated
+ * map (still safe), never an overrun. */
+#define SW_HTTP_MAX_HEADERS   128   /* distinct header lines kept */
+#define SW_HTTP_MAX_HDR_NAME  128   /* bytes of a header name (incl. NUL) */
+#define SW_HTTP_MAX_HDR_VALUE 4096  /* bytes of a header value (incl. NUL) */
+
+/* Parse the header block [hdr_start, hdr_end) (i.e. the lines AFTER the
+ * request line, up to but excluding the terminating CRLF CRLF) into a fresh
+ * sw_val_t MAP. Keys are the header names lowercased (so handlers can match
+ * `map_get(headers, "authorization")` regardless of on-the-wire casing);
+ * values are the raw field text with surrounding whitespace trimmed.
+ *
+ * A duplicate header name overwrites the earlier value via sw_val_map_put
+ * (last wins) — adequate for auth/signature reads; combine-with-comma is not
+ * required by any caller. Returns an empty map if there are no header lines.
+ * Never reads past hdr_end; never writes past the bounded stack temporaries. */
+static sw_val_t *http_parse_headers(const char *hdr_start, const char *hdr_end) {
+    sw_val_t *map = sw_val_map_new(NULL, NULL, 0);
+    if (!hdr_start || hdr_start >= hdr_end) return map;
+
+    const char *line = hdr_start;
+    int kept = 0;
+    while (line < hdr_end && kept < SW_HTTP_MAX_HEADERS) {
+        /* Find end of this header line (CRLF). strstr is NUL-safe because
+         * conn_on_data always NUL-terminates c->buf one past buf_len. */
+        const char *line_end = strstr(line, "\r\n");
+        if (!line_end || line_end > hdr_end) break;
+        if (line_end == line) break; /* empty line — end of headers */
+
+        const char *colon = memchr(line, ':', (size_t)(line_end - line));
+        if (colon && colon > line) {
+            /* Header NAME — lowercased into a bounded buffer. */
+            char name[SW_HTTP_MAX_HDR_NAME];
+            size_t nlen = (size_t)(colon - line);
+            if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+            for (size_t i = 0; i < nlen; i++) {
+                char ch = line[i];
+                if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+                name[i] = ch;
+            }
+            name[nlen] = '\0';
+
+            /* Header VALUE — skip OWS after the colon, trim trailing OWS. */
+            const char *vstart = colon + 1;
+            while (vstart < line_end && (*vstart == ' ' || *vstart == '\t'))
+                vstart++;
+            const char *vend = line_end;
+            while (vend > vstart && (vend[-1] == ' ' || vend[-1] == '\t'))
+                vend--;
+            char value[SW_HTTP_MAX_HDR_VALUE];
+            size_t vlen = (size_t)(vend - vstart);
+            if (vlen >= sizeof(value)) vlen = sizeof(value) - 1;
+            memcpy(value, vstart, vlen);
+            value[vlen] = '\0';
+
+            sw_val_t *k = sw_val_string(name);
+            sw_val_t *v = sw_val_string(value);
+            map = sw_val_map_put(map, k, v); /* last-wins on duplicate name */
+            kept++;
+        }
+        /* Advance past CRLF. */
+        line = line_end + 2;
+    }
+    return map;
+}
+
 static void http_try_parse(int cid) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
@@ -385,6 +460,20 @@ static void http_try_parse(int cid) {
         line = line_end + 2;
     }
 
+    /* Build the request-header MAP now, while c->buf is still intact (the
+     * consume/memmove below mutates it). `line` after the request line is
+     * the first header; hdr_end is the start of the terminating CRLF CRLF.
+     * Stash on the conn so it survives a buffered POST body and is reachable
+     * for a WS upgrade. Replaces any stale map from a prior keep-alive
+     * request on this connection. */
+    {
+        char *hdr1 = strchr(hdr, '\n');
+        if (hdr1) hdr1++;
+        c->req_headers = http_parse_headers(hdr1, hdr_end);
+        if (c->req_path) { free(c->req_path); c->req_path = NULL; }
+        c->req_path = strdup(path);
+    }
+
     /* Chunked transfer-encoding: not fully supported. Don't hang waiting for
      * a Content-Length that will never arrive — drain anything that looks
      * like a terminating chunk and dispatch with empty body. */
@@ -418,7 +507,14 @@ static void http_try_parse(int cid) {
     c->buf_len = remaining;
 
     if (is_upgrade && ws_key[0]) {
-        /* WebSocket upgrade */
+        /* WebSocket upgrade. The upgrade request's headers (Origin,
+         * Authorization, the Telnyx signature headers, etc.) and its
+         * path+query are retained on the connection (c->req_headers /
+         * c->req_path, set above) for the whole WS lifetime, queryable by
+         * the handler via ws_request_headers(conn) / ws_request_path(conn).
+         * The {'ws_connect', conn, path} message keeps its original 3-tuple
+         * shape so existing handlers (studio LiveView, swarm-live) keep
+         * working untouched. */
         strncpy(c->ws_key, ws_key, sizeof(c->ws_key) - 1);
         ws_do_handshake(cid);
         c->mode = SW_HTTP_MODE_WS;
@@ -462,9 +558,14 @@ static void http_try_parse(int cid) {
         items[1] = sw_val_int(cid);
         items[2] = sw_val_atom(method);
         items[3] = sw_val_string(path);
-        items[4] = sw_val_string(""); /* headers (simplified) */
+        /* headers: the real request-header MAP (lowercased keys), built
+         * above into c->req_headers. Hand it off by reference and drop our
+         * pointer — the delivered message keeps it alive. */
+        items[4] = c->req_headers ? c->req_headers : sw_val_map_new(NULL, NULL, 0);
         items[5] = sw_val_string(body_str);
         sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
+        c->req_headers = NULL;
+        if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         if (body_buf) free(body_buf);
     }
     return;
@@ -499,9 +600,13 @@ deliver_body:
         items[1] = sw_val_int(cid);
         items[2] = sw_val_atom(method);
         items[3] = sw_val_string(path);
-        items[4] = sw_val_string("");
+        /* headers MAP captured when the header block first arrived (before
+         * the body was buffered). Hand off by reference, then drop. */
+        items[4] = c->req_headers ? c->req_headers : sw_val_map_new(NULL, NULL, 0);
         items[5] = sw_val_string(body_buf);
         sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
+        c->req_headers = NULL;
+        if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         free(body_buf);
     }
 }
@@ -774,6 +879,52 @@ int sw_ws_set_handler(int conn_id, sw_process_t *handler) {
     return 0;
 }
 
+/* Request-header MAP captured from the UPGRADE request, for a live WS conn.
+ * Returns a fresh empty map (never NULL) if the connection has no captured
+ * headers, so handlers can map_get without a nil guard. */
+sw_val_t *sw_ws_request_headers(int conn_id) {
+    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS)
+        return sw_val_map_new(NULL, NULL, 0);
+    sw_http_conn_t *c = &g_http_conns[conn_id];
+    if (!c->active || !c->req_headers)
+        return sw_val_map_new(NULL, NULL, 0);
+    return c->req_headers;
+}
+
+/* Request path+query from the UPGRADE request, for a live WS conn.
+ * Returns "" if unknown. */
+const char *sw_ws_request_path(int conn_id) {
+    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return "";
+    sw_http_conn_t *c = &g_http_conns[conn_id];
+    if (!c->active || !c->req_path) return "";
+    return c->req_path;
+}
+
 const char *sw_liveview_js(void) {
     return SWARMRT_LIVEVIEW_JS;
 }
+
+#ifdef SW_FUZZ_HTTP
+/* Fuzz entry: drive the request-line scan + header-block parser over
+ * arbitrary bytes, exactly as conn_on_data → http_try_parse would, but
+ * scheduler-free (no port, no handler). Exercises http_parse_headers and
+ * the find_header_end / request-line sscanf surface I touched. The caller
+ * (tests/fuzz/fuzz_http.c) passes a NUL-terminated copy. */
+void sw_http_fuzz_parse(const char *buf, uint32_t len) {
+    if (!buf) return;
+    uint8_t *end = find_header_end((uint8_t *)buf, len);
+    if (!end) return; /* incomplete headers — nothing to parse */
+
+    /* Request line (same bounded sscanf as http_try_parse). */
+    char method[16] = {0}, path[512] = {0}, version[16] = {0};
+    sscanf(buf, "%15s %511s %15s", method, path, version);
+
+    /* Header block = first line after the request line, up to the CRLFCRLF. */
+    const char *hdr1 = strchr(buf, '\n');
+    if (hdr1) hdr1++;
+    sw_val_t *map = http_parse_headers(hdr1, (const char *)end);
+    /* Touch the map so the build isn't optimized away; value is discarded
+     * (GC reclaims it — we run ASAN with detect_leaks=0). */
+    (void)sw_val_map_get(map, sw_val_string("authorization"));
+}
+#endif /* SW_FUZZ_HTTP */
