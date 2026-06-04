@@ -266,6 +266,27 @@ Pass the table value into spawned processes — they share backing storage. `ets
 
 ---
 
+## Records: named state instead of positional tuples
+
+Agent state is usually a few related fields — a call's id/from/state, a job's id/status/result. Tuples make this positional (`elem(job, 1)`), which is exactly the kind of off-by-one an LLM gets wrong. Use a record instead:
+
+```sw
+import Record
+
+fun new_job(id, prompt) {
+    Record.build('Job', ['id', 'prompt', 'status', 'result'],
+                 %{id: id, prompt: prompt, status: 'queued', result: nil})
+}
+
+fun mark_done(job, result) {
+    Record.update(Record.update(job, 'status', 'done'), 'result', result)
+}
+```
+
+Records are tagged maps, so they send over messages, survive `json_encode`, and match in `receive` / `case` with normal `%{...}` patterns. `Record.build` checks every field is present when you construct it, so a missing field fails loudly at the call site instead of surfacing as a `nil` three functions later. It is not a type system — fields aren't typed and nothing is checked at compile time; the check is a value-level guard at construction. `Record.new` is the recoverable twin (`{'ok', rec}` / `{'error', reason}`).
+
+---
+
 ## Supervised crash recovery
 
 For agents that should restart on crash (a long-running watcher, a stateful tool worker), wrap them in a supervisor:

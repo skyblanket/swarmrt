@@ -168,6 +168,21 @@ name = map_get(person, 'name')          # atom-key lookup
 older = map_put(person, 'age', 31)      # functional update — original unchanged
 ```
 
+**Records** are just tagged maps — named fields instead of fragile tuple positions. There is no `record` keyword and no new type: a record is a `%{}` with a `'__record'` tag, built and checked by the `Record` library (`import Record`). Field access is the ordinary `.field` you already have (it desugars to `map_get`):
+
+```sw
+import Record
+
+c = Record.build('Call', ['id', 'from', 'state'],
+                 %{id: 7, from: "+1555", state: 'ringing'})
+
+c.state                          # 'ringing'  — named, not elem(c, 2)
+Record.is(c, 'Call')             # 'true'
+c2 = Record.update(c, 'state', 'connected')   # functional update of a checked field
+```
+
+`Record.build` panics on a missing field (fail-fast); `Record.new` returns `{'ok', rec}` / `{'error', reason}` for recoverable validation (same split as [§11 Errors and panics](#11-errors-and-panics)). Records pattern-match like any map (`case c { %{__record: 'Call', state: s} -> … }`), send over messages, and `json_encode` cleanly. It is **not** a type system: fields aren't typed and nothing is rejected at compile time — the only check is field-presence at construction. Use a record when a tuple's positions have started to feel arbitrary.
+
 Strings concat with `++` (auto-coerces non-strings):
 
 ```sw
