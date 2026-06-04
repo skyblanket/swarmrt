@@ -4247,9 +4247,13 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (strcmp(fname, "map_size") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP)
             return sw_val_int(args[0]->v.map.count);
         if (strcmp(fname, "map_has_key") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
-            for (int i = 0; i < args[0]->v.map.count; i++)
-                if (sw_val_equal(args[0]->v.map.keys[i], args[1])) return sw_val_atom("true");
-            return sw_val_atom("false");
+            /* Delegate to sw_val_map_get so the atom-vs-string fallback matches:
+             * the bare sw_val_equal loop diverged from map_get (and from the
+             * compiled _builtin_map_has_key) on json_decode'd maps, where a
+             * string-keyed query missed an atom key that map_get still found.
+             * Now byte-for-byte identical to the compiled backend. */
+            sw_val_t *v = sw_val_map_get(args[0], args[1]);
+            return sw_val_atom((v && v->type != SW_VAL_NIL) ? "true" : "false");
         }
         if (strcmp(fname, "timestamp") == 0) {
             struct timeval tv; gettimeofday(&tv, NULL);
