@@ -22,7 +22,7 @@ SwarmRT is a native actor-model runtime written in C. It provides lightweight pr
 │  Links, Monitors, Timers, Signals       │
 ├─────────────────────────────────────────┤
 │         Infrastructure                  │
-│  Arena Allocator, GC, Hot Reload        │
+│  Arena Allocator, GC, Module Registry   │
 │  IO/Ports, Distribution, Context Switch │
 └─────────────────────────────────────────┘
 ```
@@ -148,7 +148,7 @@ The compiler emits C code that calls the runtime API directly:
 ## Additional Systems
 
 - **IO/Ports** — kqueue-based async I/O, TCP accept/read/write as port messages
-- **Hot code reload** — module versioning, swap running code without stopping processes
+- **Module registry** — versioned C-module slots (`sw_module_register` / `sw_module_upgrade`); a C embedder can re-point a named slot to another C function compiled into the same binary and roll back, notifying tracked processes via `SW_TAG_CODE_CHANGE`. C-API only — no `sw`-level builtin and no loading of new code at runtime (`swc build` AOT-compiles every sw function to a fixed C symbol; there is no `dlopen`/bytecode loader).
 - **Generational GC** — per-process heaps with minor/major collection
 - **Distribution** — multi-node TCP message routing with automatic reconnection
 - **Context switching** — ARM64 assembly for register save/restore (~100ns)

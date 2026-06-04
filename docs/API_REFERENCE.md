@@ -830,7 +830,7 @@ Internal: close all ports owned by a dying process.
 
 **Header:** `swarmrt_hotload.h`
 
-Live module upgrade without stopping processes.
+Versioned C-module registry: re-point a named slot's entry function (and roll back) without stopping processes. It swaps between C functions already compiled into the binary — it does not load new code.
 
 > **Available to C embedders only.** There is no `sw`-level builtin yet —
 > `sw_module_upgrade()` takes a `void (*)(void *)` C function pointer, which
@@ -872,8 +872,9 @@ Look up a registered module.
 ```c
 int sw_module_upgrade(const char *name, void (*new_func)(void *));
 ```
-Upgrade a module to a new version. Old version kept for rollback. Running processes
-receive `SW_TAG_CODE_CHANGE` (15) messages.
+Re-point a module's entry to another already-compiled C function (`new_func`) and bump its
+version. Old function kept for rollback. Tracked processes receive `SW_TAG_CODE_CHANGE` (15)
+messages carrying the new pointer.
 
 ```c
 int sw_module_rollback(const char *name);

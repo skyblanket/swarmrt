@@ -42,7 +42,7 @@ Counter stopped at 8
 
 SwarmRT is a runtime + language for writing concurrent programs that compile to a single native binary.
 
-It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, hot reload, distribution — and reimplements them as a ~13K-line core C runtime + ~6K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~3K-line ahead-of-time compiler that emits native code. No interpreter. No bytecode. No VM warm-up. Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
+It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, distribution — and reimplements them as a ~13K-line core C runtime + ~6K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~3K-line ahead-of-time compiler that emits native code. No interpreter. No bytecode. No VM warm-up. Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
 
 (The full `src/` tree is ~42K lines; the rest is tests, benchmarks, three earlier prototype runtimes kept for reference, and tools like the search CLI and MCP server.)
 
@@ -79,7 +79,7 @@ That's it. No package manager for the language, no language server install, no V
 | If you're… | What SwarmRT gives you |
 |---|---|
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
-| **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Hot code reload. Process linking and monitoring. |
+| **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Process linking and monitoring. Versioned module registry with rollback for C embedders (no `sw`-level hot reload yet — see below). |
 | **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
 | **Avoiding language overhead** | One binary, no VM, no GC pauses (per-process generational GC means no global stop-the-world), <10ms startup. The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
 
@@ -193,7 +193,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **`exec_argv(cmd, args)`** | Fork+exec without a shell — safe for user-supplied args (no injection risk). Returns `{exit_code, output}`. *(REPL / interpreter only — not in compiled path yet; use `shell_sandboxed` in compiled agents.)* |
 | **`case`** | Tool-call dispatch: `case tool_name { "read" -> ... ; "bash" -> ... ; _ -> ... }`. |
 
-> Hot reload is implemented in the runtime (`sw_module_register` / `sw_module_upgrade`) but is currently only reachable from **C embedders** — there is no `sw`-level builtin yet. See [docs/API_REFERENCE.md §12](docs/API_REFERENCE.md#12-hot-code-reload).
+> "Hot reload" here is a C-embedder-only module registry (`sw_module_register` / `sw_module_upgrade`): it re-points a named slot to **another C function already compiled into the binary** — versioned, with rollback — and notifies tracked processes. It does **not** load new code, and there is no `sw`-level builtin: because every `.sw` function AOT-compiles to a fixed C symbol with no `dlopen`/bytecode loader, a compiled sw agent's own code cannot be swapped at runtime. See [docs/API_REFERENCE.md §12](docs/API_REFERENCE.md#12-hot-code-reload).
 
 **Read more:** [docs/BUILDING_AGENTS.md](docs/BUILDING_AGENTS.md) — the developer-facing guide with the patterns.
 
@@ -231,7 +231,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **Behaviours** | GenServer, Supervisor, Task, GenStateMachine, ETS, Registry — all built on top of the bare `spawn`/`send`/`receive` primitives. |
 | **IO** | kqueue-based async ports. TCP accept/read/write as port messages. HTTP / WebSocket / Chrome DevTools as builtins. |
 | **Distribution** | Multi-node TCP message routing with automatic reconnection. Process linking across nodes. |
-| **Hot reload** | Module versioning, swap running code without stopping processes. *(C API only — no `sw`-level builtin yet.)* |
+| **Hot reload** | Versioned module registry with rollback: re-points a named slot to another C function already compiled into the binary and notifies tracked processes — does not load new code. *(C API only — no `sw`-level builtin; compiled `.sw` code can't be swapped at runtime.)* |
 | **Compiler (`swc`)** | `.sw` → AST → C → native binary. Tail-call optimisation, optional XOR-string obfuscation, optional symbol stripping. |
 
 Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns (pointer sharing), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
