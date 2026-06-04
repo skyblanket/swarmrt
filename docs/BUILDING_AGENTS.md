@@ -458,6 +458,24 @@ Telemetry.emit("tool.bash.end",   %{exit_code: 0, ms: 42})
 
 Custom sinks are just functions `fun(event_map) { ... }`. Push to OpenTelemetry, Slack webhooks, a dashboard ETS table — your call.
 
+## Seeing the swarm: `Swarm.top()` / `Swarm.tree()`
+
+Telemetry is what your agent *emits*; `Swarm` is what it can *observe about itself* right now. When you've spawned a swarm of agents and tool workers, you usually want the equivalent of `top` and a supervision tree:
+
+```sw
+import Swarm
+
+Swarm.top()     # list of %{pid, status, messages, name?, parent?} for every live process
+Swarm.tree()    # the supervision forest: each root + its children, recursively
+
+Swarm.print_top()    # prints a flat table, returns the count
+Swarm.print_tree()   # prints an indented tree, returns the root count
+```
+
+`top()` is a flat snapshot; `tree()` reconstructs the hierarchy from each process's parent link (set by `spawn_link` / the supervisors), so a worker started with `sup_start_child` shows up nested under its supervisor. Use it to drive a LiveView dashboard, log a periodic census, or just answer "what's alive and who's supervising it?" while debugging.
+
+It's a thin pure-sw library over the `process_list` / `process_info` builtins — and like all process primitives it's compiled-only (`swc build`); under the interpreter the underlying reads return `nil`. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
+
 ---
 
 ## Prompt templates

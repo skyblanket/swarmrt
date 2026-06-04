@@ -3115,6 +3115,12 @@ static sw_val_t *_builtin_process_info(sw_val_t **a, int n) {
     keys[c] = sw_val_atom("messages");    vals[c] = sw_val_int((int64_t)proc->mailbox.count); c++;
     keys[c] = sw_val_atom("heap_used");   vals[c] = sw_val_int((int64_t)(proc->heap.top - proc->heap.start)); c++;
     keys[c] = sw_val_atom("heap_size");   vals[c] = sw_val_int((int64_t)proc->heap.size); c++;
+    /* parent pid (numeric, matching the int 'pid' field above) so Swarm.tree()
+     * can reconstruct the supervision hierarchy from the child->parent link.
+     * Best-effort read of the arena slab, like process_list — the slot memory
+     * never unmaps, so a stale parent at most mis-groups a child as a root. */
+    if (proc->parent)
+        { keys[c] = sw_val_atom("parent"); vals[c] = sw_val_int((int64_t)proc->parent->pid); c++; }
     if (proc->reg_entry)
         { keys[c] = sw_val_atom("name"); vals[c] = sw_val_string(proc->reg_entry->name); c++; }
 

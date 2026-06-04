@@ -630,9 +630,10 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `self()` | own pid |
 | `send(pid, msg)` | non-blocking |
 | `register(name, pid)` / `whereis(name)` | atom registry |
-| `process_info(pid)` | inspection map |
+| `process_info(pid)` | inspection map: `pid, status, reductions, messages, heap_used, heap_size`, plus `name` / `parent` (parent's pid) when set |
 | `process_list()` | all live pids |
-| `registered()` | all registered atoms |
+| `registered()` | all registered `{name, pid}` pairs |
+| `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Compiled-only (see note below). |
 | `pid_alive(os_pid)` | `'true'` if the OS process (integer pid from `subprocess_spawn`) is still running, `'false'` if it has exited. Uses `kill(pid, 0)` — no signal sent. Does **not** take sw actor pids returned by `spawn()`. |
 | `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |
 | `monitor(pid)` → ref | one-way watch; watcher receives `{'DOWN', ref, 'process', pid, reason}` (5-tuple, Erlang-shaped) on death. `demonitor(ref)` to cancel |
@@ -643,6 +644,8 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `sup_start_child(sup, {name, fn, restart})` → pid | add+start one supervised child at runtime (`name` may be `nil` for anonymous); `nil` on failure |
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
+
+> **Compiled-only.** The process/scheduler primitives (spawn, send, receive, the supervisors, and `process_list`/`process_info`/`registered` / `Swarm.*`) need the real scheduler, which the tree-walking interpreter doesn't have. Under `swc run`, `swc test`, and the REPL they print a one-line note and return `nil` — run `swc build file.sw -o bin/x && bin/x` for full process semantics.
 
 ### Subprocesses (bidirectional)
 | | |
