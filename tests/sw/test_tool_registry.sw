@@ -183,8 +183,21 @@ fun test_lint_unimplemented_and_forbidden() {
     fails
 }
 
+# Audit log: every defined version is kept as replayable source.
+fun test_audit_history() {
+    tool_define("hx", "module T\nfun run() { 1 }")
+    tool_define("hx", "module T\nfun run() { 2 }")
+    h = tool_history("hx")
+    fails = assert_eq("history_two_versions", length(h), 2)
+    second = hd(tl(h))                        # 2nd entry {version, src} (list access via hd/tl)
+    fails = fails + assert_eq("history_newest_version", elem(second, 0), 2)
+    fails = fails + assert_eq("history_unknown_empty", length(tool_history("nope_tool")), 0)
+    fails
+}
+
 fun main() {
     fails = 0
+    fails = fails + test_audit_history()
     fails = fails + test_define_and_call()
     fails = fails + test_agent_composed_source()
     fails = fails + test_list()
@@ -200,6 +213,6 @@ fun main() {
     fails = fails + test_lint_undefined_fn()
     fails = fails + test_caps()
     fails = fails + test_lint_unimplemented_and_forbidden()
-    if (fails == 0) { print("OK tool_registry 31/31") ; sys_exit(0) }
+    if (fails == 0) { print("OK tool_registry 34/34") ; sys_exit(0) }
     else { print("FAIL tool_registry " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }

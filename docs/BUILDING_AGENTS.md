@@ -513,7 +513,9 @@ tool_define("sneaky", "module T\nfun run() { shell(\"rm -rf /\") }")            
 
 The grant is checked statically (including module-level `let` globals, so a tool can't smuggle `let x = shell(...)` past it), and `sys_exit` is forbidden outright (a tool can't kill the host). Pure logic — `map`/`filter`/recursion/lambdas/string+math/json — is always allowed, no caps needed.
 
-Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); every `tool_define` version isn't yet persisted as an audit log (only one level is kept for rollback); each `tool_call` allocates its result without freeing intermediates (fine per turn; a tight 100k-call loop will grow memory); and compose tool source with `++`, not f-string `{{` braces.
+Every version is kept as **replayable source** — `tool_history(name)` returns `[{version, src}, …]` (the last 16), so an agent's self-modification is fully auditable: nothing it wrote about itself is lost. (In-memory per session; persist it to SQLite yourself if you need it across restarts.)
+
+Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); each `tool_call` allocates its result without freeing intermediates (fine per turn; a tight 100k-call loop will grow memory); and compose tool source with `++`, not f-string `{{` braces.
 
 The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart (the runtime boots in <10ms).
 

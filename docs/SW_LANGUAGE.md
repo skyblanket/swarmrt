@@ -656,6 +656,7 @@ An agent can write a new tool *as `sw` source at runtime* and call it live, with
 | `tool_call(name, args…)` → result \| `nil` | run the tool's `run` with the trailing args (`nil` if no such tool) |
 | `tool_list()` → `[{name, version}, …]` | every registered tool and its version |
 | `tool_rollback(name)` → `'ok'` \| `{'error', reason}` | swap a tool back to its previous version (toggles) |
+| `tool_history(name)` → `[{version, src}, …]` | every defined version of the tool as replayable source (last 16), oldest→newest — the audit log |
 
 ```sw
 tool_define("summarize", "module T\nfun run(text) { ... }")

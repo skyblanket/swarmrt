@@ -3016,6 +3016,7 @@ static sw_val_t *_builtin_sup_count_children(sw_val_t **a, int n) {
  * Entry fn is `run`. Pure-logic tools only.
  */
 #define SW_TOOL_MAX 256
+#define SW_TOOL_HIST 16           /* per-tool audit-log depth (last N versions) */
 typedef struct {
     char name[64];
     void *ast;                /* current parsed-module AST (immutable, shared) */
@@ -3023,6 +3024,12 @@ typedef struct {
     char *src;                /* current source (for audit/history) */
     char *prev_src;
     uint64_t version;
+    /* Audit log: every defined version kept as replayable source (ring of the
+     * last SW_TOOL_HIST). Makes self-modification auditable: tool_history(name)
+     * returns [{version, src}] so nothing the agent wrote about itself is lost. */
+    char    *hist_src[SW_TOOL_HIST];
+    uint64_t hist_ver[SW_TOOL_HIST];
+    int      hist_count;      /* total versions ever recorded (>= entries kept) */
 } sw_tool_entry_t;
 static sw_tool_entry_t g_tools[SW_TOOL_MAX];
 static int g_tool_count = 0;
@@ -3131,8 +3138,39 @@ static sw_val_t *_builtin_tool_define(sw_val_t **a, int n) {
     e->ast = ast;
     e->src = strdup(a[1]->v.str);
     e->version++;
+    /* audit log: record this version into the ring (last SW_TOOL_HIST kept). */
+    {
+        int slot = e->hist_count % SW_TOOL_HIST;
+        if (e->hist_src[slot]) free(e->hist_src[slot]);   /* overwrite oldest */
+        e->hist_src[slot] = strdup(a[1]->v.str);
+        e->hist_ver[slot] = e->version;
+        e->hist_count++;
+    }
     pthread_rwlock_unlock(&g_tool_lock);
     return sw_val_atom("ok");
+}
+
+/* tool_history(name) -> list of {version, src} tuples, oldest→newest (the last
+ * SW_TOOL_HIST versions). Every self-written version as replayable source. */
+static sw_val_t *_builtin_tool_history(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || (a[0]->type != SW_VAL_STRING && a[0]->type != SW_VAL_ATOM) || !a[0]->v.str)
+        return sw_val_list(NULL, 0);
+    pthread_rwlock_rdlock(&g_tool_lock);
+    sw_tool_entry_t *e = _tool_find(a[0]->v.str);
+    if (!e || e->hist_count == 0) { pthread_rwlock_unlock(&g_tool_lock); return sw_val_list(NULL, 0); }
+    int kept = e->hist_count < SW_TOOL_HIST ? e->hist_count : SW_TOOL_HIST;
+    int start = e->hist_count - kept;            /* index of oldest kept version */
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * kept);
+    for (int i = 0; i < kept; i++) {
+        int slot = (start + i) % SW_TOOL_HIST;
+        sw_val_t *pair[2] = { sw_val_int((int64_t)e->hist_ver[slot]),
+                              sw_val_string(e->hist_src[slot] ? e->hist_src[slot] : "") };
+        items[i] = sw_val_tuple(pair, 2);
+    }
+    pthread_rwlock_unlock(&g_tool_lock);
+    sw_val_t *r = sw_val_list(items, kept);
+    free(items);
+    return r;
 }
 
 /* tool_call(name, args...) -> result | nil
