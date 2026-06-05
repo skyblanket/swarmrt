@@ -123,6 +123,14 @@ void *sw_lang_parse(const char *source);
  * parsed module before use, e.g. the tool registry checking for `run`). */
 int sw_lang_has_fun(void *module_ast, const char *name);
 
+/* Call `func_name` in `module_ast` with a FRESH, per-call interpreter (its own
+ * global_env + error/call_depth) off the (immutable, read-only) AST. Safe to run
+ * concurrently from multiple threads on the SAME ast, and a fault never persists
+ * past the call. Used by the tool registry (each tool_call is isolated). The
+ * returned value is heap-owned and outlives the call; the AST is NOT freed. */
+sw_val_t *sw_lang_call_fresh(void *module_ast, const char *func_name,
+                             sw_val_t **args, int num_args);
+
 /* Create interpreter from parsed module AST */
 sw_interp_t *sw_lang_new(void *module_ast);
 

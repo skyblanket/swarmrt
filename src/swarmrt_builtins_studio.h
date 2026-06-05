@@ -3005,18 +3005,21 @@ static sw_val_t *_builtin_sup_count_children(sw_val_t **a, int n) {
  * The AI-era headline: an agent writes a new tool AS sw source at runtime and
  * registers it, callable on the next turn with NO restart. Each tool keeps its
  * own parsed-module interpreter alive; tool_call invokes the tool's `run`
- * function via sw_lang_call (the args are the same sw_val_t* the compiled caller
- * already holds — no codegen change, no call-site indirection). Re-defining a
- * tool atomically swaps the interpreter and RETAINS the previous one for
- * tool_rollback — old versions are never freed (a fiber may still be mid-call in
- * one; the retain-old-code discipline a hot VM uses). The tool's entry fn is
- * `run`. Pure-logic tools only: process primitives degrade to nil here.
+ * function. Each tool_call gets a FRESH per-call interpreter off the tool's
+ * immutable AST (sw_lang_call_fresh) — so concurrent callers never share mutable
+ * state and a fault never poisons the tool — and runs on a dedicated 8MB-stack
+ * thread (the parser/eval recurse on the C stack, and a 128KB process fiber is
+ * too small; the helper thread also makes the interpreter's pthread-bounds stack
+ * guard measure the right stack, so deep tool recursion errors cleanly instead
+ * of crashing, and process primitives degrade to nil since sw_self() is NULL
+ * there). Re-defining swaps the AST and RETAINS the previous for tool_rollback.
+ * Entry fn is `run`. Pure-logic tools only.
  */
 #define SW_TOOL_MAX 256
 typedef struct {
     char name[64];
-    sw_interp_t *interp;      /* current parsed-module interp */
-    sw_interp_t *prev;        /* previous version, retained for rollback */
+    void *ast;                /* current parsed-module AST (immutable, shared) */
+    void *prev_ast;           /* previous version, retained for rollback */
     char *src;                /* current source (for audit/history) */
     char *prev_src;
     uint64_t version;
@@ -3061,6 +3064,29 @@ static void *_tool_parse_big_stack(const char *src) {
     return ctx.ast;
 }
 
+/* Run a tool's `run` on an 8MB-stack thread with a fresh per-call interpreter.
+ * The result is a heap-owned sw_val tree (thread-agnostic), valid after join.
+ * On the helper thread sw_self()==NULL, so process primitives degrade to nil
+ * (a tool can't send/receive/spawn into the host scheduler). */
+typedef struct { void *ast; const char *fn; sw_val_t **args; int n; sw_val_t *result; } _tool_eval_ctx;
+static void *_tool_eval_thread(void *arg) {
+    _tool_eval_ctx *c = (_tool_eval_ctx *)arg;
+    c->result = sw_lang_call_fresh(c->ast, c->fn, c->args, c->n);
+    return NULL;
+}
+static sw_val_t *_tool_eval_big_stack(void *ast, const char *fn, sw_val_t **args, int n) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return sw_lang_call_fresh(ast, fn, args, n);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    _tool_eval_ctx ctx = { ast, fn, args, n, NULL };
+    pthread_t t;
+    int rc = pthread_create(&t, &attr, _tool_eval_thread, &ctx);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) return sw_lang_call_fresh(ast, fn, args, n); /* fallback */
+    pthread_join(t, NULL);
+    return ctx.result;
+}
+
 /* tool_define(name, src) -> 'ok' | {'error', reason}
  * Parse `src` (a module defining `fn run(...)`) and register it under `name`.
  * Re-defining swaps in the new version and keeps the old for rollback. */
@@ -3068,12 +3094,15 @@ static sw_val_t *_builtin_tool_define(sw_val_t **a, int n) {
     if (n < 2 || !a[0] || (a[0]->type != SW_VAL_STRING && a[0]->type != SW_VAL_ATOM) ||
         !a[0]->v.str || !a[1] || a[1]->type != SW_VAL_STRING || !a[1]->v.str)
         return _tool_err("tool_define(name, src): name + source string required");
+    /* Reject over-length names LOUDLY rather than silently truncating into the
+     * name[64] buffer (a truncated name never matches on tool_call). */
+    if (strlen(a[0]->v.str) > sizeof(g_tools[0].name) - 1)
+        return _tool_err("tool name too long (max 63 chars)");
 
     void *ast = _tool_parse_big_stack(a[1]->v.str);
     if (!ast) return _tool_err("parse error in tool source");
     if (!sw_lang_has_fun(ast, "run"))
         return _tool_err("tool source must define `fun run(...)` (the entry point)");
-    sw_interp_t *interp = sw_lang_new(ast);
 
     pthread_rwlock_wrlock(&g_tool_lock);
     sw_tool_entry_t *e = _tool_find(a[0]->v.str);
@@ -3086,10 +3115,10 @@ static sw_val_t *_builtin_tool_define(sw_val_t **a, int n) {
         memset(e, 0, sizeof(*e));
         strncpy(e->name, a[0]->v.str, sizeof(e->name) - 1);
     }
-    /* retain old version for rollback — never freed (a fiber may be mid-call) */
-    e->prev = e->interp;
+    /* retain old AST for rollback — never freed (a thread may be mid-call) */
+    e->prev_ast = e->ast;
     e->prev_src = e->src;
-    e->interp = interp;
+    e->ast = ast;
     e->src = strdup(a[1]->v.str);
     e->version++;
     pthread_rwlock_unlock(&g_tool_lock);
@@ -3103,11 +3132,12 @@ static sw_val_t *_builtin_tool_call(sw_val_t **a, int n) {
         return sw_val_nil();
     pthread_rwlock_rdlock(&g_tool_lock);
     sw_tool_entry_t *e = _tool_find(a[0]->v.str);
-    sw_interp_t *interp = e ? e->interp : NULL;
+    void *ast = e ? e->ast : NULL;
     pthread_rwlock_unlock(&g_tool_lock);
-    if (!interp) return sw_val_nil();
-    /* call outside the lock on the snapshot; retained interps stay valid */
-    return sw_lang_call(interp, "run", &a[1], n - 1);
+    if (!ast) return sw_val_nil();
+    /* eval outside the lock on the snapshot AST (immutable, retained); fresh
+     * per-call interpreter on an 8MB thread (isolation + stack + degrade). */
+    return _tool_eval_big_stack(ast, "run", &a[1], n - 1);
 }
 
 /* tool_list() -> list of {name, version} tuples for every registered tool. */
@@ -3130,15 +3160,15 @@ static sw_val_t *_builtin_tool_list(sw_val_t **a, int n) {
 
 /* tool_rollback(name) -> 'ok' | {'error', reason}
  * Swap a tool back to its previous version (toggles, so calling again rolls
- * forward). The retained-never-freed interps make this a pure pointer swap. */
+ * forward). The retained-never-freed ASTs make this a pure pointer swap. */
 static sw_val_t *_builtin_tool_rollback(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || (a[0]->type != SW_VAL_STRING && a[0]->type != SW_VAL_ATOM) || !a[0]->v.str)
         return _tool_err("tool_rollback(name): name required");
     pthread_rwlock_wrlock(&g_tool_lock);
     sw_tool_entry_t *e = _tool_find(a[0]->v.str);
     if (!e) { pthread_rwlock_unlock(&g_tool_lock); return _tool_err("no such tool"); }
-    if (!e->prev) { pthread_rwlock_unlock(&g_tool_lock); return _tool_err("no previous version to roll back to"); }
-    sw_interp_t *ti = e->interp; e->interp = e->prev; e->prev = ti;
+    if (!e->prev_ast) { pthread_rwlock_unlock(&g_tool_lock); return _tool_err("no previous version to roll back to"); }
+    void *ta = e->ast; e->ast = e->prev_ast; e->prev_ast = ta;
     char *ts = e->src; e->src = e->prev_src; e->prev_src = ts;
     e->version++;
     pthread_rwlock_unlock(&g_tool_lock);

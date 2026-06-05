@@ -4618,6 +4618,27 @@ sw_val_t *sw_lang_call(sw_interp_t *interp, const char *func_name,
     return result;
 }
 
+sw_val_t *sw_lang_call_fresh(void *module_ast, const char *func_name,
+                             sw_val_t **args, int num_args) {
+    if (!module_ast) return sw_val_nil();
+    /* Per-call interpreter: its own global_env + error/call_depth, off the
+     * shared read-only AST. Two threads calling the same tool never touch each
+     * other's state, and a fault doesn't outlive this call. (Mirrors the
+     * module-globals seeding sw_lang_new does, but never frees the AST.) */
+    sw_interp_t local;
+    memset(&local, 0, sizeof(local));
+    local.module_ast = module_ast;
+    local.global_env = env_new(NULL);
+    node_t *mod = (node_t *)module_ast;
+    for (int i = 0; i < mod->v.mod.nglobals; i++) {
+        sw_val_t *sv = eval(&local, mod->v.mod.globals[i].val, local.global_env);
+        env_set(local.global_env, mod->v.mod.globals[i].name, sv);
+    }
+    sw_val_t *result = sw_lang_call(&local, func_name, args, num_args);
+    env_free(local.global_env);
+    return result;
+}
+
 sw_val_t *sw_lang_eval(sw_interp_t *interp, const char *expr_source) {
     /* Wrap in a minimal module for eval */
     char wrapped[2048];

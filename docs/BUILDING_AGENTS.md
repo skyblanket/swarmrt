@@ -502,7 +502,9 @@ tool_rollback("scale")            # back to *3 if the new one misbehaves
 tool_list()                       # [{scale, 3}, ...] — every tool + version
 ```
 
-The design keeps it honest and safe-ish by construction: tools are **pure logic** (process primitives degrade to `nil` inside a tool, so a tool can't quietly spawn or send), they hold **no state of their own** (state lives in the caller, ETS, or SQLite, so a reload never corrupts memory), and every version is retained for `tool_rollback`. It's compiled-only — the interpreter that runs the tool is only live in a `swc build` binary.
+The design keeps it honest and safe-ish by construction: tools are **pure logic** (process primitives degrade to `nil` inside a tool, so a tool can't quietly spawn, send, or receive), they hold **no state of their own** (state lives in the caller, ETS, or SQLite, so a reload never corrupts memory), and every version is retained for `tool_rollback`. A tool's `run` can use the full language — helpers, recursion, `case`, `map`/`filter`, f-strings — and each `tool_call` runs in an isolated interpreter, so concurrent callers and a faulting call can't corrupt or poison each other. It's compiled-only — the interpreter that runs the tool is only live in a `swc build` binary.
+
+Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); there's no capability sandbox or admission-lint yet, so a tool that calls an undefined function returns `nil` rather than a loud error; and each `tool_call` allocates its result without freeing intermediates (fine per turn; a tight 100k-call loop will grow memory). Compose tool source with `++`, not f-string `{{` braces.
 
 The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart (the runtime boots in <10ms).
 
