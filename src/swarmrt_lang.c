@@ -4594,6 +4594,208 @@ sw_interp_t *sw_lang_new(void *module_ast) {
     return interp;
 }
 
+/* === Tool-registry admission lint ======================================= *
+ * interp_is_known_builtin mirrors the builtins the INTERPRETER actually
+ * implements (eval's N_CALL prelude + interp_extra_builtin) — derived from the
+ * real dispatch, NOT codegen's is_builtin (which is compiler-only and lists
+ * compiled-only builtins like http_get/pmap that a tool's interpreter can't run,
+ * so admitting them would re-introduce the silent-nil). tests/sw/
+ * test_tool_registry.sw locks the pure set in so a dropped name fails CI. */
+static const char *k_interp_builtins[] = {
+    /* eval N_CALL prelude */
+    "abs","assert","assert_eq","assert_ne","assert_raises","elem","format","hd",
+    "json_decode","json_encode","length","list_append","map_get","map_has_key",
+    "map_keys","map_new","map_put","map_size","map_values","print",
+    "string_contains","string_ends_with","string_index_of","string_length",
+    "string_lower","string_split","string_starts_with","string_trim",
+    "string_upper","timestamp","tl","to_string","typeof",
+    /* interp_extra_builtin */
+    "audio_pcm16_to_ulaw","audio_pcm16_to_ulaw_b","audio_resample",
+    "audio_resample_b","audio_ulaw_to_pcm16","audio_ulaw_to_pcm16_b",
+    "base64_decode","base64_encode","byte","byte_at","byte_size","byte_slice",
+    "bytes_concat","bytes_from_base64","bytes_from_ints","bytes_to_base64",
+    "bytes_to_string","codepoint_at","db_close","db_exec","db_open","db_query",
+    "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_get",
+    "ets_list","ets_new","ets_put","ets_take","ets_update","ets_update_counter",
+    "exec_argv","expect","file_append","file_delete","file_exists","file_list",
+    "file_mkdir","file_read","file_read_bytes","file_write","file_write_bytes",
+    "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
+    "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
+    "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
+    "random_int","reduce","shell","shell_sandboxed","sleep","string_replace",
+    "string_sub","string_to_bytes","string_truncate","sys_exit","to_float",
+    NULL
+};
+int interp_is_known_builtin(const char *name) {
+    if (!name) return 0;
+    for (int i = 0; k_interp_builtins[i]; i++)
+        if (strcmp(k_interp_builtins[i], name) == 0) return 1;
+    return 0;
+}
+
+/* Capability a gated builtin requires, or NULL for an always-allowed pure one. */
+static const char *lint_required_cap(const char *name) {
+    if (strncmp(name, "file_", 5) == 0) return "file";
+    if (strncmp(name, "db_", 3) == 0)   return "db";
+    if (strcmp(name, "shell") == 0 || strcmp(name, "shell_sandboxed") == 0 ||
+        strcmp(name, "exec_argv") == 0) return "shell";
+    return NULL;
+}
+
+/* 1 if the caps list/tuple of atoms contains `cap`. */
+static int lint_caps_has(sw_val_t *caps, const char *cap) {
+    if (!caps || (caps->type != SW_VAL_LIST && caps->type != SW_VAL_TUPLE)) return 0;
+    for (int i = 0; i < caps->v.tuple.count; i++) {
+        sw_val_t *c = caps->v.tuple.items[i];
+        if (c && (c->type == SW_VAL_ATOM || c->type == SW_VAL_STRING) &&
+            c->v.str && strcmp(c->v.str, cap) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Bound names (params + local `x = ...` assignments + loop vars) seen so far —
+ * a call to one of these is a local variable (e.g. a lambda/callback), not a
+ * builtin, so it must NOT be flagged as unknown. Flat module-wide set: a lint
+ * is for catching typo'd builtins and ungranted caps, not enforcing scoping,
+ * so over-permissiveness on local-var calls is fine. */
+typedef struct { const char *names[512]; int count; } lint_bound_t;
+static void lint_bind(lint_bound_t *b, const char *nm) {
+    if (!nm || !nm[0] || b->count >= 512) return;
+    for (int i = 0; i < b->count; i++) if (strcmp(b->names[i], nm) == 0) return;
+    b->names[b->count++] = nm;
+}
+static int lint_is_bound(lint_bound_t *b, const char *nm) {
+    if (!nm) return 0;
+    for (int i = 0; i < b->count; i++) if (strcmp(b->names[i], nm) == 0) return 1;
+    return 0;
+}
+
+/* Vet one call target. Returns 1 (and fills err) if it must be rejected. */
+static int lint_check_call(const char *name, node_t *mod, lint_bound_t *b,
+                           sw_val_t *caps, char *err, unsigned long errlen) {
+    if (!name) return 0;
+    if (find_fun(mod, name)) return 0;            /* a fn this tool defines: ok */
+    if (lint_is_bound(b, name)) return 0;         /* a local var (lambda/callback): ok */
+    if (strcmp(name, "sys_exit") == 0) {          /* would kill the host process */
+        snprintf(err, errlen, "`sys_exit` is not allowed inside a tool");
+        return 1;
+    }
+    if (!interp_is_known_builtin(name)) {
+        snprintf(err, errlen,
+                 "unknown function `%s` (typo, or not available inside a tool)", name);
+        return 1;
+    }
+    const char *cap = lint_required_cap(name);
+    if (cap && !lint_caps_has(caps, cap)) {
+        snprintf(err, errlen,
+                 "builtin `%s` needs capability '%s' — pass it: tool_define(name, src, ['%s'])",
+                 name, cap, cap);
+        return 1;
+    }
+    return 0;
+}
+
+/* Recursive read-only AST walk (mirrors node_free's arms). 1 if rejected.
+ * Binds params/locals into `b` as it descends so calls to them aren't flagged. */
+static int lint_walk(node_t *n, node_t *mod, lint_bound_t *b, sw_val_t *caps,
+                     char *err, unsigned long errlen) {
+    if (!n) return 0;
+    switch (n->type) {
+    case N_CALL:
+        if (n->v.call.func && n->v.call.func->type == N_IDENT &&
+            lint_check_call(n->v.call.func->v.sval, mod, b, caps, err, errlen)) return 1;
+        if (lint_walk(n->v.call.func, mod, b, caps, err, errlen)) return 1;
+        for (int i = 0; i < n->v.call.nargs; i++)
+            if (lint_walk(n->v.call.args[i], mod, b, caps, err, errlen)) return 1;
+        return 0;
+    case N_PIPE:
+        if (n->v.pipe.func && n->v.pipe.func->type == N_IDENT &&
+            lint_check_call(n->v.pipe.func->v.sval, mod, b, caps, err, errlen)) return 1;
+        if (lint_walk(n->v.pipe.val, mod, b, caps, err, errlen)) return 1;
+        return lint_walk(n->v.pipe.func, mod, b, caps, err, errlen);
+    case N_FUN:
+        for (int i = 0; i < n->v.fun.nparams; i++) lint_bind(b, n->v.fun.params[i]);
+        return lint_walk(n->v.fun.body, mod, b, caps, err, errlen);
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++)
+            if (lint_walk(n->v.block.stmts[i], mod, b, caps, err, errlen)) return 1;
+        return 0;
+    case N_ASSIGN:
+        lint_bind(b, n->v.assign.name);           /* `f = fun(){...}` → f is local */
+        return lint_walk(n->v.assign.value, mod, b, caps, err, errlen);
+    case N_SPAWN: return lint_walk(n->v.spawn.expr, mod, b, caps, err, errlen);
+    case N_SEND:
+        return lint_walk(n->v.send.to, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.send.msg, mod, b, caps, err, errlen);
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++)
+            if (lint_walk(n->v.recv.clauses[i], mod, b, caps, err, errlen)) return 1;
+        return lint_walk(n->v.recv.after_body, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.recv.after_expr, mod, b, caps, err, errlen);
+    case N_CLAUSE:
+        return lint_walk(n->v.clause.guard, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.clause.body, mod, b, caps, err, errlen);
+    case N_IF:
+        return lint_walk(n->v.iff.cond, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.iff.then_b, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.iff.else_b, mod, b, caps, err, errlen);
+    case N_BINOP:
+        return lint_walk(n->v.binop.left, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.binop.right, mod, b, caps, err, errlen);
+    case N_UNARY: return lint_walk(n->v.unary.operand, mod, b, caps, err, errlen);
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < n->v.coll.count; i++)
+            if (lint_walk(n->v.coll.items[i], mod, b, caps, err, errlen)) return 1;
+        return 0;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++)
+            if (lint_walk(n->v.map.keys[i], mod, b, caps, err, errlen) ||
+                lint_walk(n->v.map.vals[i], mod, b, caps, err, errlen)) return 1;
+        return 0;
+    case N_FOR:
+        lint_bind(b, n->v.forloop.var);
+        return lint_walk(n->v.forloop.iter, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.forloop.body, mod, b, caps, err, errlen);
+    case N_LIST_COMP:
+        lint_bind(b, n->v.lcomp.var);
+        return lint_walk(n->v.lcomp.iter, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.lcomp.body, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.lcomp.guard, mod, b, caps, err, errlen);
+    case N_RANGE:
+        return lint_walk(n->v.range.from, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.range.to, mod, b, caps, err, errlen);
+    case N_TRY:
+        return lint_walk(n->v.trycatch.body, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.trycatch.catch_body, mod, b, caps, err, errlen);
+    case N_LIST_CONS:
+        return lint_walk(n->v.cons.head, mod, b, caps, err, errlen) ||
+               lint_walk(n->v.cons.tail, mod, b, caps, err, errlen);
+    case N_CASE:
+        if (lint_walk(n->v.casex.subject, mod, b, caps, err, errlen)) return 1;
+        for (int i = 0; i < n->v.casex.nclauses; i++)
+            if (lint_walk(n->v.casex.clauses[i], mod, b, caps, err, errlen)) return 1;
+        return 0;
+    default: return 0;  /* leaves: N_INT/FLOAT/STRING/ATOM/IDENT/SELF */
+    }
+}
+
+int sw_lang_lint_tool(void *module_ast, sw_val_t *caps, char *err, unsigned long errlen) {
+    node_t *mod = (node_t *)module_ast;
+    if (!mod || mod->type != N_MODULE) return 0;
+    lint_bound_t b; b.count = 0;
+    /* Pre-bind every top-level fn's params (forward refs across fns). */
+    for (int i = 0; i < mod->v.mod.nfuns; i++)
+        for (int j = 0; j < mod->v.mod.funs[i]->v.fun.nparams; j++)
+            lint_bind(&b, mod->v.mod.funs[i]->v.fun.params[j]);
+    for (int i = 0; i < mod->v.mod.nfuns; i++)
+        if (lint_walk(mod->v.mod.funs[i], mod, &b, caps, err, errlen)) return 1;
+    /* module-level `let x = ...` globals run before run(), so lint them too
+     * (else `let p = shell(...)` evades caps). */
+    for (int i = 0; i < mod->v.mod.nglobals; i++)
+        if (lint_walk(mod->v.mod.globals[i].val, mod, &b, caps, err, errlen)) return 1;
+    return 0;
+}
+
 int sw_lang_has_fun(void *module_ast, const char *name) {
     return module_ast && find_fun((node_t *)module_ast, name) != NULL;
 }

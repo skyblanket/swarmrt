@@ -3103,6 +3103,16 @@ static sw_val_t *_builtin_tool_define(sw_val_t **a, int n) {
     if (!ast) return _tool_err("parse error in tool source");
     if (!sw_lang_has_fun(ast, "run"))
         return _tool_err("tool source must define `fun run(...)` (the entry point)");
+    /* Admission lint: reject hallucinated/undefined-fn calls and dangerous
+     * builtins not granted via the optional caps list, LOUDLY at define time
+     * (not a silent nil three calls later). caps = a[2] (a list of atoms);
+     * absent => pure-logic only. */
+    {
+        sw_val_t *caps = (n >= 3) ? a[2] : NULL;
+        char lint_err[256];
+        if (sw_lang_lint_tool(ast, caps, lint_err, sizeof(lint_err)))
+            return _tool_err(lint_err);
+    }
 
     pthread_rwlock_wrlock(&g_tool_lock);
     sw_tool_entry_t *e = _tool_find(a[0]->v.str);

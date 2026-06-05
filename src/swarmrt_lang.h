@@ -123,6 +123,18 @@ void *sw_lang_parse(const char *source);
  * parsed module before use, e.g. the tool registry checking for `run`). */
 int sw_lang_has_fun(void *module_ast, const char *name);
 
+/* 1 if `name` is a builtin the RUNTIME interpreter actually implements (the
+ * authoritative runtime set — codegen's is_builtin is compiler-only). Used by
+ * the tool-registry admission lint to tell a real builtin from a typo. */
+int interp_is_known_builtin(const char *name);
+
+/* Tool-registry admission lint. Walks `module_ast` read-only; returns non-zero
+ * (and writes a human reason into `err`) if any call target is neither a
+ * runtime builtin nor a fn in this module, or is a capability-gated builtin
+ * (the file_ / db_ / shell families) whose capability is not in `caps` (a
+ * list/tuple of atoms; NULL => pure-only). Returns 0 when the tool is admitted. */
+int sw_lang_lint_tool(void *module_ast, sw_val_t *caps, char *err, unsigned long errlen);
+
 /* Call `func_name` in `module_ast` with a FRESH, per-call interpreter (its own
  * global_env + error/call_depth) off the (immutable, read-only) AST. Safe to run
  * concurrently from multiple threads on the SAME ast, and a fault never persists

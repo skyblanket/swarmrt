@@ -652,7 +652,7 @@ An agent can write a new tool *as `sw` source at runtime* and call it live, with
 
 | | |
 |---|---|
-| `tool_define(name, src)` → `'ok'` \| `{'error', reason}` | parse `src` (a module defining `fun run(...)`) and register it under `name`; re-defining hot-swaps the new version and keeps the old for rollback |
+| `tool_define(name, src, caps?)` → `'ok'` \| `{'error', reason}` | parse `src` (a module defining `fun run(...)`), **admission-lint it** (reject hallucinated/undefined-fn calls and dangerous builtins not in `caps` — a list of capability atoms like `['db','file','shell']`; default = pure-logic only), and register under `name`. Re-defining hot-swaps + keeps the old for rollback |
 | `tool_call(name, args…)` → result \| `nil` | run the tool's `run` with the trailing args (`nil` if no such tool) |
 | `tool_list()` → `[{name, version}, …]` | every registered tool and its version |
 | `tool_rollback(name)` → `'ok'` \| `{'error', reason}` | swap a tool back to its previous version (toggles) |

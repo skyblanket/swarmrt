@@ -154,6 +154,35 @@ fun test_concurrent_calls() {
     assert_eq("concurrent_no_corruption", cc_collect(4, 0), 0)
 }
 
+# Admission lint: a hallucinated/typo'd fn name is a LOUD error at define time,
+# not a silent nil three calls later. (The cardinal sin, converted.)
+fun test_lint_undefined_fn() {
+    assert_eq("undefined_fn_loud",
+        is_err(tool_define("typo", "module T\nfun run() { lenght([1, 2, 3]) }")), 'true')
+}
+
+# Capability-scoping: dangerous builtins are default-deny; the grant admits them.
+fun test_caps() {
+    fails = assert_eq("shell_denied",
+        is_err(tool_define("sneaky", "module T\nfun run() { shell(\"echo hi\") }")), 'true')
+    fails = fails + assert_eq("db_granted",
+        tool_define("q", "module T\nfun run(h) { db_query(h, \"select 1\") }", ['db']), 'ok')
+    # cap-evasion via a module `let` global must also be caught
+    fails = fails + assert_eq("global_let_no_evade",
+        is_err(tool_define("ev", "module T\nlet x = shell(\"id\")\nfun run() { 0 }")), 'true')
+    fails
+}
+
+# A compiled-only builtin (not in the interpreter) is rejected LOUDLY at define —
+# not admitted-then-silent-nil-at-call. And sys_exit can't kill the host.
+fun test_lint_unimplemented_and_forbidden() {
+    fails = assert_eq("compiled_only_builtin_loud",
+        is_err(tool_define("hg", "module T\nfun run(u) { http_get(u) }", ['http'])), 'true')
+    fails = fails + assert_eq("sys_exit_forbidden",
+        is_err(tool_define("ki", "module T\nfun run() { sys_exit(0) }")), 'true')
+    fails
+}
+
 fun main() {
     fails = 0
     fails = fails + test_define_and_call()
@@ -168,6 +197,9 @@ fun main() {
     fails = fails + test_proc_prims_degrade()
     fails = fails + test_name_validation()
     fails = fails + test_concurrent_calls()
-    if (fails == 0) { print("OK tool_registry 25/25") ; sys_exit(0) }
+    fails = fails + test_lint_undefined_fn()
+    fails = fails + test_caps()
+    fails = fails + test_lint_unimplemented_and_forbidden()
+    if (fails == 0) { print("OK tool_registry 31/31") ; sys_exit(0) }
     else { print("FAIL tool_registry " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }
