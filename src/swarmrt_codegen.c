@@ -231,6 +231,11 @@ static int is_builtin(const char *name) {
            strcmp(name, "sup_start_child") == 0 ||
            strcmp(name, "sup_terminate_child") == 0 ||
            strcmp(name, "sup_count_children") == 0 ||
+           /* Tool registry (self-defined hot-loaded sw tools) */
+           strcmp(name, "tool_define") == 0 ||
+           strcmp(name, "tool_call") == 0 ||
+           strcmp(name, "tool_list") == 0 ||
+           strcmp(name, "tool_rollback") == 0 ||
            /* Distributed nodes */
            strcmp(name, "node_start") == 0 || strcmp(name, "node_stop") == 0 ||
            strcmp(name, "node_name") == 0 || strcmp(name, "node_connect") == 0 ||
@@ -1809,6 +1814,7 @@ static const char *_common_builtins[] = {
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "pid_alive",
     "random_int", "supervise",
     "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
+    "tool_define", "tool_call", "tool_list", "tool_rollback",
     NULL
 };
 
@@ -2166,7 +2172,12 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "dyn_supervisor") == 0 ||
              strcmp(fname, "sup_start_child") == 0 ||
              strcmp(fname, "sup_terminate_child") == 0 ||
-             strcmp(fname, "sup_count_children") == 0)
+             strcmp(fname, "sup_count_children") == 0 ||
+             /* Tool registry */
+             strcmp(fname, "tool_define") == 0 ||
+             strcmp(fname, "tool_call") == 0 ||
+             strcmp(fname, "tool_list") == 0 ||
+             strcmp(fname, "tool_rollback") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         if (nargs > 0)

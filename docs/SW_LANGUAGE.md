@@ -645,7 +645,24 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
-> **Compiled-only.** The process/scheduler primitives (spawn, send, receive, the supervisors, and `process_list`/`process_info`/`registered` / `Swarm.*`) need the real scheduler, which the tree-walking interpreter doesn't have. Under `swc run`, `swc test`, and the REPL they print a one-line note and return `nil` — run `swc build file.sw -o bin/x && bin/x` for full process semantics.
+> **Compiled-only.** The process/scheduler primitives (spawn, send, receive, the supervisors, `process_list`/`process_info`/`registered` / `Swarm.*`, and the `tool_*` registry below) need the real scheduler / embedded interpreter, which the REPL path doesn't run. Under `swc run`, `swc test`, and the REPL they print a one-line note and return `nil` — run `swc build file.sw -o bin/x && bin/x` for full semantics.
+
+### Tool registry — self-defined, hot-loaded tools
+An agent can write a new tool *as `sw` source at runtime* and call it live, with no restart — the source is parsed and run by the interpreter that ships inside every compiled binary. The tool's entry function is `run`.
+
+| | |
+|---|---|
+| `tool_define(name, src)` → `'ok'` \| `{'error', reason}` | parse `src` (a module defining `fun run(...)`) and register it under `name`; re-defining hot-swaps the new version and keeps the old for rollback |
+| `tool_call(name, args…)` → result \| `nil` | run the tool's `run` with the trailing args (`nil` if no such tool) |
+| `tool_list()` → `[{name, version}, …]` | every registered tool and its version |
+| `tool_rollback(name)` → `'ok'` \| `{'error', reason}` | swap a tool back to its previous version (toggles) |
+
+```sw
+tool_define("summarize", "module T\nfun run(text) { ... }")
+tool_call("summarize", article)
+```
+
+Tools are pure logic — process primitives degrade to `nil` inside them, and a tool keeps no state of its own (put state in the caller, ETS, or SQLite). Bad source fails loudly (`{'error', reason}`), never a silent `nil`. Compiled-only (see the note above).
 
 ### Subprocesses (bidirectional)
 | | |

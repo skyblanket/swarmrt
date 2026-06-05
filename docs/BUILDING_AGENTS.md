@@ -478,6 +478,36 @@ It's a thin pure-sw library over the `process_list` / `process_info` builtins �
 
 ---
 
+## Self-defined tools: an agent that writes its own code
+
+This is the one most agent runtimes can't do. A swarmrt binary ships the `sw` interpreter *inside it*, so an agent can write a brand-new tool **as `sw` source at runtime** and call it live — no recompile, no restart, no separate process:
+
+```sw
+# the model emitted this source (a string); register it as a named tool
+src = "module T\nfun run(text) { ... summarize text ... }"
+case tool_define("summarize", src) {
+    'ok'            -> tool_call("summarize", article)
+    {'error', why}  -> retry_with_feedback(why)   # bad source fails LOUDLY
+}
+```
+
+The loop that makes this powerful: the model proposes a tool, you `tool_define` it, and if the source is malformed you get `{'error', reason}` back — feed that straight to the model as a compile error and let it fix its own tool. A tool that references something that doesn't exist, or omits `fun run(...)`, is rejected at define time, not discovered as a silent `nil` three turns later.
+
+```sw
+tool_define("scale", "module T\nfun run(x) { x * 3 }")
+tool_call("scale", 7)              # 21
+tool_define("scale", "module T\nfun run(x) { x * 10 }")   # hot-swap, live
+tool_call("scale", 7)             # 70 — no restart
+tool_rollback("scale")            # back to *3 if the new one misbehaves
+tool_list()                       # [{scale, 3}, ...] — every tool + version
+```
+
+The design keeps it honest and safe-ish by construction: tools are **pure logic** (process primitives degrade to `nil` inside a tool, so a tool can't quietly spawn or send), they hold **no state of their own** (state lives in the caller, ETS, or SQLite, so a reload never corrupts memory), and every version is retained for `tool_rollback`. It's compiled-only — the interpreter that runs the tool is only live in a `swc build` binary.
+
+The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart (the runtime boots in <10ms).
+
+---
+
 ## Prompt templates
 
 Stop stuffing 200-line strings inline:

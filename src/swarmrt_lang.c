@@ -3782,6 +3782,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         "demonitor", "exit_proc", "trap_exit", "supervise",
         "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
         "process_list", "process_info", "registered",
+        "tool_define", "tool_call", "tool_list", "tool_rollback",
         "http_listen", "http_respond", "ws_send", "ws_close",
         "ws_set_handler", "ws_send_binary", "ws_request_headers", "ws_request_path",
         "telemetry_emit", "telemetry_subscribe",
@@ -4591,6 +4592,10 @@ sw_interp_t *sw_lang_new(void *module_ast) {
         }
     }
     return interp;
+}
+
+int sw_lang_has_fun(void *module_ast, const char *name) {
+    return module_ast && find_fun((node_t *)module_ast, name) != NULL;
 }
 
 sw_val_t *sw_lang_call(sw_interp_t *interp, const char *func_name,

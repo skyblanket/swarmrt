@@ -119,6 +119,10 @@ typedef struct {
 /* Parse source code, returns module AST (or NULL on error) */
 void *sw_lang_parse(const char *source);
 
+/* 1 if the parsed module defines a function named `name` (for validating a
+ * parsed module before use, e.g. the tool registry checking for `run`). */
+int sw_lang_has_fun(void *module_ast, const char *name);
+
 /* Create interpreter from parsed module AST */
 sw_interp_t *sw_lang_new(void *module_ast);
 

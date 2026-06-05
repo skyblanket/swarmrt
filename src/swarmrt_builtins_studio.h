@@ -3000,6 +3000,151 @@ static sw_val_t *_builtin_sup_count_children(sw_val_t **a, int n) {
     return sw_val_int((int64_t)sw_dynsup_count_children_proc(a[0]->v.pid));
 }
 
+/* === Tool registry — self-defined sw tools, hot-loaded from source =========
+ *
+ * The AI-era headline: an agent writes a new tool AS sw source at runtime and
+ * registers it, callable on the next turn with NO restart. Each tool keeps its
+ * own parsed-module interpreter alive; tool_call invokes the tool's `run`
+ * function via sw_lang_call (the args are the same sw_val_t* the compiled caller
+ * already holds — no codegen change, no call-site indirection). Re-defining a
+ * tool atomically swaps the interpreter and RETAINS the previous one for
+ * tool_rollback — old versions are never freed (a fiber may still be mid-call in
+ * one; the retain-old-code discipline a hot VM uses). The tool's entry fn is
+ * `run`. Pure-logic tools only: process primitives degrade to nil here.
+ */
+#define SW_TOOL_MAX 256
+typedef struct {
+    char name[64];
+    sw_interp_t *interp;      /* current parsed-module interp */
+    sw_interp_t *prev;        /* previous version, retained for rollback */
+    char *src;                /* current source (for audit/history) */
+    char *prev_src;
+    uint64_t version;
+} sw_tool_entry_t;
+static sw_tool_entry_t g_tools[SW_TOOL_MAX];
+static int g_tool_count = 0;
+static pthread_rwlock_t g_tool_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static sw_tool_entry_t *_tool_find(const char *name) {
+    for (int i = 0; i < g_tool_count; i++)
+        if (strcmp(g_tools[i].name, name) == 0) return &g_tools[i];
+    return NULL;
+}
+
+static sw_val_t *_tool_err(const char *reason) {
+    sw_val_t *items[2] = { sw_val_atom("error"), sw_val_string(reason) };
+    return sw_val_tuple(items, 2);
+}
+
+/* The recursive-descent parser uses ~14KB/frame (8KB by-value tokens), which
+ * overflows a process fiber's modest stack on nested expressions. Parsing is
+ * rare (once per tool_define) and produces a heap AST that's thread-agnostic,
+ * so we run it on a dedicated 8MB-stack thread — the same headroom swc's own
+ * main thread has, where the parser is known to handle any program. eval
+ * (tool_call) stays on the fiber; tool bodies are modest. */
+typedef struct { const char *src; void *ast; } _tool_parse_ctx;
+static void *_tool_parse_thread(void *arg) {
+    _tool_parse_ctx *c = (_tool_parse_ctx *)arg;
+    c->ast = sw_lang_parse(c->src);
+    return NULL;
+}
+static void *_tool_parse_big_stack(const char *src) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return sw_lang_parse(src);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    _tool_parse_ctx ctx = { src, NULL };
+    pthread_t t;
+    int rc = pthread_create(&t, &attr, _tool_parse_thread, &ctx);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) return sw_lang_parse(src); /* fallback: current stack */
+    pthread_join(t, NULL);
+    return ctx.ast;
+}
+
+/* tool_define(name, src) -> 'ok' | {'error', reason}
+ * Parse `src` (a module defining `fn run(...)`) and register it under `name`.
+ * Re-defining swaps in the new version and keeps the old for rollback. */
+static sw_val_t *_builtin_tool_define(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || (a[0]->type != SW_VAL_STRING && a[0]->type != SW_VAL_ATOM) ||
+        !a[0]->v.str || !a[1] || a[1]->type != SW_VAL_STRING || !a[1]->v.str)
+        return _tool_err("tool_define(name, src): name + source string required");
+
+    void *ast = _tool_parse_big_stack(a[1]->v.str);
+    if (!ast) return _tool_err("parse error in tool source");
+    if (!sw_lang_has_fun(ast, "run"))
+        return _tool_err("tool source must define `fun run(...)` (the entry point)");
+    sw_interp_t *interp = sw_lang_new(ast);
+
+    pthread_rwlock_wrlock(&g_tool_lock);
+    sw_tool_entry_t *e = _tool_find(a[0]->v.str);
+    if (!e) {
+        if (g_tool_count >= SW_TOOL_MAX) {
+            pthread_rwlock_unlock(&g_tool_lock);
+            return _tool_err("tool registry full");
+        }
+        e = &g_tools[g_tool_count++];
+        memset(e, 0, sizeof(*e));
+        strncpy(e->name, a[0]->v.str, sizeof(e->name) - 1);
+    }
+    /* retain old version for rollback — never freed (a fiber may be mid-call) */
+    e->prev = e->interp;
+    e->prev_src = e->src;
+    e->interp = interp;
+    e->src = strdup(a[1]->v.str);
+    e->version++;
+    pthread_rwlock_unlock(&g_tool_lock);
+    return sw_val_atom("ok");
+}
+
+/* tool_call(name, args...) -> result | nil
+ * Invoke the tool's `run` function with the trailing args. */
+static sw_val_t *_builtin_tool_call(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || (a[0]->type != SW_VAL_STRING && a[0]->type != SW_VAL_ATOM) || !a[0]->v.str)
+        return sw_val_nil();
+    pthread_rwlock_rdlock(&g_tool_lock);
+    sw_tool_entry_t *e = _tool_find(a[0]->v.str);
+    sw_interp_t *interp = e ? e->interp : NULL;
+    pthread_rwlock_unlock(&g_tool_lock);
+    if (!interp) return sw_val_nil();
+    /* call outside the lock on the snapshot; retained interps stay valid */
+    return sw_lang_call(interp, "run", &a[1], n - 1);
+}
+
+/* tool_list() -> list of {name, version} tuples for every registered tool. */
+static sw_val_t *_builtin_tool_list(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    pthread_rwlock_rdlock(&g_tool_lock);
+    int cnt = g_tool_count;
+    if (cnt == 0) { pthread_rwlock_unlock(&g_tool_lock); return sw_val_list(NULL, 0); }
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cnt);
+    for (int i = 0; i < cnt; i++) {
+        sw_val_t *pair[2] = { sw_val_string(g_tools[i].name),
+                              sw_val_int((int64_t)g_tools[i].version) };
+        items[i] = sw_val_tuple(pair, 2);
+    }
+    pthread_rwlock_unlock(&g_tool_lock);
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
+/* tool_rollback(name) -> 'ok' | {'error', reason}
+ * Swap a tool back to its previous version (toggles, so calling again rolls
+ * forward). The retained-never-freed interps make this a pure pointer swap. */
+static sw_val_t *_builtin_tool_rollback(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || (a[0]->type != SW_VAL_STRING && a[0]->type != SW_VAL_ATOM) || !a[0]->v.str)
+        return _tool_err("tool_rollback(name): name required");
+    pthread_rwlock_wrlock(&g_tool_lock);
+    sw_tool_entry_t *e = _tool_find(a[0]->v.str);
+    if (!e) { pthread_rwlock_unlock(&g_tool_lock); return _tool_err("no such tool"); }
+    if (!e->prev) { pthread_rwlock_unlock(&g_tool_lock); return _tool_err("no previous version to roll back to"); }
+    sw_interp_t *ti = e->interp; e->interp = e->prev; e->prev = ti;
+    char *ts = e->src; e->src = e->prev_src; e->prev_src = ts;
+    e->version++;
+    pthread_rwlock_unlock(&g_tool_lock);
+    return sw_val_atom("ok");
+}
+
 /* === Distributed Nodes === */
 
 #include "swarmrt_node.h"

@@ -194,9 +194,19 @@ if [ -d "$INVM_DIR" ]; then
         # deadlock hangs forever — so a generous alarm still catches a regression
         # while tolerating CPU contention (e.g. right after a full rebuild, where
         # a 20s bound flaked even though the two-server in-VM WS dance was fine).
-        SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 60; exec @ARGV or die' \
-            "$bin" >"$log" 2>&1
-        rc=$?
+        # This fixture's pass/fail is load-sensitive: its in-test 25s idle guard
+        # ("tx_handler idle") can trip under heavy CPU contention even though the
+        # code is fine (verified: pristine main flakes at the same rate under
+        # load). Retry up to 3x — a transient load spike shouldn't red the suite,
+        # but a REAL reintroduced deadlock fails all 3 (each bounded by the 60s
+        # alarm). Pass on the first attempt that exits 0.
+        rc=1
+        for _attempt in 1 2 3; do
+            SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 60; exec @ARGV or die' \
+                "$bin" >"$log" 2>&1
+            rc=$?
+            [ "$rc" -eq 0 ] && break
+        done
         if [ "$rc" -eq 0 ]; then
             summary=$(grep -E '^OK |^FAIL ' "$log" | tail -1)
             passes=$(grep -c '^PASS ' "$log" || true)

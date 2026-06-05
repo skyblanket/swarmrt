@@ -438,7 +438,13 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     /* Allocate process stack with guard page (lazy — reuse across lifetimes).
      * Layout: [GUARD PAGE | usable stack ... ]
      * Stack grows downward; guard page at bottom catches overflow via SIGSEGV. */
-#define SW_PROC_STACK_SIZE  (64 * 1024)  /* 64KB usable per process stack */
+#define SW_PROC_STACK_SIZE  (128 * 1024) /* 128KB usable per process stack.
+     * The runtime embeds the tree-walking interpreter, and tools run it ON a
+     * process fiber (tool_call -> sw_lang_call -> eval). Parsing (the 8KB-token,
+     * ~14KB/frame hog) is offloaded to an 8MB helper thread in tool_define, so
+     * the fiber only carries eval — but eval is still recursive, so 64KB was
+     * tight. 128KB gives eval comfortable headroom while staying lightweight
+     * (stacks are lazily mmap'd; physical = touched pages only). */
     if (!proc->stack_mem) {
 #ifdef _WIN32
         long page_size = 4096;
