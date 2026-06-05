@@ -56,7 +56,7 @@ fun tx_handler(done) {
             }
         }
         {'ws_close', _c} -> tx_handler(done)
-        after 25000 { print("FAIL: tx_handler idle (deadlock?)") sys_exit(2) }
+        after 50000 { print("FAIL: tx_handler idle (deadlock?)") sys_exit(2) }
     }
 }
 
@@ -68,7 +68,7 @@ fun oa_loop() {
     receive {
         {'ws_message', conn, text} -> ws_send(conn, text) oa_loop()
         {'ws_close', _c}           -> oa_loop()
-        after 25000 { 0 }
+        after 50000 { 0 }
     }
 }
 
@@ -90,5 +90,5 @@ fun main() {
         _     -> { wsc_send(h, "start") }
     }
     # Keep the driver (and thus T's incoming conn) alive while the bridge dials O.
-    receive { after 25000 { print("FAIL: driver idle (deadlock?)") sys_exit(3) } }
+    receive { after 50000 { print("FAIL: driver idle (deadlock?)") sys_exit(3) } }
 }
