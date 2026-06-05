@@ -32,6 +32,16 @@ fun test_base64_known() {
     check_eq("base64_known", base64_encode("hello"), "aGVsbG8=")
 }
 
+# f-string `{{`/`}}` escape to literal braces (so source full of `{ }` — e.g. an
+# agent composing tool source — survives an f-string); single `{ }` still interpolate.
+fun test_fstring_escape() {
+    x = 5
+    fails = check_eq("fstring_escape_literal", f"a {{b}} c", "a {b} c")
+    fails = fails + check_eq("fstring_interp_still_works", f"v={x}", "v=5")
+    fails = fails + check_eq("fstring_mixed", f"{{ {x} }}", "{ 5 }")
+    fails
+}
+
 fun main() {
     fails = 0
     fails = fails + test_index_of_hit()
@@ -41,6 +51,7 @@ fun main() {
     fails = fails + test_concat()
     fails = fails + test_base64_roundtrip()
     fails = fails + test_base64_known()
-    if (fails == 0) { print("OK strings 7/7") ; sys_exit(0) }
+    fails = fails + test_fstring_escape()
+    if (fails == 0) { print("OK strings 10/10") ; sys_exit(0) }
     else { print("FAIL strings " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }

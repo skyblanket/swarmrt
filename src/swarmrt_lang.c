@@ -382,6 +382,10 @@ static tok_t lnext(lex_t *l) {
                 continue;
             }
             if (ch == '{' && brace_depth == 0) {
+                /* `{{` is an escaped literal brace, NOT interpolation — so an
+                 * agent can compose tool source (full of `{ }`) with an
+                 * f-string. Emit one literal `{`, consume both. */
+                if (lpeek2(l) == '{') { ladv(l); ladv(l); t.text[i++] = '{'; continue; }
                 /* Top-level `{` — rewrite as `#{` so the existing
                  * #{expr} interpolation kicks in. */
                 ladv(l);
@@ -391,7 +395,13 @@ static tok_t lnext(lex_t *l) {
                 continue;
             }
             if (ch == '{') { brace_depth++; t.text[i++] = ladv(l); continue; }
-            if (ch == '}') { if (brace_depth > 0) brace_depth--; t.text[i++] = ladv(l); continue; }
+            if (ch == '}') {
+                /* `}}` at top level is an escaped literal `}` (mirrors `{{`). */
+                if (brace_depth == 0 && lpeek2(l) == '}') { ladv(l); ladv(l); t.text[i++] = '}'; continue; }
+                if (brace_depth > 0) brace_depth--;
+                t.text[i++] = ladv(l);
+                continue;
+            }
             if (ch == '\\') {
                 ladv(l); /* consume '\' */
                 /* A trailing backslash at end-of-source (`f"...\` then NUL)
