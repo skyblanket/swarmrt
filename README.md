@@ -81,7 +81,7 @@ That's it. No package manager for the language, no language server install, no V
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
 | **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Process linking and monitoring. Versioned module registry with rollback for C embedders (no `sw`-level hot reload yet — see below). |
 | **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
-| **Avoiding language overhead** | One binary, no VM, no GC pauses, <10ms startup. (There's no tracing collector yet — per-process value memory is reclaimed when the process exits, so keep long-running loop bodies allocation-light or cycle workers; a real per-process GC is the top roadmap item.) The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses, <10ms startup. (There's no tracing collector yet — values live until the **OS process** exits, not when an sw process does. Bounded/exiting programs are fine; a long-running high-throughput service accumulates memory and needs a periodic binary restart for now. A real per-process GC is the top roadmap item.) The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
 
 ---
 
