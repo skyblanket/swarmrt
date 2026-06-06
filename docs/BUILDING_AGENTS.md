@@ -62,7 +62,7 @@ fun start(name, initial) {
 **Three things to internalise:**
 
 1. **The function is the agent.** No class, no struct, no `Agent` superclass. The function definition + the recursion is the entire agent definition.
-2. **State is the recursion arg.** `agent(name, new_state)` is how you "update" state. The compiler turns self-tail-calls into `goto`, so the stack doesn't grow — the agent can run forever.
+2. **State is the recursion arg.** `agent(name, new_state)` is how you "update" state. The compiler turns self-tail-calls into `goto`, so the **stack** doesn't grow across iterations. (Heap value memory is a different story: there's no tracing GC yet, so values allocated each turn aren't reclaimed until the process exits — keep per-iteration allocation light, or cycle the worker periodically, for a genuinely long-lived loop. A real per-process GC is the top roadmap item.)
 3. **The mailbox + selective receive are the dispatch system.** No event loop framework. No callback registration. `receive { pattern -> body }` waits until something matching shows up.
 
 ---

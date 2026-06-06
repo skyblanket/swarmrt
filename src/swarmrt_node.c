@@ -205,7 +205,22 @@ int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
     return 0;
 }
 
+/* Nesting-depth guard against an attacker-crafted deeply-nested marshalled
+ * value (this is the cross-node wire path — remote-triggerable). The breadth is
+ * already capped (100000); depth recursed one C frame per level and could SIGILL
+ * the receiving fiber. Over the cap, return nil without consuming (callers'
+ * count loops are bounded, so the unwind is bounded). */
+static sw_val_t *unmarsh_val_inner(const uint8_t *buf, uint32_t len, uint32_t *pos);
+static __thread int g_unmarsh_depth = 0;
+#define SW_UNMARSH_MAX_DEPTH 256
 static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
+    if (g_unmarsh_depth >= SW_UNMARSH_MAX_DEPTH) return sw_val_nil();
+    g_unmarsh_depth++;
+    sw_val_t *r = unmarsh_val_inner(buf, len, pos);
+    g_unmarsh_depth--;
+    return r;
+}
+static sw_val_t *unmarsh_val_inner(const uint8_t *buf, uint32_t len, uint32_t *pos) {
     if (*pos >= len) return sw_val_nil();
     uint8_t tag = buf[(*pos)++];
     /* Invariant: *pos <= len here and after every advance below. All
@@ -306,6 +321,7 @@ static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
 sw_val_t *sw_unmarshal(const uint8_t *buf, uint32_t len,
                        const char *default_remote_node) {
     uint32_t pos = 0;
+    g_unmarsh_depth = 0;   /* reset the per-message nesting-depth guard */
     tls_unmarshal_default_node = default_remote_node;
     sw_val_t *r = unmarsh_val(buf, len, &pos);
     tls_unmarshal_default_node = NULL;

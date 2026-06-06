@@ -1727,12 +1727,25 @@ static node_t *par_fun(par_t *p) {
     if (p->cur.type != TOK_RPAREN) {
         do {
             tok_t param = par_expect(p, TOK_IDENT, "parameter");
-            strncpy(fn->v.fun.params[fn->v.fun.nparams], param.text, 127);
-            fn->v.fun.defaults[fn->v.fun.nparams] = NULL;
-            if (par_match(p, TOK_ASSIGN)) {
-                fn->v.fun.defaults[fn->v.fun.nparams] = par_expr(p);
+            /* params[]/defaults[] are fixed [16] buffers (swarmrt_lang.h). Cap
+             * at 16 so a long parameter list can't overrun the node — the
+             * lambda path (above) guards this; the top-level fun path didn't,
+             * and a >16-param fn from LLM-generated source corrupted the heap. */
+            if (fn->v.fun.nparams < 16) {
+                strncpy(fn->v.fun.params[fn->v.fun.nparams], param.text, 127);
+                fn->v.fun.defaults[fn->v.fun.nparams] = NULL;
+                if (par_match(p, TOK_ASSIGN)) {
+                    fn->v.fun.defaults[fn->v.fun.nparams] = par_expr(p);
+                }
+                fn->v.fun.nparams++;
+            } else {
+                if (par_match(p, TOK_ASSIGN)) node_free(par_expr(p)); /* consume, don't store */
+                if (!p->err) {
+                    snprintf(p->errmsg, sizeof(p->errmsg),
+                             "too many function parameters (max 16)");
+                    p->err = 1;
+                }
             }
-            fn->v.fun.nparams++;
         } while (par_match(p, TOK_COMMA));
     }
     par_expect(p, TOK_RPAREN, "')'");
@@ -4916,6 +4929,12 @@ void sw_lang_free(sw_interp_t *interp) {
 /* === JSON decode for distribution layer === */
 
 static sw_val_t *_jd_parse(const char **pp);
+static sw_val_t *_jd_parse_inner(const char **pp);
+/* Nesting-depth guard: deeply-nested JSON recurses one C frame per level and
+ * SIGILLs on the fiber stack. Cap nesting; over the cap _jd_parse returns nil
+ * without consuming (the callers' cnt caps bound the resulting spin). */
+static __thread int g_jd_depth = 0;
+#define SW_JD_MAX_DEPTH 256
 
 static void _jd_skip_ws(const char **pp) {
     while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
@@ -5012,6 +5031,14 @@ static sw_val_t *_jd_parse_string(const char **pp) {
 }
 
 static sw_val_t *_jd_parse(const char **pp) {
+    if (g_jd_depth >= SW_JD_MAX_DEPTH) return sw_val_nil();  /* too deep */
+    g_jd_depth++;
+    sw_val_t *r = _jd_parse_inner(pp);
+    g_jd_depth--;
+    return r;
+}
+
+static sw_val_t *_jd_parse_inner(const char **pp) {
     _jd_skip_ws(pp);
     if (**pp == '"') return _jd_parse_string(pp);
     if (**pp == '[') {
@@ -5065,5 +5092,6 @@ static sw_val_t *_jd_parse(const char **pp) {
 sw_val_t *sw_lang_json_decode(const char *s) {
     if (!s) return sw_val_nil();
     const char *p = s;
+    g_jd_depth = 0;   /* reset the per-decode depth guard */
     return _jd_parse(&p);
 }

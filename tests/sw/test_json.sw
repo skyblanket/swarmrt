@@ -48,6 +48,17 @@ fun test_nested_list_roundtrip() {
     assert_eq("nested_list_len", length(dec), 4)
 }
 
+# Deeply-nested JSON must NOT crash (depth guard): over the cap it returns a
+# truncated/partial value, and a normal decode still works right after. If the
+# decoder SIGILL'd on the deep input, the program never reaches the assertion.
+fun rep(s, n, acc) { if (n <= 0) { acc } else { rep(s, n - 1, acc ++ s) } }
+fun test_deep_json_no_crash() {
+    deep = rep("[", 1000, "") ++ rep("]", 1000, "")
+    json_decode(deep)                                   # must not crash
+    healthy = json_decode("[1, 2, 3]")                  # decoder still works after
+    assert_eq("deep_json_survived_then_works", length(healthy), 3)
+}
+
 fun main() {
     fails = 0
     fails = fails + test_string_roundtrip()
@@ -55,6 +66,7 @@ fun main() {
     fails = fails + test_map_roundtrip()
     fails = fails + test_unicode_escape()
     fails = fails + test_nested_list_roundtrip()
-    if (fails == 0) { print("OK json 5/5") ; sys_exit(0) }
+    fails = fails + test_deep_json_no_crash()
+    if (fails == 0) { print("OK json 6/6") ; sys_exit(0) }
     else { print("FAIL json " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }

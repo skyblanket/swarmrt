@@ -81,7 +81,7 @@ That's it. No package manager for the language, no language server install, no V
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
 | **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Process linking and monitoring. Versioned module registry with rollback for C embedders (no `sw`-level hot reload yet — see below). |
 | **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
-| **Avoiding language overhead** | One binary, no VM, no GC pauses (per-process generational GC means no global stop-the-world), <10ms startup. The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses, <10ms startup. (There's no tracing collector yet — per-process value memory is reclaimed when the process exits, so keep long-running loop bodies allocation-light or cycle workers; a real per-process GC is the top roadmap item.) The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
 
 ---
 
@@ -227,7 +227,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | Subsystem | What it does |
 |---|---|
 | **Scheduler** | One OS thread per core. Per-scheduler run queue with 4 priority levels. Reduction-counted preemption. Work stealing between cores. |
-| **Process** | 2KB arena-allocated PCB + 64KB stack. Lock-free MPSC mailbox. Per-process generational GC. |
+| **Process** | 2KB arena-allocated PCB + 128KB stack. Lock-free MPSC mailbox. Per-process heap, reclaimed at process exit (tracing GC on the roadmap). |
 | **Behaviours** | GenServer, Supervisor, Task, GenStateMachine, ETS, Registry — all built on top of the bare `spawn`/`send`/`receive` primitives. |
 | **IO** | kqueue-based async ports. TCP accept/read/write as port messages. HTTP / WebSocket / Chrome DevTools as builtins. |
 | **Distribution** | Multi-node TCP message routing with automatic reconnection. Process linking across nodes. |
@@ -351,7 +351,7 @@ make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search
 - **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run.
 - **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
 
-Together the suite reports `all sw tests passed — 11 files, 133 assertions`.
+Together the suite reports `all sw tests passed — 50 files, 433 assertions`.
 
 Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
 
@@ -362,7 +362,10 @@ Add a `test_<topic>.sw` file in either directory and it'll be picked up automati
 The [`eval/`](eval/) directory is an empirical benchmark of how well LLMs write `sw` from the published docs. Pure code-gen, single-shot, no agent harness — measures the floor.
 
 ```bash
-export MOONSHOT_KEY=...           # or whichever endpoint's key
+# Keys match models.json: Kimi uses MOONSHOT_KEY; GPT-4.1 / Gemini / DeepSeek /
+# Qwen route through OpenRouter. Set either or both — an unset key SKIPs that model.
+export OPENROUTER_API_KEY=...     # GPT-4.1, Gemini 2.5 Flash, DeepSeek, Qwen
+export MOONSHOT_KEY=...           # Kimi K2.6 / K2.5 / moonshot-v1-32k
 cd eval && ./runner.sh            # 10 prompts × the models in models.json, ~20 min
 ```
 
@@ -402,7 +405,7 @@ src/
   swarmrt_phase5.{c,h}     GenStateMachine, Process Groups
   swarmrt_io.{c,h}         kqueue async I/O, TCP ports
   swarmrt_hotload.{c,h}    Hot code reload with versioning
-  swarmrt_gc.{c,h}         Per-process generational GC
+  swarmrt_gc.{c,h}         Per-process heap / GC scaffolding (WIP)
   swarmrt_node.{c,h}       Multi-node distribution
   swarmrt_lang.{c,h}       Lexer, parser, tree-walking interpreter
   swarmrt_codegen.{c,h}    AST → C code generation
@@ -424,7 +427,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
-- `make test-sw` — **11 files, 133 assertions** (`.sw` language: compiled + interpreter paths)
+- `make test-sw` — **50 files, 433 assertions** (`.sw` language: compiled + interpreter + `swc run` paths)
 - `make test-phase$p` for `p` in **2 through 9** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC (phase 8), distribution (phase 9); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 

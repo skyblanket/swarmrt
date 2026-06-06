@@ -1961,6 +1961,27 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     snprintf(err_file, sizeof(err_file), "%s/sw_stream_err_%d_%u.txt",
              sw_tmpdir(), sw_getpid_os(), sw_random_u32());
 
+    /* Stream-stall guard: if SWARM_CODE_STREAM_STALL_MS is set, convert it
+     * to seconds (minimum 10s, default 120s) and pass --speed-limit 1
+     * --speed-time <N> to curl.  This aborts with exit 28 if fewer than
+     * 1 byte/s arrives for N consecutive seconds of the live stream,
+     * without affecting normal bursty generation.  The existing exit-28
+     * trunc_marker + sw-level retry path in chat_native_retry handles the
+     * recovery automatically. */
+    int stall_secs = 120;
+    {
+        const char *stall_env = getenv("SWARM_CODE_STREAM_STALL_MS");
+        if (stall_env) {
+            long ms = atol(stall_env);
+            if (ms > 0) {
+                int s = (int)(ms / 1000);
+                stall_secs = (s < 10) ? 10 : s;
+            }
+        }
+    }
+    char stall_secs_str[16];
+    snprintf(stall_secs_str, sizeof(stall_secs_str), "%d", stall_secs);
+
     /* Build a curl ARGV (no shell — url/headers can't inject) with -N for
      * unbuffered streaming.
      * --keepalive-time 30: send TCP keepalives so flaky long-distance
@@ -1972,15 +1993,18 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      *   streaming). Catches transient SSL/connect timeouts (curl 28/35).
      * --max-time 1800: hard ceiling at 30 min — long reasoning is fine
      *   but eventually we want to surface a failure rather than hang.
+     * --speed-limit 1 --speed-time N: stream-stall guard — abort with
+     *   exit 28 if throughput drops below 1 byte/s for N seconds.
      * curl stderr is redirected to err_file by _sw_popen_argv. */
     char body_arg[300];
     snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
     int nhdr = (headers && headers->type == SW_VAL_LIST) ? headers->v.tuple.count : 0;
-    /* 19 fixed + 2 per header + (--data-binary, body_arg, url) + NULL.
-     * The "+2" over the prior 17 is the --write-out flag + format below,
-     * which routes the final HTTP status code to stderr (err_file) so we
-     * can detect non-2xx responses without polluting the SSE stdout. */
-    char **argv = (char **)malloc(sizeof(char *) * (19 + 2 * nhdr + 3 + 1));
+    /* 23 fixed + 2 per header + (--data-binary, body_arg, url) + NULL.
+     * +4 over the prior 19: --speed-limit, "1", --speed-time, stall_secs_str.
+     * The --write-out flag + format routes the final HTTP status code to
+     * stderr (err_file) so we can detect non-2xx responses without
+     * polluting the SSE stdout. */
+    char **argv = (char **)malloc(sizeof(char *) * (23 + 2 * nhdr + 3 + 1));
     char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
     int argc = 0, nhdr_alloc = 0;
     argv[argc++] = "curl";
@@ -2000,6 +2024,13 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     argv[argc++] = "1";
     argv[argc++] = "--retry-connrefused";
     argv[argc++] = "--retry-all-errors";
+    /* Stream-stall guard: abort if throughput < 1 byte/s for stall_secs.
+     * Triggers curl exit 28, same as --max-time, which the sw retry path
+     * already handles via the trunc_marker / chat_native_retry loop. */
+    argv[argc++] = "--speed-limit";
+    argv[argc++] = "1";
+    argv[argc++] = "--speed-time";
+    argv[argc++] = stall_secs_str;
     /* %{stderr} routes the write-out to stderr (curl >= 7.63), which we
      * already redirect to err_file. We parse "SW_HTTP_CODE:NNN" back out
      * after the stream closes to branch ok/error on non-2xx statuses. */
@@ -4862,12 +4893,23 @@ static sw_val_t *_json_parse_string(const char **pp) {
     return r;
 }
 
+/* Depth guard: nested arrays/objects recurse one C frame each on a 128KB fiber
+ * stack — ~800 levels of adversarial JSON (an LLM response, an HTTP body) used
+ * to SIGILL uncatchably. Count nesting at array/object entry; past the cap, set
+ * a thread-local abort that the element loops check, so the parse unwinds to a
+ * partial/nil value instead of crashing. */
+#define SW_JSON_MAX_DEPTH 256
+static __thread int g_json_depth = 0;
+static __thread int g_json_abort = 0;
+
 static sw_val_t *_json_parse_array(const char **pp) {
+    if (g_json_depth >= SW_JSON_MAX_DEPTH) { g_json_abort = 1; return sw_val_nil(); }
+    g_json_depth++;
     (*pp)++; /* skip [ */
     _json_skip_ws(pp);
     int cap = 64, cnt = 0;
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
-    while (**pp && **pp != ']') {
+    while (**pp && **pp != ']' && !g_json_abort) {
         items[cnt++] = _json_parse(pp);
         if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
         _json_skip_ws(pp);
@@ -4877,16 +4919,19 @@ static sw_val_t *_json_parse_array(const char **pp) {
     if (**pp == ']') (*pp)++;
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);
+    g_json_depth--;
     return r;
 }
 
 static sw_val_t *_json_parse_object(const char **pp) {
+    if (g_json_depth >= SW_JSON_MAX_DEPTH) { g_json_abort = 1; return sw_val_nil(); }
+    g_json_depth++;
     (*pp)++; /* skip { */
     _json_skip_ws(pp);
     int cap = 32, cnt = 0;
     sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
     sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
-    while (**pp && **pp != '}') {
+    while (**pp && **pp != '}' && !g_json_abort) {
         _json_skip_ws(pp);
         if (**pp != '"') break;
         /* Parse key as atom (for dot access) */
@@ -4906,6 +4951,7 @@ static sw_val_t *_json_parse_object(const char **pp) {
     sw_val_t *r = sw_val_map_new(keys, vals, cnt);
     free(keys);
     free(vals);
+    g_json_depth--;
     return r;
 }
 
@@ -4937,6 +4983,7 @@ static sw_val_t *_json_parse(const char **pp) {
 static sw_val_t *_builtin_json_decode(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *p = a[0]->v.str;
+    g_json_depth = 0; g_json_abort = 0;   /* reset the per-decode depth guard */
     return _json_parse(&p);
 }
 

@@ -21,8 +21,7 @@ is unset is skipped cleanly; you never need every key.
 # key from the named env var; an unset key => that model is SKIPped (no call,
 # no cost). Keys are referenced by env only — none are stored in this repo.
 export MOONSHOT_KEY=...        # Kimi K2.6 / K2.5 / moonshot-v1-32k (Moonshot)
-export OPENAI_API_KEY=...      # OpenAI GPT-4.1            (frontier-closed)
-export DEEPSEEK_API_KEY=...    # DeepSeek V4 (deepseek-chat)        (open)
+export OPENROUTER_API_KEY=...  # GPT-4.1 / Gemini 2.5 Flash / DeepSeek / Qwen (via OpenRouter)
 
 cd eval
 ./check_leakage.sh             # gate: fail-closed if the prompt leaks answers
