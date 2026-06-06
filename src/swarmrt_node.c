@@ -342,7 +342,10 @@ const char *sw_node_local_name(void) {
 void sw_send_dispatch(sw_val_t *target, sw_val_t *msg) {
     if (!target) return;
     if (target->type == SW_VAL_PID) {
-        sw_send_tagged(target->v.pid, SW_TAG_NONE, msg);
+        /* GC v1: deep-copy the value to the global heap so it survives the
+         * sender's arena being freed on exit (compiled send shares pointers
+         * cross-process — see [[swarmrt-gc-design]]). */
+        sw_send_value(target->v.pid, SW_TAG_NONE, msg);
     } else if (target->type == SW_VAL_REMOTE_PID && target->v.rpid.node) {
         uint8_t *buf = NULL;
         uint32_t blen = 0;
@@ -548,7 +551,10 @@ static void handle_remote_data(uint8_t *data, uint32_t len, sw_port_t *conn) {
         sw_val_t *msg = sw_unmarshal((const uint8_t *)payload, plen,
                                      hdr->from_node);
         free(payload);
-        sw_send_tagged(target, hdr->tag, msg);
+        /* GC v1: sw_unmarshal builds the value in the dist handler's arena;
+         * deep-copy to the global heap so it survives that process's teardown
+         * (and so the receiver doesn't alias the dist handler's arena). */
+        sw_send_value(target, hdr->tag, msg);
     } else if (target) {
         sw_send_tagged(target, hdr->tag, NULL);
     } else {

@@ -17,6 +17,12 @@
 #include <stdatomic.h>
 #include "swarmrt_phase5.h"
 
+/* GC v1: type-safe value-send (deep-copies the payload to the global heap).
+ * Declared locally as void* since this file treats payloads opaquely; the
+ * real signature (swarmrt_lang.h) is (sw_process_t*, uint64_t, sw_val_t*) —
+ * ABI-identical. Resolves to the strong impl in swarmrt_lang.c at link. */
+extern void sw_send_value(sw_process_t *to, uint64_t tag, void *v);
+
 /* ============================================================================
  * GENSTATEMACHINE IMPLEMENTATION
  *
@@ -322,7 +328,12 @@ int sw_pg_dispatch(const char *group, uint64_t tag, void *msg) {
     while (m) {
         if (m->proc && m->proc->state != SW_PROC_FREE &&
             m->proc->state != SW_PROC_EXITING) {
-            sw_send_tagged(m->proc, tag, msg);
+            /* GC v1: pubsub/telemetry broadcast — `msg` is an sw_val_t tuple
+             * built in the broadcaster's arena. Deep-copy PER subscriber (each
+             * needs its own global copy; sharing one would double-free if a
+             * subscriber exits with it still undelivered). NULL msg passes
+             * through (test_phase5 dispatches NULL). */
+            sw_send_value(m->proc, tag, msg);
             sent++;
         }
         m = m->next;

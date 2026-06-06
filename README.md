@@ -81,7 +81,7 @@ That's it. No package manager for the language, no language server install, no V
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
 | **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Process linking and monitoring. Versioned module registry with rollback for C embedders (no `sw`-level hot reload yet — see below). |
 | **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
-| **Avoiding language overhead** | One binary, no VM, no GC pauses, <10ms startup. (There's no tracing collector yet — values live until the **OS process** exits, not when an sw process does. Bounded/exiting programs are fine; a long-running high-throughput service accumulates memory and needs a periodic binary restart for now. A real per-process GC is the top roadmap item.) The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses, <10ms startup. (Memory model: each sw process has a **value arena** freed wholesale when that process exits — so the spawn-a-worker-per-task pattern reclaims, with peak RSS scaling with *concurrently-live* processes, not cumulative spawns (measured: 50k spawn-and-exit workers hold ~490 MB with the arena vs ~4.5 GB and climbing without it). Cross-process messages are deep-copied, BEAM-style. Not yet reclaimed: a single long-lived process that loops forever accumulates its own per-iteration garbage until it exits — prefer a worker-per-job shape; mid-life reclaim is the next GC step.) The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
 
 ---
 
@@ -227,7 +227,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | Subsystem | What it does |
 |---|---|
 | **Scheduler** | One OS thread per core. Per-scheduler run queue with 4 priority levels. Reduction-counted preemption. Work stealing between cores. |
-| **Process** | 2KB arena-allocated PCB + 128KB stack. Lock-free MPSC mailbox. Per-process heap, reclaimed at process exit (tracing GC on the roadmap). |
+| **Process** | 2KB arena-allocated PCB + 128KB stack. Lock-free MPSC mailbox. Per-process **value arena**, reclaimed wholesale at process exit; cross-process messages deep-copied (no shared heap). Mid-life reclaim for long-lived loops is the next GC step. |
 | **Behaviours** | GenServer, Supervisor, Task, GenStateMachine, ETS, Registry — all built on top of the bare `spawn`/`send`/`receive` primitives. |
 | **IO** | kqueue-based async ports. TCP accept/read/write as port messages. HTTP / WebSocket / Chrome DevTools as builtins. |
 | **Distribution** | Multi-node TCP message routing with automatic reconnection. Process linking across nodes. |

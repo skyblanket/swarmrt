@@ -182,11 +182,14 @@ static sw_val_t *_builtin_ets_put(sw_val_t **a, int n) {
     pthread_rwlock_wrlock(&t->lock);
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
-        if (_vets_key_eq(e->key, a[1])) { e->value = a[2]; pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }
+        /* GC v1: ETS is a cross-process store outliving the inserter, so its
+         * keys/values must live on the global heap (deep-copied), not in the
+         * inserting process's arena which is freed on its exit. */
+        if (_vets_key_eq(e->key, a[1])) { e->value = sw_val_deep_copy_global(a[2]); pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }
         e = e->next;
     }
     _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
-    ne->key = a[1]; ne->value = a[2]; ne->next = t->buckets[bucket];
+    ne->key = sw_val_deep_copy_global(a[1]); ne->value = sw_val_deep_copy_global(a[2]); ne->next = t->buckets[bucket];
     t->buckets[bucket] = ne;
     pthread_rwlock_unlock(&t->lock);
     /* ETS debug removed */
@@ -255,7 +258,7 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
                  * one in place would corrupt any caller still holding
                  * the previous reference. */
                 int64_t result = e->value->v.i + delta;
-                e->value = sw_val_int(result);
+                e->value = sw_val_deep_copy_global(sw_val_int(result));  /* GC v1: ETS store on global heap */
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_int(result);
             }
@@ -269,9 +272,9 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
      * later update on the same key mutates the caller's earlier
      * binding. Matches Erlang's update_counter/4 semantics. */
     int64_t seeded = initial + delta;
-    sw_val_t *stored = sw_val_int(seeded);
+    sw_val_t *stored = sw_val_deep_copy_global(sw_val_int(seeded));  /* GC v1: ETS store on global heap */
     _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
-    ne->key = a[1]; ne->value = stored; ne->next = t->buckets[bucket];
+    ne->key = sw_val_deep_copy_global(a[1]); ne->value = stored; ne->next = t->buckets[bucket];
     t->buckets[bucket] = ne;
     pthread_rwlock_unlock(&t->lock);
     return sw_val_int(seeded);
@@ -289,7 +292,7 @@ static sw_val_t *_builtin_ets_cas(sw_val_t **a, int n) {
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
             if (_vets_key_eq(e->value, a[2])) {
-                e->value = a[3];
+                e->value = sw_val_deep_copy_global(a[3]);  /* GC v1: ETS store on global heap */
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("true");
             }
@@ -363,7 +366,7 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
     e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
-            e->value = new_val;
+            e->value = sw_val_deep_copy_global(new_val);  /* GC v1: ETS store on global heap */
             pthread_rwlock_unlock(&t->lock);
             return new_val;
         }
@@ -1735,7 +1738,7 @@ static void _stream_out_send_tagged(sw_process_t *target, const char *tag,
     items[1] = sw_val_string(name);
     items[2] = sw_val_string(text);
     sw_val_t *msg = sw_val_tuple(items, 3);
-    sw_send_tagged(target, SW_TAG_NONE, msg);
+    sw_send_value(target, SW_TAG_NONE, msg);   /* GC v1: copy off sender arena */
 }
 
 static void _stream_out_flush(_stream_out_t *o) {
@@ -2877,7 +2880,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         items[0] = sw_val_atom("stream_done");
         items[1] = sw_val_string(so.name);
         sw_val_t *msg = sw_val_tuple(items, 2);
-        sw_send_tagged(so.target, SW_TAG_NONE, msg);
+        sw_send_value(so.target, SW_TAG_NONE, msg);   /* GC v1: copy off sender arena */
     }
     return result;
 }
@@ -2930,7 +2933,10 @@ static sw_val_t *_builtin_supervise(sw_val_t **a, int n) {
             snprintf(specs[valid].name, 63, "child_%d", i);
 
         _sup_child_closure_t *c = (_sup_child_closure_t *)malloc(sizeof(_sup_child_closure_t));
-        c->fn = fn_v;
+        /* GC v1: the supervisor outlives the caller and re-applies fn on every
+         * restart — deep-copy the closure to the global heap so it survives the
+         * caller's arena being freed. */
+        c->fn = fn_v ? sw_val_deep_copy_global(fn_v) : NULL;
         specs[valid].start_func = _sup_child_entry;
         specs[valid].start_arg = c;
         specs[valid].restart = SW_PERMANENT;
@@ -3004,7 +3010,9 @@ static sw_val_t *_builtin_sup_start_child(sw_val_t **a, int n) {
         spec.name[0] = '\0'; /* anonymous */
 
     _sup_child_closure_t *c = (_sup_child_closure_t *)malloc(sizeof(_sup_child_closure_t));
-    c->fn = fn_v;
+    /* GC v1: deep-copy the closure — the dynamic supervisor holds it for
+     * restarts beyond the caller's lifetime (see static supervise above). */
+    c->fn = fn_v ? sw_val_deep_copy_global(fn_v) : NULL;
     spec.start_func = _sup_child_entry;
     spec.start_arg = c;
     spec.restart = SW_PERMANENT;
@@ -5119,7 +5127,9 @@ static void _after_entry(void *raw) {
 static sw_val_t *_builtin_delay(sw_val_t **a, int n) {
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1]) return sw_val_nil();
     _timer_closure_t *c = (_timer_closure_t *)malloc(sizeof(_timer_closure_t));
-    c->fn = a[1];
+    /* GC v1: the timer process fires fn after the caller may have exited —
+     * deep-copy the closure to the global heap so it survives. */
+    c->fn = sw_val_deep_copy_global(a[1]);
     c->ms = (uint64_t)a[0]->v.i;
     sw_process_t *p = sw_spawn(_after_entry, c);
     return p ? sw_val_pid(p) : sw_val_nil();
@@ -5137,7 +5147,9 @@ static void _every_entry(void *raw) {
 static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1]) return sw_val_nil();
     _timer_closure_t *c = (_timer_closure_t *)malloc(sizeof(_timer_closure_t));
-    c->fn = a[1];
+    /* GC v1: the interval process re-applies fn forever, past the caller's
+     * lifetime — deep-copy the closure to the global heap. */
+    c->fn = sw_val_deep_copy_global(a[1]);
     c->ms = (uint64_t)a[0]->v.i;
     sw_process_t *p = sw_spawn(_every_entry, c);
     return p ? sw_val_pid(p) : sw_val_nil();
@@ -6140,7 +6152,7 @@ static void _llm_stream_entry(void *raw) {
         sw_val_t *items[2];
         items[0] = sw_val_atom("llm_done");
         items[1] = sw_val_string("error: failed to start curl");
-        sw_send_tagged(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));
+        sw_send_value(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
         goto cleanup;
     }
 
@@ -6202,7 +6214,7 @@ static void _llm_stream_entry(void *raw) {
             sw_val_t *items[2];
             items[0] = sw_val_atom("llm_token");
             items[1] = sw_val_string(token);
-            sw_send_tagged(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));
+            sw_send_value(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
         }
     }
 
@@ -6213,7 +6225,7 @@ static void _llm_stream_entry(void *raw) {
         sw_val_t *items[2];
         items[0] = sw_val_atom("llm_done");
         items[1] = sw_val_string(full_text);
-        sw_send_tagged(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));
+        sw_send_value(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
     }
     free(full_text);
 
@@ -7666,13 +7678,13 @@ static void _sw_wsc_reader_entry(void *raw) {
             items[0] = sw_val_atom("wsc_message");
             items[1] = sw_val_int(handle);
             items[2] = frame;   /* the recv'd string value (already owned) */
-            sw_send_tagged(owner, SW_TAG_NONE, sw_val_tuple(items, 3));
+            sw_send_value(owner, SW_TAG_NONE, sw_val_tuple(items, 3));   /* GC v1: copy off worker arena */
         } else {
             /* Close / error → notify once and tear the slot down ourselves. */
             sw_val_t *items[2];
             items[0] = sw_val_atom("wsc_close");
             items[1] = sw_val_int(handle);
-            sw_send_tagged(owner, SW_TAG_NONE, sw_val_tuple(items, 2));
+            sw_send_value(owner, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
             if (handle >= 0 && handle < _SW_WSC_MAX && _sw_wsc[handle].used) {
                 int fd = _sw_wsc[handle].fd;
                 _sw_wsc_free_slot(handle);   /* frees SSL/CTX if TLS */

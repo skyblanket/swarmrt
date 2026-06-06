@@ -162,7 +162,7 @@ static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint
         items[0] = sw_val_atom("ws_binary");
         items[1] = sw_val_int(cid);
         items[2] = sw_val_string(b64);
-        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
+        sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
         free(b64);
     } else {
         /* text */
@@ -174,7 +174,7 @@ static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint
         items[0] = sw_val_atom("ws_message");
         items[1] = sw_val_int(cid);
         items[2] = sw_val_string(text);
-        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
+        sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
         free(text);
     }
 }
@@ -269,7 +269,7 @@ static void ws_try_parse(int cid) {
             sw_val_t *items[2];
             items[0] = sw_val_atom("ws_close");
             items[1] = sw_val_int(cid);
-            sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 2));
+            sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 2));
 
             /* Echo close frame back */
             uint8_t close_frame[2] = {0x88, 0x00};
@@ -524,7 +524,7 @@ static void http_try_parse(int cid) {
         items[0] = sw_val_atom("ws_connect");
         items[1] = sw_val_int(cid);
         items[2] = sw_val_string(path);
-        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
+        sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
         return;
     }
 
@@ -563,7 +563,7 @@ static void http_try_parse(int cid) {
          * pointer — the delivered message keeps it alive. */
         items[4] = c->req_headers ? c->req_headers : sw_val_map_new(NULL, NULL, 0);
         items[5] = sw_val_string(body_str);
-        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
+        sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
         c->req_headers = NULL;
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         if (body_buf) free(body_buf);
@@ -604,7 +604,7 @@ deliver_body:
          * the body was buffered). Hand off by reference, then drop. */
         items[4] = c->req_headers ? c->req_headers : sw_val_map_new(NULL, NULL, 0);
         items[5] = sw_val_string(body_buf);
-        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
+        sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
         c->req_headers = NULL;
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         free(body_buf);
@@ -649,7 +649,7 @@ static void conn_on_close(int cid) {
         sw_val_t *items[2];
         items[0] = sw_val_atom("ws_close");
         items[1] = sw_val_int(cid);
-        sw_send_tagged(c->handler, SW_TAG_NONE, sw_val_tuple(items, 2));
+        sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 2));
     }
 
     conn_free(cid);

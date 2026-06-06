@@ -62,6 +62,7 @@ typedef enum {
 struct sw_process;
 struct sw_scheduler;
 struct sw_swarm;
+struct sw_value_arena;   /* GC v1 per-process value arena (swarmrt_varena.h) */
 typedef struct sw_process sw_process_t;
 typedef struct sw_scheduler sw_scheduler_t;
 typedef struct sw_swarm sw_swarm_t;
@@ -250,6 +251,13 @@ struct sw_process {
     /* === Arena allocation === */
     uint32_t arena_slot;      /* Index into proc_slab */
     uint32_t heap_block_idx;  /* Index into block pool */
+
+    /* === GC v1: per-process VALUE arena ===
+     * All sw_val_t this process builds while running live here; freed
+     * wholesale in process_destroy. NULL until process_init_arena creates
+     * it (and for the interpreter, which has no scheduler). Distinct from
+     * `heap` above (the dead bump-block). See [[swarmrt-gc-design]]. */
+    struct sw_value_arena *varena;
     
     /* === Run queue link (MPSC intrusive) === */
     _Atomic(sw_process_t *) rq_next;  /* Atomic for lock-free MPSC push */

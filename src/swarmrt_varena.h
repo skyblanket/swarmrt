@@ -1,0 +1,58 @@
+/* swarmrt_varena.h — per-process VALUE arena (GC v1).
+ *
+ * Distinct from swarmrt_arena.h (that one is the mmap'd process-slab / block
+ * pool for zero-syscall spawning). This is a bump-allocated region attached
+ * to each runtime process holding the sw_val_t nodes and owned blobs
+ * (strings, tuple/list spines, map keys/vals, bytes) that the process builds
+ * while running. On process exit (process_destroy) the whole varena is freed
+ * in O(chunks) — no tracing, no refcounting, no relocation.
+ *
+ * SINGLE-WRITER: only the owning fiber allocates into it (a fiber never runs
+ * concurrently with itself). Values that escape a process (sent messages,
+ * spawn captures, ETS entries) are deep-copied to the GLOBAL heap at the
+ * escape boundary, so no other thread touches this varena. Hence no lock.
+ *
+ * See [[swarmrt-gc-design]] in memory for the full design + escape audit.
+ */
+#ifndef SWARMRT_VARENA_H
+#define SWARMRT_VARENA_H
+
+#include <stddef.h>
+
+typedef struct sw_varena_chunk {
+    struct sw_varena_chunk *next;  /* previous chunk (singly-linked stack) */
+    size_t used;
+    size_t cap;
+    /* `cap` bytes of storage follow this header inline. */
+} sw_varena_chunk_t;
+
+typedef struct sw_value_arena {
+    sw_varena_chunk_t *head;       /* current (most-recent) chunk */
+    size_t total_bytes;            /* stat: bytes handed out */
+    size_t chunk_count;            /* stat: number of chunks */
+} sw_value_arena_t;
+
+/* Create a value arena with an initial chunk of at least `first_chunk`
+ * bytes. Returns NULL on OOM (callers fall back to global calloc). */
+sw_value_arena_t *sw_varena_create(size_t first_chunk);
+
+/* Bump-allocate `n` bytes, 16-byte aligned. NOT zeroed (callers that need
+ * zeroing — e.g. value nodes — memset themselves). Returns NULL on OOM. */
+void *sw_varena_alloc(sw_value_arena_t *a, size_t n);
+
+/* strdup / memdup into the arena. */
+char *sw_varena_strdup(sw_value_arena_t *a, const char *s);
+void *sw_varena_memdup(sw_value_arena_t *a, const void *src, size_t n);
+
+/* Free every chunk and the arena header. After this the pointer is dead.
+ * Build with -DSW_ARENA_POISON to fill freed chunks with 0xDE so any
+ * escaped pointer that slipped past the copy-on-escape audit faults loudly. */
+void sw_varena_free_all(sw_value_arena_t *a);
+
+/* The current process's value arena, or NULL when there is none (the
+ * interpreter, the REPL, or builtins running before any fiber). The value
+ * constructors route allocations here. Strong impl in swarmrt_native.c reads
+ * tls_current->varena; a weak stub in swarmrt_lang.c covers runtime-less links. */
+sw_value_arena_t *sw_self_varena(void);
+
+#endif /* SWARMRT_VARENA_H */

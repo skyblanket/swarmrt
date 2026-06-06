@@ -42,6 +42,7 @@
 #include "swarmrt_ets.h"
 #include "swarmrt_phase5.h"
 #include "swarmrt_hotload.h"
+#include "swarmrt_varena.h"   /* GC v1 per-process value arena */
 
 /* === Global State === */
 sw_swarm_t *g_swarm = NULL;
@@ -431,6 +432,19 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->stop = NULL;
     proc->heap_block_idx = block_idx;
 
+    /* GC v1 LIVE: per-process value arena. Every sw_val_t this fiber builds
+     * lives here and is freed wholesale in process_destroy. Every value that
+     * escapes the process (send/spawn/ETS/supervisor/timer/dist) is deep-copied
+     * to the global heap at the boundary, so freeing this arena is safe. NULL
+     * on OOM → val_alloc falls back to the global heap (pre-GC behaviour).
+     * SW_GC_OFF=1 in the environment reverts to that pre-GC behaviour wholesale
+     * (escape hatch + A/B harness; sampled once, cached). */
+    {
+        static int gc_off = -1;
+        if (gc_off < 0) gc_off = getenv("SW_GC_OFF") ? 1 : 0;
+        proc->varena = gc_off ? NULL : sw_varena_create(8192);
+    }
+
     /* Core fields */
     proc->entry = entry;
     proc->arg = arg;
@@ -580,6 +594,15 @@ static void process_destroy(sw_process_t *proc) {
     /* Free the panic_msg string set by sw_process_panic. */
     free(proc->panic_msg);
     proc->panic_msg = NULL;
+
+    /* GC v1: reclaim this process's whole value arena in O(chunks). Runs after
+     * the fiber has returned, so there are no live sw_val_t* C-stack roots.
+     * Every value that escaped this process was deep-copied to the global heap
+     * at the send/spawn/ETS boundary, so nothing else aliases these chunks. */
+    if (proc->varena) {
+        sw_varena_free_all(proc->varena);
+        proc->varena = NULL;
+    }
 
     /* Return block and slot to the current scheduler's partition
      * immediately. The slot-reuse race (R2-#4) is now closed by the
@@ -1494,6 +1517,12 @@ void sw_process_kill(sw_process_t *proc, int reason) {
 
 sw_process_t *sw_self(void) {
     return tls_current;
+}
+
+/* GC v1: the running process's value arena (NULL outside a fiber). The value
+ * constructors in swarmrt_lang.c route allocations here. */
+sw_value_arena_t *sw_self_varena(void) {
+    return tls_current ? tls_current->varena : NULL;
 }
 
 uint64_t sw_getpid(void) {

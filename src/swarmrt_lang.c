@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include "swarmrt_lang.h"
 #include "swarmrt_ets.h"
+#include "swarmrt_varena.h"  /* per-process value arena (GC v1) */
 #include "swarmrt_audio.h"   /* G.711 / PCM16 / resample for REPL+test parity */
 
 /* ed25519_verify lives in swarmrt_builtins_studio.h for the compiled path, but
@@ -119,6 +120,10 @@ static sw_val_t *_sw_lang_ed25519_verify(sw_val_t **args, int nargs) {
 __attribute__((weak)) void *sw_receive_any(uint64_t t, uint64_t *tag) { (void)t; (void)tag; return NULL; }
 __attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) { (void)to; (void)tag; (void)msg; }
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
+/* Returns the current process's value arena, or NULL (interpreter / pre-fiber).
+ * Strong impl in swarmrt_native.c reads tls_current->varena; this weak stub
+ * keeps swc linkable without the runtime and makes the interpreter use calloc. */
+__attribute__((weak)) sw_value_arena_t *sw_self_varena(void) { return NULL; }
 
 /* =========================================================================
  * Lexer
@@ -1779,7 +1784,7 @@ static node_t *par_module(par_t *p) {
         if (p->cur.type == TOK_IMPORT) {
             par_adv(p);
             tok_t iname = par_expect(p, TOK_IDENT, "module name");
-            if (mod->v.mod.nimports < 16)
+            if (mod->v.mod.nimports < 32)
                 strncpy(mod->v.mod.imports[mod->v.mod.nimports++], iname.text, 127);
         } else { /* TOK_EXPORT */
             par_adv(p);
@@ -1845,33 +1850,79 @@ static node_t *par_expr_string(const char *src) {
 int    sw_prog_argc = 0;
 char **sw_prog_argv = NULL;
 
+/* === GC v1: per-process value arena (see [[swarmrt-gc-design]]) ===========
+ *
+ * Every value constructor allocates through val_alloc/val_strdup/val_memdup.
+ * Allocation target is chosen at call time:
+ *   1. g_alloc_force_global set  -> global heap (calloc/strdup). Used by
+ *      sw_val_deep_copy_global so values that ESCAPE a process (sent messages,
+ *      spawn captures, ETS entries) land on the global heap and survive the
+ *      sender's arena being freed on exit.
+ *   2. else sw_self()->varena    -> the running process's arena (compiled
+ *      backend); freed wholesale in process_destroy.
+ *   3. else                      -> global heap (interpreter / REPL / pre-fiber
+ *      builtins, where sw_self()==NULL — leaks until OS exit, as before).
+ *
+ * The flag is thread-local: a fiber never runs concurrently with itself, and
+ * escapes go to the global heap (never another process's arena), so the arena
+ * is single-writer and needs no lock. */
+static __thread int g_alloc_force_global = 0;
+
+/* Allocate a value node / owned blob. Routes to the running process's arena
+ * (compiled backend, freed wholesale on process exit) unless a copy-on-escape
+ * is in progress (force_global) or there is no current arena (interpreter /
+ * pre-fiber), in which case it falls back to the global heap exactly as before.
+ * val_alloc zeroes (constructors rely on calloc semantics). */
+static inline void *val_alloc(size_t n) {
+    if (!g_alloc_force_global) {
+        sw_value_arena_t *a = sw_self_varena();
+        if (a) {
+            void *p = sw_varena_alloc(a, n);
+            if (p) { memset(p, 0, n); return p; }
+        }
+    }
+    return calloc(1, n);
+}
+
+static inline char *val_strdup(const char *s) {
+    if (!s) return NULL;
+    if (!g_alloc_force_global) {
+        sw_value_arena_t *a = sw_self_varena();
+        if (a) {
+            char *p = sw_varena_strdup(a, s);
+            if (p) return p;
+        }
+    }
+    return strdup(s);
+}
+
 sw_val_t *sw_val_nil(void) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_NIL;
     return v;
 }
 
 sw_val_t *sw_val_int(int64_t i) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_INT; v->v.i = i;
     return v;
 }
 
 sw_val_t *sw_val_float(double f) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_FLOAT; v->v.f = f;
     return v;
 }
 
 sw_val_t *sw_val_string(const char *s) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
-    v->type = SW_VAL_STRING; v->v.str = strdup(s);
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_STRING; v->v.str = val_strdup(s);
     return v;
 }
 
 sw_val_t *sw_val_atom(const char *s) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
-    v->type = SW_VAL_ATOM; v->v.str = strdup(s);
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_ATOM; v->v.str = val_strdup(s);
     return v;
 }
 
@@ -1881,16 +1932,16 @@ sw_val_t *sw_val_atom(const char *s) {
  * malloc(0): len==0 still allocates 1 byte so `data` is non-NULL and
  * free()/memcmp() need no special-casing. */
 sw_val_t *sw_val_bytes(const uint8_t *data, size_t len) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_BYTES;
     v->v.bytes.len = len;
-    v->v.bytes.data = malloc(len ? len : 1);
+    v->v.bytes.data = val_alloc(len ? len : 1);
     if (len && data) memcpy(v->v.bytes.data, data, len);
     return v;
 }
 
 sw_val_t *sw_val_pid(sw_process_t *p) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_PID; v->v.pid = p;
     return v;
 }
@@ -1901,26 +1952,26 @@ sw_val_t *sw_val_pid(sw_process_t *p) {
  * through sw_node_send_pid. Constructed by sw_unmarshal when a
  * SW_MARSHAL_PID is decoded out of a wire message. */
 sw_val_t *sw_val_remote_pid(const char *node, uint64_t id) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_REMOTE_PID;
-    v->v.rpid.node = node ? strdup(node) : NULL;
+    v->v.rpid.node = node ? val_strdup(node) : NULL;
     v->v.rpid.id = id;
     return v;
 }
 
 sw_val_t *sw_val_tuple(sw_val_t **items, int count) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_TUPLE;
-    v->v.tuple.items = malloc(sizeof(sw_val_t*) * count);
+    v->v.tuple.items = val_alloc(sizeof(sw_val_t*) * count);
     memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
     v->v.tuple.count = count;
     return v;
 }
 
 sw_val_t *sw_val_list(sw_val_t **items, int count) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_LIST;
-    v->v.tuple.items = malloc(sizeof(sw_val_t*) * count);
+    v->v.tuple.items = val_alloc(sizeof(sw_val_t*) * count);
     memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
     v->v.tuple.count = count;
     return v;
@@ -1928,13 +1979,13 @@ sw_val_t *sw_val_list(sw_val_t **items, int count) {
 
 sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_FUN;
     v->v.fun.cfunc = fn_ptr;
     v->v.fun.num_params = nparams;
     v->v.fun.ncaptures = ncaptures;
     if (ncaptures > 0 && captures) {
-        v->v.fun.captures = malloc(sizeof(sw_val_t*) * ncaptures);
+        v->v.fun.captures = val_alloc(sizeof(sw_val_t*) * ncaptures);
         memcpy(v->v.fun.captures, captures, sizeof(sw_val_t*) * ncaptures);
     }
     return v;
@@ -2014,13 +2065,98 @@ sw_val_t *sw_now_iso(void) {
     return sw_val_string(s);
 }
 
+/* === Deep copy to the global heap (GC v1 copy-on-escape) ===================
+ *
+ * Rebuild the whole value DAG on the global heap so it survives the source
+ * process's arena being freed. No memoization: there are no cycles (all
+ * constructors build bottom-up) and DAG-shared subvalues copy as a tree, so
+ * the result is alias-free and sw_val_free can recurse it safely. A depth
+ * cap (matching the marshal/json limits) guards pathological nesting against
+ * fiber-stack overflow.
+ *
+ * PIDs copy by value (the slab pointer outlives any one process). Compiled
+ * closures (cfunc + captures) copy the cfunc and deep-copy each capture;
+ * interpreter closures (body AST + closure_env) never reach here (they exist
+ * only in the single-process interpreter, which has no arena to free). */
+#define SW_COPY_MAX_DEPTH 256
+
+static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
+    if (!v) return sw_val_nil();
+    if (depth > SW_COPY_MAX_DEPTH) return sw_val_nil();
+    switch (v->type) {
+    case SW_VAL_NIL:    return sw_val_nil();
+    case SW_VAL_INT:    return sw_val_int(v->v.i);
+    case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
+    case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
+    case SW_VAL_ATOM:   return sw_val_atom(v->v.str ? v->v.str : "");
+    case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
+    case SW_VAL_PID:    return sw_val_pid(v->v.pid);
+    case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
+    case SW_VAL_TUPLE:
+    case SW_VAL_LIST: {
+        int n = v->v.tuple.count;
+        sw_val_t **items = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
+        for (int i = 0; i < n; i++)
+            items[i] = deep_copy_rec(v->v.tuple.items[i], depth + 1);
+        sw_val_t *r = (v->type == SW_VAL_TUPLE)
+                          ? sw_val_tuple(items, n)
+                          : sw_val_list(items, n);
+        free(items);
+        return r;
+    }
+    case SW_VAL_MAP: {
+        int n = v->v.map.count;
+        sw_val_t **ks = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
+        sw_val_t **vs = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
+        for (int i = 0; i < n; i++) {
+            ks[i] = deep_copy_rec(v->v.map.keys[i], depth + 1);
+            vs[i] = deep_copy_rec(v->v.map.vals[i], depth + 1);
+        }
+        sw_val_t *r = sw_val_map_new(ks, vs, n);
+        free(ks); free(vs);
+        return r;
+    }
+    case SW_VAL_FUN: {
+        int nc = v->v.fun.ncaptures;
+        sw_val_t **caps = (nc > 0) ? malloc(sizeof(sw_val_t *) * nc) : NULL;
+        for (int i = 0; i < nc; i++)
+            caps[i] = deep_copy_rec(v->v.fun.captures[i], depth + 1);
+        sw_val_t *r = sw_val_fun_native(v->v.fun.cfunc, v->v.fun.num_params, caps, nc);
+        free(caps);
+        return r;
+    }
+    default: return sw_val_nil();
+    }
+}
+
+sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
+    int save = g_alloc_force_global;
+    g_alloc_force_global = 1;
+    sw_val_t *r = deep_copy_rec(v, 0);
+    g_alloc_force_global = save;
+    return r;
+}
+
+/* sw_send_value: enqueue an sw_val_t VALUE message, deep-copied to the global
+ * heap so it outlives the sender's arena (GC v1 copy-on-send). This is the
+ * type-safe choke point for every value send — its sw_val_t* parameter makes
+ * passing a runtime struct (sw_call_t*, port/hotload structs, …) a compile
+ * error, so those keep using the generic void* sw_send_tagged untouched.
+ * Runs in the sender's context; the copy lands on the global heap regardless
+ * of which process is current. NULL payload passes through unchanged (matches
+ * the prior sw_send_tagged contract). */
+void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v) {
+    if (!to) return;
+    sw_send_tagged(to, tag, v ? sw_val_deep_copy_global(v) : NULL);
+}
+
 sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {
-    sw_val_t *v = calloc(1, sizeof(sw_val_t));
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_MAP;
     v->v.map.count = count;
     v->v.map.cap = count > 4 ? count : 4;
-    v->v.map.keys = malloc(sizeof(sw_val_t*) * v->v.map.cap);
-    v->v.map.vals = malloc(sizeof(sw_val_t*) * v->v.map.cap);
+    v->v.map.keys = val_alloc(sizeof(sw_val_t*) * v->v.map.cap);
+    v->v.map.vals = val_alloc(sizeof(sw_val_t*) * v->v.map.cap);
     if (count > 0 && keys && vals) {
         memcpy(v->v.map.keys, keys, sizeof(sw_val_t*) * count);
         memcpy(v->v.map.vals, vals, sizeof(sw_val_t*) * count);
@@ -4594,7 +4730,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
 
     case N_FUN: {
         /* Anonymous function: capture closure env */
-        sw_val_t *v = calloc(1, sizeof(sw_val_t));
+        sw_val_t *v = val_alloc(sizeof(sw_val_t));
         v->type = SW_VAL_FUN;
         v->v.fun.name = strdup(n->v.fun.name);
         v->v.fun.num_params = n->v.fun.nparams;

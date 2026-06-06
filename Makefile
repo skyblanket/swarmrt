@@ -58,7 +58,7 @@ EXAMPLES_DIR = examples
 # Core object files (needed by all native targets since process_exit hooks into all modules)
 CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
             swarmrt_phase4 swarmrt_phase5 swarmrt_hotload swarmrt_io swarmrt_gc swarmrt_node \
-            swarmrt_lang swarmrt_http swarmrt_pdf
+            swarmrt_lang swarmrt_http swarmrt_pdf swarmrt_varena
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
@@ -264,7 +264,7 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_task.c $(SRC_DIR)/swarmrt_ets.c $(SRC_DIR)/swarmrt_phase4.c \
            $(SRC_DIR)/swarmrt_phase5.c $(SRC_DIR)/swarmrt_hotload.c $(SRC_DIR)/swarmrt_io.c \
            $(SRC_DIR)/swarmrt_gc.c $(SRC_DIR)/swarmrt_node.c $(SRC_DIR)/swarmrt_lang.c \
-           $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c
+           $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 
 .PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http
@@ -287,6 +287,20 @@ fuzz-http: dirs
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
 
 fuzz: fuzz-parse fuzz-marshal fuzz-http
+
+# GC v1 correctness gate: the copy-on-escape stress harness compiled with ASAN +
+# SW_ARENA_POISON. Workers build compound values in their per-process arenas,
+# hand them to longer-lived readers (parent / ETS / pmap / task_stream), then
+# exit — freeing + poisoning (0xDE) their arena. A missed deep-copy at any escape
+# boundary surfaces as an ASAN use-after-free or a 0xDE-garbage content assert.
+# Emits the generated C, compiles it + the runtime under the sanitizers, runs it.
+.PHONY: gc-stress
+gc-stress: swc libswarmrt
+	@./bin/swc build --emit-c tests/sw/test_uaf_stress.sw -o $(BIN_DIR)/_gc_stress_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/sw/test_uaf_stress.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_stress $(LDFLAGS)
+	@rm -f tests/sw/test_uaf_stress.gen.c $(BIN_DIR)/_gc_stress_emit
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_stress
 
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every

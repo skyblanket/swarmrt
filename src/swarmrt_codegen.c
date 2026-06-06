@@ -1264,7 +1264,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    sw_val_t *result = sw_val_apply(w->fn, arg, 1);\n"
         "    sw_val_t *ti[] = {sw_val_int(w->idx), result};\n"
         "    sw_val_t *msg = sw_val_tuple(ti, 2);\n"
-        "    sw_send_tagged(w->caller, 11, msg);\n"
+        "    sw_send_value(w->caller, 11, msg);\n"  /* GC v1: copy result off the dying worker's arena */
         "    free(w);\n"
         "}\n"
         "static sw_val_t *_builtin_pmap(sw_val_t **a, int n) {\n"
@@ -1284,7 +1284,10 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    sw_val_t **res = calloc(cnt, sizeof(sw_val_t*));\n"
         "    for (int i = 0; i < cnt; i++) {\n"
         "        _pmap_w_t *w = malloc(sizeof(_pmap_w_t));\n"
-        "        w->fn = fn; w->item = lst->v.tuple.items[i];\n"
+        /* GC v1: copy fn + item off the caller's arena. The caller blocks on
+         * the result, but its receive can time out (5s) and the caller then
+         * exit while a slow worker still holds these pointers. */
+        "        w->fn = sw_val_deep_copy_global(fn); w->item = sw_val_deep_copy_global(lst->v.tuple.items[i]);\n"
         "        w->caller = self; w->idx = i;\n"
         "        sw_spawn(_pmap_entry, w);\n"
         "    }\n"
@@ -2276,7 +2279,9 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         emit_expr(ctx, inner, 0, fn_val, sizeof(fn_val));
         char pv[32];
         fresh_var(ctx, pv, sizeof(pv));
-        fprintf(f, "    sw_process_t *%s = sw_spawn(_sw_lambda_spawn_trampoline, %s);\n",
+        /* GC v1: deep-copy the closure (+ its captures) to the global heap so
+         * the child can read it after the parent's arena is freed on exit. */
+        fprintf(f, "    sw_process_t *%s = sw_spawn(_sw_lambda_spawn_trampoline, sw_val_deep_copy_global(%s));\n",
                 pv, fn_val);
         emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
         return;
@@ -2310,11 +2315,13 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     fprintf(f, "    _%s_sp%d_t *%s = malloc(sizeof(_%s_sp%d_t));\n",
             ctx->mod_name, sp_id, sa, ctx->mod_name, sp_id);
 
-    /* Evaluate and assign spawn arguments */
+    /* Evaluate and assign spawn arguments. GC v1: deep-copy each to the global
+     * heap — the child reads them after the parent may have exited and freed
+     * its arena (the captures point into the parent's arena otherwise). */
     for (int i = 0; i < sp->nargs; i++) {
         char arg[32];
         emit_expr(ctx, inner->v.call.args[i], 0, arg, sizeof(arg));
-        fprintf(f, "    %s->a%d = %s;\n", sa, i, arg);
+        fprintf(f, "    %s->a%d = sw_val_deep_copy_global(%s);\n", sa, i, arg);
     }
 
     char pv[32];

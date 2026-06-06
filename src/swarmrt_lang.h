@@ -176,6 +176,15 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures);
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
 
+/* GC v1: deep-copy a value to the GLOBAL heap (copy-on-escape) so it
+ * outlives the source process's arena. See [[swarmrt-gc-design]]. */
+sw_val_t *sw_val_deep_copy_global(sw_val_t *v);
+
+/* GC v1: type-safe value-send choke point — deep-copies the payload to the
+ * global heap, then enqueues via sw_send_tagged. Route every sw_val_t* send
+ * through this (struct sends keep using sw_send_tagged directly). */
+void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v);
+
 /* Shared builtin helpers — one impl, called by both backends (see swarmrt_lang.c). */
 sw_val_t *sw_coerce_int(sw_val_t *v);    /* to_int:   string/float/int -> int  | nil */
 sw_val_t *sw_coerce_float(sw_val_t *v);  /* to_float: string/int/float -> float | nil */
@@ -227,7 +236,7 @@ typedef struct node {
     union {
         /* N_MODULE */
         struct { char name[128]; struct node **funs; int nfuns;
-                 char imports[16][128]; int nimports;
+                 char imports[32][128]; int nimports;
                  /* Module-level immutable globals: let x = literal */
                  struct { char name[128]; struct node *val; } globals[16];
                  int nglobals; } mod;
