@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sqlite3.h>
@@ -1957,6 +1958,62 @@ sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
     return fn(args, nargs);
 }
 
+/* === Shared builtin helpers (ONE impl, called by BOTH the interpreter and the
+ * compiled runtime, so the backends can't drift). =========================== */
+
+/* to_int(v): parse a string/atom, truncate a float, pass an int. nil on a
+ * non-numeric string (a clear "couldn't parse", not a silent 0). */
+sw_val_t *sw_coerce_int(sw_val_t *v) {
+    if (!v) return sw_val_nil();
+    if (v->type == SW_VAL_INT)   return sw_val_int(v->v.i);
+    if (v->type == SW_VAL_FLOAT) return sw_val_int((int64_t)v->v.f);
+    if ((v->type == SW_VAL_STRING || v->type == SW_VAL_ATOM) && v->v.str) {
+        char *end = NULL;
+        long long x = strtoll(v->v.str, &end, 10);
+        if (end == v->v.str) return sw_val_nil();   /* no digits consumed */
+        return sw_val_int((int64_t)x);
+    }
+    return sw_val_nil();
+}
+
+/* to_float(v): parse a string/atom, or widen/pass a number. nil on non-numeric. */
+sw_val_t *sw_coerce_float(sw_val_t *v) {
+    if (!v) return sw_val_nil();
+    if (v->type == SW_VAL_INT)   return sw_val_float((double)v->v.i);
+    if (v->type == SW_VAL_FLOAT) return sw_val_float(v->v.f);
+    if ((v->type == SW_VAL_STRING || v->type == SW_VAL_ATOM) && v->v.str) {
+        char *end = NULL;
+        double x = strtod(v->v.str, &end);
+        if (end == v->v.str) return sw_val_nil();
+        return sw_val_float(x);
+    }
+    return sw_val_nil();
+}
+
+/* uuid(): a random RFC-4122 v4 UUID string. */
+sw_val_t *sw_make_uuid(void) {
+    uint8_t b[16];
+    arc4random_buf(b, sizeof(b));
+    b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);   /* version 4 */
+    b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);   /* variant 1 */
+    char s[37];
+    snprintf(s, sizeof(s),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+        b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+    return sw_val_string(s);
+}
+
+/* now_iso(): current UTC time as ISO-8601, e.g. "2026-06-06T18:30:00Z". */
+sw_val_t *sw_now_iso(void) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    char s[32];
+    strftime(s, sizeof(s), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    return sw_val_string(s);
+}
+
 sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {
     sw_val_t *v = calloc(1, sizeof(sw_val_t));
     v->type = SW_VAL_MAP;
@@ -3751,6 +3808,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_int((int64_t)s[i]);
     }
 
+    /* to_int / to_float (parse strings too) + uuid + now_iso — shared helpers
+     * so interp and compiled agree. (Caught BEFORE the math block so to_float
+     * here handles strings, not just numbers.) */
+    if (strcmp(fname, "to_int") == 0 && nargs >= 1)   return sw_coerce_int(args[0]);
+    if (strcmp(fname, "to_float") == 0 && nargs >= 1) return sw_coerce_float(args[0]);
+    if (strcmp(fname, "uuid") == 0)                   return sw_make_uuid();
+    if (strcmp(fname, "now_iso") == 0)                return sw_now_iso();
+
     /* === Math (libm-backed; parity with codegen) =============== */
     if ((strcmp(fname, "to_float") == 0 || strcmp(fname, "math_sqrt") == 0 ||
          strcmp(fname, "math_sin") == 0 || strcmp(fname, "math_cos") == 0 ||
@@ -4647,6 +4712,7 @@ static const char *k_interp_builtins[] = {
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
     "random_int","reduce","shell","shell_sandboxed","sleep","string_replace",
     "string_sub","string_to_bytes","string_truncate","sys_exit","to_float",
+    "to_int","uuid","now_iso",
     NULL
 };
 int interp_is_known_builtin(const char *name) {

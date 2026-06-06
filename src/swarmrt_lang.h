@@ -176,6 +176,12 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures);
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
 
+/* Shared builtin helpers — one impl, called by both backends (see swarmrt_lang.c). */
+sw_val_t *sw_coerce_int(sw_val_t *v);    /* to_int:   string/float/int -> int  | nil */
+sw_val_t *sw_coerce_float(sw_val_t *v);  /* to_float: string/int/float -> float | nil */
+sw_val_t *sw_make_uuid(void);            /* uuid():    random RFC-4122 v4 string */
+sw_val_t *sw_now_iso(void);              /* now_iso(): current UTC time as ISO-8601 */
+
 /* Process command-line arguments. A compiled program's generated
  * main() wires argc/argv straight into these (see swarmrt_codegen.c);
  * the os_args() builtin exposes them to sw as a list of strings.

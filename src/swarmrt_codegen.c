@@ -331,6 +331,9 @@ static int is_builtin(const char *name) {
            strcmp(name, "ord") == 0 ||
            strcmp(name, "codepoint_at") == 0 ||
            strcmp(name, "to_float") == 0 ||
+           strcmp(name, "to_int") == 0 ||
+           strcmp(name, "uuid") == 0 ||
+           strcmp(name, "now_iso") == 0 ||
            strcmp(name, "math_sqrt") == 0 || strcmp(name, "math_sin") == 0 ||
            strcmp(name, "math_cos") == 0 || strcmp(name, "math_pow") == 0 ||
            strcmp(name, "math_exp") == 0 || strcmp(name, "math_log") == 0 ||
@@ -1794,6 +1797,7 @@ static const char *_common_builtins[] = {
     "bytes_from_base64", "bytes_to_base64", "byte_size", "byte_at",
     "byte_slice", "bytes_concat", "string_to_bytes", "bytes_to_string",
     "bytes_from_ints", "byte", "ord", "codepoint_at", "to_float",
+    "to_int", "uuid", "now_iso",
     "math_sqrt", "math_sin", "math_cos", "math_pow", "math_exp", "math_log",
     "math_floor", "math_ceil", "math_round",
     "audio_ulaw_to_pcm16_b", "audio_pcm16_to_ulaw_b", "audio_resample_b",
@@ -2126,6 +2130,9 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "ord") == 0 ||
              strcmp(fname, "codepoint_at") == 0 ||
              strcmp(fname, "to_float") == 0 ||
+             strcmp(fname, "to_int") == 0 ||
+             strcmp(fname, "uuid") == 0 ||
+             strcmp(fname, "now_iso") == 0 ||
              strcmp(fname, "math_sqrt") == 0 || strcmp(fname, "math_sin") == 0 ||
              strcmp(fname, "math_cos") == 0 || strcmp(fname, "math_pow") == 0 ||
              strcmp(fname, "math_exp") == 0 || strcmp(fname, "math_log") == 0 ||

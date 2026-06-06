@@ -483,11 +483,20 @@ static double _sw_to_double(sw_val_t *v) {
     return 0.0;
 }
 
-/* to_float(x) → float. int/float → float; nil → 0.0. */
+/* to_float(x) → float; to_int(x) → int. Parse a string/atom, or coerce a
+ * number; nil on a non-numeric string. Shared impl with the interpreter
+ * (sw_coerce_*), so the backends can't drift. */
 static sw_val_t *_builtin_to_float(sw_val_t **a, int n) {
-    if (n < 1 || !a[0]) return sw_val_float(0.0);
-    return sw_val_float(_sw_to_double(a[0]));
+    if (n < 1) return sw_val_nil();
+    return sw_coerce_float(a[0]);
 }
+static sw_val_t *_builtin_to_int(sw_val_t **a, int n) {
+    if (n < 1) return sw_val_nil();
+    return sw_coerce_int(a[0]);
+}
+/* uuid() → random RFC-4122 v4 string; now_iso() → current UTC ISO-8601. */
+static sw_val_t *_builtin_uuid(sw_val_t **a, int n) { (void)a; (void)n; return sw_make_uuid(); }
+static sw_val_t *_builtin_now_iso(sw_val_t **a, int n) { (void)a; (void)n; return sw_now_iso(); }
 
 static sw_val_t *_builtin_math_sqrt(sw_val_t **a, int n) {
     if (n < 1 || !a[0]) return sw_val_float(0.0);

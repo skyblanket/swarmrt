@@ -113,34 +113,5 @@ fun stop(wake_pid) {
 }
 
 # ---- helpers ----
-
-fun to_int(s) {
-    # Cheap atoi via shell — sw doesn't currently expose strtol.
-    # Returns 0 on parse failure.
-    r = shell(f"printf %d {s} 2>/dev/null || echo 0")
-    raw = string_trim(elem(r, 1))
-    case raw {
-        "" -> 0
-        _  -> parse_digits(raw, 0, 0)
-    }
-}
-
-fun parse_digits(s, i, acc) {
-    if (i >= string_length(s)) { acc }
-    else {
-        ch = string_sub(s, i, 1)
-        d = digit_value(ch)
-        case d {
-            -1 -> acc
-            _  -> parse_digits(s, i + 1, acc * 10 + d)
-        }
-    }
-}
-
-fun digit_value(ch) {
-    case ch {
-        "0" -> 0 ; "1" -> 1 ; "2" -> 2 ; "3" -> 3 ; "4" -> 4
-        "5" -> 5 ; "6" -> 6 ; "7" -> 7 ; "8" -> 8 ; "9" -> 9
-        _   -> -1
-    }
-}
+# `to_int` is now a builtin (string/float -> int, nil on non-numeric) — no more
+# shell-fork atoi. Cron time strings (HH:MM, `date +%H:%M:%S`) are well-formed.

@@ -555,7 +555,10 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | | |
 |---|---|
 | `abs(n)` | absolute value (int or float) |
-| `to_float(n)` | coerce an int to a float (`Math.float(n)` is the friendlier alias) |
+| `to_int(v)` | parse a string (`to_int("42")` → `42`), truncate a float, or pass an int; **`nil`** on a non-numeric string |
+| `to_float(v)` | parse a string (`to_float("3.14")` → `3.14`) or widen a number; **`nil`** on a non-numeric string |
+| `uuid()` | a random RFC-4122 v4 UUID string (e.g. `"f47ac10b-58cc-4372-a567-0e02b2c3d479"`) |
+| `now_iso()` | current UTC time as ISO-8601 (`"2026-06-06T13:08:05Z"`) |
 | `ord(s)` | first byte of a string as an int (`ord("A")` → `65`) |
 | `typeof(v)` | type as a string: `"int"`, `"float"`, `"string"`, `"atom"`, `"list"`, `"map"`, `"tuple"`, `"bytes"`, `"pid"`, … |
 | `is_list(v)` | `'true'` / `'false'` |
