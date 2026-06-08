@@ -18,15 +18,46 @@ static inline char *chunk_data(sw_varena_chunk_t *c) {
     return (char *)(c + 1);
 }
 
-sw_value_arena_t *sw_varena_create(size_t first_chunk) {
+static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
     sw_value_arena_t *a = (sw_value_arena_t *)malloc(sizeof(sw_value_arena_t));
     if (!a) return NULL;
-    if (first_chunk < 1024) first_chunk = 8192;
     a->head = chunk_new(first_chunk);
     if (!a->head) { free(a); return NULL; }
     a->total_bytes = 0;
     a->chunk_count = 1;
+    a->kind = kind;
+    a->list_next = NULL;
     return a;
+}
+
+sw_value_arena_t *sw_varena_create(size_t first_chunk) {
+    if (first_chunk < 1024) first_chunk = 8192;   /* process arena: 8KB floor */
+    return varena_new(first_chunk, SW_REGION_PROCESS);
+}
+
+/* Right-sized region: clamp(hint, 256B, 64KB), NO 8KB floor — a tiny message
+ * costs a 256B chunk, the 32KB spawn arg one ~right-sized chunk. */
+sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind) {
+    if (hint < 256) hint = 256;
+    else if (hint > 64 * 1024) hint = 64 * 1024;
+    return varena_new(hint, kind);
+}
+
+/* O(1) splice: move src's chunk list onto dst, then free src's header. dst->head
+ * becomes src's (full) head, so the next dst alloc trips used+n>cap and grows a
+ * fresh chunk — correct, one partially-used chunk's tail goes unused. src is dead
+ * after this (header freed; chunks now owned by dst, reclaimed on dst free). */
+void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src) {
+    if (!dst || !src) return;
+    if (src->head) {
+        sw_varena_chunk_t *tail = src->head;
+        while (tail->next) tail = tail->next;
+        tail->next = dst->head;     /* src's oldest chunk links to dst's stack */
+        dst->head = src->head;      /* src's newest chunk becomes the alloc point */
+        dst->total_bytes += src->total_bytes;
+        dst->chunk_count += src->chunk_count;
+    }
+    free(src);                       /* header only; chunks transferred to dst */
 }
 
 void *sw_varena_alloc(sw_value_arena_t *a, size_t n) {

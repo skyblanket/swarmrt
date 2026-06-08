@@ -26,15 +26,38 @@ typedef struct sw_varena_chunk {
     /* `cap` bytes of storage follow this header inline. */
 } sw_varena_chunk_t;
 
+/* Ownership v2: a region is just a value arena tagged by who owns its lifecycle.
+ * The arena IS the region (no separate wrapper — see [[swarmrt-gc-design]]). */
+typedef enum {
+    SW_REGION_PROCESS = 0,   /* a process's own values; freed at process exit / turn checkpoint */
+    SW_REGION_MESSAGE,       /* a queued message payload; adopted by the receiver on match */
+    SW_REGION_SPAWN,         /* spawn args/captures; adopted by the child on entry */
+    SW_REGION_ETS,           /* a stored ETS value; freed on replace/delete/table-destroy */
+    SW_REGION_PERSISTENT     /* explicit long-lived store */
+} sw_region_kind_t;
+
 typedef struct sw_value_arena {
     sw_varena_chunk_t *head;       /* current (most-recent) chunk */
     size_t total_bytes;            /* stat: bytes handed out */
     size_t chunk_count;            /* stat: number of chunks */
+    sw_region_kind_t kind;         /* lifecycle owner class (v2) */
+    struct sw_value_arena *list_next; /* per-process region chain (accounting/teardown) */
 } sw_value_arena_t;
 
-/* Create a value arena with an initial chunk of at least `first_chunk`
- * bytes. Returns NULL on OOM (callers fall back to global calloc). */
+/* Create a SW_REGION_PROCESS arena with an initial chunk of at least
+ * `first_chunk` bytes (floored to 8KB). Returns NULL on OOM. */
 sw_value_arena_t *sw_varena_create(size_t first_chunk);
+
+/* Create a region of `kind` whose first chunk is right-sized: clamp(hint,
+ * 256B, 64KB) with NO 8KB floor — so a tiny message (an int, a 3-tuple) costs
+ * a 256B chunk, not 8KB. Used for message + spawn regions. */
+sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind);
+
+/* O(1) ownership transfer: splice all of `src`'s chunks into `dst` and free
+ * the `src` header (its chunks are now owned by `dst`, reclaimed when `dst` is
+ * freed). After this `src` is dead. Used to adopt a message region into the
+ * receiver's arena on match, and a spawn region into the child's arena on entry. */
+void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src);
 
 /* Bump-allocate `n` bytes, 16-byte aligned. NOT zeroed (callers that need
  * zeroing — e.g. value nodes — memset themselves). Returns NULL on OOM. */

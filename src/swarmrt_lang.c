@@ -1867,15 +1867,18 @@ char **sw_prog_argv = NULL;
  * escapes go to the global heap (never another process's arena), so the arena
  * is single-writer and needs no lock. */
 static __thread int g_alloc_force_global = 0;
+/* Ownership v2: when set, constructors allocate into THIS region instead of the
+ * running process's arena. The missing channel that lets deep_copy_into() target
+ * a message/spawn/turn region (force_global only forces calloc). */
+static __thread sw_value_arena_t *g_alloc_target = NULL;
 
-/* Allocate a value node / owned blob. Routes to the running process's arena
- * (compiled backend, freed wholesale on process exit) unless a copy-on-escape
- * is in progress (force_global) or there is no current arena (interpreter /
- * pre-fiber), in which case it falls back to the global heap exactly as before.
- * val_alloc zeroes (constructors rely on calloc semantics). */
+/* Allocate a value node / owned blob. Routes (in order): force_global → global
+ * heap; an explicit target region (deep_copy_into) → that region; the running
+ * process's arena (compiled backend, freed at process exit) → that; else the
+ * global heap (interpreter / pre-fiber). val_alloc zeroes (calloc semantics). */
 static inline void *val_alloc(size_t n) {
     if (!g_alloc_force_global) {
-        sw_value_arena_t *a = sw_self_varena();
+        sw_value_arena_t *a = g_alloc_target ? g_alloc_target : sw_self_varena();
         if (a) {
             void *p = sw_varena_alloc(a, n);
             if (p) { memset(p, 0, n); return p; }
@@ -1887,7 +1890,7 @@ static inline void *val_alloc(size_t n) {
 static inline char *val_strdup(const char *s) {
     if (!s) return NULL;
     if (!g_alloc_force_global) {
-        sw_value_arena_t *a = sw_self_varena();
+        sw_value_arena_t *a = g_alloc_target ? g_alloc_target : sw_self_varena();
         if (a) {
             char *p = sw_varena_strdup(a, s);
             if (p) return p;
@@ -2134,6 +2137,22 @@ sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     g_alloc_force_global = 1;
     sw_val_t *r = deep_copy_rec(v, 0);
     g_alloc_force_global = save;
+    return r;
+}
+
+/* Ownership v2: deep-copy v's whole graph INTO `region` (a message/spawn/turn
+ * region). The region target wins over force_global and over the process arena.
+ * Reads the source graph (wherever it lives) and writes the copy into `region`.
+ * Returns the copied root. If region is NULL, falls back to a global-heap copy. */
+sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
+    if (!region) return sw_val_deep_copy_global(v);
+    sw_value_arena_t *save_t = g_alloc_target;
+    int save_g = g_alloc_force_global;
+    g_alloc_target = region;
+    g_alloc_force_global = 0;
+    sw_val_t *r = deep_copy_rec(v, 0);
+    g_alloc_target = save_t;
+    g_alloc_force_global = save_g;
     return r;
 }
 

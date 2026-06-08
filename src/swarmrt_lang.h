@@ -180,6 +180,12 @@ sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
  * outlives the source process's arena. See [[swarmrt-gc-design]]. */
 sw_val_t *sw_val_deep_copy_global(sw_val_t *v);
 
+/* Ownership v2: deep-copy a value's whole graph INTO a specific region (message/
+ * spawn/turn). `region` is `struct sw_value_arena *` (swarmrt_varena.h); forward-
+ * declared here so this header needn't include it. NULL region → global-heap copy. */
+struct sw_value_arena;
+sw_val_t *deep_copy_into(sw_val_t *v, struct sw_value_arena *region);
+
 /* GC v1: type-safe value-send choke point — deep-copies the payload to the
  * global heap, then enqueues via sw_send_tagged. Route every sw_val_t* send
  * through this (struct sends keep using sw_send_tagged directly). */
