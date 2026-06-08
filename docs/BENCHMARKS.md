@@ -53,11 +53,15 @@ Selective receive: ~50-100ns (queue scan by tag)
 Cross-scheduler:   ~100-200ns (includes cache line transfer)
 
 Note: GC v1 gives each process a value arena freed on exit (no shared heap), so a
-send deep-copies its payload into the receiver's ownership — the ~10ns is the queue
-op; total send cost adds an O(message-size) copy. Small messages stay cheap.
+send deep-copies its payload onto the global heap (which the receiver then reads) —
+the ~10ns is the queue op; total send cost adds an O(message-size) copy. Small
+messages stay cheap. (Those global-heap copies are not yet lifecycle-reclaimed —
+Ownership v2 moves them to owned, freed regions.)
 ```
 
-Messages between processes on the same node share pointers directly — no serialization overhead.
+Same-node messages are deep-copied into a global-heap value graph the receiver reads
+(GC v1 copy-on-escape: no serialization, but an O(size) copy — not pointer-sharing).
+Cross-node messages are marshaled over TCP.
 
 ---
 

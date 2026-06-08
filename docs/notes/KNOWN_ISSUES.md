@@ -33,13 +33,14 @@ print(undefined_var)   # compiles; prints :undefined_var
 errors. This is a deliberate tradeoff (matching the dynamic, Erlang-shaped
 model), recorded here so the behavior is not a surprise.
 
+## Recently cleared
+
 ### No `swc run` subcommand
 
-`swc` exposes `build`, `emit`, `repl`, and `test`, but no one-shot
-`swc run file.sw` (compile + run + exit). **Workaround:** `swc build file.sw -o
-out && ./out`. **Impact:** minor ergonomics gap for quick scripts.
-
-## Recently cleared
+Cleared. `swc run file.sw` exists (parse → codegen → `cc` → run the resulting
+binary in one shot; see `run_file` in `src/swc.c`). The interpreter path
+(`swc run`, REPL, `swc test`) shares the runtime's builtins with the compiled
+path.
 
 ### Multi-head cons patterns are unimplemented
 

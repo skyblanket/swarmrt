@@ -19,7 +19,9 @@
 #
 # Unique per-tag temp names so many invocations can run without clobbering.
 set -u
-REPO="/Users/sky/swarmrt"; cd "$REPO" || { echo "VERDICT: BASELINE_FAIL (no repo)"; exit 99; }
+# Repo root = parent of this script's dir (no hardcoded paths). Override with SWARMRT_REPO.
+REPO="${SWARMRT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
+cd "$REPO" || { echo "VERDICT: BASELINE_FAIL (no repo at $REPO)"; exit 99; }
 SW="${1:?usage: gc_asan_run.sh <test.sw> [tag]}"; TAG="${2:-$$}"
 b="/tmp/gctest_${TAG}"
 # Portable timeout: gtimeout (coreutils) if present, else run with no limit.
