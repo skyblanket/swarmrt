@@ -19,8 +19,11 @@ make swc libswarmrt
 Before opening a PR, run what CI runs:
 
 ```bash
-make test-sw                       # sw-language suite — 50 files (compiled + interpreter + swc-run paths)
+make check-docs                    # every documented sw snippet + example compiles
+make doctest                       # documented examples run + match their claimed output
+make test-sw                       # sw-language suite — 53 files, 475 assertions (compiled + interpreter + swc-run paths)
 for p in 2 3 4 5 6 7 8 9 10; do make test-phase$p; done   # C-side runtime tests (phases 2–10)
+make gc-stress                     # GC copy-on-escape safety (ASAN + arena poison)
 make stress                        # high-process-count race guard (Linux x86_64)
 ```
 

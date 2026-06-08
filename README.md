@@ -429,9 +429,11 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
 - `make test-sw` — **53 files, 475 assertions** (`.sw` language: compiled + interpreter + `swc run` paths)
-- `make test-phase$p` for `p` in **2 through 9** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC (phase 8), distribution (phase 9); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
+- `make test-phase$p` for `p` in **2 through 10** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC scaffolding (phase 8), distribution (phase 9), language frontend (phase 10); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 - `make gc-stress` — GC v1 copy-on-escape correctness: the value-arena stress harness compiled with ASAN + `-DSW_ARENA_POISON`; a missed deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free or a `0xDE`-garbage content assert
+
+Not yet a CI gate (RED until Ownership v2): `make gc-slope` — the escaped-value memory-slope gate (peak-RSS growth under fixed-concurrency spawns / fixed-depth messages must stay under budget). It fails today because escaped values accumulate on the global heap; it becomes a CI gate once Ownership v2 reclaims them.
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
 - **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
