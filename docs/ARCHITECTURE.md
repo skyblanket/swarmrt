@@ -138,8 +138,8 @@ The compiler emits C code that calls the runtime API directly:
 |--------|-------|
 | Process spawn | ~100-500ns |
 | Context switch | ~100-200ns |
-| Message send | ~10ns (pointer sharing) |
-| Memory per process | ~200B + 64KB stack |
+| Message send | ~10ns enqueue + payload deep-copy (O(message size), no shared heap) |
+| Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
 | Max processes | 100K+ (configurable) |
 | Compute | native C speed |
 
@@ -149,7 +149,7 @@ The compiler emits C code that calls the runtime API directly:
 
 - **IO/Ports** — kqueue-based async I/O, TCP accept/read/write as port messages
 - **Module registry** — versioned C-module slots (`sw_module_register` / `sw_module_upgrade`); a C embedder can re-point a named slot to another C function compiled into the same binary and roll back, notifying tracked processes via `SW_TAG_CODE_CHANGE`. C-API only — no `sw`-level builtin and no loading of new code at runtime (`swc build` AOT-compiles every sw function to a fixed C symbol; there is no `dlopen`/bytecode loader).
-- **Generational GC** — per-process heaps with minor/major collection
+- **GC v1 (`swarmrt_varena.c`)** — per-process value arena, freed wholesale when the process exits. Values that escape a process (sent messages, spawn captures, ETS entries, supervisor/timer closures) are deep-copied to the global heap at the boundary (no shared heap, BEAM-style). So spawn-a-worker-per-task reclaims; a single long-lived loop accumulates until it exits (mid-life loop-reset is the next step). The older `swarmrt_gc.c` scaffolding is unused.
 - **Distribution** — multi-node TCP message routing with automatic reconnection
 - **Context switching** — ARM64 assembly for register save/restore (~100ns)
 - **Deadlock watchdog** — background thread detects schedulers where all processes are blocked waiting on each other; logs a diagnostic and terminates the stuck processes to prevent indefinite hangs

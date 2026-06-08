@@ -42,9 +42,9 @@ Counter stopped at 8
 
 SwarmRT is a runtime + language for writing concurrent programs that compile to a single native binary.
 
-It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, distribution — and reimplements them as a ~13K-line core C runtime + ~6K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~3K-line ahead-of-time compiler that emits native code. No interpreter. No bytecode. No VM warm-up. Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
+It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, distribution — and reimplements them as a ~12K-line core C runtime + ~8.5K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~4K-line ahead-of-time compiler that emits native code. (A ~5.5K-line tree-walking interpreter powers the REPL, `swc run`, and the tests — but `swc build` compiles your `.sw` straight to native machine code: no bytecode, no VM warm-up.) Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
 
-(The full `src/` tree is ~42K lines; the rest is tests, benchmarks, three earlier prototype runtimes kept for reference, and tools like the search CLI and MCP server.)
+(The full `src/` tree is ~50K lines; the rest is C-side tests, benchmarks, three earlier prototype runtimes kept for reference, and tools like the search CLI and MCP server.)
 
 It exists because the same workload BEAM was built for in 1986 — *thousands of long-lived, message-passing, partial-failure-tolerant processes* — is exactly what you need when you're running a swarm of AI agents. SwarmRT is the substrate behind [swarm-code](https://github.com/skyblanket/swarm-code) and a growing pile of agent-driven tools.
 
@@ -163,7 +163,7 @@ Most languages were designed for humans first; LLM ergonomics are a happy accide
 - **Module-level `let` globals.** Top-level constant bindings at module scope — `let base_url = "https://api.example.com"` — shared by all functions in the module without threading them as arguments. *(Interpreter / REPL path only; codegen support is not yet wired — compiled binaries resolve the name as an atom. Use a top-of-function `let` binding or a module function returning the constant in compiled code.)*
 - **`exec_argv(cmd, args)` builtin.** Fork+exec with no shell — safe for user-supplied arguments, no injection risk. *(REPL / interpreter path only — not yet available in `swc build` compiled code. Use `shell_sandboxed` for agent tool dispatch in compiled agents.)*
 - **`assert_raises(fn, msg)` builtin.** In `swc test` files, assert that a zero-arg lambda panics (or errors) with a message containing `msg`. The test runner intercepts the panic so the suite continues.
-- **The whole language fits in one document.** SW_LANGUAGE.md is ~600 lines including examples — small enough to paste into a system prompt.
+- **The whole language fits in one document.** SW_LANGUAGE.md is ~950 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
 
@@ -234,7 +234,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **Hot reload** | Versioned module registry with rollback: re-points a named slot to another C function already compiled into the binary and notifies tracked processes — does not load new code. *(C API only — no `sw`-level builtin; compiled `.sw` code can't be swapped at runtime.)* |
 | **Compiler (`swc`)** | `.sw` → AST → C → native binary. Tail-call optimisation, optional XOR-string obfuscation, optional symbol stripping. |
 
-Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns (pointer sharing), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns to enqueue plus a deep-copy of the payload into the receiver (BEAM-style no-shared-heap — O(message size); small messages stay cheap), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ### Runtime env vars
 
@@ -351,7 +351,7 @@ make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search
 - **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run.
 - **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
 
-Together the suite reports `all sw tests passed — 50 files, 433 assertions`.
+Together the suite reports `all sw tests passed — 53 files, 475 assertions`.
 
 Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
 
@@ -405,7 +405,8 @@ src/
   swarmrt_phase5.{c,h}     GenStateMachine, Process Groups
   swarmrt_io.{c,h}         kqueue async I/O, TCP ports
   swarmrt_hotload.{c,h}    Hot code reload with versioning
-  swarmrt_gc.{c,h}         Per-process heap / GC scaffolding (WIP)
+  swarmrt_varena.{c,h}     Per-process value arena (GC v1 — freed on process exit)
+  swarmrt_gc.{c,h}         Legacy GC scaffolding (unused; superseded by varena)
   swarmrt_node.{c,h}       Multi-node distribution
   swarmrt_lang.{c,h}       Lexer, parser, tree-walking interpreter
   swarmrt_codegen.{c,h}    AST → C code generation
@@ -427,13 +428,15 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
-- `make test-sw` — **50 files, 433 assertions** (`.sw` language: compiled + interpreter + `swc run` paths)
+- `make test-sw` — **53 files, 475 assertions** (`.sw` language: compiled + interpreter + `swc run` paths)
 - `make test-phase$p` for `p` in **2 through 9** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC (phase 8), distribution (phase 9); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
+- `make gc-stress` — GC v1 copy-on-escape correctness: the value-arena stress harness compiled with ASAN + `-DSW_ARENA_POISON`; a missed deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free or a `0xDE`-garbage content assert
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
 - **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
 - **No static type or shape checking** — `sw` is dynamically typed by design. Typos in variable names compile to atoms rather than erroring (e.g. `undefined_var` becomes `:undefined_var`); there is no compile-time catch.
+- **GC v1 doesn't reclaim mid-life within a long-lived process.** Each process's value arena is freed when *that process* exits, so worker-per-task patterns reclaim fully — but a single process that loops forever accumulating per-iteration garbage grows until it exits. Prefer a worker-per-job shape; mid-life reclaim (loop-reset) is the next GC step. Values deeper than 256 nested levels are truncated on cross-process copy.
 
 The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
 

@@ -4,6 +4,18 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-08 — GC v1: per-process value arena, freed on exit + copy-on-escape
+
+**feat(gc): memory is reclaimed.** Until now every `sw_val_t` lived until the OS process exited — a long-running or high-spawn agent leaked without bound, which made swarmrt unusable for anything real. GC v1 (`swarmrt_varena.{c,h}`) gives each runtime process a **value arena**: every value it builds while running lives there and is freed wholesale in `process_destroy` — *after* the fiber returns, so there are no live C-stack roots to enumerate (why an arena beats refcount/tracing for v1). The value constructors route through `val_alloc`/`val_strdup`, keyed on `sw_self_varena()` (arena when a fiber runs; global heap for the interpreter / on escape). Measured: 50k spawn-and-exit workers hold **~493 MB with the arena vs ~4,491 MB and climbing without it** (`SW_GC_OFF=1`) — peak RSS now tracks concurrently-live processes, not cumulative spawns.
+
+**feat(gc): copy-on-escape re-establishes BEAM's no-shared-heap invariant.** Compiled `send` shared the raw `sw_val_t*` cross-process, so a naive per-process free would be a use-after-free. `sw_val_deep_copy_global` now rebuilds the value DAG on the global heap, funnelled through a type-safe `sw_send_value()` choke point (its `sw_val_t*` param makes passing a runtime struct a compile error). Every value escape is routed: send dispatch + remote delivery, spawn struct/lambda captures + pmap, ETS stores, pubsub (per-subscriber), http handler delivery, supervisor child closures, timer closures. Cross-process messages are deep-copied (O(message size)); the ~10ns figure is now just the enqueue.
+
+**test(gc): two independent adversarial workflow waves, 24 surfaces, zero defects.** `make gc-stress` compiles a copy-on-escape stress harness under ASAN + `-DSW_ARENA_POISON` (freed chunks filled with `0xDE`) — a missed deep-copy surfaces as a use-after-free or a `0xDE`-garbage content assert. Validated across registered-name sends, monitor/link exit reasons, gen_server call/cast, Cron timers, nested spawn, binaries, closures-as-messages, wide/DAG/edge values, ETS churn, multi-message workers, concurrency ping-pong (6400 crossings), supervised crash+restart, depth-cap boundary, undelivered-message teardown, and a mixed soak. `scripts/gc_asan_run.sh <test.sw>` runs any test under the same gate. test-sw 53/475, fuzz clean.
+
+**Honest scope:** v1 does NOT reclaim mid-life within a single long-lived process (bump-allocation can't free inside a living fiber) — prefer a worker-per-job shape; loop-reset is the next GC step. Values nested deeper than 256 levels truncate on cross-process copy. `SW_GC_OFF=1` reverts to the pre-GC global-heap behaviour (escape hatch). README/ARCHITECTURE/BENCHMARKS/BUILDING_AGENTS updated to match (incl. LoC: ~12K runtime + ~8.5K studio + ~4K compiler + ~5.5K interpreter; ~50K total `src/`).
+
+---
+
 ## 2026-06-03 — headless polish + doctest harness (the "docs lie" tripwire)
 
 **fix(swc): silence resolver "cannot open './X.sw'" noise on successful imports.** The build-path import resolver probes four candidate paths per import (CamelCase + lowercase × input-dir + stdlib) and used the noisy `read_file` for each probe, so every *successful* stdlib import (`import Std`) printed two spurious `swc: cannot open '...'` lines to stderr from the candidates it tried before the hit. Switched the candidate probe to the silent `read_file_quiet` (the `swc run` path already used it). A genuine total-resolution failure still prints the clear `swc: cannot resolve import 'X' (looked in .../ and .../)` error. Headless/piped agents no longer eat phantom error lines on a clean build.

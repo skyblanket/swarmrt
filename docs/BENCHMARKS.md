@@ -11,8 +11,8 @@
 |--------|-------|
 | Process spawn | ~100-500ns |
 | Context switch | ~100-200ns (assembly) |
-| Message send (local) | ~10ns |
-| Memory per process | ~200B PCB + 64KB stack |
+| Message send (local) | ~10ns enqueue + payload deep-copy (O(message size); no shared heap) |
+| Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
 | Max concurrent processes | 100K+ |
 
 ---
@@ -48,9 +48,13 @@ Saves callee-saved registers only (x19-x28, d8-d15, sp, lr on ARM64). No kernel 
 Lock-free MPSC queue (Vyukov design):
 
 ```
-Local send:       ~10ns (atomic CAS push)
+Local send:       ~10ns (atomic CAS push) + payload deep-copy (O(message size))
 Selective receive: ~50-100ns (queue scan by tag)
 Cross-scheduler:   ~100-200ns (includes cache line transfer)
+
+Note: GC v1 gives each process a value arena freed on exit (no shared heap), so a
+send deep-copies its payload into the receiver's ownership — the ~10ns is the queue
+op; total send cost adds an O(message-size) copy. Small messages stay cheap.
 ```
 
 Messages between processes on the same node share pointers directly — no serialization overhead.
