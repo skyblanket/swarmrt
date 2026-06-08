@@ -302,6 +302,18 @@ gc-stress: swc libswarmrt
 	@rm -f tests/sw/test_uaf_stress.gen.c $(BIN_DIR)/_gc_stress_emit
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_stress
 
+# GC memory-slope gate: run the escaped-value slope probes at a low and high count
+# (fixed concurrency / mailbox depth) and fail if peak-RSS growth exceeds budget.
+# RED until Ownership v2 reclaims escaped spawn args + messages (the escaped-value
+# leak makes RSS grow ~50 KB/job today). Honors SW_SCHEDULERS / SW_GC_OFF.
+.PHONY: gc-slope
+gc-slope: swc
+	@rc=0; \
+	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw   200 2000 80 spawn || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_message.sw 500 4000 80 msg   || rc=1; \
+	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded — Ownership v2 target)"; \
+	 exit $$rc
+
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
 # run to print `ok 80000`. Requires native Linux x86_64 thread scheduling
