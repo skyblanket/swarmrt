@@ -4,6 +4,35 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-08 — Ownership v2: lifecycle-owned escaped values + scoped turn-checkpoint
+
+**feat(gc): escaped memory is now reclaimed, not just safe.** GC v1 deep-copied escaped
+values (messages, spawn args) to the global heap where they leaked; a fixed-concurrency
+workload passing large values grew with cumulative jobs, and long-lived loops accumulated
+every turn. Ownership v2 gives every escaped graph exactly one lifecycle owner:
+- **Spawn regions** (`swarmrt_codegen.c`): a spawn's args/captures (incl. the `spawn(f)`
+  lambda form that used to leak) are copied into a right-sized region the child **adopts**
+  into its arena on entry (O(1) chunk splice) and frees at exit; spawn failure reclaims it.
+- **Message regions** (`swarmrt_native.c` + codegen): `sw_send_value` copies the payload
+  into a per-message region (discriminated from RAW signal/struct payloads by a `pkind`
+  tag); a compiled `receive` match **adopts** it; `process_destroy` bulk-frees undelivered
+  ones; C-level `sw_receive*` materialize a free-able global copy (keeping their contract).
+- **Scoped turn-checkpoint** (`swarmrt_codegen.c` tail-call): a tail-recursive function
+  records an arena "floor" at entry and, past a threshold above it, copies the recursion
+  args into a temp region, `sw_varena_reset_to(floor)` to reclaim *this function's* per-turn
+  garbage (never the caller's values below the floor — a naive whole-arena reset corrupted
+  callers, caught by gc-stress), and splices the args back.
+
+**test(gc): the slope gate goes from RED to GREEN.** `make gc-slope` (now a CI gate, run
+under default + `SW_SCHEDULERS=1`) proves bounded memory: a fixed-width 32 KB-arg spawn
+workload (200→2000 jobs), a fixed-depth large-message stream (500→4000), and a 100k-turn
+loop all hold **flat** peak RSS (each was +87 / +169 / unbounded MB before). gc-stress
+ASAN+poison stays green (the floor-scoped reset and adopt-splice are UAF-clean), test-sw
+53/475, phases 2-10, `make stress`, check-docs, doctest all green. SW_GC_OFF preserved.
+
+**Remaining (honest):** ETS values are still global-heap (reclaimed on table destroy, not
+on replace/delete — a high-churn ETS loop grows until then); the interpreter has no arena.
+
 ## 2026-06-08 — GC v1: per-process value arena, freed on exit + copy-on-escape
 
 **feat(gc): memory is reclaimed.** Until now every `sw_val_t` lived until the OS process exited — a long-running or high-spawn agent leaked without bound, which made swarmrt unusable for anything real. GC v1 (`swarmrt_varena.{c,h}`) gives each runtime process a **value arena**: every value it builds while running lives there and is freed wholesale in `process_destroy` — *after* the fiber returns, so there are no live C-stack roots to enumerate (why an arena beats refcount/tracing for v1). The value constructors route through `val_alloc`/`val_strdup`, keyed on `sw_self_varena()` (arena when a fiber runs; global heap for the interpreter / on escape). Measured: 50k spawn-and-exit workers hold **~493 MB with the arena vs ~4,491 MB and climbing without it** (`SW_GC_OFF=1`) — peak RSS now tracks concurrently-live processes, not cumulative spawns.

@@ -79,12 +79,20 @@ jobs:
           done
 
       - name: GC copy-on-escape gate (ASAN + arena poison)
-        # The doc-claimed GC safety gate. Compiles the copy-on-escape stress
-        # harness under -fsanitize=address + -DSW_ARENA_POISON; a missed
-        # deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free
-        # or a 0xDE-garbage content assert. (Memory-slope reclamation — make
-        # gc-slope — is RED until Ownership v2 and is gated separately then.)
+        # Compiles the copy-on-escape stress harness under -fsanitize=address +
+        # -DSW_ARENA_POISON; a missed deep-copy on any send/spawn/ETS boundary
+        # surfaces as a use-after-free or a 0xDE-garbage content assert.
         run: make gc-stress
+
+      - name: GC memory-slope gate (Ownership v2 — bounded escaped memory)
+        # Proves RECLAMATION, not just safety: peak-RSS growth must stay under
+        # budget across a 10x scale-up of fixed-concurrency spawns, fixed-depth
+        # messages, and a long-lived tail-recursive loop. Runs under default and
+        # single-scheduler so adopt/reset/destroy ordering bugs surface too.
+        run: |
+          set -e
+          make gc-slope
+          SW_SCHEDULERS=1 make gc-slope
 
       - name: Stress test (high-process-count race guard)
         # Catches regressions in the high-spawn scheduler/mailbox path.
