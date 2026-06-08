@@ -78,4 +78,35 @@ void sw_varena_free_all(sw_value_arena_t *a);
  * tls_current->varena; a weak stub in swarmrt_lang.c covers runtime-less links. */
 sw_value_arena_t *sw_self_varena(void);
 
+/* Ownership v2 turn-checkpoint: swap the current process's value arena (after
+ * copying carry-forward state into the new one). No-op outside a process. */
+void sw_set_self_varena(sw_value_arena_t *a);
+
+/* A high-water mark into an arena — the (chunk, offset, bytes) at the moment a
+ * tail-recursive function was entered. The "floor": everything below it belongs
+ * to the CALLER and must be preserved; everything the function allocates is
+ * above it. A SCOPED reset reclaims only above the floor (so a tail-recursive
+ * helper called mid-computation can't free its caller's live values). */
+typedef struct {
+    sw_varena_chunk_t *chunk;
+    size_t used;
+    size_t total_bytes;
+} sw_varena_mark_t;
+
+sw_varena_mark_t sw_varena_mark(sw_value_arena_t *a);
+
+/* Free every chunk newer than `mark.chunk` and rewind `mark.chunk` to
+ * `mark.used` — reclaiming everything allocated since the mark while preserving
+ * everything below it. The arena's alloc point becomes `mark.chunk` again. */
+void sw_varena_reset_to(sw_value_arena_t *a, sw_varena_mark_t mark);
+
+/* Turn-checkpoint threshold: a self-tail-call resets the process arena only once
+ * it has handed out more than this many bytes since the last reset (total_bytes
+ * only grows until a reset). This bounds a long-lived loop's memory to ~this
+ * while avoiding a create+free per iteration for tight loops that allocate
+ * little. Tunable; the gate just needs it well under the slope budget. */
+#ifndef SW_TURN_RESET_BYTES
+#define SW_TURN_RESET_BYTES (256 * 1024)
+#endif
+
 #endif /* SWARMRT_VARENA_H */

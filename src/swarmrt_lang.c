@@ -119,11 +119,13 @@ static sw_val_t *_sw_lang_ed25519_verify(sw_val_t **args, int nargs) {
  * These are only called by the interpreter, never by the compiler. */
 __attribute__((weak)) void *sw_receive_any(uint64_t t, uint64_t *tag) { (void)t; (void)tag; return NULL; }
 __attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) { (void)to; (void)tag; (void)msg; }
+__attribute__((weak)) void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload, struct sw_value_arena *region) { (void)to; (void)tag; (void)payload; (void)region; }
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
 /* Returns the current process's value arena, or NULL (interpreter / pre-fiber).
  * Strong impl in swarmrt_native.c reads tls_current->varena; this weak stub
  * keeps swc linkable without the runtime and makes the interpreter use calloc. */
 __attribute__((weak)) sw_value_arena_t *sw_self_varena(void) { return NULL; }
+__attribute__((weak)) void sw_set_self_varena(sw_value_arena_t *a) { (void)a; }
 
 /* =========================================================================
  * Lexer
@@ -2166,7 +2168,16 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
  * the prior sw_send_tagged contract). */
 void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v) {
     if (!to) return;
-    sw_send_tagged(to, tag, v ? sw_val_deep_copy_global(v) : NULL);
+    if (!v) { sw_send_tagged(to, tag, NULL); return; }
+    /* Ownership v2: when the sender runs under GC (has an arena, so the whole
+     * binary does — the receiver will too), copy the payload into a MESSAGE
+     * region the receiver adopts on match and that process_destroy bulk-frees if
+     * undelivered. SW_GC_OFF / no arena / region-OOM → v1 global-heap copy. */
+    if (sw_self_varena()) {
+        sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_MESSAGE);
+        if (r) { sw_send_tagged_msg(to, tag, deep_copy_into(v, r), r); return; }
+    }
+    sw_send_tagged(to, tag, sw_val_deep_copy_global(v));
 }
 
 sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {

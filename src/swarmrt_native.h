@@ -93,6 +93,14 @@ typedef struct {
     uint64_t stack_base;
 } sw_context_t;
 
+/* Ownership v2: payload kind discriminant. Do NOT steal tag bits — tags are
+ * load-bearing small ints (selective receive). RAW = the generic void* payload
+ * (signals via deliver_signal, gen_server call structs, port structs — freed by
+ * the existing paths). VALUE = an sw_val_t* graph OWNED by `region`, adopted into
+ * the receiver's arena on match and bulk-freed (not free(payload)) on teardown. */
+#define SW_PK_RAW   0
+#define SW_PK_VALUE 1
+
 /* === Message === */
 typedef struct sw_msg {
     uint64_t tag;             /* Message tag for selective receive */
@@ -101,6 +109,8 @@ typedef struct sw_msg {
     struct sw_msg *next;      /* Private queue: next in doubly-linked list */
     struct sw_msg *prev;      /* Private queue: prev in doubly-linked list */
     _Atomic(struct sw_msg *) sig_next;  /* Signal queue: Vyukov MPSC link */
+    struct sw_value_arena *region;  /* v2: owns a SW_PK_VALUE payload while queued */
+    uint8_t pkind;            /* v2: SW_PK_RAW (0) or SW_PK_VALUE (1) */
 } sw_msg_t;
 
 /* === Mailbox (Lock-free MPSC + process-local private queue) ===
@@ -482,6 +492,9 @@ int sw_cancel_timer(uint64_t ref);
 
 /* Tagged messages & selective receive */
 void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg);
+/* Ownership v2: enqueue an sw_val_t VALUE owned by `region` (SW_PK_VALUE). */
+void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
+                        struct sw_value_arena *region);
 void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms);
 void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
 

@@ -47,6 +47,36 @@ sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind) {
  * becomes src's (full) head, so the next dst alloc trips used+n>cap and grows a
  * fresh chunk — correct, one partially-used chunk's tail goes unused. src is dead
  * after this (header freed; chunks now owned by dst, reclaimed on dst free). */
+sw_varena_mark_t sw_varena_mark(sw_value_arena_t *a) {
+    sw_varena_mark_t m = { NULL, 0, 0 };
+    if (a) { m.chunk = a->head; m.used = a->head ? a->head->used : 0; m.total_bytes = a->total_bytes; }
+    return m;
+}
+
+/* Scoped reset: free chunks newer than mark.chunk, rewind mark.chunk to
+ * mark.used. Chunks below the mark (caller's values) are untouched. */
+void sw_varena_reset_to(sw_value_arena_t *a, sw_varena_mark_t mark) {
+    if (!a || !mark.chunk) return;
+    sw_varena_chunk_t *c = a->head;
+    while (c && c != mark.chunk) {
+        sw_varena_chunk_t *next = c->next;
+#ifdef SW_ARENA_POISON
+        memset((char *)(c + 1), 0xDE, c->cap);
+#endif
+        free(c);
+        a->chunk_count--;
+        c = next;
+    }
+    /* c == mark.chunk (still in the list, below the freed ones). */
+    a->head = mark.chunk;
+#ifdef SW_ARENA_POISON
+    if (mark.chunk->used > mark.used)
+        memset((char *)(mark.chunk + 1) + mark.used, 0xDE, mark.chunk->used - mark.used);
+#endif
+    mark.chunk->used = mark.used;
+    a->total_bytes = mark.total_bytes;
+}
+
 void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src) {
     if (!dst || !src) return;
     if (src->head) {

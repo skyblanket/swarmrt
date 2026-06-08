@@ -180,13 +180,19 @@ static __thread sw_msg_t *tls_msg_free = NULL;
 static __thread int tls_msg_free_count = 0;
 
 static inline sw_msg_t *msg_alloc(void) {
+    sw_msg_t *m;
     if (tls_msg_free) {
-        sw_msg_t *m = tls_msg_free;
+        m = tls_msg_free;
         tls_msg_free = m->next;
         tls_msg_free_count--;
-        return m;
+    } else {
+        m = (sw_msg_t *)malloc(sizeof(sw_msg_t));
     }
-    return (sw_msg_t *)malloc(sizeof(sw_msg_t));
+    /* Ownership v2: a recycled freelist envelope must never carry a stale region/
+     * pkind (would double-free or mis-free a foreign region). Zero them here so
+     * every enqueue path starts clean; value sends set them in sw_send_tagged_msg. */
+    if (m) { m->region = NULL; m->pkind = SW_PK_RAW; }
+    return m;
 }
 
 static inline void msg_free(sw_msg_t *m) {
@@ -197,6 +203,24 @@ static inline void msg_free(sw_msg_t *m) {
         return;
     }
     free(m);
+}
+
+/* Ownership v2: hand a popped message's payload to a C-LEVEL receiver
+ * (sw_receive / sw_receive_any / sw_receive_tagged — used by tests, pmap, task,
+ * remote delivery). The compiled-sw `receive` has its own loop that ADOPTS the
+ * region; C consumers instead expect a standalone, free-able payload. So for a
+ * SW_PK_VALUE message, materialize the graph onto the global heap (free-able)
+ * and reclaim the region here. RAW payloads pass through unchanged. */
+static inline void *msg_take_payload(sw_msg_t *m) {
+    void *p = m->payload;
+    if (m->pkind == SW_PK_VALUE && m->region) {
+        extern void *sw_val_deep_copy_global(void *);
+        p = sw_val_deep_copy_global(p);     /* free-able global-heap copy */
+        sw_varena_free_all(m->region);
+        m->region = NULL;
+        m->pkind = SW_PK_RAW;
+    }
+    return p;
 }
 
 /* Public wrapper around msg_free for codegen — sw_msg_t and msg_free
@@ -563,7 +587,12 @@ static void process_destroy(sw_process_t *proc) {
     sw_msg_t *sig = atomic_exchange(&proc->mailbox.sig_head, NULL);
     while (sig) {
         sw_msg_t *next = (sw_msg_t *)atomic_load_explicit(&sig->sig_next, memory_order_relaxed);
-        if (sig->payload) {
+        /* Ownership v2: a VALUE message's payload graph is OWNED by its region —
+         * bulk-free the region and do NOT free(payload). RAW payloads (signals,
+         * gen_server/port structs) keep their exact existing free path. */
+        if (sig->pkind == SW_PK_VALUE) {
+            if (sig->region) sw_varena_free_all(sig->region);
+        } else if (sig->payload) {
             if (sig->tag == SW_TAG_EXIT || sig->tag == SW_TAG_DOWN) {
                 sw_signal_t *s = (sw_signal_t *)sig->payload;
                 free(s->reason_str);
@@ -577,7 +606,9 @@ static void process_destroy(sw_process_t *proc) {
     sw_msg_t *msg = proc->mailbox.priv_head;
     while (msg) {
         sw_msg_t *next = msg->next;
-        if (msg->payload) {
+        if (msg->pkind == SW_PK_VALUE) {
+            if (msg->region) sw_varena_free_all(msg->region);
+        } else if (msg->payload) {
             if (msg->tag == SW_TAG_EXIT || msg->tag == SW_TAG_DOWN) {
                 sw_signal_t *s = (sw_signal_t *)msg->payload;
                 free(s->reason_str);
@@ -1525,6 +1556,12 @@ sw_value_arena_t *sw_self_varena(void) {
     return tls_current ? tls_current->varena : NULL;
 }
 
+/* Ownership v2 turn-checkpoint: install a fresh value arena for the current
+ * process (the caller copied carry-forward state into `a` and will free the old). */
+void sw_set_self_varena(sw_value_arena_t *a) {
+    if (tls_current) tls_current->varena = a;
+}
+
 uint64_t sw_getpid(void) {
     sw_process_t *proc = tls_current;
     return proc ? proc->pid : 0;
@@ -1677,7 +1714,7 @@ void *sw_receive(uint64_t timeout_ms) {
         /* Pop first message from private queue */
         sw_msg_t *m = mailbox_pop_first(&proc->mailbox);
         if (m) {
-            void *payload = m->payload;
+            void *payload = msg_take_payload(m);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -1703,7 +1740,7 @@ void *sw_receive(uint64_t timeout_ms) {
             if (was_waiting) {
                 /* We won — not in runq, safe to self-resume */
                 proc->state = SW_PROC_RUNNING;
-                void *payload = m->payload;
+                void *payload = msg_take_payload(m);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -2434,8 +2471,32 @@ void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
     m->from_pid = tls_current ? tls_current->pid : 0;
     m->next = NULL;
     m->prev = NULL;
+    /* region=NULL, pkind=SW_PK_RAW already set by msg_alloc — RAW payload path. */
 
     /* Lock-free MPSC push + wake */
+    mailbox_push(&to->mailbox, m);
+    mailbox_wake(to);
+
+    if (tls_current) tls_current->messages_sent++;
+}
+
+/* Ownership v2: enqueue an sw_val_t VALUE payload OWNED by `region`. The region
+ * holds the deep-copied graph while queued; the receiver adopts it on match
+ * (codegen), and process_destroy bulk-frees it if undelivered. Distinct from the
+ * RAW sw_send_tagged so signals/gen_server/port payloads are never region-freed. */
+void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
+                        struct sw_value_arena *region) {
+    if (!to) return;
+
+    sw_msg_t *m = msg_alloc();
+    m->tag = tag;
+    m->payload = payload;
+    m->from_pid = tls_current ? tls_current->pid : 0;
+    m->next = NULL;
+    m->prev = NULL;
+    m->region = region;
+    m->pkind = SW_PK_VALUE;
+
     mailbox_push(&to->mailbox, m);
     mailbox_wake(to);
 
@@ -2462,7 +2523,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         mailbox_drain(&proc->mailbox);
         sw_msg_t *m = mailbox_pop_tagged(&proc->mailbox, tag);
         if (m) {
-            void *payload = m->payload;
+            void *payload = msg_take_payload(m);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -2481,7 +2542,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
                 proc->state = SW_PROC_RUNNING;
-                void *payload = m->payload;
+                void *payload = msg_take_payload(m);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -2550,7 +2611,7 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
         sw_msg_t *m = mailbox_pop_first(&proc->mailbox);
         if (m) {
             if (out_tag) *out_tag = m->tag;
-            void *payload = m->payload;
+            void *payload = msg_take_payload(m);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -2570,7 +2631,7 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
             if (was_waiting) {
                 proc->state = SW_PROC_RUNNING;
                 if (out_tag) *out_tag = m->tag;
-                void *payload = m->payload;
+                void *payload = msg_take_payload(m);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;

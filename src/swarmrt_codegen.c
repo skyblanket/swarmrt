@@ -1965,10 +1965,45 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     for (int i = 0; i < nargs && i < 16; i++)
         emit_expr(ctx, n->v.call.args[i], 0, arg_vars[i], sizeof(arg_vars[i]));
 
-    /* Tail call optimization: self-recursive call in tail position */
+    /* Tail call optimization: self-recursive call in tail position.
+     *
+     * Ownership v2 TURN-CHECKPOINT: a self-tail-call is one loop iteration. The
+     * ONLY values that survive `goto _tail` are the recursion args (every other
+     * turn value is dead after the jump). So: copy just the args into a FRESH
+     * process arena (deep_copy_into is transitive — it pulls forward any
+     * still-referenced adopted-message substructure too), swap it in, then
+     * bulk-free the OLD arena (reclaiming this turn's garbage + unreferenced
+     * adopted-message chunks). This bounds long-lived loops mid-life. ORDER is
+     * load-bearing: copy-from-old-into-new BEFORE free-old. Skipped when there is
+     * no process arena (SW_GC_OFF / interpreter) or on OOM — plain reassign. */
     if (tail && is_self_call(ctx, n)) {
-        for (int i = 0; i < nargs && i < ctx->cur_nparams; i++)
-            fprintf(f, "    %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
+        int np = nargs < ctx->cur_nparams ? nargs : ctx->cur_nparams;
+        /* SCOPED turn-checkpoint: when this function has accumulated more than
+         * the reset threshold ABOVE its entry floor, copy the recursion args
+         * into a temp region, rewind the arena to the floor (reclaiming this
+         * function's per-turn garbage + unreferenced adopted-message chunks, but
+         * NOT the caller's values below the floor), then splice the args back in.
+         * deep_copy_into is transitive (carries forward still-referenced adopted
+         * substructure). Bounds long-lived loops without touching callers. */
+        fprintf(f, "    { sw_value_arena_t *_gc_a = sw_self_varena();\n");
+        fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES) {\n");
+        fprintf(f, "        sw_value_arena_t *_gc_r = sw_varena_create_kind(256, SW_REGION_PROCESS);\n");
+        fprintf(f, "        if (_gc_r) {\n");
+        for (int i = 0; i < np; i++)
+            fprintf(f, "          sw_val_t *_gc_t%d = deep_copy_into(%s, _gc_r);\n", i, arg_vars[i]);
+        fprintf(f, "          sw_varena_reset_to(_gc_a, _gc_floor);\n");
+        fprintf(f, "          sw_varena_adopt(_gc_a, _gc_r);\n");
+        for (int i = 0; i < np; i++)
+            fprintf(f, "          %s = _gc_t%d;\n", ctx->cur_params[i], i);
+        fprintf(f, "        } else {\n");
+        for (int i = 0; i < np; i++)
+            fprintf(f, "          %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
+        fprintf(f, "        }\n");
+        fprintf(f, "      } else {\n");
+        for (int i = 0; i < np; i++)
+            fprintf(f, "        %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
+        fprintf(f, "      }\n");
+        fprintf(f, "    }\n");
         fprintf(f, "    goto _tail;\n");
         out[0] = '\0';
         return;
@@ -2471,6 +2506,11 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
             fprintf(f, "            if (sw_val_is_truthy(%s)) {\n", guard_res);
             fprintf(f, "              sw_mailbox_remove_msg(%s);\n", cur);
             fprintf(f, "              _matched = 1;\n");
+            /* Ownership v2: ADOPT-SPLICE the message region into the receiver's
+             * arena so the bound payload aliases live in receiver lifecycle
+             * (freed at process exit / next turn checkpoint). Skips EXIT/DOWN
+             * (pkind RAW) and the GC-off path (no receiver arena). */
+            fprintf(f, "              { sw_value_arena_t *_rv = sw_self_varena(); if (%s->pkind == SW_PK_VALUE && %s->region && _rv) { sw_varena_adopt(_rv, %s->region); %s->region = NULL; } }\n", cur, cur, cur, cur);
             fprintf(f, "              sw_msg_release(%s);\n", cur);
             char body_res[32];
             emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
@@ -2481,6 +2521,8 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
             fprintf(f, "            sw_mailbox_remove_msg(%s);\n", cur);
             fprintf(f, "            _matched = 1;\n");
             emit_pattern_bind(ctx, cl->v.clause.pattern, msg);
+            /* Ownership v2: ADOPT-SPLICE the message region (see guard arm). */
+            fprintf(f, "            { sw_value_arena_t *_rv = sw_self_varena(); if (%s->pkind == SW_PK_VALUE && %s->region && _rv) { sw_varena_adopt(_rv, %s->region); %s->region = NULL; } }\n", cur, cur, cur, cur);
             fprintf(f, "            sw_msg_release(%s);\n", cur);
             char body_res[32];
             emit_expr(ctx, cl->v.clause.body, tail, body_res, sizeof(body_res));
@@ -3198,9 +3240,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     fprintf(f, "    _sw_trace_push(\"%s\", \"%s\", %d);\n",
             ctx->mod_name, fn->v.fun.name, fn->line);
 
-    /* Tail call label */
-    if (ctx->has_tail)
+    /* Tail call label. Ownership v2: record the arena "floor" at entry — the
+     * scoped turn-checkpoint (emit_call) reclaims only what THIS function
+     * allocates above it, never the caller's live values below it. */
+    if (ctx->has_tail) {
+        fprintf(f, "    sw_varena_mark_t _gc_floor = sw_varena_mark(sw_self_varena());\n");
+        fprintf(f, "    (void)_gc_floor;\n");
         fprintf(f, "_tail:;\n");
+    }
 
     /* Body */
     char result[32];
