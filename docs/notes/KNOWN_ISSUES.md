@@ -19,22 +19,17 @@ the divergence is the issue.
 when compiled. **Workaround:** add an explicit `after MS -> ...` clause to any
 `receive` that might not match, so compiled and interpreted runs behave the same.
 
-### `try/catch` catches builtin panics in the interpreter but not compiled (divergence)
+### Interpreter recursion depth is bounded (no TCO in the tree-walker)
 
-```sw
-r = try { hd([]) } catch e { "caught" }
-```
+The interpreter (`swc run` / REPL / `swc test`) evaluates on the C stack with
+a stack-margin guard and no tail-call optimisation; deep recursion raises a
+clean, uncatchable `interpreter recursion depth exceeded` panic (exit 1). The
+exact ceiling is environment-dependent (real stack headroom is measured);
+assume a few hundred frames. Compiled binaries TCO self-tail-calls to
+unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
 
-Under `swc run` this binds `r = "caught"`; in a compiled binary the panic
-propagates and kills the process. The docs side with the compiled behavior
-("panics cannot be caught"), so the interpreter is the out-of-spec path — but
-the same program meaning two things on the two paths is the real bug. Found in
-the Round-7 audit ([REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O1).
-
-**Impact:** error-handling code validated in the REPL silently changes meaning
-when compiled. **Workaround:** never rely on `try/catch` to stop a panicking
-builtin — guard first (`if (length(xs) > 0) { hd(xs) }`), and treat `try/catch`
-as catching `error()` only.
+**Impact:** recursion-heavy programs must be compiled. **Workaround:**
+`swc build` — the interpreter is for short scripts, tests, and the REPL.
 
 ### Mutual tail recursion is not TCO'd; deep chains overflow silently
 
@@ -64,12 +59,32 @@ model), recorded here so the behavior is not a surprise.
 
 ## Recently cleared
 
+### `try/catch` caught builtin panics in the interpreter but not compiled
+
+Cleared on 2026-06-09 (Round-7 follow-up). The error model is now identical
+on both paths and gated by the dual-path conformance runner
+(`tests/sw/run_conform.sh`, wired into `make test-sw`):
+
+- `error()` unwinds the full dynamic extent to the nearest `try` — an
+  `error()` raised inside a callee lands in the caller's `catch`, and the
+  statements after the raise do NOT run. (Compiled: per-process
+  setjmp/longjmp chain, `sw_self_try_chain`; the old codegen ran the whole
+  try body and tested the sentinel once at the end, so the statement after
+  an `error()` still executed — and could panic the process before the
+  catch was consulted.)
+- `error()` outside any `try` stays the documented silent
+  continue-with-nil on both paths (the interpreter previously unwound the
+  entire rest of the program, silently).
+- Panics (builtin panics, `panic()`, failed `expect()`) are uncatchable on
+  both paths: `try/catch` does not absorb them, the run exits 1.
+  `assert_raises` remains the sanctioned test-only interceptor.
+
 ### No `swc run` subcommand
 
-Cleared. `swc run file.sw` exists (parse → codegen → `cc` → run the resulting
-binary in one shot; see `run_file` in `src/swc.c`). The interpreter path
-(`swc run`, REPL, `swc test`) shares the runtime's builtins with the compiled
-path.
+Cleared. `swc run file.sw` exists and runs the tree-walking interpreter
+(parse → merge imports → interpret `main()`; see `run_file` in `src/swc.c`).
+The interpreter path (`swc run`, REPL, `swc test`) shares the runtime's
+builtins with the compiled path.
 
 ### Multi-head cons patterns are unimplemented
 
