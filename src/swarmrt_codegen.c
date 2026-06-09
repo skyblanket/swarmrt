@@ -2011,6 +2011,16 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "        %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
         fprintf(f, "      }\n");
         fprintf(f, "    }\n");
+        /* Reduction check at the loop backedge. A self-tail-call is the
+         * language's only unbounded loop, and without this the compiled
+         * loop never yields: a spawn storm on one scheduler kept every
+         * child queued behind the running parent (80K live 128KB stacks
+         * = ~160K VMAs, over Linux's default vm.max_map_count 65530 —
+         * mmap/calloc then fail and the storm dies by SIGSEGV instead
+         * of fairness). One TLS decrement per turn; yields every
+         * SWARM_CONTEXT_REDS turns, same budget receive-blocking uses.
+         * Both calls are no-ops outside a fiber (interpreter path). */
+        fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
         fprintf(f, "    goto _tail;\n");
         out[0] = '\0';
         return;
