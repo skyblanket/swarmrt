@@ -2143,6 +2143,22 @@ sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     return r;
 }
 
+/* Deep-copy into the running process's arena (default allocator). Explicitly
+ * clears force-global AND any target region so the copy always lands in the
+ * caller's arena (or the global heap when no process is current). Lets a
+ * long-lived store hand a reader its OWN arena copy, so the store can free its
+ * stored copy without dangling the reader (ETS copy-out). */
+sw_val_t *sw_val_deep_copy_local(sw_val_t *v) {
+    sw_value_arena_t *save_t = g_alloc_target;
+    int save_g = g_alloc_force_global;
+    g_alloc_target = NULL;
+    g_alloc_force_global = 0;
+    sw_val_t *r = deep_copy_rec(v, 0);
+    g_alloc_target = save_t;
+    g_alloc_force_global = save_g;
+    return r;
+}
+
 /* Ownership v2: deep-copy v's whole graph INTO `region` (a message/spawn/turn
  * region). The region target wins over force_global and over the process arena.
  * Reads the source graph (wherever it lives) and writes the copy into `region`.

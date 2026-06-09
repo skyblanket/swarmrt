@@ -160,6 +160,39 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
     }
 }
 
+/* Fully recursive free of a global-heap value tree OWNED by an ETS entry.
+ * Mirrors deep_copy_rec's allocations (every node val_alloc'd; strings/atoms and
+ * bytes own their buffers; tuple/list/map/fun element arrays are malloc'd).
+ * Unlike sw_val_free it recurses into MAP keys/vals and FUN captures, because an
+ * ETS value is a deep_copy_global tree — fully independent, no interned or shared
+ * nodes (verified: every sw_val_* constructor allocates fresh) — so the WHOLE
+ * graph must go. Safe to call on replace/delete/take because get/take copy the
+ * value OUT to the reader (sw_val_deep_copy_local), so no reader ever holds the
+ * stored pointer. The rwlock serialises this against readers. */
+static void _vets_free_val(sw_val_t *v) {
+    if (!v) return;
+    switch (v->type) {
+    case SW_VAL_STRING: case SW_VAL_ATOM:
+        free(v->v.str); break;
+    case SW_VAL_BYTES:
+        free(v->v.bytes.data); break;
+    case SW_VAL_TUPLE: case SW_VAL_LIST:
+        for (int i = 0; i < v->v.tuple.count; i++) _vets_free_val(v->v.tuple.items[i]);
+        free(v->v.tuple.items); break;
+    case SW_VAL_MAP:
+        for (int i = 0; i < v->v.map.count; i++) {
+            _vets_free_val(v->v.map.keys[i]);
+            _vets_free_val(v->v.map.vals[i]);
+        }
+        free(v->v.map.keys); free(v->v.map.vals); break;
+    case SW_VAL_FUN:
+        for (int i = 0; i < v->v.fun.ncaptures; i++) _vets_free_val(v->v.fun.captures[i]);
+        free(v->v.fun.captures); break;
+    default: break;
+    }
+    free(v);
+}
+
 static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
     (void)a; (void)n;
     pthread_mutex_lock(&_vets_meta);
@@ -185,7 +218,7 @@ static sw_val_t *_builtin_ets_put(sw_val_t **a, int n) {
         /* GC v1: ETS is a cross-process store outliving the inserter, so its
          * keys/values must live on the global heap (deep-copied), not in the
          * inserting process's arena which is freed on its exit. */
-        if (_vets_key_eq(e->key, a[1])) { e->value = sw_val_deep_copy_global(a[2]); pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }
+        if (_vets_key_eq(e->key, a[1])) { _vets_free_val(e->value); e->value = sw_val_deep_copy_global(a[2]); pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }  /* free old to bound replace churn */
         e = e->next;
     }
     _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
@@ -208,7 +241,11 @@ static sw_val_t *_builtin_ets_get(sw_val_t **a, int n) {
     int count = 0;
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
-            sw_val_t *v = e->value;
+            /* Copy OUT into the caller's arena (BEAM ETS semantics) so the table
+             * can own + free its stored copy without dangling this reader. Done
+             * under the read lock — a writer (replace/delete/take) needs the write
+             * lock, so the stored value can't be freed mid-copy. */
+            sw_val_t *v = sw_val_deep_copy_local(e->value);
             pthread_rwlock_unlock(&t->lock);
             return v;
         }
@@ -230,7 +267,8 @@ static sw_val_t *_builtin_ets_delete(sw_val_t **a, int n) {
     _vets_entry_t **pp = &t->buckets[bucket];
     while (*pp) {
         if (_vets_key_eq((*pp)->key, a[1])) {
-            _vets_entry_t *dead = *pp; *pp = dead->next; free(dead);
+            _vets_entry_t *dead = *pp; *pp = dead->next;
+            _vets_free_val(dead->value); _vets_free_val(dead->key); free(dead);  /* free stored value+key, not just the entry */
             pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok");
         }
         pp = &(*pp)->next;
@@ -257,8 +295,9 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
                 /* Allocate a NEW int for the entry — mutating the old
                  * one in place would corrupt any caller still holding
                  * the previous reference. */
-                int64_t result = e->value->v.i + delta;
-                e->value = sw_val_deep_copy_global(sw_val_int(result));  /* GC v1: ETS store on global heap */
+                int64_t result = e->value->v.i + delta;  /* read int BEFORE freeing */
+                _vets_free_val(e->value);
+                e->value = sw_val_deep_copy_global(sw_val_int(result));  /* GC v1: ETS store on global heap; free old to bound churn */
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_int(result);
             }
@@ -291,8 +330,9 @@ static sw_val_t *_builtin_ets_cas(sw_val_t **a, int n) {
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
-            if (_vets_key_eq(e->value, a[2])) {
-                e->value = sw_val_deep_copy_global(a[3]);  /* GC v1: ETS store on global heap */
+            if (_vets_key_eq(e->value, a[2])) {  /* reads old value before freeing */
+                _vets_free_val(e->value);
+                e->value = sw_val_deep_copy_global(a[3]);  /* GC v1: ETS store on global heap; free old to bound churn */
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("true");
             }
@@ -317,11 +357,13 @@ static sw_val_t *_builtin_ets_take(sw_val_t **a, int n) {
     while (*pp) {
         if (_vets_key_eq((*pp)->key, a[1])) {
             _vets_entry_t *dead = *pp;
-            sw_val_t *val = dead->value;
+            /* Copy OUT to the caller, then free the table's stored value + key +
+             * entry (the entry is removed; bound the memory). */
+            sw_val_t *out = dead->value ? sw_val_deep_copy_local(dead->value) : sw_val_nil();
             *pp = dead->next;
-            free(dead);
+            _vets_free_val(dead->value); _vets_free_val(dead->key); free(dead);
             pthread_rwlock_unlock(&t->lock);
-            return val ? val : sw_val_nil();
+            return out;
         }
         pp = &(*pp)->next;
     }
@@ -349,7 +391,10 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
     sw_val_t *old_val = NULL;
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
-        if (_vets_key_eq(e->key, a[1])) { old_val = e->value; break; }
+        /* Snapshot a COPY: the lambda runs OUTSIDE the lock (below), and another
+         * process could replace/delete this key meanwhile and free the stored
+         * value — passing the table's pointer to the lambda would be a UAF. */
+        if (_vets_key_eq(e->key, a[1])) { old_val = sw_val_deep_copy_local(e->value); break; }
         e = e->next;
     }
     pthread_rwlock_unlock(&t->lock);
@@ -366,7 +411,8 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
     e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
-            e->value = sw_val_deep_copy_global(new_val);  /* GC v1: ETS store on global heap */
+            _vets_free_val(e->value);
+            e->value = sw_val_deep_copy_global(new_val);  /* GC v1: ETS store on global heap; free old to bound churn */
             pthread_rwlock_unlock(&t->lock);
             return new_val;
         }

@@ -180,6 +180,13 @@ sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
  * outlives the source process's arena. See [[swarmrt-gc-design]]. */
 sw_val_t *sw_val_deep_copy_global(sw_val_t *v);
 
+/* Ownership v2: deep-copy a value's whole graph into the RUNNING PROCESS's arena
+ * (the default allocator), regardless of any force-global/target flag in effect.
+ * Used to copy a long-lived store's value OUT to a reader so the store can own
+ * and free its own copy — BEAM's ETS copy-out semantics. Outside a process (no
+ * arena) it lands on the global heap. See [[swarmrt-gc-design]]. */
+sw_val_t *sw_val_deep_copy_local(sw_val_t *v);
+
 /* Ownership v2: deep-copy a value's whole graph INTO a specific region (message/
  * spawn/turn). `region` is `struct sw_value_arena *` (swarmrt_varena.h); forward-
  * declared here so this header needn't include it. NULL region → global-heap copy. */

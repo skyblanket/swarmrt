@@ -324,12 +324,22 @@ gc-stress: swc libswarmrt
 	@# process's OWN call chain — not frames left by an unrelated fiber parked deep
 	@# on the same scheduler thread. Observable only on stderr, so a grep gate.
 	@bash scripts/gc_trace_check.sh tests/gc/trace_xproc_repro.sw stress
+	@# ETS cross-process aliasing: ets_get must COPY the value out, so a reader
+	@# holding a looked-up value is immune to another process replacing/deleting the
+	@# key (which now frees the stored copy). A shared pointer would heap-UAF when
+	@# the holder deep-reads its value after the churner freed it.
+	@./bin/swc build --emit-c tests/gc/ets_alias_repro.sw -o $(BIN_DIR)/_etsa_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/ets_alias_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_ets_alias $(LDFLAGS)
+	@rm -f tests/gc/ets_alias_repro.gen.c $(BIN_DIR)/_etsa_emit
+	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_ets_alias
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
 # (scripts/gc_slope.sh enforces this — a crashing/sys_exit(1) probe FAILS). Covers
-# spawn args, value messages, a long-lived tail loop, and pmap. Honors
+# spawn args, value messages, a long-lived tail loop, pmap, and ETS churn (a
+# fixed live-set hammered with put-replace/delete/take must hold flat). Honors
 # SW_SCHEDULERS / SW_GC_OFF.
 .PHONY: gc-slope
 gc-slope: swc
@@ -339,6 +349,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_turn.sw      5000 100000 80 turn     || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw      200 2000   80 pmap     || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 

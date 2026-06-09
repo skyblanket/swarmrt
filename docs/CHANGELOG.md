@@ -4,6 +4,38 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-09 — bounded memory: ETS values are freed on replace/delete (BEAM copy-out semantics)
+
+**fix(gc): a high-churn ETS table no longer grows without bound.** The compiled-backend
+ETS store (`_vets_*` in `swarmrt_builtins_studio.h`) copied values IN on insert (global
+heap, so they outlive the inserting process) but never freed them: `ets_put`/`update`/
+`cas`/`update_counter` replace paths overwrote the stored pointer without freeing the old
+value, and `ets_delete`/`ets_take` freed only the entry struct, not the value (and never
+the key). A long-lived table hammered with replace/delete leaked a value graph per
+mutation. Now the table OWNS its stored key+value and frees them on every replace, delete,
+and take (`_vets_free_val` — a full recursive free that, unlike `sw_val_free`, also reclaims
+MAP elements and FUN captures, safe because ETS values are independent `deep_copy_global`
+trees with no interned/shared nodes).
+
+**The enabling change — `ets_get`/`ets_take` now COPY the value OUT** into the reading
+process's arena (`sw_val_deep_copy_local`), done under the table lock. This is BEAM's ETS
+semantics (a lookup copies the term into the calling process) and is what makes
+free-on-replace safe: a reader never holds the table's pointer, so freeing the stored copy
+can't dangle it. `ets_update`'s lambda runs outside the lock, so the old value is snapshotted
+as a copy first (else a concurrent free during the call would be a UAF).
+
+**test(gc): two permanent gates.** `tests/gc/slope_ets.sw` (wired into `make gc-slope`,
+budget 10 MB): a fixed 32-key live set hammered with put-replace/update_counter/delete/take
+holds **flat** RSS (0 MB growth 2k→20k rounds; pre-fix grew 19 MB → FAILs the 10 MB budget).
+`tests/gc/ets_alias_repro.sw` (wired into `make gc-stress`, `SW_SCHEDULERS=1` + ASAN +
+`-DSW_ARENA_POISON`): a holder parks holding a looked-up value while a churner replaces+
+deletes that key 60×, then deep-reads it — clean post-fix; pre-fix (sharing the raw pointer)
+it's a confirmed `heap-use-after-free in _builtin_to_string`. gc-stress (both modes, 5 gates),
+gc-slope (6 probes), phases 2-10 (arena fully reclaimed), test-sw 53/475 all green; zero
+warnings. Remaining global-heap owners: supervisor child closures + timer/cron closures
+(next). (The separate C-API `sw_ets_*` in `swarmrt_ets.c` — interpreter/phase-test path,
+short-lived — is not yet converted.)
+
 ## 2026-06-09 — process isolation: panic traces (line/file/call-stack) are per-process too
 
 **fix(gc): a panic now reports the panicking process's OWN location and call chain.**
