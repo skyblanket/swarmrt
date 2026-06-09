@@ -105,19 +105,28 @@ Generated-code process isolation is proven and every long-lived ownership path i
 
 Do these in roughly this order. Each is "verify locally, then branch → ff-merge to main → push".
 
-### 2.1 Linux LeakSanitizer CI leg  *(highest leverage — closes the leak-blindness above)*
-- Add a job/leg to `.github/workflows/linux-quickstart.yml` that builds the `gc-stress`/`gc-slope`
-  probes on Linux and runs them with `ASAN_OPTIONS=detect_leaks=1` (real LSan, which macOS lacks).
-  This would have caught the kill-path leaks that passed a green slope. Cannot be verified on the
-  macOS dev box — keep the config minimal and low-risk; gate it as advisory first, promote to
-  blocking once green.
-- Bonus: a small standalone C harness (mirror `gc_ets_alias`) that spins the runtime, runs
-  create→cancel/kill→reap loops for timers + supervisors, `sw_swarm_shutdown()`, and lets LSan
-  assert **zero leaks at exit** — a precise, non-noisy leak gate.
+### 2.1 Linux LeakSanitizer CI leg  ✅ **DONE** (Round-7 continuation, 2026-06-09, on Linux)
+- `make lsan-gate` (Linux-only): `tests/gc/lsan_lifecycle.sw` churns every lifecycle owner
+  (timers fired + cancelled incl. pre-trampoline kill, static + dynamic supervisors killed,
+  ETS replace/delete, spawns, compound messages; ~64 KB captures), exits cleanly, and LSan
+  asserts zero definitely-lost blocks at exit. Suppressions in `tests/gc/lsan.supp`, each tied
+  to a documented accepted-minor. **Proven bidirectional** (an injected unreachable block fails
+  it). Advisory CI leg added to linux-quickstart.yml — promote to blocking once green a week.
+- Phase-1 validation: 40 rounds of full lifecycle churn → **zero unsuppressed leaks**.
+- Canary-writing lesson: at `-O1` clang elides an unused `malloc` — escape the pointer through
+  a `volatile` global or your leak canary tests nothing.
 
-### 2.2 Scheduler-count matrix  *(locally verifiable)*
-- Run `make gc-stress`, `make test-sw`, and the phase tests under `SW_SCHEDULERS=1`, `2`, `$(nproc)`,
-  and oversubscribed (`2×nproc`). Fix anything that breaks; wire the matrix into CI.
+### 2.2 Scheduler-count matrix  ✅ **DONE** (same session) — found a real architecture issue
+- Suite + conformance run under `SW_SCHEDULERS=1/2/4/8`. **Finding:** the curl-backed HTTP
+  client builtins block their scheduler OS THREAD, so self-loopback tests (in-process server +
+  blocking client) **deadlock forever under SW_SCHEDULERS=1** — invisible at default counts,
+  and the deadlock watchdog does not flag it (the thread is busy in libcurl, not parked).
+  Documented in KNOWN_ISSUES; those tests SKIP at S=1; `run_tests.sh` now bounds every test
+  with a 180s timeout so a hang FAILS instead of wedging the suite. Real fix is the Phase-3
+  item below (blocking transports → I/O thread pool with fiber park/wake, like `wsc_*`).
+- Cross-scheduler wake cost (Round-7 O4): bounded spin-before-park in the scheduler idle loop
+  (`SW_SPIN_US`, default 30, 0 disables). Measured: cross-sched ping-pong **58.4 → 4.5 µs/rt
+  (13×)**; spawn/exit cycles −26%; same-sched and single-sched unchanged.
 
 ### 2.3 ThreadSanitizer build + race test
 - macOS clang has TSan. Build the runtime under `-fsanitize=thread` and run a multi-scheduler

@@ -325,7 +325,10 @@ Rebased onto the Phase-1 ownership work (`e1a7713`) and executed the
 | O3 silent spawn failure | **FIXED** — panics "process table full — raise SW_MAX_PROCS". |
 | O6 diagnostics | **PARTIAL** — f-string interpolations now carry their real line. Fabricated `src/<Mod>.sw` paths and module-qualified did-you-mean still open. |
 | O7 grammar/stdlib paper cuts | **MOSTLY FIXED** — tuple-destructuring assignment (`{'ok', v} = fetch()`, literal positions assert-match); multi-arm `with`/`else` with guards; `after MS ->` accepted; `Std.map`/`Std.filter`/`Std.join` exist (and the codegen guard that rejected them is relaxed). Still open: codepoint-aware string ops, list/nested destructuring. |
-| O4 cross-scheduler wake cost, O5 startup time, O8 gate portability docs | open (unchanged). |
+| O4 cross-scheduler wake cost | **FIXED** — bounded spin-before-park in the scheduler idle loop (`SW_SPIN_US`, default 30µs, 0 disables; producer pays nothing — `idle` stays unset while spinning). Measured on the original repro: 58.4 → 4.5 µs per cross-scheduler ping-pong round trip (13×); spawn cycles −26%; same-sched unchanged at ~920ns. |
+| O6 diagnostics (remainder) | **FIXED** — real source paths registered by swc (diagnostics + #line use the actual file); module-qualified calls validate with did-you-mean ("module Std has no function 'mpa' — did you mean 'Std.map'?"). |
+| O7 codepoint strings | **FIXED** — `string_chars(s)` (UTF-8 codepoint split, both paths, conform-gated). |
+| O5 startup time, O8 gate portability docs | open (unchanged). |
 
 **And the structural fix from the assessment section is in:** the
 dual-path conformance gate (`tests/sw/run_conform.sh` + `tests/sw/conform/`,
