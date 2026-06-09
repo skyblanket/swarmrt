@@ -107,6 +107,20 @@ jobs:
         continue-on-error: true
         run: make lsan-gate
 
+      - name: Scheduler-count matrix (Phase 2.2 — suite under S=1 and oversubscribed)
+        # The default-scheduler run above covers nproc; these legs cover the
+        # edges. S=1 found a real architecture issue (blocking curl client +
+        # in-process server deadlocks — the affected tests SKIP below 3
+        # schedulers, see KNOWN_ISSUES); S=8 oversubscribes the runner's
+        # cores so cross-scheduler interleavings get exercised. The per-test
+        # 180s timeout in run_tests.sh turns any future hang into a loud FAIL.
+        run: |
+          set -e
+          SW_SCHEDULERS=1 ./tests/sw/run_tests.sh
+          SW_SCHEDULERS=1 ./tests/sw/run_conform.sh
+          SW_SCHEDULERS=8 ./tests/sw/run_tests.sh
+          SW_SCHEDULERS=8 ./tests/sw/run_conform.sh
+
       - name: Stress test (high-process-count race guard)
         # Catches regressions in the high-spawn scheduler/mailbox path.
         # The historical ctx-tear race is closed by per-slot generation

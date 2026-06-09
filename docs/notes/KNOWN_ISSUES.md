@@ -31,6 +31,30 @@ unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
 **Impact:** recursion-heavy programs must be compiled. **Workaround:**
 `swc build` — the interpreter is for short scripts, tests, and the REPL.
 
+### Blocking C-call builtins occupy their scheduler OS thread
+
+The curl-backed HTTP client builtins (`http_get` / `http_post` /
+`http_request` / `http_post_stream`) and other synchronous C calls block
+the scheduler THREAD, not just the calling fiber. Consequence: a program
+that runs an in-process server fiber AND calls itself over HTTP
+deadlocks under `SW_SCHEDULERS=1` — the blocked client holds the only
+scheduler, the server fiber never runs. At `SW_SCHEDULERS=2` the same
+deadlock fires whenever the client and server fibers happen to be placed
+on the SAME scheduler: a runnable fiber in a blocked scheduler's local
+queue is unstealable (work stealing covers only the global overflow
+queue, not peer local queues). Found by the Phase-2.2 scheduler-count
+matrix (test_http_request hung forever single-sched, all three loopback
+tests failed at S=2; they now SKIP below 3 schedulers and the test
+runner bounds every test with a 180s timeout). The deadlock watchdog did
+not flag this shape — the thread is busy inside libcurl, not parked.
+
+**Impact:** single-scheduler deployments must not self-call over
+blocking clients; chatty blocking I/O also steals a core from every
+other process on that scheduler. **Workaround:** `SW_SCHEDULERS>=2` for
+self-loopback workloads (the WebSocket client is yield-aware and not
+affected). **Fix direction (Phase 3):** run blocking transports on a
+dedicated I/O thread pool with fiber park/wake, like `wsc_*` does.
+
 ### Mutual tail recursion is not TCO'd; deep chains overflow silently
 
 Only **self** tail calls are optimised. Two functions tail-calling each other
