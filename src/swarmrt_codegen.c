@@ -2606,8 +2606,18 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
  * both `n`s are separate). */
 static void emit_case(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
-    char subj[32], res[32];
-    emit_expr(ctx, n->v.casex.subject, 0, subj, sizeof(subj));
+    char subj0[32], subj[32], res[32];
+    emit_expr(ctx, n->v.casex.subject, 0, subj0, sizeof(subj0));
+    /* Snapshot the subject into a fresh temp before any arm binds. When
+     * the subject is a plain variable and an arm re-binds the same name
+     * (`case n { n when n > 0 -> ... }`), binding straight off the
+     * subject emitted `sw_val_t *n = n;` — C self-initialization, so the
+     * arm-local n read indeterminate memory (wrong guard results at
+     * best, SIGSEGV at worst). Tuple/cons/map sub-binds had the same
+     * hazard through `n->v.tuple.items[i]`. One pointer copy fixes the
+     * whole class; `with` desugars to case, so it is covered too. */
+    fresh_var(ctx, subj, sizeof(subj));
+    fprintf(f, "    sw_val_t *%s = %s;\n", subj, subj0);
     fresh_var(ctx, res, sizeof(res));
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
 

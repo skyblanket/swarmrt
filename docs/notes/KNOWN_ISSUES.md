@@ -19,6 +19,35 @@ the divergence is the issue.
 when compiled. **Workaround:** add an explicit `after MS -> ...` clause to any
 `receive` that might not match, so compiled and interpreted runs behave the same.
 
+### `try/catch` catches builtin panics in the interpreter but not compiled (divergence)
+
+```sw
+r = try { hd([]) } catch e { "caught" }
+```
+
+Under `swc run` this binds `r = "caught"`; in a compiled binary the panic
+propagates and kills the process. The docs side with the compiled behavior
+("panics cannot be caught"), so the interpreter is the out-of-spec path — but
+the same program meaning two things on the two paths is the real bug. Found in
+the Round-7 audit ([REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O1).
+
+**Impact:** error-handling code validated in the REPL silently changes meaning
+when compiled. **Workaround:** never rely on `try/catch` to stop a panicking
+builtin — guard first (`if (length(xs) > 0) { hd(xs) }`), and treat `try/catch`
+as catching `error()` only.
+
+### Mutual tail recursion is not TCO'd; deep chains overflow silently
+
+Only **self** tail calls are optimised. Two functions tail-calling each other
+(the natural state-machine shape) consume a C stack frame per hop and overflow
+the 128KB fiber stack at depth ~10^4–10^5 — currently as a raw SIGSEGV without
+even the crash banner (the handler runs on the overflowed fiber stack; needs
+`sigaltstack`). See [REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O2.
+
+**Impact:** mutually recursive FSMs die at depth in compiled binaries.
+**Workaround:** keep the loop in one function and dispatch on an argument
+(`fun fsm(state, n) { case state { ... } }`).
+
 ### No static type or shape checking
 
 `sw` is dynamically typed by design — there is no compile-time type or arity

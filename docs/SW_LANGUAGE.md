@@ -103,7 +103,7 @@ fun greet(name) {
 - Body is one or more expressions; the last expression's value is the return value.
 - Parameters are positional; default values: `fun greet(name = "world") { ... }`.
 - No explicit `return` — Erlang-style trailing-expression-is-the-value.
-- Recursion is the loop construct (no `for`/`while`). Tail calls are detected and optimised by the codegen, so unbounded tail recursion doesn't blow the stack.
+- Recursion is the loop construct (no `for`/`while`). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
 
 ```sw
 fun count_down(n) {
