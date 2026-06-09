@@ -571,6 +571,12 @@ struct sw_val **sw_self_error_slot(void);
  * until the child's trampoline adopts it. Reclaimed by process_destroy if the
  * child dies pre-trampoline; on spawn failure (NULL) the caller reclaims it. */
 sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_arena *region);
+/* Spawn with a per-process teardown hook recorded BEFORE the child is runnable
+ * (proc->on_destroy = dtor, on_destroy_arg = arg), so even a pre-trampoline kill
+ * reclaims `arg` via process_destroy. dtor(arg) frees the spawn arg. On spawn
+ * failure (NULL) nothing was recorded — the caller reclaims `arg`. */
+sw_process_t *sw_spawn_dtor(void (*entry)(void*), void *arg, void (*dtor)(void*));
+sw_process_t *sw_spawn_link_dtor(void (*entry)(void*), void *arg, void (*dtor)(void*));
 /* Called by the child trampoline: atomically take (read+clear) this process's
  * spawn_region so it can adopt it and process_destroy won't double-free. */
 struct sw_value_arena *sw_self_take_spawn_region(void);

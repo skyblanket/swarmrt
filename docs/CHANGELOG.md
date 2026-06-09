@@ -4,6 +4,35 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-10 — close the pre-trampoline kill window (timer + supervisor child) via sw_spawn_dtor
+
+**fix(gc): a timer/child killed before its entry fn ever runs now reclaims its arg.** A
+confirmation audit of the kill-path fixes found one residual: the timer (and, symmetrically,
+the supervisor child) armed `on_destroy` as the *first statement of its entry fn* — but a
+`p = interval(...); exit_proc(p)` with no intervening yield kills the child while it's still
+in the run queue, so the scheduler's pre-swap `kill_flag` check runs `process_destroy`
+**before the entry fn ever executes** → `on_destroy` is still NULL and the closure leaks
+(verified +143 MB; 100% under `SW_SCHEDULERS=1`). Arming *after* `sw_spawn` returns can't fix
+it (the child may already have completed and recycled its slot — a write-after-free).
+
+Fix: `sw_spawn_dtor` / `sw_spawn_link_dtor` (`swarmrt_native.c`) record `proc->on_destroy`
+**before the child is made runnable** — mirroring how `sw_spawn_owned` threads the spawn region
+(a thread-local consumed in `sw_spawn_opts` ahead of `sw_add_to_runq`). The timer
+(`_builtin_interval`/`_builtin_delay`) and supervisor child spawn sites (`sup_start_child`,
+dynsup start/restart) now use it; the entry-fn self-arming is removed. So the arg is reclaimed
+on *every* path including pre-trampoline kill, with no slot-reuse race. Native-C child specs
+pass a NULL dtor (unchanged). `slope_interval` updated to kill with **no intervening yield**
+(was stepping around the bug), and verified flat at both default and `SW_SCHEDULERS=1`;
+ASAN-clean (no double-free from pre-runnable arming). gc-stress (9 gates), gc-slope (10
+probes), phases 2-10 (supervisor 14/14 + 12/12), test-sw 53/475 all green; zero warnings.
+
+With this, all pre-trampoline leak windows (the only residual after the kill-path fix) are
+closed. Remaining accepted-minor: the timer spurious-*compound*-message shallow `free(m)`
+(`_sw_free_global_val` would crash on a RAW payload). The audit also re-confirmed gen-exec
+isolation, supervisor master/copy disjointness, and ETS copy-out-on-read all memory-safe.
+
+---
+
 ## 2026-06-10 — fix kill-path leaks in timer + supervisor teardown (adversarial-audit follow-up)
 
 **fix(gc): killing a timer or supervisor no longer leaks its closures/state.** A fresh-eyes

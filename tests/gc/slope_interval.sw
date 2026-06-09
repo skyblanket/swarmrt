@@ -22,13 +22,13 @@ fun big_string(acc, n) { if (n <= 0) { acc } else { big_string(acc ++ "012345678
 fun loop(rounds, cap) {
     if (rounds <= 0) { 0 }
     else {
-        # Long period: the interval parks in sw_receive_any almost immediately and
-        # never ticks; exit_proc then wakes the parked receive (mailbox_wake) so it
-        # unwinds and frees promptly — no need to wait for a tick. The leak (c+c->fn)
-        # is per-spawned-interval regardless of whether it fired.
+        # No yield between interval() and exit_proc(): exercises BOTH the
+        # cancel-while-parked path AND the PRE-TRAMPOLINE kill (child killed before
+        # its entry fn ever runs — 100% under SW_SCHEDULERS=1). Both must reclaim the
+        # closure (on_destroy armed pre-runnable by sw_spawn_dtor). A long period
+        # means it never ticks; the leak (c+c->fn) is per-spawned-interval regardless.
         p = interval(100000, fn() { cap })
-        sleep(1)                          # let it reach sw_receive_any and park
-        exit_proc(p, 'killed')            # cancel — wakes the parked receive -> free
+        exit_proc(p, 'killed')            # cancel immediately (no intervening yield)
         sleep(1)                          # reaped before the next round (bounded concurrency)
         loop(rounds - 1, cap)
     }

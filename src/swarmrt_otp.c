@@ -237,7 +237,10 @@ static int sup_start_child(sw_sup_child_rt_t *child) {
      * process_destroy; the master in child->spec.start_arg is reused for the next
      * restart and freed only at teardown. */
     void *arg = sw_spec_child_arg(&child->spec);
-    child->proc = sw_spawn_link(child->spec.start_func, arg);
+    /* Arm the child's on_destroy (free its copy) BEFORE it is runnable, so even a
+     * pre-trampoline kill reclaims the copy. free_start_arg is NULL for native
+     * specs -> no hook, raw arg not freed. */
+    child->proc = sw_spawn_link_dtor(child->spec.start_func, arg, child->spec.free_start_arg);
     if (!child->proc) { sw_spec_free_child_arg(&child->spec, arg); return -1; }
 
     child->monitor_ref = sw_monitor(child->proc);

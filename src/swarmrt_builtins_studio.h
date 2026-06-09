@@ -2960,12 +2960,10 @@ static void *_sup_copy_child_closure(void *raw) {
 static void _sup_child_entry(void *raw) {
     _sup_child_closure_t *c = (_sup_child_closure_t *)raw;
     /* `c` is THIS incarnation's private copy (made by _sup_copy_child_closure at
-     * spawn). Free it in process_destroy via the on_destroy hook — crash-safe: a
-     * panic sw_context_swaps to the scheduler and never returns here, so a
-     * fiber-tail free would be skipped, but process_destroy always runs. The
-     * supervisor's master copy is a separate allocation freed at child removal. */
-    sw_process_t *self = sw_self();
-    if (self) { self->on_destroy = _free_sup_child_closure; self->on_destroy_arg = c; }
+     * spawn). It is freed in process_destroy via on_destroy = _free_sup_child_closure,
+     * armed by sw_spawn_link_dtor BEFORE this fiber was runnable — crash-safe (a
+     * panic never returns here) AND pre-trampoline-kill-safe. The supervisor's
+     * master is a separate allocation freed at child removal/teardown. */
     sw_val_apply(c->fn, NULL, 0);
 }
 
@@ -5212,20 +5210,18 @@ static void _free_timer_closure(void *raw) {
 
 static void _after_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
-    /* Reclaim the closure in process_destroy (kill-safe) — armed BEFORE we park
-     * in sw_receive_any, so a delay() cancelled while parked still frees it. */
-    sw_process_t *self = sw_self();
-    if (self) { self->on_destroy = _free_timer_closure; self->on_destroy_arg = c; }
-    /* Wait via the yielding, kill-aware sw_receive_any (like _builtin_sleep) —
-     * NOT raw usleep (blocks the scheduler thread, uninterruptible). Returns NULL
-     * on timeout OR kill. */
+    /* The closure is freed in process_destroy via on_destroy = _free_timer_closure,
+     * armed by sw_spawn_dtor BEFORE this fiber was runnable — so it's reclaimed on
+     * EVERY exit: natural fire, cancel-while-parked (the scheduler tears a killed
+     * parked fiber down without resuming it), kill-while-running, and even a
+     * pre-trampoline kill (before this fn ever runs). Wait via the yielding,
+     * kill-aware sw_receive_any (NOT raw usleep — blocks the thread). */
     uint64_t tag;
     void *m = sw_receive_any(c->ms, &tag);
     if (m) free(m);                       /* discard any spurious message */
-    self = sw_self();
+    sw_process_t *self = sw_self();
     if (!(self && self->kill_flag))       /* fire only if not cancelled mid-wait */
         sw_val_apply(c->fn, NULL, 0);
-    /* closure freed by on_destroy in process_destroy (covers fire AND cancel) */
 }
 
 /* delay(ms, fn) → pid — run fn once after ms milliseconds */
@@ -5236,32 +5232,29 @@ static sw_val_t *_builtin_delay(sw_val_t **a, int n) {
      * deep-copy the closure to the global heap so it survives. */
     c->fn = sw_val_deep_copy_global(a[1]);
     c->ms = (uint64_t)a[0]->v.i;
-    sw_process_t *p = sw_spawn(_after_entry, c);
+    /* on_destroy armed pre-runnable -> reclaimed even on a pre-trampoline kill. */
+    sw_process_t *p = sw_spawn_dtor(_after_entry, c, _free_timer_closure);
     if (!p) { _free_timer_closure(c); return sw_val_nil(); }  /* spawn failed: reclaim */
     return sw_val_pid(p);
 }
 
 static void _every_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
-    /* Reclaim the closure in process_destroy (kill-safe) — armed BEFORE we park.
-     * A cancelled interval is killed while parked in sw_receive_any and the
-     * scheduler tears it down without resuming this fiber, so the on_destroy hook
-     * (which process_destroy always fires) is what actually frees the closure. */
-    sw_process_t *self = sw_self();
-    if (self) { self->on_destroy = _free_timer_closure; self->on_destroy_arg = c; }
-    /* Yielding, kill-aware loop — NOT raw usleep (blocks the scheduler thread,
-     * uninterruptible). sw_receive_any yields each tick, returns NULL on kill. */
+    /* The closure is freed in process_destroy via on_destroy = _free_timer_closure,
+     * armed by sw_spawn_dtor BEFORE this fiber was runnable (so a cancelled
+     * interval — killed while parked, which the scheduler tears down WITHOUT
+     * resuming this fiber — still reclaims it, as does a pre-trampoline kill).
+     * Yielding, kill-aware loop — NOT raw usleep (blocks the scheduler thread). */
     for (;;) {
         uint64_t tag;
         void *m = sw_receive_any(c->ms, &tag);
         if (m) free(m);                        /* discard any spurious message */
-        self = sw_self();
+        sw_process_t *self = sw_self();
         if (self && self->kill_flag) break;    /* cancelled during the wait */
         sw_val_apply(c->fn, NULL, 0);
         self = sw_self();
         if (self && self->kill_flag) break;    /* cancelled during/after the tick */
     }
-    /* closure freed by on_destroy in process_destroy */
 }
 
 /* interval(ms, fn) → pid — run fn repeatedly every ms milliseconds */
@@ -5272,7 +5265,8 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
      * lifetime — deep-copy the closure to the global heap. */
     c->fn = sw_val_deep_copy_global(a[1]);
     c->ms = (uint64_t)a[0]->v.i;
-    sw_process_t *p = sw_spawn(_every_entry, c);
+    /* on_destroy armed pre-runnable -> reclaimed even on a pre-trampoline kill. */
+    sw_process_t *p = sw_spawn_dtor(_every_entry, c, _free_timer_closure);
     if (!p) { _free_timer_closure(c); return sw_val_nil(); }  /* spawn failed: reclaim */
     return sw_val_pid(p);
 }

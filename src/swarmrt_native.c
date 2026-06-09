@@ -89,6 +89,14 @@ __thread sw_gen_exec_t *_sw_gen;
  * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
 static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
 
+/* Per-process teardown hook handed to the next sw_spawn_opts to record on the
+ * child's proc->on_destroy BEFORE it is runnable — so even a pre-trampoline kill
+ * (the child killed before its entry fn ever runs to self-arm) reclaims the
+ * spawn arg via process_destroy. Set by sw_spawn_dtor/sw_spawn_link_dtor,
+ * consumed once. on_destroy_arg is the spawn arg. */
+static __thread void (*g_pending_on_destroy)(void *) = NULL;
+static __thread void *g_pending_on_destroy_arg = NULL;
+
 /* Optional per-spawn pin set by sw_spawn_link so the child lands on a
  * specific scheduler (not the parent's). sw_spawn_opts honours this
  * when non-NULL and falls back to round-robin otherwise. NULL on
@@ -1545,6 +1553,14 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
     proc->spawn_region = g_pending_spawn_region;
     g_pending_spawn_region = NULL;
 
+    /* Record the teardown hook (if any) BEFORE the child is runnable — same
+     * reason: a pre-trampoline kill must still reclaim the spawn arg. (Overrides
+     * the NULL set by process_init_arena.) Consumed once. */
+    proc->on_destroy = g_pending_on_destroy;
+    proc->on_destroy_arg = g_pending_on_destroy_arg;
+    g_pending_on_destroy = NULL;
+    g_pending_on_destroy_arg = NULL;
+
     /* 5. Assign PID (monotonic, lock-free) */
     proc->pid = atomic_fetch_add(&arena->next_pid, 1);
     atomic_fetch_add(&g_swarm->total_spawns, 1);
@@ -1567,6 +1583,32 @@ sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_ar
     g_pending_spawn_region = region;
     sw_process_t *p = sw_spawn_opts(entry, arg, SW_PRIO_NORMAL);
     g_pending_spawn_region = NULL;   /* clear if spawn failed before consuming */
+    return p;
+}
+
+/* Spawn with a teardown hook recorded on the child BEFORE it is runnable, so a
+ * pre-trampoline kill (child killed before its entry fn runs to self-arm) still
+ * reclaims `arg` via process_destroy -> on_destroy. dtor(arg) frees the spawn
+ * arg. On spawn failure (NULL) nothing was recorded; the caller reclaims `arg`.
+ * Race-free vs self-arming in the entry fn: the hook is set before sw_add_to_runq
+ * (the child cannot run until then), and vs arm-after-spawn: no window where the
+ * child could complete + recycle the slot before the parent writes the hook. */
+sw_process_t *sw_spawn_dtor(void (*entry)(void*), void *arg, void (*dtor)(void*)) {
+    g_pending_on_destroy = dtor;
+    g_pending_on_destroy_arg = arg;
+    sw_process_t *p = sw_spawn(entry, arg);
+    g_pending_on_destroy = NULL;     /* clear if spawn failed before consuming */
+    g_pending_on_destroy_arg = NULL;
+    return p;
+}
+
+/* sw_spawn_link + a pre-runnable teardown hook (see sw_spawn_dtor). */
+sw_process_t *sw_spawn_link_dtor(void (*entry)(void*), void *arg, void (*dtor)(void*)) {
+    g_pending_on_destroy = dtor;
+    g_pending_on_destroy_arg = arg;
+    sw_process_t *p = sw_spawn_link(entry, arg);
+    g_pending_on_destroy = NULL;
+    g_pending_on_destroy_arg = NULL;
     return p;
 }
 

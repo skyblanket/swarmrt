@@ -472,7 +472,9 @@ static void dynsup_entry(void *arg) {
                  * (the master stays in the node for restarts; see node->spec
                  * below). The child frees its copy in process_destroy. */
                 void *carg = sw_spec_child_arg(&req->child_spec);
-                sw_process_t *child = sw_spawn_link(req->child_spec.start_func, carg);
+                /* Arm on_destroy (free the copy) pre-runnable -> reclaimed even on
+                 * a pre-trampoline kill. NULL dtor for native specs. */
+                sw_process_t *child = sw_spawn_link_dtor(req->child_spec.start_func, carg, req->child_spec.free_start_arg);
                 if (!child) {
                     sw_spec_free_child_arg(&req->child_spec, carg);
                     /* master not yet stored in a node — reclaim it now */
@@ -562,7 +564,8 @@ static void dynsup_entry(void *arg) {
                     /* Restart: spawn new with a FRESH closure copy (master stays
                      * in the node), replace in node. */
                     void *carg = sw_spec_child_arg(&child->spec);
-                    sw_process_t *new_child = sw_spawn_link(child->spec.start_func, carg);
+                    /* Arm on_destroy (free the copy) pre-runnable. NULL for native. */
+                    sw_process_t *new_child = sw_spawn_link_dtor(child->spec.start_func, carg, child->spec.free_start_arg);
                     if (new_child) {
                         child->proc = new_child;
                         child->monitor_ref = sw_monitor(new_child);
