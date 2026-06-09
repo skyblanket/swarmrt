@@ -15,6 +15,12 @@ export [
     zip, unzip, partition, group_by, sort, sort_by, reverse,
     flatten, unique, contains, find, any, all, count, last, init,
     chunk_every, intersperse, max_by, min_by, sum, product,
+    # map / filter / reduce are GLOBAL builtins; Std.map / Std.filter /
+    # Std.join also work because that's what an Elixir-shaped guess
+    # reaches for, and the miss used to surface as a raw linker error.
+    # (No Std.reduce — sum/product call the global `reduce` bare, and a
+    # same-named module fun would shadow it.) join == string_join.
+    map, filter, join,
     # ---- map ops ----
     map_each, map_filter,
     # ---- string ops ----
@@ -299,6 +305,35 @@ fun _map_filter(ks, m, pred, acc) {
 # ============================================================
 # STRING OPS
 # ============================================================
+
+# Std.map / Std.filter / Std.reduce — the global builtins exist, but
+# Std.map / Std.filter is what an Elixir-shaped guess reaches for, and
+# the miss used to die as a raw linker error. Self-contained (not
+# delegating to the same-named builtin) and order-tolerant like the
+# globals: the list may be either of the first two arguments.
+fun map(a, b) {
+    if (typeof(a) == "list") { _map_acc(a, b, []) }
+    else { _map_acc(b, a, []) }
+}
+fun _map_acc(lst, f, acc) {
+    if (length(lst) == 0) { reverse(acc) }
+    else { _map_acc(tl(lst), f, [f(hd(lst)) | acc]) }
+}
+
+fun filter(a, b) {
+    if (typeof(a) == "list") { _filter_acc(a, b, []) }
+    else { _filter_acc(b, a, []) }
+}
+fun _filter_acc(lst, pred, acc) {
+    if (length(lst) == 0) { reverse(acc) }
+    else {
+        if (pred(hd(lst))) { _filter_acc(tl(lst), pred, [hd(lst) | acc]) }
+        else { _filter_acc(tl(lst), pred, acc) }
+    }
+}
+
+# Std.join(lst, sep) — alias for string_join (the name people guess).
+fun join(lst, sep) { string_join(lst, sep) }
 
 # string_join(lst, sep) -> "a,b,c"
 fun string_join(lst, sep) {

@@ -2053,17 +2053,17 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         char mod[128], func[128];
         int mlen = (int)(dot - fname);
         strncpy(mod, fname, mlen); mod[mlen] = '\0';
-        /* Gleam-style hint for the `Std.map(...)` / `Std.filter(...)` reflex:
-         * map/filter/reduce/pmap are GLOBAL builtins, not module functions.
-         * Without this the qualified form leaks a raw cc "undeclared function
-         * Std_map". Small hard-coded denylist — not a general per-module export
-         * check. NOTE: `each` is deliberately NOT here — it is a real Std module
-         * function (lib/Std.sw, list-first `each(lst, fn)`), so `Std.each(...)`
-         * must keep compiling. */
+        /* Gleam-style hint for the qualified-builtin reflex. Std.map and
+         * Std.filter are REAL module functions now (lib/Std.sw aliases over
+         * the global builtins — the Elixir-shaped guess models emit), so
+         * only the names with no Std alias stay on this denylist:
+         * Std.reduce can't exist (Std's own sum/product call the global
+         * `reduce` bare; a same-named module fun would shadow it) and pmap
+         * has no alias either. */
         const char *gf = dot + 1;
-        if (strcmp(gf, "map") == 0 || strcmp(gf, "filter") == 0 ||
-            strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) {
-            fprintf(stderr, "swc: src/%s.sw:%d: %s/filter/reduce are global builtins \xe2\x80\x94 write %s(fn, list), not %s(...)\n",
+        if ((strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) &&
+            strcmp(mod, "Std") == 0) {
+            fprintf(stderr, "swc: src/%s.sw:%d: %s is a global builtin \xe2\x80\x94 write %s(fn, list, ...), not %s(...)\n",
                     ctx->mod_name, n->line, gf, gf, fname);
             ctx->had_unknown_fn = 1;
         }
