@@ -4189,6 +4189,32 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "string_to_bytes") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         return sw_val_bytes((const uint8_t *)args[0]->v.str, strlen(args[0]->v.str));
     }
+    if (strcmp(fname, "string_chars") == 0 && nargs >= 1) {
+        /* Codepoint-aware split — twin of _builtin_string_chars (studio.h):
+         * list of single-codepoint strings via UTF-8 lead-byte lengths;
+         * invalid leads degrade to one byte. Conform gate t04 holds the
+         * two paths identical. */
+        if (args[0]->type != SW_VAL_STRING) return sw_val_list(NULL, 0);
+        const char *s = args[0]->v.str ? args[0]->v.str : "";
+        size_t len = strlen(s);
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (len + 1));
+        int cnt = 0;
+        size_t i = 0;
+        while (i < len) {
+            unsigned char c = (unsigned char)s[i];
+            int sl = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2 :
+                     ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xF8) == 0xF0) ? 4 : 1;
+            if (i + (size_t)sl > len) sl = 1;
+            char buf[8];
+            memcpy(buf, s + i, sl);
+            buf[sl] = 0;
+            items[cnt++] = sw_val_string(buf);
+            i += (size_t)sl;
+        }
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
+    }
     if (strcmp(fname, "bytes_to_string") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
         size_t len = args[0]->v.bytes.len;
         char *tmp = (char *)malloc(len + 1);
@@ -5158,7 +5184,7 @@ static const char *k_interp_builtins[] = {
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
     "random_int","reduce","shell","shell_sandboxed","sleep","string_replace",
-    "string_sub","string_to_bytes","string_truncate","sys_exit","to_float",
+    "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
     NULL
 };

@@ -534,6 +534,7 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | `byte_slice(b, start, len)` | subrange; `len` clamps to end |
 | `bytes_concat(a, b)` | new bytes `a ++ b` |
 | `string_to_bytes(s)` | string chars → bytes |
+| `string_chars(s)` | list of single-**codepoint** strings (UTF-8 aware — `string_length` is bytes; `length(string_chars(s))` is codepoints; rejoin slices with `Std.join(cs, "")`). No grapheme clustering: combining marks stay separate codepoints |
 | `bytes_to_string(b)` | bytes → string (truncates at first NUL by design) |
 | `audio_ulaw_to_pcm16_b(b)` | mu-law bytes → PCM16 bytes (codec twin) |
 | `audio_pcm16_to_ulaw_b(b)` | PCM16 bytes → mu-law bytes (codec twin) |

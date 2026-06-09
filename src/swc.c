@@ -311,6 +311,8 @@ int main(int argc, char **argv) {
         free(source);
         if (!ast) { fprintf(stderr, "swc: parse failed for %s\n", inputs[i]); return 1; }
         asts[nasts] = ast;
+        /* Diagnostics + #line directives point at the REAL file. */
+        sw_codegen_register_source(get_mod_name(ast), inputs[i]);
 
         /* Find which module has main() */
         const char *fnames[64];
@@ -414,6 +416,7 @@ int main(int argc, char **argv) {
                 }
                 if (nasts < 64) {
                     asts[nasts++] = imp_ast;
+                    sw_codegen_register_source(get_mod_name(imp_ast), imp_path);
                     fprintf(stderr, "swc: auto-imported %s from %s\n", imp_name, imp_path);
                 }
             }

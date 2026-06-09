@@ -15,4 +15,7 @@ fun main() {
     print("concat: " ++ "a" ++ "b" ++ to_string(3))
     # unicode byte-length (documented: bytes, not codepoints)
     print(f"bytes={string_length("世界")}")
+    # codepoint-aware split: string_chars walks UTF-8 sequences
+    cs = string_chars("héllo 世界")
+    print(f"chars={cs} ncp={length(cs)}")
 }

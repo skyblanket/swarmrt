@@ -319,6 +319,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "byte_slice") == 0 ||
            strcmp(name, "bytes_concat") == 0 ||
            strcmp(name, "string_to_bytes") == 0 ||
+           strcmp(name, "string_chars") == 0 ||
            strcmp(name, "bytes_to_string") == 0 ||
            strcmp(name, "bytes_from_ints") == 0 ||
            strcmp(name, "byte") == 0 ||
@@ -1830,6 +1831,7 @@ static const char *_common_builtins[] = {
     "base64_encode", "base64_decode",
     "bytes_from_base64", "bytes_to_base64", "byte_size", "byte_at",
     "byte_slice", "bytes_concat", "string_to_bytes", "bytes_to_string",
+    "string_chars",
     "bytes_from_ints", "byte", "ord", "codepoint_at", "to_float",
     "to_int", "uuid", "now_iso",
     "math_sqrt", "math_sin", "math_cos", "math_pow", "math_exp", "math_log",
@@ -1959,6 +1961,62 @@ static void did_you_mean(cg_ctx_t *ctx, const char *fname, int line) {
     fprintf(stderr, "\n");
 }
 
+/* Module → function-name table for cross-module call validation.
+ * Populated by sw_codegen_multi (every compiled module, entry +
+ * imports) so `Module.func(...)` against a module we ARE compiling can
+ * be checked at codegen time with a proper did-you-mean, instead of
+ * leaking a raw cc implicit-declaration warning + linker
+ * `undefined reference to 'Module_func'` (the worst diagnostic in the
+ * compiler — found in the Round-7 audit, O6). A qualified call whose
+ * module is NOT in the table (not compiled in) is left alone. */
+#define CG_MAX_MODS 24
+static struct {
+    char name[128];
+    char funs[CG_MAX_FUNCS][128];
+    int nfuns;
+} g_mod_table[CG_MAX_MODS];
+static int g_nmod_table;
+
+static void mod_table_add(node_t *mod) {
+    if (!mod || mod->type != N_MODULE || g_nmod_table >= CG_MAX_MODS) return;
+    int t = g_nmod_table++;
+    strncpy(g_mod_table[t].name, mod->v.mod.name, 127);
+    g_mod_table[t].name[127] = '\0';
+    g_mod_table[t].nfuns = 0;
+    for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
+        strncpy(g_mod_table[t].funs[i], mod->v.mod.funs[i]->v.fun.name, 127);
+        g_mod_table[t].funs[i][127] = '\0';
+        g_mod_table[t].nfuns++;
+    }
+}
+
+/* Validate Module.func against the table. Returns 0 (and prints the
+ * diagnostic) when the module is known and the function is not. */
+static int check_qualified_call(cg_ctx_t *ctx, const char *mod,
+                                const char *func, int line) {
+    int t = -1;
+    for (int i = 0; i < g_nmod_table; i++)
+        if (strcmp(g_mod_table[i].name, mod) == 0) { t = i; break; }
+    if (t < 0) return 1;   /* module not compiled in — leave to the linker */
+    for (int i = 0; i < g_mod_table[t].nfuns; i++)
+        if (strcmp(g_mod_table[t].funs[i], func) == 0) return 1;
+
+    ctx->had_unknown_fn = 1;
+    int flen = (int)strlen(func);
+    int threshold = flen >= 8 ? 3 : (flen >= 3 ? 2 : 1);
+    const char *best = NULL; int best_d = threshold + 1;
+    for (int i = 0; i < g_mod_table[t].nfuns; i++) {
+        int d = _lev_distance(func, g_mod_table[t].funs[i]);
+        if (d < best_d) { best_d = d; best = g_mod_table[t].funs[i]; }
+    }
+    fprintf(stderr, "swc: %s:%d: module %s has no function '%s'",
+            guess_sw_path(ctx->mod_name), line > 0 ? line : 0, mod, func);
+    if (best)
+        fprintf(stderr, " \xe2\x80\x94 did you mean '%s.%s'?", mod, best);
+    fprintf(stderr, "\n");
+    return 0;
+}
+
 static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
     const char *fname = n->v.call.func->v.sval;
@@ -2066,6 +2124,11 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(stderr, "swc: src/%s.sw:%d: %s is a global builtin \xe2\x80\x94 write %s(fn, list, ...), not %s(...)\n",
                     ctx->mod_name, n->line, gf, gf, fname);
             ctx->had_unknown_fn = 1;
+        } else {
+            /* General check: a qualified call into a module we're compiling
+             * must name a real function — with a did-you-mean, instead of a
+             * raw linker error. */
+            check_qualified_call(ctx, mod, gf, n->line);
         }
         strncpy(func, dot + 1, sizeof(func) - 1);
         if (nargs > 0)
@@ -2197,6 +2260,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "byte_slice") == 0 ||
              strcmp(fname, "bytes_concat") == 0 ||
              strcmp(fname, "string_to_bytes") == 0 ||
+             strcmp(fname, "string_chars") == 0 ||
              strcmp(fname, "bytes_to_string") == 0 ||
              strcmp(fname, "bytes_from_ints") == 0 ||
              strcmp(fname, "byte") == 0 ||
@@ -3218,13 +3282,39 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
  * Function emission
  * ========================================================================= */
 
-/* Map a module name to its likely source path. Convention: most
- * modules live at src/<ModName>.sw (case preserved), with the
- * exception of `Main` → `src/main.sw` (lowercase). swc.c uses the
- * same fallback when resolving imports. Returned in a static buffer
- * — caller copies if needed. */
+/* Module → REAL source path registry, filled by swc.c as it reads each
+ * file (entry inputs + resolved imports). Diagnostics and #line
+ * directives previously FABRICATED `src/<Mod>.sw` from the naming
+ * convention, which lied whenever the file lived anywhere else
+ * (`swc build /tmp/foo.sw` errors pointed at a nonexistent src/Foo.sw
+ * — Round-7 audit, O6). Convention stays as the fallback for embedders
+ * that call sw_codegen without registering paths. */
+#define CG_MAX_PATHS 64
+static struct { char mod[128]; char path[512]; } g_mod_paths[CG_MAX_PATHS];
+static int g_nmod_paths;
+
+void sw_codegen_register_source(const char *mod_name, const char *path) {
+    if (!mod_name || !path) return;
+    /* Re-registering a module updates it (REPL / repeated builds). */
+    for (int i = 0; i < g_nmod_paths; i++)
+        if (strcmp(g_mod_paths[i].mod, mod_name) == 0) {
+            strncpy(g_mod_paths[i].path, path, sizeof(g_mod_paths[i].path) - 1);
+            return;
+        }
+    if (g_nmod_paths >= CG_MAX_PATHS) return;
+    strncpy(g_mod_paths[g_nmod_paths].mod, mod_name, 127);
+    strncpy(g_mod_paths[g_nmod_paths].path, path, 511);
+    g_nmod_paths++;
+}
+
+/* Real registered path if swc told us; else the src/<ModName>.sw
+ * convention (`Main` → src/main.sw, legacy). Static buffer — copy if
+ * you keep it. */
 static const char *guess_sw_path(const char *mod_name) {
-    static char path[256];
+    static char path[512];
+    for (int i = 0; i < g_nmod_paths; i++)
+        if (strcmp(g_mod_paths[i].mod, mod_name) == 0)
+            return g_mod_paths[i].path;
     /* Special-case Main → main.sw (legacy convention). */
     if (strcmp(mod_name, "Main") == 0) {
         snprintf(path, sizeof(path), "src/main.sw");
@@ -3403,6 +3493,11 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     node_t *mod = (node_t *)ast;
     if (mod->type != N_MODULE) return -1;
 
+    /* Single-module build: the qualified-call table holds just this
+     * module (a self-qualified call still validates). */
+    g_nmod_table = 0;
+    mod_table_add(mod);
+
     cg_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.out = out;
@@ -3511,6 +3606,12 @@ int sw_codegen_module(void *ast, FILE *out) {
 int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
     if (!modules || nmodules <= 0 || !out) return -1;
     if (main_idx < 0 || main_idx >= nmodules) return -1;
+
+    /* Module → function table for qualified-call validation (every
+     * compiled module, entry + imports). Reset per invocation. */
+    g_nmod_table = 0;
+    for (int m = 0; m < nmodules; m++)
+        mod_table_add((node_t *)modules[m]);
 
     /* Emit preamble once (from the main module's context) */
     cg_ctx_t preamble_ctx;

@@ -8465,6 +8465,45 @@ static sw_val_t *_builtin_string_to_bytes(sw_val_t **a, int n) {
     return sw_val_bytes((const uint8_t *)a[0]->v.str, strlen(a[0]->v.str));
 }
 
+/* UTF-8 sequence length from the lead byte (1–4); 1 for invalid leads so a
+ * malformed byte degrades to one char instead of desyncing the walk. */
+static int _sw_utf8_seq_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+/* string_chars(s) → list of single-CODEPOINT strings. The codepoint-aware
+ * complement to byte-oriented string_length/string_sub: slicing UTF-8 text
+ * by bytes corrupts multi-byte runes (Round-7 audit O7), and agent code
+ * handles non-ASCII text constantly. length(string_chars(s)) is the
+ * codepoint length; reassemble slices with Std.join(chars, ""). Walks raw
+ * UTF-8 sequence lengths (no grapheme clustering — combining marks stay
+ * separate codepoints, documented). */
+static sw_val_t *_builtin_string_chars(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_list(NULL, 0);
+    const char *s = a[0]->v.str ? a[0]->v.str : "";
+    size_t len = strlen(s);
+    int cap = (int)len + 1;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    int cnt = 0;
+    size_t i = 0;
+    while (i < len) {
+        int sl = _sw_utf8_seq_len((unsigned char)s[i]);
+        if (i + (size_t)sl > len) sl = 1;   /* truncated tail sequence */
+        char buf[8];
+        memcpy(buf, s + i, sl);
+        buf[sl] = 0;
+        items[cnt++] = sw_val_string(buf);
+        i += (size_t)sl;
+    }
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
+}
+
 /* bytes_to_string(b) → string. Renders bytes as a string; truncates at the
  * first embedded NUL BY DESIGN (explicit, opt-in — call only when the data
  * is known to be text). NUL-free input round-trips losslessly. */
