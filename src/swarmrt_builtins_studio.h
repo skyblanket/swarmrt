@@ -5172,11 +5172,19 @@ typedef struct { sw_val_t *fn; uint64_t ms; } _timer_closure_t;
 
 static void _after_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
-    usleep((useconds_t)(c->ms * 1000));
-    sw_val_apply(c->fn, NULL, 0);
-    /* One-shot: the closure fired exactly once and nothing else holds this
-     * private deep copy (the apply result is discarded), so free the whole
-     * closure graph — captures included — to bound repeated delay() use. */
+    /* Wait via the yielding, kill-aware sw_receive_any (like _builtin_sleep) —
+     * NOT raw usleep, which blocks the whole scheduler OS thread and is
+     * uninterruptible, so a delay() cancelled before firing could neither stop
+     * nor free. sw_receive_any swaps back to the scheduler and returns NULL on
+     * timeout OR kill (it checks kill_flag on resume). */
+    uint64_t tag;
+    void *m = sw_receive_any(c->ms, &tag);
+    if (m) free(m);                       /* discard any spurious message */
+    sw_process_t *self = sw_self();
+    if (!(self && self->kill_flag))       /* fire only if not cancelled mid-wait */
+        sw_val_apply(c->fn, NULL, 0);
+    /* One-shot: free the whole closure graph (captures included) either way —
+     * nothing else holds this private deep copy (the apply result is discarded). */
     _sw_free_global_val(c->fn);
     free(c);
 }
@@ -5195,10 +5203,25 @@ static sw_val_t *_builtin_delay(sw_val_t **a, int n) {
 
 static void _every_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
+    /* Yielding, kill-aware loop — NOT raw usleep (which blocks the scheduler OS
+     * thread and is uninterruptible, so a cancelled interval could neither stop
+     * NOR free its closure: kill_flag is never observed and process_destroy
+     * never runs). sw_receive_any yields each tick and returns NULL on kill; we
+     * then unwind so the scheduler reaches process_destroy and we free here. */
     for (;;) {
-        usleep((useconds_t)(c->ms * 1000));
+        uint64_t tag;
+        void *m = sw_receive_any(c->ms, &tag);
+        if (m) free(m);                        /* discard any spurious message */
+        sw_process_t *self = sw_self();
+        if (self && self->kill_flag) break;    /* cancelled during the wait */
         sw_val_apply(c->fn, NULL, 0);
+        self = sw_self();
+        if (self && self->kill_flag) break;    /* cancelled during/after the tick */
     }
+    /* Owner frees its own closure on cancel (same shape as _after_entry). A
+     * never-cancelled interval keeps its closure for life — bounded, correct. */
+    _sw_free_global_val(c->fn);
+    free(c);
 }
 
 /* interval(ms, fn) → pid — run fn repeatedly every ms milliseconds */

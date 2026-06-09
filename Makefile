@@ -351,6 +351,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_timer.sw     2000 20000 8  timer    || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  2000 12000 6  interval || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 

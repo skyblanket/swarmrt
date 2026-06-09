@@ -4,6 +4,36 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-09 — timers: interval/delay are now cancellable + non-blocking (and interval frees its closure)
+
+**fix(timer): `interval`/`delay` no longer block a scheduler thread or run uninterruptibly.**
+The timer entries `_every_entry`/`_after_entry` slept with raw libc `usleep` inside a plain C
+loop — which blocks the whole scheduler OS thread for the sleep (starving every co-located
+fiber) and, worse, never yields, so a killed timer was **uninterruptible**: `kill_flag` was
+never observed, `process_destroy` never ran, the interval spun forever, and its global-heap
+closure leaked without bound. Both now wait via the yielding, kill-aware `sw_receive_any`
+(the same primitive `_builtin_sleep` uses): it swaps back to the scheduler each tick (no
+starvation) and returns on kill, after which the loop unwinds and frees its own closure.
+So a cancelled `interval` actually stops, the scheduler reaps it, and `_sw_free_global_val`
+reclaims the deep-copied closure (captures included). `delay` likewise becomes cancellable
+before firing (and still frees its one-shot closure). Cron is unaffected — `lib/Cron.sw` is
+pure-sw on `receive ... after N`, already yielding/cancellable, arena-freed.
+
+**test(gc): `tests/gc/slope_interval.sw` → `make gc-slope` (budget 6 MB).** Each round starts
+an interval whose closure captures ~1 KB, lets it park, `exit_proc`-cancels it, and waits for
+it to be reaped — bounded concurrency, so RSS must be flat (0 MB growth 2k→12k rounds). The
+probe doubles as a **cancellability regression test**: pre-fix the interval can't be killed,
+so it hangs (no `PROBE_OK`) and the gate fails on timeout. Verified ASAN+poison-clean (no
+double-free of the closure). gc-stress (both modes, 5 gates), gc-slope (8 probes), phases
+2-10, test-sw 53/475 all green; zero warnings.
+
+**Still global-heap (next): supervisor child-spec closures.** Freeing them on child
+removal/teardown is NOT a simple leak fix — `sw_process_kill` is async and the closure IS the
+child's running code (the child lives inside `sw_val_apply(c->fn)`), so freeing it at removal
+races the live child (confirmed heap-UAF). Needs a master + per-incarnation-copy ownership
+split (supervisor frees the master with no live referencer; each child frees its own copy on
+exit). Deferred to a careful pass.
+
 ## 2026-06-09 — bounded memory: one-shot timer (delay) closures are freed after firing
 
 **fix(gc): repeated `delay(ms, fn)` no longer leaks a closure per call.** `delay` deep-copies
