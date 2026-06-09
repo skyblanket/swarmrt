@@ -232,8 +232,13 @@ static void sup_record_restart(sw_sup_state_t *st) {
 }
 
 static int sup_start_child(sw_sup_child_rt_t *child) {
-    child->proc = sw_spawn_link(child->spec.start_func, child->spec.start_arg);
-    if (!child->proc) return -1;
+    /* Hand the child a FRESH per-incarnation copy of the closure (closure specs)
+     * or the raw arg (native specs). The child owns + frees its copy in
+     * process_destroy; the master in child->spec.start_arg is reused for the next
+     * restart and freed only at teardown. */
+    void *arg = sw_spec_child_arg(&child->spec);
+    child->proc = sw_spawn_link(child->spec.start_func, arg);
+    if (!child->proc) { sw_spec_free_child_arg(&child->spec, arg); return -1; }
 
     child->monitor_ref = sw_monitor(child->proc);
     child->alive = 1;
@@ -243,6 +248,14 @@ static int sup_start_child(sw_sup_child_rt_t *child) {
     }
 
     return 0;
+}
+
+/* Free every child spec's MASTER closure on supervisor teardown. Called only at
+ * the two free(st) sites — never on a restart (sup_start_child re-copies the
+ * master for each incarnation). Iterating children[] covers alive=0 children. */
+static void sup_free_child_masters(sw_sup_state_t *st) {
+    for (uint32_t i = 0; i < st->spec.num_children && i < SW_MAX_CHILDREN; i++)
+        sw_spec_free_start_arg(&st->children[i].spec);
 }
 
 static void sup_kill_child(sw_sup_child_rt_t *child) {
@@ -350,6 +363,7 @@ static void supervisor_entry(void *arg) {
                         }
                         sw_self()->exit_reason = -2; /* shutdown */
                         free(msg);
+                        sup_free_child_masters(st);
                         free(st);
                         return;
                     }
@@ -415,6 +429,7 @@ static void supervisor_entry(void *arg) {
         }
     }
 
+    sup_free_child_masters(st);
     free(st);
 }
 

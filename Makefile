@@ -333,14 +333,36 @@ gc-stress: swc libswarmrt
 	    tests/gc/ets_alias_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_ets_alias $(LDFLAGS)
 	@rm -f tests/gc/ets_alias_repro.gen.c $(BIN_DIR)/_etsa_emit
 	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_ets_alias
+	@# Supervisor child closures: each child gets a private COPY (freed in its own
+	@# process_destroy, crash-safe); the supervisor frees the MASTER at permanent
+	@# removal/teardown. Freeing the master must NOT race a live child (kill is
+	@# async, the closure is the child's running code) — the copy/master split
+	@# avoids that. dynsup_churn = start_child/terminate_child UAF check;
+	@# sup_restart = crash+restart+teardown double-free tripwire (master reused on
+	@# restart, copy freed per dead incarnation on the panic path).
+	@./bin/swc build --emit-c tests/gc/slope_dynsup_churn.sw -o $(BIN_DIR)/_dsc_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/slope_dynsup_churn.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_dynsup_churn $(LDFLAGS)
+	@rm -f tests/gc/slope_dynsup_churn.gen.c $(BIN_DIR)/_dsc_emit
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_dynsup_churn 300 >/dev/null
+	@./bin/swc build --emit-c tests/gc/sup_restart_repro.sw -o $(BIN_DIR)/_srr_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/sup_restart_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_sup_restart $(LDFLAGS)
+	@rm -f tests/gc/sup_restart_repro.gen.c $(BIN_DIR)/_srr_emit
+	@# Children panic on purpose here; hide the expected panic banners on success,
+	@# but surface stderr (incl. any ASAN report) if it exits non-zero.
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_sup_restart 8 >/dev/null 2>$(BIN_DIR)/_srr.err || (cat $(BIN_DIR)/_srr.err; rm -f $(BIN_DIR)/_srr.err; exit 1)
+	@rm -f $(BIN_DIR)/_srr.err
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
 # (scripts/gc_slope.sh enforces this — a crashing/sys_exit(1) probe FAILS). Covers
 # spawn args, value messages, a long-lived tail loop, pmap, ETS churn (a fixed
-# live-set hammered with put-replace/delete/take must hold flat), and one-shot
-# timer (delay) closures (freed after firing). Honors SW_SCHEDULERS / SW_GC_OFF.
+# live-set hammered with put-replace/delete/take must hold flat), timer closures
+# (delay one-shot + interval cancel), and dynamic-supervisor child churn
+# (start_child/terminate_child must free the master closure). Honors
+# SW_SCHEDULERS / SW_GC_OFF.
 .PHONY: gc-slope
 gc-slope: swc
 	@rc=0; \
@@ -352,6 +374,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_timer.sw     2000 20000 8  timer    || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  2000 12000 6  interval || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 

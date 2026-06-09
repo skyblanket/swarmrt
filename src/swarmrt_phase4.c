@@ -350,6 +350,7 @@ static void dynsup_kill_all(sw_dynsup_state_t *st) {
     while (c) {
         sw_dynsup_child_t *next = c->next;
         if (c->proc) dynsup_kill_child(c);
+        sw_spec_free_start_arg(&c->spec);   /* teardown: free each child's master closure */
         free(c);
         c = next;
     }
@@ -438,10 +439,15 @@ static void dynsup_entry(void *arg) {
                     break;
                 }
 
-                /* Spawn linked child */
-                sw_process_t *child = sw_spawn_link(req->child_spec.start_func,
-                                                      req->child_spec.start_arg);
+                /* Spawn linked child with a FRESH per-incarnation closure copy
+                 * (the master stays in the node for restarts; see node->spec
+                 * below). The child frees its copy in process_destroy. */
+                void *carg = sw_spec_child_arg(&req->child_spec);
+                sw_process_t *child = sw_spawn_link(req->child_spec.start_func, carg);
                 if (!child) {
+                    sw_spec_free_child_arg(&req->child_spec, carg);
+                    /* master not yet stored in a node — reclaim it now */
+                    sw_spec_free_start_arg(&req->child_spec);
                     sw_send_tagged(call->from, call->ref, NULL);
                     break;
                 }
@@ -471,6 +477,7 @@ static void dynsup_entry(void *arg) {
                 sw_dynsup_child_t *node = dynsup_remove_child(&st, req->child);
                 if (node) {
                     dynsup_kill_child(node);
+                    sw_spec_free_start_arg(&node->spec);  /* permanent removal: free master */
                     free(node);
                     /* Reply success (non-NULL) */
                     sw_send_tagged(call->from, call->ref, (void *)1);
@@ -523,9 +530,10 @@ static void dynsup_entry(void *arg) {
 
                     dynsup_record_restart(&st);
 
-                    /* Restart: spawn new, replace in node */
-                    sw_process_t *new_child = sw_spawn_link(child->spec.start_func,
-                                                              child->spec.start_arg);
+                    /* Restart: spawn new with a FRESH closure copy (master stays
+                     * in the node), replace in node. */
+                    void *carg = sw_spec_child_arg(&child->spec);
+                    sw_process_t *new_child = sw_spawn_link(child->spec.start_func, carg);
                     if (new_child) {
                         child->proc = new_child;
                         child->monitor_ref = sw_monitor(new_child);
@@ -533,13 +541,17 @@ static void dynsup_entry(void *arg) {
                             sw_register(child->spec.name, new_child);
                         }
                     } else {
-                        /* Spawn failed — remove from list */
+                        /* Spawn failed — permanent removal: free the unused copy +
+                         * the master, then drop the node. */
+                        sw_spec_free_child_arg(&child->spec, carg);
                         dynsup_remove_by_ref(&st, sig->ref);
+                        sw_spec_free_start_arg(&child->spec);
                         free(child);
                     }
                 } else {
-                    /* No restart — remove from list */
+                    /* No restart — permanent removal: free the master, drop node. */
                     dynsup_remove_by_ref(&st, sig->ref);
+                    sw_spec_free_start_arg(&child->spec);
                     free(child);
                 }
             }

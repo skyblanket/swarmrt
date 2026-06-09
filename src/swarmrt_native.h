@@ -362,6 +362,16 @@ struct sw_process {
      * use / on OOM (then `_sw_gen` falls back to a thread-local). At struct END
      * so it shifts no asm-pinned offset. */
     sw_gen_exec_t *gen_exec;
+
+    /* Optional per-process teardown hook, invoked in process_destroy on EVERY
+     * exit path — normal return, kill, AND panic (a panic sw_context_swaps to
+     * the scheduler and never returns to the entry fn, so a fiber-tail free
+     * would be skipped; process_destroy always runs). Used by supervisor child
+     * fibers to free their private start-closure copy crash-safely. The hook
+     * frees GLOBAL-heap state only (never the arena, freed separately). NULL =
+     * no hook. At struct END so it shifts no asm-pinned offset. */
+    void (*on_destroy)(void *);
+    void *on_destroy_arg;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */

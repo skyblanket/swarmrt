@@ -106,8 +106,39 @@ typedef struct {
     char name[SW_REG_NAME_MAX];
     void (*start_func)(void*);
     void *start_arg;
+    /* Ownership of a heap-allocated start_arg the supervisor must reclaim (set by
+     * the compiled backend for closure children; NULL for native specs whose
+     * start_arg it does not own). The supervisor keeps `start_arg` as the MASTER
+     * and frees it via free_start_arg ONLY when the child is permanently removed
+     * or the supervisor is torn down. Each (re)start hands the child a FRESH
+     * per-incarnation copy via copy_start_arg (freed by the child itself in
+     * process_destroy) — so freeing the master never races a live child, and
+     * sw_process_kill being async is harmless. Both NULL for native specs. */
+    void *(*copy_start_arg)(void *);   /* returns an owned, free_start_arg-able copy */
+    void (*free_start_arg)(void *);    /* frees a copy or the master */
     sw_child_restart_t restart;
 } sw_child_spec_t;
+
+/* Hand a child a fresh per-incarnation copy of start_arg (closure specs) or the
+ * raw start_arg (native specs). Caller owns the result: pass it as the child's
+ * arg; the child frees it in process_destroy (closure specs arm that hook). */
+static inline void *sw_spec_child_arg(const sw_child_spec_t *s) {
+    return s->copy_start_arg ? s->copy_start_arg(s->start_arg) : s->start_arg;
+}
+/* Reclaim a per-incarnation copy that was never handed to a running child (spawn
+ * failed). No-op for native specs (the raw arg is not owned here). */
+static inline void sw_spec_free_child_arg(const sw_child_spec_t *s, void *arg) {
+    if (s->copy_start_arg && s->free_start_arg && arg) s->free_start_arg(arg);
+}
+/* Free the MASTER start_arg on permanent child removal / supervisor teardown.
+ * Idempotent (nulls it). No-op for native specs. MUST NOT run on a restart —
+ * the master is re-copied for each new incarnation. */
+static inline void sw_spec_free_start_arg(sw_child_spec_t *s) {
+    if (s && s->free_start_arg && s->start_arg) {
+        s->free_start_arg(s->start_arg);
+        s->start_arg = NULL;
+    }
+}
 
 /* Supervisor specification */
 #define SW_MAX_CHILDREN 64

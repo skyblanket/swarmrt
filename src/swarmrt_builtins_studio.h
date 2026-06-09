@@ -2938,8 +2938,34 @@ typedef struct {
     sw_val_t *fn;
 } _sup_child_closure_t;
 
+/* Free a child-start closure (a deep_copy_global tree). Used as
+ * sw_child_spec_t.free_start_arg so otp.c/phase4.c can reclaim the MASTER, and as
+ * a child fiber's on_destroy hook to reclaim its private COPY. */
+static void _free_sup_child_closure(void *raw) {
+    _sup_child_closure_t *c = (_sup_child_closure_t *)raw;
+    if (c) { _sw_free_global_val(c->fn); free(c); }
+}
+
+/* Make a fresh per-incarnation copy of a child-start closure (its own
+ * deep_copy_global of fn). Used as sw_child_spec_t.copy_start_arg so each child
+ * incarnation owns an independent closure it frees in process_destroy, leaving
+ * the supervisor's master untouched. */
+static void *_sup_copy_child_closure(void *raw) {
+    _sup_child_closure_t *src = (_sup_child_closure_t *)raw;
+    _sup_child_closure_t *cp = (_sup_child_closure_t *)malloc(sizeof(_sup_child_closure_t));
+    cp->fn = (src && src->fn) ? sw_val_deep_copy_global(src->fn) : NULL;
+    return cp;
+}
+
 static void _sup_child_entry(void *raw) {
     _sup_child_closure_t *c = (_sup_child_closure_t *)raw;
+    /* `c` is THIS incarnation's private copy (made by _sup_copy_child_closure at
+     * spawn). Free it in process_destroy via the on_destroy hook — crash-safe: a
+     * panic sw_context_swaps to the scheduler and never returns here, so a
+     * fiber-tail free would be skipped, but process_destroy always runs. The
+     * supervisor's master copy is a separate allocation freed at child removal. */
+    sw_process_t *self = sw_self();
+    if (self) { self->on_destroy = _free_sup_child_closure; self->on_destroy_arg = c; }
     sw_val_apply(c->fn, NULL, 0);
 }
 
@@ -2985,7 +3011,9 @@ static sw_val_t *_builtin_supervise(sw_val_t **a, int n) {
          * caller's arena being freed. */
         c->fn = fn_v ? sw_val_deep_copy_global(fn_v) : NULL;
         specs[valid].start_func = _sup_child_entry;
-        specs[valid].start_arg = c;
+        specs[valid].start_arg = c;                              /* MASTER */
+        specs[valid].copy_start_arg = _sup_copy_child_closure;   /* per-child copy */
+        specs[valid].free_start_arg = _free_sup_child_closure;
         specs[valid].restart = SW_PERMANENT;
 
         if (restart_v->type == SW_VAL_ATOM) {
@@ -3061,7 +3089,9 @@ static sw_val_t *_builtin_sup_start_child(sw_val_t **a, int n) {
      * restarts beyond the caller's lifetime (see static supervise above). */
     c->fn = fn_v ? sw_val_deep_copy_global(fn_v) : NULL;
     spec.start_func = _sup_child_entry;
-    spec.start_arg = c;
+    spec.start_arg = c;                              /* MASTER */
+    spec.copy_start_arg = _sup_copy_child_closure;   /* per-child copy */
+    spec.free_start_arg = _free_sup_child_closure;
     spec.restart = SW_PERMANENT;
 
     if (child->v.tuple.count >= 3) {
@@ -3073,10 +3103,10 @@ static sw_val_t *_builtin_sup_start_child(sw_val_t **a, int n) {
     }
 
     sw_process_t *proc = sw_dynsup_start_child_proc(a[0]->v.pid, &spec);
-    /* spec is copied by value into the supervisor's child node; closure c is
-     * NOT freed — the supervisor re-uses spec.start_arg on every restart, so
-     * freeing it would be a use-after-free on restart. Deliberate small leak,
-     * identical to supervise(). */
+    /* spec (incl. start_arg=MASTER + copy/free fn ptrs) is copied by value into
+     * the supervisor's child node, which owns the master thereafter: it hands each
+     * (re)started child a fresh copy (copy_start_arg) and frees the master
+     * (free_start_arg) only on permanent removal / teardown. */
     return proc ? sw_val_pid(proc) : sw_val_nil();
 }
 

@@ -532,6 +532,12 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         proc->gen_exec->current_file = "<unknown>";
     }
 
+    /* Optional per-process teardown hook — cleared on every (re)use of the slot
+     * so a reused slot never inherits a stale destructor (set later by e.g. a
+     * supervisor child fiber). */
+    proc->on_destroy = NULL;
+    proc->on_destroy_arg = NULL;
+
     /* Core fields */
     proc->entry = entry;
     proc->arg = arg;
@@ -644,6 +650,19 @@ static void process_destroy(sw_process_t *proc) {
      * can immediately reuse this slot and reinitialize it. */
     uint32_t block_idx = proc->heap_block_idx;
     uint32_t slot = proc->arena_slot;
+
+    /* Per-process teardown hook FIRST (snapshot-then-clear-then-call so a
+     * re-entrant/double destroy can't fire it twice). Runs before the arena /
+     * region frees and the slot recycle below — the hook touches only global-heap
+     * state (e.g. a supervisor child's start-closure copy), never this arena. No
+     * lock is held here (process_exit already released link_lock). */
+    {
+        void (*od)(void *) = proc->on_destroy;
+        void *oda = proc->on_destroy_arg;
+        proc->on_destroy = NULL;
+        proc->on_destroy_arg = NULL;
+        if (od) od(oda);
+    }
 
     /* Free any remaining messages in signal stack. EXIT/DOWN payloads
      * are sw_signal_t with an owned reason_str — must free that too. */

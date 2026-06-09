@@ -4,6 +4,44 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-09 — bounded memory: supervisor child-start closures (master + per-incarnation copy)
+
+**fix(gc): supervisor child-start closures are reclaimed — without racing live children.** A
+supervisor deep-copies each child's start closure (`spec.start_arg`) to the global heap so it
+can re-apply it across restarts; before, that closure was never freed (leaked on every
+permanent child removal and at supervisor teardown — unbounded under start_child/terminate
+churn or crash-restart storms). The naive fix — free it at the removal/teardown site — is a
+**use-after-free** (confirmed by ASAN): `sw_process_kill` is asynchronous and the closure *is*
+the child's running code (the child lives inside `sw_val_apply(c->fn)` for its whole life), so
+freeing it while the child is still unwinding through it faults; and restarts re-use the same
+closure, so the child can't free it either.
+
+Fix: a **master + per-incarnation-copy** ownership split. The supervisor keeps the closure as
+the MASTER (`spec.start_arg`) and frees it (`sw_spec_free_start_arg`) only on permanent child
+removal / supervisor teardown — at which point no live child references it. Each (re)start
+hands the child a FRESH copy (`spec.copy_start_arg` → `_sup_copy_child_closure`), which the
+child frees in its own `process_destroy` via a new per-process `on_destroy` hook
+(`swarmrt_native.h`, fired on EVERY exit path incl. panic — a panic `sw_context_swap`s to the
+scheduler and never returns through the entry fn, so a fiber-tail free would be skipped). The
+master and the copies are distinct allocations, so the async kill is harmless and there's no
+double-free. Native-C child specs (app children) set neither fn pointer and are untouched.
+
+**test(gc): slope + four ASAN scenarios.** `tests/gc/slope_dynsup_churn.sw` → `make gc-slope`
+(budget 8 MB): start_child/terminate_child churn holds flat (1 MB growth 2k→20k; pre-fix
+neutered = 28 MB → FAILs). `tests/gc/sup_restart_repro.sw` + `slope_dynsup_churn.sw` → `make
+gc-stress` (ASAN + `-DSW_ARENA_POISON`): dynamic churn UAF check + a crash+restart+teardown
+double-free tripwire (permanent child crashes repeatedly → restarted with a fresh copy each
+time, master reused, copies freed per dead incarnation on the panic path). Also ASAN-verified:
+static `one_for_all` teardown with multiple children. gc-stress (7 gates), gc-slope (9 probes),
+phases 2-10 (incl. 14/14 supervisor + 12/12), test-sw 53/475 all green; zero warnings.
+
+**Phase 1 of the production roadmap is complete:** all generated execution state per-process
+(`_sw_error` + line/file/trace), and every long-lived ownership path bounded — ETS values,
+timer closures (delay + interval), and supervisor child closures. (Cron needed nothing —
+`lib/Cron.sw` is pure-sw on `receive ... after N`, already arena-freed.) The separate C-API
+`sw_ets_*` in `swarmrt_ets.c` (interpreter/phase-test path, short-lived) is the one known
+residual, deferred.
+
 ## 2026-06-09 — timers: interval/delay are now cancellable + non-blocking (and interval frees its closure)
 
 **fix(timer): `interval`/`delay` no longer block a scheduler thread or run uninterruptibly.**
