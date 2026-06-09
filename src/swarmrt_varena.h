@@ -37,7 +37,8 @@ typedef enum {
 } sw_region_kind_t;
 
 typedef struct sw_value_arena {
-    sw_varena_chunk_t *head;       /* current (most-recent) chunk */
+    sw_varena_chunk_t *head;       /* current (most-recent) chunk; alloc point */
+    sw_varena_chunk_t *tail;       /* oldest chunk (first created); for O(1) adopt */
     size_t total_bytes;            /* stat: bytes handed out */
     size_t chunk_count;            /* stat: number of chunks */
     sw_region_kind_t kind;         /* lifecycle owner class (v2) */
@@ -53,10 +54,11 @@ sw_value_arena_t *sw_varena_create(size_t first_chunk);
  * a 256B chunk, not 8KB. Used for message + spawn regions. */
 sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind);
 
-/* O(1) ownership transfer: splice all of `src`'s chunks into `dst` and free
- * the `src` header (its chunks are now owned by `dst`, reclaimed when `dst` is
- * freed). After this `src` is dead. Used to adopt a message region into the
- * receiver's arena on match, and a spawn region into the child's arena on entry. */
+/* O(1) ownership transfer: splice all of `src`'s chunks onto `dst` (via src's
+ * tracked tail — no walk) and free the `src` header (its chunks are now owned by
+ * `dst`, reclaimed when `dst` is freed). After this `src` is dead. Used to adopt
+ * a message region into the receiver's arena on match, and a spawn region into
+ * the child's arena on entry. */
 void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src);
 
 /* Bump-allocate `n` bytes, 16-byte aligned. NOT zeroed (callers that need

@@ -23,6 +23,7 @@ static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
     if (!a) return NULL;
     a->head = chunk_new(first_chunk);
     if (!a->head) { free(a); return NULL; }
+    a->tail = a->head;   /* oldest chunk; never changes (new chunks prepend at head) */
     a->total_bytes = 0;
     a->chunk_count = 1;
     a->kind = kind;
@@ -79,11 +80,12 @@ void sw_varena_reset_to(sw_value_arena_t *a, sw_varena_mark_t mark) {
 
 void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src) {
     if (!dst || !src) return;
-    if (src->head) {
-        sw_varena_chunk_t *tail = src->head;
-        while (tail->next) tail = tail->next;
-        tail->next = dst->head;     /* src's oldest chunk links to dst's stack */
-        dst->head = src->head;      /* src's newest chunk becomes the alloc point */
+    if (src->head && src->tail) {
+        /* O(1): src->tail is src's oldest chunk (tracked, not walked). Link it
+         * onto dst's stack and make src's newest chunk dst's alloc point. dst's
+         * own tail (oldest) is unchanged. */
+        src->tail->next = dst->head;
+        dst->head = src->head;
         dst->total_bytes += src->total_bytes;
         dst->chunk_count += src->chunk_count;
     }

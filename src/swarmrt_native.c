@@ -43,6 +43,22 @@
 #include "swarmrt_phase5.h"
 #include "swarmrt_hotload.h"
 #include "swarmrt_varena.h"   /* GC v1 per-process value arena */
+#include <stddef.h>
+
+/* The context-switch asm (swarmrt_asm.S) reads sw_process fields by HARDCODED
+ * byte offset per architecture. Pin them so any struct-layout change that shifts
+ * ctx/entry/arg is a COMPILE ERROR here instead of an intermittent crash. Keep
+ * these in lockstep with the CTX_OFFSET/ENTRY_OFFSET/ARG_OFFSET defines in
+ * swarmrt_asm.S. (New sw_process fields go at the END to avoid shifting these.) */
+#if defined(__aarch64__) || defined(__arm64__)
+_Static_assert(offsetof(struct sw_process, ctx)   == 0x70, "swarmrt_asm.S CTX_OFFSET (arm64) out of sync");
+_Static_assert(offsetof(struct sw_process, entry) == 0xF0, "swarmrt_asm.S ENTRY_OFFSET (arm64) out of sync");
+_Static_assert(offsetof(struct sw_process, arg)   == 0xF8, "swarmrt_asm.S ARG_OFFSET (arm64) out of sync");
+#elif defined(__x86_64__)
+_Static_assert(offsetof(struct sw_process, ctx)   == 0x70, "swarmrt_asm.S CTX_OFFSET (x86_64) out of sync");
+_Static_assert(offsetof(struct sw_process, entry) == 0xC0, "swarmrt_asm.S ENTRY_OFFSET (x86_64) out of sync");
+_Static_assert(offsetof(struct sw_process, arg)   == 0xC8, "swarmrt_asm.S ARG_OFFSET (x86_64) out of sync");
+#endif
 
 /* === Global State === */
 sw_swarm_t *g_swarm = NULL;
@@ -208,25 +224,22 @@ static inline void msg_free(sw_msg_t *m) {
     free(m);
 }
 
-/* Ownership v2: when set (sw_recv_any_adopt), a C-level receive ADOPTS a VALUE
- * message's region into the current process's arena instead of materializing a
- * free-able global copy — for consumers (pmap) that INCORPORATE the payload into
- * a value they return rather than free()ing it. Thread-local; off by default. */
-static __thread int g_recv_adopt = 0;
-
 /* Ownership v2: hand a popped message's payload to a C-LEVEL receiver
  * (sw_receive / sw_receive_any / sw_receive_tagged — used by tests, pmap, task,
  * remote delivery). The compiled-sw `receive` has its own loop that ADOPTS the
  * region; C consumers instead expect a standalone, free-able payload. So for a
  * SW_PK_VALUE message, materialize the graph onto the global heap (free-able)
- * and reclaim the region here — UNLESS g_recv_adopt is set, in which case adopt
- * the region into this process's arena (caller keeps it, must NOT free it).
- * RAW payloads pass through unchanged. */
-static inline void *msg_take_payload(sw_msg_t *m) {
+ * and reclaim the region here — UNLESS `adopt` is set, in which case adopt the
+ * region into this process's arena (caller keeps it, must NOT free it).
+ * RAW payloads pass through unchanged. `adopt` is a PARAMETER (on the caller's
+ * fiber stack), NEVER a thread-local: a TLS flag would leak across the context
+ * switch that a blocking receive performs, into whatever fiber runs next on this
+ * scheduler thread — corrupting an unrelated process's ownership. */
+static inline void *msg_take_payload(sw_msg_t *m, int adopt) {
     void *p = m->payload;
     if (m->pkind == SW_PK_VALUE && m->region) {
         sw_value_arena_t *self = sw_self_varena();
-        if (g_recv_adopt && self) {
+        if (adopt && self) {
             sw_varena_adopt(self, m->region);   /* payload now lives in self's arena */
         } else {
             extern void *sw_val_deep_copy_global(void *);
@@ -1762,7 +1775,7 @@ void *sw_receive(uint64_t timeout_ms) {
         /* Pop first message from private queue */
         sw_msg_t *m = mailbox_pop_first(&proc->mailbox);
         if (m) {
-            void *payload = msg_take_payload(m);
+            void *payload = msg_take_payload(m, 0);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -1788,7 +1801,7 @@ void *sw_receive(uint64_t timeout_ms) {
             if (was_waiting) {
                 /* We won — not in runq, safe to self-resume */
                 proc->state = SW_PROC_RUNNING;
-                void *payload = msg_take_payload(m);
+                void *payload = msg_take_payload(m, 0);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -2571,7 +2584,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         mailbox_drain(&proc->mailbox);
         sw_msg_t *m = mailbox_pop_tagged(&proc->mailbox, tag);
         if (m) {
-            void *payload = msg_take_payload(m);
+            void *payload = msg_take_payload(m, 0);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -2590,7 +2603,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
                 proc->state = SW_PROC_RUNNING;
-                void *payload = msg_take_payload(m);
+                void *payload = msg_take_payload(m, 0);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -2642,9 +2655,11 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
 
 /*
  * sw_receive_any: Receive any message, returning the tag.
- * Used by GenServer loop to dispatch on message type.
+ * Used by GenServer loop to dispatch on message type. `adopt` (a parameter, not
+ * a thread-local — it must survive the blocking context switch on THIS fiber's
+ * stack, never leak to another fiber) selects region adoption vs materialize.
  */
-void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
+static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int adopt) {
     sw_process_t *proc = tls_current;
     if (!proc) return NULL;
     if (out_tag) *out_tag = SW_TAG_NONE;
@@ -2659,7 +2674,7 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
         sw_msg_t *m = mailbox_pop_first(&proc->mailbox);
         if (m) {
             if (out_tag) *out_tag = m->tag;
-            void *payload = msg_take_payload(m);
+            void *payload = msg_take_payload(m, adopt);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -2679,7 +2694,7 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
             if (was_waiting) {
                 proc->state = SW_PROC_RUNNING;
                 if (out_tag) *out_tag = m->tag;
-                void *payload = msg_take_payload(m);
+                void *payload = msg_take_payload(m, adopt);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -2729,15 +2744,19 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
     }
 }
 
+/* Public sw_receive_any: materialize VALUE payloads to a free-able global copy. */
+void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
+    return sw_receive_any_impl(timeout_ms, out_tag, 0);
+}
+
 /* Ownership v2: like sw_receive_any but ADOPTS a VALUE message's region into the
  * current process's arena instead of materializing a free-able global copy. For
  * consumers that incorporate the payload into a returned value (pmap) — the
- * caller must NOT free the returned payload. */
+ * caller must NOT free the returned payload. `adopt` is threaded as a parameter
+ * (NOT a thread-local) so it can't leak across the blocking receive's context
+ * switch into another fiber. */
 void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag) {
-    g_recv_adopt = 1;
-    void *p = sw_receive_any(timeout_ms, out_tag);
-    g_recv_adopt = 0;
-    return p;
+    return sw_receive_any_impl(timeout_ms, out_tag, 1);
 }
 
 /* ============================================================================

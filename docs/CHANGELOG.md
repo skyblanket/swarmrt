@@ -30,8 +30,9 @@ loop all hold **flat** peak RSS (each was +87 / +169 / unbounded MB before). gc-
 ASAN+poison stays green (the floor-scoped reset and adopt-splice are UAF-clean), test-sw
 53/475, phases 2-10, `make stress`, check-docs, doctest all green. SW_GC_OFF preserved.
 
-**Remaining (honest):** ETS values are still global-heap (reclaimed on table destroy, not
-on replace/delete — a high-churn ETS loop grows until then); the interpreter has no arena.
+**Remaining (honest), still global-heap (reclaimed at OS exit / table destroy):** ETS
+values (a high-churn ETS replace/delete loop grows until table destroy), supervisor child
+closures, and timer/cron closures; the interpreter has no arena (short-lived).
 
 ## 2026-06-08 — GC v1: per-process value arena, freed on exit + copy-on-escape
 

@@ -301,6 +301,14 @@ gc-stress: swc libswarmrt
 	    tests/sw/test_uaf_stress.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_stress $(LDFLAGS)
 	@rm -f tests/sw/test_uaf_stress.gen.c $(BIN_DIR)/_gc_stress_emit
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_stress
+	@# Cross-fiber adopt-ownership repro: a pmap driver leaking adopt across its
+	@# blocking receive must NOT make another fiber's sleep()-receive free an
+	@# arena-interior pointer. Single-scheduler forces the deterministic interleave.
+	@./bin/swc build --emit-c tests/gc/tls_adopt_repro.sw -o $(BIN_DIR)/_tls_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/tls_adopt_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_tls_repro $(LDFLAGS)
+	@rm -f tests/gc/tls_adopt_repro.gen.c $(BIN_DIR)/_tls_emit
+	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_tls_repro
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
@@ -311,10 +319,11 @@ gc-stress: swc libswarmrt
 .PHONY: gc-slope
 gc-slope: swc
 	@rc=0; \
-	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw   200 2000   80 spawn || rc=1; \
-	 bash scripts/gc_slope.sh tests/gc/slope_message.sw 500 4000   80 msg   || rc=1; \
-	 bash scripts/gc_slope.sh tests/gc/slope_turn.sw    5000 100000 80 turn  || rc=1; \
-	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw    200 2000   80 pmap  || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw     200 2000   80 spawn    || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_message.sw   500 4000   80 msg      || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_turn.sw      5000 100000 80 turn     || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw      200 2000   80 pmap     || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
