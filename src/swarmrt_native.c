@@ -1081,6 +1081,42 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             proc = sw_steal_work(sched);
         }
 
+        /* Adaptive spin before parking (O4, Round-7: cross-scheduler
+         * ping-pong paid a full mutex+condvar+futex wake per message —
+         * ~53us/round-trip vs ~1us same-scheduler, because each send
+         * found the peer's scheduler PARKED). Spin-poll local + steal
+         * for a bounded window first: while spinning, rq->idle stays 0,
+         * so the producer's sw_add_to_runq pays NOTHING (no lock, no
+         * signal) and the consumer picks the work up within ~ns. Budget
+         * is per-idle-transition, env-tunable: SW_SPIN_US (default 30,
+         * 0 disables). Burns at most that many us of CPU per scheduler
+         * per idle transition; the 0.5ms park below is unchanged. */
+        if (!proc) {
+            static int spin_iters = -1;
+            if (spin_iters < 0) {
+                const char *e = getenv("SW_SPIN_US");
+                int us = e ? atoi(e) : 30;
+                if (us < 0) us = 0;
+                if (us > 1000) us = 1000;
+                /* ~25 pause-loop iterations per us on contemporary cores
+                 * (pause ~25-40ns + two acquire loads). Coarse is fine. */
+                spin_iters = us * 25;
+            }
+            for (int i = 0; i < spin_iters && !sched->should_exit; i++) {
+                proc = sw_pick_next(sched);
+                if (proc) break;
+                if ((i & 63) == 63) {   /* steal probe every ~64 spins */
+                    proc = sw_steal_work(sched);
+                    if (proc) break;
+                }
+#ifdef __aarch64__
+                __asm__ volatile("yield");
+#else
+                __asm__ volatile("pause");
+#endif
+            }
+        }
+
         if (proc) {
             /* Sample the generation BEFORE any side effect. If another
              * scheduler reuses this slot between pick and swap, the
