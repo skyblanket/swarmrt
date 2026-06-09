@@ -160,16 +160,17 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
     }
 }
 
-/* Fully recursive free of a global-heap value tree OWNED by an ETS entry.
- * Mirrors deep_copy_rec's allocations (every node val_alloc'd; strings/atoms and
- * bytes own their buffers; tuple/list/map/fun element arrays are malloc'd).
- * Unlike sw_val_free it recurses into MAP keys/vals and FUN captures, because an
- * ETS value is a deep_copy_global tree — fully independent, no interned or shared
- * nodes (verified: every sw_val_* constructor allocates fresh) — so the WHOLE
- * graph must go. Safe to call on replace/delete/take because get/take copy the
- * value OUT to the reader (sw_val_deep_copy_local), so no reader ever holds the
- * stored pointer. The rwlock serialises this against readers. */
-static void _vets_free_val(sw_val_t *v) {
+/* Fully recursive free of a global-heap value tree that a long-lived owner (an
+ * ETS entry, a timer closure) deep-copied via sw_val_deep_copy_global and is now
+ * discarding. Mirrors deep_copy_rec's allocations (every node val_alloc'd;
+ * strings/atoms and bytes own their buffers; tuple/list/map/fun element arrays
+ * are malloc'd). Unlike sw_val_free it recurses into MAP keys/vals and FUN
+ * captures, because such a value is a deep_copy_global tree — fully independent,
+ * no interned or shared nodes (verified: every sw_val_* constructor allocates
+ * fresh) — so the WHOLE graph must go. Caller must ensure no one else holds the
+ * pointer (ETS copies values OUT to readers; a one-shot timer frees only after
+ * its single apply returns). */
+static void _sw_free_global_val(sw_val_t *v) {
     if (!v) return;
     switch (v->type) {
     case SW_VAL_STRING: case SW_VAL_ATOM:
@@ -177,16 +178,16 @@ static void _vets_free_val(sw_val_t *v) {
     case SW_VAL_BYTES:
         free(v->v.bytes.data); break;
     case SW_VAL_TUPLE: case SW_VAL_LIST:
-        for (int i = 0; i < v->v.tuple.count; i++) _vets_free_val(v->v.tuple.items[i]);
+        for (int i = 0; i < v->v.tuple.count; i++) _sw_free_global_val(v->v.tuple.items[i]);
         free(v->v.tuple.items); break;
     case SW_VAL_MAP:
         for (int i = 0; i < v->v.map.count; i++) {
-            _vets_free_val(v->v.map.keys[i]);
-            _vets_free_val(v->v.map.vals[i]);
+            _sw_free_global_val(v->v.map.keys[i]);
+            _sw_free_global_val(v->v.map.vals[i]);
         }
         free(v->v.map.keys); free(v->v.map.vals); break;
     case SW_VAL_FUN:
-        for (int i = 0; i < v->v.fun.ncaptures; i++) _vets_free_val(v->v.fun.captures[i]);
+        for (int i = 0; i < v->v.fun.ncaptures; i++) _sw_free_global_val(v->v.fun.captures[i]);
         free(v->v.fun.captures); break;
     default: break;
     }
@@ -218,7 +219,7 @@ static sw_val_t *_builtin_ets_put(sw_val_t **a, int n) {
         /* GC v1: ETS is a cross-process store outliving the inserter, so its
          * keys/values must live on the global heap (deep-copied), not in the
          * inserting process's arena which is freed on its exit. */
-        if (_vets_key_eq(e->key, a[1])) { _vets_free_val(e->value); e->value = sw_val_deep_copy_global(a[2]); pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }  /* free old to bound replace churn */
+        if (_vets_key_eq(e->key, a[1])) { _sw_free_global_val(e->value); e->value = sw_val_deep_copy_global(a[2]); pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }  /* free old to bound replace churn */
         e = e->next;
     }
     _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
@@ -268,7 +269,7 @@ static sw_val_t *_builtin_ets_delete(sw_val_t **a, int n) {
     while (*pp) {
         if (_vets_key_eq((*pp)->key, a[1])) {
             _vets_entry_t *dead = *pp; *pp = dead->next;
-            _vets_free_val(dead->value); _vets_free_val(dead->key); free(dead);  /* free stored value+key, not just the entry */
+            _sw_free_global_val(dead->value); _sw_free_global_val(dead->key); free(dead);  /* free stored value+key, not just the entry */
             pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok");
         }
         pp = &(*pp)->next;
@@ -296,7 +297,7 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
                  * one in place would corrupt any caller still holding
                  * the previous reference. */
                 int64_t result = e->value->v.i + delta;  /* read int BEFORE freeing */
-                _vets_free_val(e->value);
+                _sw_free_global_val(e->value);
                 e->value = sw_val_deep_copy_global(sw_val_int(result));  /* GC v1: ETS store on global heap; free old to bound churn */
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_int(result);
@@ -331,7 +332,7 @@ static sw_val_t *_builtin_ets_cas(sw_val_t **a, int n) {
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
             if (_vets_key_eq(e->value, a[2])) {  /* reads old value before freeing */
-                _vets_free_val(e->value);
+                _sw_free_global_val(e->value);
                 e->value = sw_val_deep_copy_global(a[3]);  /* GC v1: ETS store on global heap; free old to bound churn */
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("true");
@@ -361,7 +362,7 @@ static sw_val_t *_builtin_ets_take(sw_val_t **a, int n) {
              * entry (the entry is removed; bound the memory). */
             sw_val_t *out = dead->value ? sw_val_deep_copy_local(dead->value) : sw_val_nil();
             *pp = dead->next;
-            _vets_free_val(dead->value); _vets_free_val(dead->key); free(dead);
+            _sw_free_global_val(dead->value); _sw_free_global_val(dead->key); free(dead);
             pthread_rwlock_unlock(&t->lock);
             return out;
         }
@@ -411,7 +412,7 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
     e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
-            _vets_free_val(e->value);
+            _sw_free_global_val(e->value);
             e->value = sw_val_deep_copy_global(new_val);  /* GC v1: ETS store on global heap; free old to bound churn */
             pthread_rwlock_unlock(&t->lock);
             return new_val;
@@ -5173,6 +5174,10 @@ static void _after_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
     usleep((useconds_t)(c->ms * 1000));
     sw_val_apply(c->fn, NULL, 0);
+    /* One-shot: the closure fired exactly once and nothing else holds this
+     * private deep copy (the apply result is discarded), so free the whole
+     * closure graph — captures included — to bound repeated delay() use. */
+    _sw_free_global_val(c->fn);
     free(c);
 }
 

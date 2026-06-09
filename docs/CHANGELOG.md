@@ -4,6 +4,28 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-09 — bounded memory: one-shot timer (delay) closures are freed after firing
+
+**fix(gc): repeated `delay(ms, fn)` no longer leaks a closure per call.** `delay` deep-copies
+`fn` to the global heap (it fires after the caller may have exited) and spawns a one-shot
+timer process; that process applied the closure once then freed only its small struct, never
+the deep-copied closure graph — so every fired `delay` leaked. `_after_entry` now frees the
+whole closure (captures included) via `_sw_free_global_val` after its single apply returns;
+nothing else holds that private copy (the apply result is discarded), so it's safe. (The ETS
+recursive-free helper `_vets_free_val` is generalised + renamed `_sw_free_global_val`, now
+shared by ETS and timers.)
+
+**test(gc): `tests/gc/slope_timer.sw` → `make gc-slope` (budget 8 MB).** A bounded-concurrency
+probe (fire one delay, wait for its reply, repeat — so process/stack memory stays flat and the
+closure leak is the only thing that could grow) holds **flat** RSS (0 MB growth 2k→20k rounds;
+pre-fix grew 28 MB → FAILs). gc-stress (both modes, 5 gates), gc-slope (7 probes), test-sw
+53/475 all green; zero warnings.
+
+**Still global-heap (next):** `interval`/cron closures leak only on cancel (the forever-looping
+timer process holds the closure; freeing it needs a per-process destructor hook) and supervisor
+child-spec closures leak on supervisor teardown — both are leak-on-teardown of dynamically
+created entities (bounded live cost), deferred to a focused pass.
+
 ## 2026-06-09 — bounded memory: ETS values are freed on replace/delete (BEAM copy-out semantics)
 
 **fix(gc): a high-churn ETS table no longer grows without bound.** The compiled-backend

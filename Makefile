@@ -338,9 +338,9 @@ gc-stress: swc libswarmrt
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
 # (scripts/gc_slope.sh enforces this — a crashing/sys_exit(1) probe FAILS). Covers
-# spawn args, value messages, a long-lived tail loop, pmap, and ETS churn (a
-# fixed live-set hammered with put-replace/delete/take must hold flat). Honors
-# SW_SCHEDULERS / SW_GC_OFF.
+# spawn args, value messages, a long-lived tail loop, pmap, ETS churn (a fixed
+# live-set hammered with put-replace/delete/take must hold flat), and one-shot
+# timer (delay) closures (freed after firing). Honors SW_SCHEDULERS / SW_GC_OFF.
 .PHONY: gc-slope
 gc-slope: swc
 	@rc=0; \
@@ -350,6 +350,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw      200 2000   80 pmap     || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_timer.sw     2000 20000 8  timer    || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
