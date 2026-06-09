@@ -529,6 +529,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     }
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
+    proc->try_chain = NULL;      /* per-process compiled try/catch chain (see sw_self_try_chain) */
 
     /* Per-process generated line/file/call-trace state. Lazily allocated and KEPT
      * WITH THE SLAB SLOT across lifetimes (like stack_mem below): reset here, freed
@@ -1153,8 +1154,11 @@ static void scheduler_loop(sw_scheduler_t *sched) {
     }
 }
 
+static void _sw_install_altstack(void);   /* defined with the crash handler below */
+
 static void *scheduler_main(void *arg) {
     sw_scheduler_t *sched = (sw_scheduler_t *)arg;
+    _sw_install_altstack();   /* fiber-stack overflows fault on THIS thread */
     sched->active = 1;
     scheduler_loop(sched);
     return NULL;
@@ -1165,6 +1169,22 @@ static void *scheduler_main(void *arg) {
  * ============================================================================ */
 #include <execinfo.h>
 
+/* Per-thread alternate signal stack. A fiber-stack OVERFLOW faults on the
+ * guard page with the stack pointer already at the cliff edge — the handler
+ * itself then faults trying to push a frame, and the process dies with NO
+ * output at all (observed: deep mutual recursion exited silently). SA_ONSTACK
+ * + a per-thread sigaltstack lets the handler run on safe ground. Installed
+ * by each scheduler thread and the thread that calls sw_init. 64KB static
+ * per thread (SIGSTKSZ stopped being a compile-time constant in glibc 2.34). */
+static void _sw_install_altstack(void) {
+    static __thread char altstack_mem[64 * 1024];
+    stack_t ss;
+    ss.ss_sp = altstack_mem;
+    ss.ss_size = sizeof(altstack_mem);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+}
+
 static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     const char *signame = (sig == SIGSEGV) ? "SIGSEGV" :
@@ -1173,7 +1193,33 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
 
     /* Use write() not printf() — async-signal-safe */
     char msg[512];
-    int len = snprintf(msg, sizeof(msg),
+    int len;
+
+    /* Stack overflow detection: a fault inside (or within a page below) the
+     * RUNNING process's guard page means its 128KB fiber stack overflowed —
+     * almost always deep non-self recursion (mutual tail calls are not
+     * TCO'd; self-tail-calls compile to a flat loop). Say so, instead of
+     * leaving a bare SIGSEGV to be mistaken for a runtime bug. */
+    sw_process_t *cur = tls_current;
+    if (sig == SIGSEGV && cur && cur->stack_mem && info->si_addr) {
+        uintptr_t fault = (uintptr_t)info->si_addr;
+        uintptr_t guard_top = (uintptr_t)cur->stack_mem;       /* guard page is just below */
+        uintptr_t guard_bot = guard_top - 8192;                /* guard page + one page slack */
+        if (fault < guard_top && fault >= guard_bot) {
+            len = snprintf(msg, sizeof(msg),
+                "\n\033[1;31mpanic\033[0m: stack overflow in process #%llu (128KB fiber stack)\n"
+                "  likely cause: deep NON-SELF recursion — mutual tail calls are not\n"
+                "  TCO'd (self-tail-calls are). Keep the loop in one function, or see\n"
+                "  docs/notes/KNOWN_ISSUES.md.\n",
+                (unsigned long long)cur->pid);
+            write(STDERR_FILENO, msg, len);
+            signal(sig, SIG_DFL);
+            raise(sig);
+            return;
+        }
+    }
+
+    len = snprintf(msg, sizeof(msg),
         "\n\033[31m[SwarmRT] CRASH: %s at address %p\033[0m\n"
         "Backtrace:\n",
         signame, info->si_addr);
@@ -1337,10 +1383,14 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         struct sigaction crash_sa;
         memset(&crash_sa, 0, sizeof(crash_sa));
         crash_sa.sa_sigaction = _sw_crash_handler;
-        crash_sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        /* SA_ONSTACK: run on the per-thread sigaltstack. On a fiber-stack
+         * overflow the faulting stack has no headroom — without this the
+         * handler itself faulted and the process died with no output. */
+        crash_sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
         sigaction(SIGSEGV, &crash_sa, NULL);
         sigaction(SIGBUS,  &crash_sa, NULL);
         sigaction(SIGABRT, &crash_sa, NULL);
+        _sw_install_altstack();   /* this thread; schedulers install their own */
     }
 
     /* Start deadlock watchdog unless SW_DEADLOCK_DETECT=0. */
@@ -1731,6 +1781,14 @@ sw_value_arena_t *sw_self_varena(void) {
 struct sw_val **sw_self_error_slot(void) {
     static __thread struct sw_val *fallback = NULL;
     return tls_current ? &tls_current->gen_error : &fallback;
+}
+
+/* Innermost live compiled try frame (see try_chain in struct sw_process).
+ * Thread-local fallback covers the pre-fiber/main-thread path the same way
+ * sw_self_error_slot's does. */
+void **sw_self_try_chain(void) {
+    static __thread void *fallback = NULL;
+    return tls_current ? &tls_current->try_chain : &fallback;
 }
 
 /* Ownership v2 turn-checkpoint: install a fresh value arena for the current

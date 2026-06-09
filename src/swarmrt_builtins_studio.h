@@ -3684,8 +3684,26 @@ static sw_val_t *_builtin_format(sw_val_t **a, int n) {
  * freed on its exit -> use-after-free. The macro redirects every generated
  * `_sw_error` (here + the codegen try/catch) to the current process's slot. */
 #define _sw_error (*sw_self_error_slot())
+
+/* Compiled try/catch frame. The generated N_TRY allocates one as a C local —
+ * it lives on the process's FIBER stack, so the setjmp state survives a
+ * mid-try yield + resume on another scheduler thread — links it through the
+ * per-process chain head (sw_self_try_chain), and setjmps. error() unwinds by
+ * longjmp to the innermost frame: full dynamic extent, so an error() raised
+ * in a CALLEE lands in the caller's catch, matching the interpreter and every
+ * exception system users come from. With no live frame, error() keeps the
+ * documented no-try behavior: silent, execution continues with nil. Panics
+ * never use this chain — they stay uncatchable (process death). */
+#include <setjmp.h>
+typedef struct _sw_try_frame {
+    jmp_buf jb;
+    struct _sw_try_frame *prev;
+} _sw_try_frame_t;
+#define _sw_try_chain (*(_sw_try_frame_t **)sw_self_try_chain())
+
 static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
+    if (_sw_try_chain) longjmp(_sw_try_chain->jb, 1);
     return sw_val_nil();
 }
 
@@ -3799,11 +3817,15 @@ static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
         sw_val_t *args[1] = { msg };
         return _builtin_panic(args, 1);
     }
-    int is_nil = (!a[0] || a[0]->type == SW_VAL_NIL ||
-                  (a[0]->type == SW_VAL_ATOM && a[0]->v.str &&
-                   strcmp(a[0]->v.str, "nil") == 0));
-    if (!is_nil) return a[0];
-    sw_val_t *msg = (n >= 2) ? a[1] : sw_val_string("expected non-nil value, got nil");
+    /* Falsy = nil OR the 'false' atom — interpreter parity (its expect
+     * always treated 'false' as a failure; this one only caught nil, so
+     * expect(x == y, msg) compiled to a no-op pass-through on mismatch). */
+    int is_falsy = (!a[0] || a[0]->type == SW_VAL_NIL ||
+                    (a[0]->type == SW_VAL_ATOM && a[0]->v.str &&
+                     (strcmp(a[0]->v.str, "nil") == 0 ||
+                      strcmp(a[0]->v.str, "false") == 0)));
+    if (!is_falsy) return a[0];
+    sw_val_t *msg = (n >= 2) ? a[1] : sw_val_string("expected non-nil value, got nil/false");
     sw_val_t *args[1] = { msg };
     return _builtin_panic(args, 1);
 }

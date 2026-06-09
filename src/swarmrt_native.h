@@ -372,6 +372,19 @@ struct sw_process {
      * no hook. At struct END so it shifts no asm-pinned offset. */
     void (*on_destroy)(void *);
     void *on_destroy_arg;
+
+    /* Innermost live try/catch frame for the COMPILED path, PER PROCESS for
+     * the same reason as gen_error: a fiber can yield (receive/sleep) inside a
+     * try and resume on another scheduler thread, so a thread-local would
+     * unwind the wrong process. The frame itself (jmp_buf + prev link) is a C
+     * local in the generated function, i.e. it lives on this process's fiber
+     * stack — setjmp/longjmp state is fiber-contained and survives scheduler
+     * migration. error() longjmps to this frame (full dynamic unwind, callee
+     * errors land in the nearest enclosing catch); with no frame it stays the
+     * documented "silent, continue with nil". Panics NEVER use this chain —
+     * they remain uncatchable and kill the process. NULL when no try is live.
+     * At struct END so it shifts no asm-pinned offset. */
+    void *try_chain;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -566,6 +579,12 @@ void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag);
  * Per-process so a try/catch resuming after a blocking op can't catch another
  * fiber's error (whose value would be freed on that fiber's exit). */
 struct sw_val **sw_self_error_slot(void);
+
+/* Innermost live compiled try/catch frame for the current process
+ * (thread-local fallback outside a process). Same per-process rationale as
+ * sw_self_error_slot; see the try_chain field comment in struct sw_process.
+ * Holds a _sw_try_frame_t* (defined in the studio builtins header). */
+void **sw_self_try_chain(void);
 
 /* Ownership v2: spawn a process that OWNS `region` (its args/captures live in it)
  * until the child's trampoline adopts it. Reclaimed by process_destroy if the

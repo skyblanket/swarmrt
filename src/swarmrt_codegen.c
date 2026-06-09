@@ -1221,8 +1221,14 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f,
         "static sw_val_t *_builtin_reduce(sw_val_t **a, int n) {\n"
         "    if (n < 3) return sw_val_nil();\n"
-        "    sw_val_t *fn = a[0];\n"
-        "    sw_val_t *lst = a[1];\n"
+        "    /* Accept reduce(fn, list, acc) or reduce(list, fn, acc) — the\n"
+        "     * latter is what the pipe produces (xs |> reduce(f, 0)). map and\n"
+        "     * filter already had this tolerance; reduce lacking it made a\n"
+        "     * piped reduce return its init value untouched. */\n"
+        "    sw_val_t *fn, *lst;\n"
+        "    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }\n"
+        "    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }\n"
+        "    else { fn = a[0]; lst = a[1]; }\n"
         "    sw_val_t *acc = a[2];\n"
         "    if (!lst || lst->type != SW_VAL_LIST) return acc;\n"
         "    for (int i = 0; i < lst->v.tuple.count; i++) {\n"
@@ -2359,7 +2365,10 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         fprintf(f, "    %s->fn = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
                 ls, lr, fn_val, lr, fn_val);
         fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline2, %s, %s);\n", pv, ls, lr);
-        fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s); }\n", pv, lr, lr, ls);
+        /* Spawn failure must be LOUD. Continuing with a pid wrapping NULL
+         * made sends silently vanish at the SW_MAX_PROCS ceiling. */
+        fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
+        fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
         emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
         return;
     }
@@ -2411,8 +2420,11 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
      * reclaims it; the child adopts it on entry. */
     fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_%s_sp%d_entry, %s, %s);\n",
             pv, ctx->mod_name, sp_id, sa, rg);
-    /* Spawn failure: child never started, region not recorded — reclaim here. */
-    fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s); }\n", pv, rg, rg, sa);
+    /* Spawn failure: child never started, region not recorded — reclaim,
+     * then panic LOUDLY. Continuing with a pid wrapping NULL made every
+     * send to it silently vanish at the SW_MAX_PROCS ceiling. */
+    fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, rg, rg, sa);
+    fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
     emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
 }
 
@@ -3127,27 +3139,52 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     case N_TRY: {
         /* try { body } catch e { handler }
          *
-         * The C `if (_sw_error) { ... }` block is its own lexical
-         * scope, so the err_var declaration belongs only to it.
-         * Snapshot ndeclared before the catch and restore after, the
-         * same pattern emit_if uses for branch scopes — without this,
-         * a second try/catch with the same err_var name would emit
-         * `e = _sw_error;` instead of `sw_val_t *e = _sw_error;` and
-         * fail with "use of undeclared identifier 'e'". */
+         * error() must abort the REST of the try body and the dynamic
+         * extent below it (an error() inside a callee lands here too),
+         * exactly like the interpreter. The old shape ran the whole
+         * body and tested _sw_error once at the end — so the statement
+         * AFTER an error() still executed (and could panic, killing
+         * the process before the catch was ever consulted).
+         *
+         * Now: push a _sw_try_frame_t (a C local — fiber-stack-
+         * resident, so a mid-try yield + resume on another scheduler
+         * is safe) onto the per-process chain and setjmp. error()
+         * longjmps to the innermost frame. The frame is popped on BOTH
+         * arms — at the top of the catch arm so an error() raised
+         * INSIDE the catch body propagates to the enclosing try, not
+         * back into this one (infinite loop otherwise).
+         *
+         * The result var is written after setjmp returns (either
+         * entry), never read across the longjmp, so the setjmp
+         * indeterminate-locals rule doesn't bite it.
+         *
+         * The catch block is its own lexical scope; snapshot ndeclared
+         * around it (same pattern as emit_if) so a second try with the
+         * same err_var re-declares rather than colliding. */
         char v[32]; fresh_var(ctx, v, sizeof(v));
+        char fr[32]; fresh_var(ctx, fr, sizeof(fr));
+        fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", v);
+        fprintf(f, "    _sw_try_frame_t _tf%s; _tf%s.prev = _sw_try_chain; _sw_try_chain = &_tf%s;\n",
+                fr, fr, fr);
         fprintf(f, "    _sw_error = NULL;\n");
+        fprintf(f, "    if (setjmp(_tf%s.jb) == 0) {\n", fr);
         char body_res[32];
         emit_expr(ctx, n->v.trycatch.body, 0, body_res, sizeof(body_res));
-        fprintf(f, "    sw_val_t *%s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
+        fprintf(f, "        %s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
+        fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
+        /* Belt-and-braces: a stale sentinel set by a chain-less error()
+         * deeper in the call tree (no live frame at that moment) still
+         * routes to catch here, preserving the old end-check behavior. */
+        fprintf(f, "    }\n");
         fprintf(f, "    if (_sw_error) {\n");
+        fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
         int saved_ndeclared = ctx->ndeclared;
         fprintf(f, "        sw_val_t *%s = _sw_error;\n", mangle_for_c(n->v.trycatch.err_var));
         declare_var(ctx, n->v.trycatch.err_var);
         fprintf(f, "        _sw_error = NULL;\n");
         char catch_res[32];
         emit_expr(ctx, n->v.trycatch.catch_body, 0, catch_res, sizeof(catch_res));
-        if (catch_res[0])
-            fprintf(f, "        %s = %s;\n", v, catch_res);
+        fprintf(f, "        %s = %s;\n", v, catch_res[0] ? catch_res : "sw_val_nil()");
         fprintf(f, "    }\n");
         ctx->ndeclared = saved_ndeclared;
         strncpy(out, v, osz - 1);

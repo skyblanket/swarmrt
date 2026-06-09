@@ -112,6 +112,15 @@ typedef struct {
     char assert_msg[512];
     int assert_line;
     int call_depth;   /* interpreter recursion-depth guard (no TCO on C stack) */
+    /* Conformance with the compiled path (dual-path gate, tests/sw/conform):
+     * `panicking` marks a panic (uncatchable — try/catch must NOT absorb it;
+     * the run exits 1), as opposed to error() (caught by the nearest try).
+     * `try_depth` counts dynamically-enclosing trys so an error() OUTSIDE any
+     * try keeps the documented behavior — silent, execution continues with
+     * nil — instead of silently unwinding the whole program. assert_raises
+     * treats its probe fn as a try (bumps try_depth) and intercepts both. */
+    int panicking;
+    int try_depth;
 } sw_interp_t;
 
 /* === Public API === */
