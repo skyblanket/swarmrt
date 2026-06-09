@@ -1879,6 +1879,22 @@ static __thread sw_value_arena_t *g_alloc_target = NULL;
  * heap; an explicit target region (deep_copy_into) → that region; the running
  * process's arena (compiled backend, freed at process exit) → that; else the
  * global heap (interpreter / pre-fiber). val_alloc zeroes (calloc semantics). */
+/* Heap exhaustion is not recoverable from inside a value constructor (every
+ * sw_val_* caller writes fields through the result unchecked), so fail LOUD
+ * with the likely cause instead of letting the first write SIGSEGV at nil.
+ * Observed in the wild: a single-scheduler 80K spawn storm runs the host out
+ * of VMAs (each live fiber stack is its own mmap; Linux's default
+ * vm.max_map_count is 65530), at which point mmap AND calloc return NULL. */
+static void *val_alloc_oom(size_t n) {
+    fprintf(stderr,
+            "\n\x1b[1;31mpanic\x1b[0m: out of memory: value allocation of %zu bytes failed\n"
+            "  (under a spawn storm on Linux this is often VMA exhaustion — each live\n"
+            "   process stack is an mmap; check `sysctl vm.max_map_count` and the\n"
+            "   number of simultaneously-live processes)\n",
+            n);
+    abort();
+}
+
 static inline void *val_alloc(size_t n) {
     if (!g_alloc_force_global) {
         sw_value_arena_t *a = g_alloc_target ? g_alloc_target : sw_self_varena();
@@ -1887,7 +1903,8 @@ static inline void *val_alloc(size_t n) {
             if (p) { memset(p, 0, n); return p; }
         }
     }
-    return calloc(1, n);
+    void *p = calloc(1, n);
+    return p ? p : val_alloc_oom(n);
 }
 
 static inline char *val_strdup(const char *s) {
@@ -1899,7 +1916,8 @@ static inline char *val_strdup(const char *s) {
             if (p) return p;
         }
     }
-    return strdup(s);
+    char *p = strdup(s);
+    return p ? p : (char *)val_alloc_oom(strlen(s) + 1);
 }
 
 sw_val_t *sw_val_nil(void) {
