@@ -310,3 +310,28 @@ preemption (stress gate 0/50 → 50/50), loud OOM. ✔
 *Filed by the Round-7 reviewer (Claude, June 2026), against
 `6f54390` + this round's fixes. Repro programs for every open finding
 are inline above; all are <30 lines.*
+
+---
+
+## Round 7 continuation — status update (same reviewer, later the same day)
+
+Rebased onto the Phase-1 ownership work (`e1a7713`) and executed the
+"Next" tier of the upgrade path. Status of the open findings:
+
+| Finding | Status |
+|---|---|
+| O1 try/catch divergence | **FIXED** — unified error model: `error()` unwinds the full dynamic extent to the nearest catch on both paths (compiled: per-process setjmp/longjmp chain); panics uncatchable on both; `error()` outside try silent on both. |
+| O2(b) silent stack-overflow death | **FIXED** — SA_ONSTACK + per-thread sigaltstack; guard-page hits report "stack overflow in process #N" with the mutual-recursion explanation. O2(a) doc fix shipped earlier; O2(c) general TCO still future. |
+| O3 silent spawn failure | **FIXED** — panics "process table full — raise SW_MAX_PROCS". |
+| O6 diagnostics | **PARTIAL** — f-string interpolations now carry their real line. Fabricated `src/<Mod>.sw` paths and module-qualified did-you-mean still open. |
+| O7 grammar/stdlib paper cuts | **MOSTLY FIXED** — tuple-destructuring assignment (`{'ok', v} = fetch()`, literal positions assert-match); multi-arm `with`/`else` with guards; `after MS ->` accepted; `Std.map`/`Std.filter`/`Std.join` exist (and the codegen guard that rejected them is relaxed). Still open: codepoint-aware string ops, list/nested destructuring. |
+| O4 cross-scheduler wake cost, O5 startup time, O8 gate portability docs | open (unchanged). |
+
+**And the structural fix from the assessment section is in:** the
+dual-path conformance gate (`tests/sw/run_conform.sh` + `tests/sw/conform/`,
+wired into `make test-sw`). On its first run it caught four additional
+real divergences beyond O1 — interpreter pipe was a no-op for most
+builtins, piped `reduce` returned its init value compiled, compiled
+`expect()` passed `'false'` through, and a panic inside an f-string
+interpolation was laundered into the string `"nil"` by the interpreter.
+All fixed and held closed by the gate.
