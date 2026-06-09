@@ -319,6 +319,11 @@ gc-stress: swc libswarmrt
 	    tests/gc/error_xproc_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_error_repro $(LDFLAGS)
 	@rm -f tests/gc/error_xproc_repro.gen.c $(BIN_DIR)/_xperr_emit
 	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_error_repro
+	@# Cross-process panic-TRACE isolation: generated line/file/call-trace must be
+	@# per-process, not scheduler-thread-local. A panic must print the panicking
+	@# process's OWN call chain — not frames left by an unrelated fiber parked deep
+	@# on the same scheduler thread. Observable only on stderr, so a grep gate.
+	@bash scripts/gc_trace_check.sh tests/gc/trace_xproc_repro.sw stress
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS

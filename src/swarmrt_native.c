@@ -65,6 +65,26 @@ sw_swarm_t *g_swarm = NULL;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread sw_scheduler_t *tls_scheduler = NULL;
 static __thread sw_process_t *tls_current = NULL;
+
+/* Generated-code execution state (line/file/call-trace), PER PROCESS. `_sw_gen`
+ * is pointed at the running process's gen_exec block on every context switch in
+ * (below), so the generated _sw_current_line/_sw_current_file/_sw_trace* macros
+ * (swarmrt_builtins_studio.h) reach the right process — a panic after a blocking
+ * op then reports THIS process's location, not a fiber that shared the thread.
+ * The fallback covers OOM (gen_exec calloc failed) and any code not running on a
+ * fiber; it's a single thread-local, so its only failure mode is a wrong line in
+ * a diagnostic banner from non-fiber code — never a memory-safety issue.
+ *
+ * Both are zero-initialized (a __thread initializer must be a compile-time
+ * constant; a string-literal designated init / a TLS address is not). The
+ * fallback's NULL current_file is fine — the panic readers guard on it — and
+ * `_sw_gen` is assigned (to a process block or &_sw_gen_fallback) at every
+ * context switch before any generated code runs, so it's never read while NULL:
+ * generated line/file/trace writes and the studio.h panic readers both execute
+ * only on a fiber, after switch-in. Belt-and-braces, it's set at scheduler-loop
+ * entry too. */
+static __thread sw_gen_exec_t _sw_gen_fallback;
+__thread sw_gen_exec_t *_sw_gen;
 /* GC v2: region handed to the next sw_spawn_opts to record on the child's
  * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
 static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
@@ -501,6 +521,16 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     }
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
+
+    /* Per-process generated line/file/call-trace state. Lazily allocated and KEPT
+     * WITH THE SLAB SLOT across lifetimes (like stack_mem below): reset here, freed
+     * only at slab teardown. On OOM it stays NULL and the context switch falls back
+     * to a thread-local (diagnostic-only). _sw_gen is pointed here on switch-in. */
+    if (!proc->gen_exec) proc->gen_exec = (sw_gen_exec_t *)calloc(1, sizeof(sw_gen_exec_t));
+    if (proc->gen_exec) {
+        memset(proc->gen_exec, 0, sizeof(sw_gen_exec_t));
+        proc->gen_exec->current_file = "<unknown>";
+    }
 
     /* Core fields */
     proc->entry = entry;
@@ -998,6 +1028,7 @@ static void root_exit_check(sw_process_t *proc, int reason) {
 
 static void scheduler_loop(sw_scheduler_t *sched) {
     tls_scheduler = sched;
+    _sw_gen = &_sw_gen_fallback;  /* valid before the first switch-in sets it */
 
     while (!sched->should_exit && g_swarm && g_swarm->running) {
         sched->loop_iters++;
@@ -1037,6 +1068,9 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             proc->fcalls = SWARM_CONTEXT_REDS;
             sched->current = proc;
             tls_current = proc;
+            /* Point generated line/file/trace state at THIS process (fallback if
+             * gen_exec wasn't allocated, e.g. OOM — diagnostic-only degradation). */
+            _sw_gen = proc->gen_exec ? proc->gen_exec : &_sw_gen_fallback;
 
             /* Context switch to process (runs on process's own stack).
              * sw_safe_swap_into copies ctx under proc->ctx_lock so the
@@ -1044,12 +1078,14 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             if (sw_safe_swap_into(&sched->sched_proc, proc, expected_gen) < 0) {
                 /* Slot was reused between pick and swap — just loop. */
                 tls_current = NULL;
+                _sw_gen = &_sw_gen_fallback;
                 sched->current = NULL;
                 continue;
             }
 
             /* Process yielded, blocked on receive, or finished */
             tls_current = NULL;
+            _sw_gen = &_sw_gen_fallback;
             sched->current = NULL;
 
             if (proc->state == SW_PROC_EXITING) {
@@ -1370,6 +1406,12 @@ void sw_shutdown(int swarm_id) {
                 munmap(base, total);
 #endif
                 slab[i].stack_mem = NULL;
+            }
+            /* Per-process generated exec state — kept with the slot across
+             * lifetimes (like stack_mem), so freed here at slab teardown. */
+            if (slab[i].gen_exec) {
+                free(slab[i].gen_exec);
+                slab[i].gen_exec = NULL;
             }
         }
     }

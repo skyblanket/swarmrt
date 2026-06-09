@@ -4,6 +4,36 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-09 — process isolation: panic traces (line/file/call-stack) are per-process too
+
+**fix(gc): a panic now reports the panicking process's OWN location and call chain.**
+The generated line/file trackers (`_sw_current_line`, `_sw_current_file`) and the
+call-stack ring buffer (`_sw_trace`/`_sw_trace_top`/`_sw_trace_overflowed`) were
+scheduler-thread thread-locals. The call DEPTH is shared across every fiber on the OS
+thread, so a process parked in a blocking op at some depth, plus another fiber running
+(and parking) at a different depth, left the shared trace state mixed — a third process
+that panicked printed an **unrelated process's call stack**. (Memory-safe — these hold
+only `.rodata` function-name literals + ints, never a freeable value, so this was a wrong
+*diagnostic*, not a UAF — but the roadmap rightly wants correct traces.) Fix: this state
+now lives in a per-process `sw_gen_exec_t` (`swarmrt_native.h`) reached through `_sw_gen`,
+which the scheduler points at the running process on every context switch; the generated
+`_sw_current_line`/`_sw_current_file`/`_sw_trace*` macros (`swarmrt_builtins_studio.h`)
+redirect through it. Each process's trace starts at depth 0 and only ever holds its own
+frames. The block is lazily allocated and kept with the slab slot (like `stack_mem`) —
+reset on reuse, freed at slab teardown — so peak memory still tracks concurrently-live
+processes, not slab capacity (phase2 still reclaims 100000/100000; gc-slope flat).
+
+**test(gc): permanent stderr gate.** `tests/gc/trace_xproc_repro.sw` +
+`scripts/gc_trace_check.sh` (wired into `make gc-stress`, `SW_SCHEDULERS=1`): a deep,
+distinctively-named contaminant parks ~forever while a short-chained victim panics; the
+harness asserts the victim's panic call chain contains only its own frames (`xvictim_*`)
+and **no foreign frames** (`xcontam_*`). Proven bidirectional — pre-fix (shared TLS) the
+victim's banner lists the contaminant's `xcontam_e..a` frames; post-fix it's `xvictim`-only.
+gc-stress (both scheduler modes, 4 gates), gc-slope, phases 2-10, test-sw 53/475 all green;
+zero warnings. With this, ALL generated execution state (`_sw_error` + line/file/trace) is
+per-process — generated-code process isolation is complete; remaining global-heap owners
+are ETS values + supervisor/timer closures (next).
+
 ## 2026-06-09 — process isolation: generated `_sw_error` is per-process, not scheduler-thread-local
 
 **fix(gc): a process can no longer catch another process's error (was a heap-UAF).** The

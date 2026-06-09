@@ -951,27 +951,20 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <sys/time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
 
-    /* _sw_error is no longer a thread-local: studio.h #defines it as
-     * (*sw_self_error_slot()) — a PER-PROCESS slot — so a try/catch resuming
-     * after a blocking op can't catch another fiber's error (which would UAF
-     * that fiber's freed error value). See sw_self_error_slot in native.c.
-     * (Line/file/trace below remain thread-local — they hold only static strings
-     * + ints, so cross-fiber contamination there is diagnostic, not unsafe.) */
-    /* Runtime line / file tracking — codegen emits
-     *   `_sw_current_line = N; _sw_current_file = \"src/Mod.sw\";`
-     * once per source line so panic() / expect() / failing builtins
-     * can report where in the .sw source the program was running.
-     * Cheap (two stores per source line, only when the line changes). */
-    fprintf(f, "__thread int _sw_current_line = 0;\n");
-    fprintf(f, "__thread const char *_sw_current_file = \"<unknown>\";\n");
-
-    /* Call-stack ring buffer for stack traces. The typedef `_sw_frame_t`
-     * comes from builtins_studio.h (included above); we just define
-     * the thread-locals + push/pop helpers here. Capacity 64 frames —
-     * deeper recursion sets the overflow flag rather than blowing up. */
-    fprintf(f, "__thread _sw_frame_t _sw_trace[64];\n");
-    fprintf(f, "__thread int _sw_trace_top = 0;\n");
-    fprintf(f, "__thread int _sw_trace_overflowed = 0;\n");
+    /* Generated execution state — _sw_error, _sw_current_line/_sw_current_file,
+     * and the _sw_trace call-stack ring buffer — is PER PROCESS, not a
+     * scheduler-thread-local. A blocking op (sleep/receive) yields the fiber,
+     * so a thread-local would leak across the context switch: a try/catch could
+     * catch an unrelated fiber's error (UAF on its freed value), and a panic
+     * could print another fiber's line/file/call-chain. swarmrt_native.h holds
+     * the per-process `sw_gen_exec_t` + the `_sw_gen` pointer (swapped on every
+     * context switch); swarmrt_builtins_studio.h #defines _sw_error and the
+     * _sw_current_line/_sw_current_file/_sw_trace* macros to reach through it.
+     * So codegen emits NO storage for these here — just the push/pop helpers,
+     * which operate on the running process's block via those macros. Codegen
+     * still emits `_sw_current_line = N; _sw_current_file = "src/Mod.sw";` once
+     * per source line (cheap: now one pointer hop + two stores). Capacity 64
+     * frames — deeper recursion sets the overflow flag rather than blowing up. */
     fprintf(f, "static inline void _sw_trace_push(const char *m, const char *fn, int line) {\n"
                "    if (_sw_trace_top < 64) {\n"
                "        _sw_trace[_sw_trace_top].module_name = m;\n"

@@ -3614,18 +3614,23 @@ static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     return sw_val_nil();
 }
 
-/* Print the current call stack to stderr, top of stack first. Reads
- * the per-thread ring buffer the codegen maintains via
- * _sw_trace_push / _sw_trace_pop. Static — included by the generated
- * C, which is the only place the trace globals are defined. */
-typedef struct { const char *module_name; const char *fn_name; int line; } _sw_frame_t;
-extern __thread _sw_frame_t _sw_trace[];
-extern __thread int _sw_trace_top;
-extern __thread int _sw_trace_overflowed;
+/* Generated execution state (line/file/call-trace) is PER PROCESS, reached via
+ * `_sw_gen` (swarmrt_native.h) — swapped on every context switch. These macros
+ * redirect the generated `_sw_current_line = N; _sw_current_file = "..."` writes
+ * and the trace push/pop + panic readers below to the running process's block,
+ * so a panic after a blocking op reports THIS process's location/call chain, not
+ * a fiber that happened to share the scheduler thread. (`_sw_frame_t` and the
+ * sw_gen_exec_t fields are declared in swarmrt_native.h, included above.) */
+#define _sw_current_line     (_sw_gen->current_line)
+#define _sw_current_file     (_sw_gen->current_file)
+#define _sw_trace            (_sw_gen->trace)
+#define _sw_trace_top        (_sw_gen->trace_top)
+#define _sw_trace_overflowed (_sw_gen->trace_overflowed)
 
+/* Print the current call stack to stderr, top of stack first. Reads the
+ * running process's call-stack ring buffer (via the _sw_trace* macros above),
+ * which the codegen maintains through _sw_trace_push / _sw_trace_pop. */
 static void _sw_print_trace(void) {
-    extern __thread int _sw_current_line;
-    extern __thread const char *_sw_current_file;
     int top = _sw_trace_top;
     if (top <= 0) return;
     if (top > 64) top = 64;
@@ -3649,8 +3654,6 @@ static void _sw_print_trace(void) {
  * runtime line/file trackers the codegen keeps current. NORETURN. */
 __attribute__((noreturn))
 static void _sw_runtime_panic(const char *fmt, ...) {
-    extern __thread int _sw_current_line;
-    extern __thread const char *_sw_current_file;
     /* Format the message twice: once for stderr (with the ANSI banner
      * and call chain) and once into a clean buffer that we hand to
      * sw_process_panic so it lands in EXIT/DOWN messages. */
@@ -3681,8 +3684,6 @@ static void _sw_runtime_panic(const char *fmt, ...) {
  * case expression). For recoverable conditions reach for error()
  * + try/catch instead. */
 static sw_val_t *_builtin_panic(sw_val_t **a, int n) {
-    extern __thread int _sw_current_line;
-    extern __thread const char *_sw_current_file;
     char msg_buf[512];
     if (n >= 1 && a[0]) {
         char *b = NULL; size_t bl = 0;

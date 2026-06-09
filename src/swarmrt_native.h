@@ -68,6 +68,29 @@ typedef struct sw_process sw_process_t;
 typedef struct sw_scheduler sw_scheduler_t;
 typedef struct sw_swarm sw_swarm_t;
 
+/* === Generated-code execution state (PER PROCESS, not thread-local) ===
+ * The compiled backend keeps a current source line/file (for panic banners)
+ * and a call-stack ring buffer (for stack traces). These were scheduler-thread
+ * locals, but a blocking op (sleep/receive) yields the fiber, so a process
+ * resuming on the same scheduler thread would inherit an UNRELATED process's
+ * line/file/trace — a panic would then print the wrong location/call chain.
+ * (Memory-safe — they hold only .rodata string literals + ints — but wrong.)
+ * So this state lives per-process: `_sw_gen` is swapped to the running process's
+ * block at every context switch, and the generated `_sw_current_line` /
+ * `_sw_current_file` / `_sw_trace*` macros (swarmrt_builtins_studio.h) redirect
+ * through it. `_sw_frame_t` is shared with the generated trace push/pop. */
+typedef struct { const char *module_name; const char *fn_name; int line; } _sw_frame_t;
+typedef struct sw_gen_exec {
+    int current_line;            /* source line of the statement now executing */
+    const char *current_file;    /* source file (string literal, never freed)  */
+    _sw_frame_t trace[64];       /* call-stack ring buffer (innermost last)     */
+    int trace_top;               /* depth; >64 sets trace_overflowed            */
+    int trace_overflowed;        /* 1 if the call chain exceeded 64 frames      */
+} sw_gen_exec_t;
+/* Points at the running process's gen_exec block (or a thread-local fallback for
+ * non-process / OOM contexts). Swapped wherever tls_current is set. */
+extern __thread sw_gen_exec_t *_sw_gen;
+
 /* === Context (for assembly switching) === */
 typedef struct {
 #ifdef __aarch64__
@@ -331,6 +354,14 @@ struct sw_process {
      * in THIS process's arena, so it's reclaimed with the arena on exit. (Placed
      * at the END so it shifts no asm-pinned offset.) */
     struct sw_val *gen_error;
+
+    /* Per-process generated execution state (line/file/call-trace). Lazily
+     * allocated on first run and KEPT WITH THE SLAB SLOT across lifetimes (like
+     * stack_mem) — reset, not freed, in process_init_arena; freed only at slab
+     * teardown. `_sw_gen` is pointed here on context-switch in. NULL until first
+     * use / on OOM (then `_sw_gen` falls back to a thread-local). At struct END
+     * so it shifts no asm-pinned offset. */
+    sw_gen_exec_t *gen_exec;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
