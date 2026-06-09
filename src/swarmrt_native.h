@@ -268,7 +268,7 @@ struct sw_process {
      * it (and for the interpreter, which has no scheduler). Distinct from
      * `heap` above (the dead bump-block). See [[swarmrt-gc-design]]. */
     struct sw_value_arena *varena;
-    
+
     /* === Run queue link (MPSC intrusive) === */
     _Atomic(sw_process_t *) rq_next;  /* Atomic for lock-free MPSC push */
     
@@ -312,6 +312,13 @@ struct sw_process {
      * documented in R2-#4 / R3-C / R4-B). */
     _Atomic uint64_t generation;
     sw_spinlock_t ctx_lock;
+
+    /* GC v2: a SPAWN region handed to this process at spawn time, owning its
+     * args/captures until the child's trampoline ADOPTS it into varena. Recorded
+     * here (before the child is runnable) so a kill BEFORE the trampoline runs
+     * still lets process_destroy reclaim it. NULL once adopted. Placed LAST so it
+     * shifts no field offset (the asm + slot-reuse paths are offset-sensitive). */
+    struct sw_value_arena *spawn_region;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -497,6 +504,17 @@ void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
                         struct sw_value_arena *region);
 void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms);
 void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
+/* Ownership v2: sw_receive_any that adopts a VALUE region into the caller's
+ * arena (caller incorporates the payload; must NOT free it). Used by pmap. */
+void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag);
+
+/* Ownership v2: spawn a process that OWNS `region` (its args/captures live in it)
+ * until the child's trampoline adopts it. Reclaimed by process_destroy if the
+ * child dies pre-trampoline; on spawn failure (NULL) the caller reclaims it. */
+sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_arena *region);
+/* Called by the child trampoline: atomically take (read+clear) this process's
+ * spawn_region so it can adopt it and process_destroy won't double-free. */
+struct sw_value_arena *sw_self_take_spawn_region(void);
 
 /* Selective receive: scan mailbox without consuming, remove matched msg */
 void sw_mailbox_drain_signals(void);         /* Drain signal stack → private queue */

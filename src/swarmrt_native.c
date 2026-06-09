@@ -49,6 +49,9 @@ sw_swarm_t *g_swarm = NULL;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread sw_scheduler_t *tls_scheduler = NULL;
 static __thread sw_process_t *tls_current = NULL;
+/* GC v2: region handed to the next sw_spawn_opts to record on the child's
+ * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
+static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
 
 /* Optional per-spawn pin set by sw_spawn_link so the child lands on a
  * specific scheduler (not the parent's). sw_spawn_opts honours this
@@ -205,18 +208,31 @@ static inline void msg_free(sw_msg_t *m) {
     free(m);
 }
 
+/* Ownership v2: when set (sw_recv_any_adopt), a C-level receive ADOPTS a VALUE
+ * message's region into the current process's arena instead of materializing a
+ * free-able global copy — for consumers (pmap) that INCORPORATE the payload into
+ * a value they return rather than free()ing it. Thread-local; off by default. */
+static __thread int g_recv_adopt = 0;
+
 /* Ownership v2: hand a popped message's payload to a C-LEVEL receiver
  * (sw_receive / sw_receive_any / sw_receive_tagged — used by tests, pmap, task,
  * remote delivery). The compiled-sw `receive` has its own loop that ADOPTS the
  * region; C consumers instead expect a standalone, free-able payload. So for a
  * SW_PK_VALUE message, materialize the graph onto the global heap (free-able)
- * and reclaim the region here. RAW payloads pass through unchanged. */
+ * and reclaim the region here — UNLESS g_recv_adopt is set, in which case adopt
+ * the region into this process's arena (caller keeps it, must NOT free it).
+ * RAW payloads pass through unchanged. */
 static inline void *msg_take_payload(sw_msg_t *m) {
     void *p = m->payload;
     if (m->pkind == SW_PK_VALUE && m->region) {
-        extern void *sw_val_deep_copy_global(void *);
-        p = sw_val_deep_copy_global(p);     /* free-able global-heap copy */
-        sw_varena_free_all(m->region);
+        sw_value_arena_t *self = sw_self_varena();
+        if (g_recv_adopt && self) {
+            sw_varena_adopt(self, m->region);   /* payload now lives in self's arena */
+        } else {
+            extern void *sw_val_deep_copy_global(void *);
+            p = sw_val_deep_copy_global(p);     /* free-able global-heap copy */
+            sw_varena_free_all(m->region);
+        }
         m->region = NULL;
         m->pkind = SW_PK_RAW;
     }
@@ -468,6 +484,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         if (gc_off < 0) gc_off = getenv("SW_GC_OFF") ? 1 : 0;
         proc->varena = gc_off ? NULL : sw_varena_create(8192);
     }
+    proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
 
     /* Core fields */
     proc->entry = entry;
@@ -633,6 +650,13 @@ static void process_destroy(sw_process_t *proc) {
     if (proc->varena) {
         sw_varena_free_all(proc->varena);
         proc->varena = NULL;
+    }
+
+    /* GC v2: a spawn region still attached means the child was killed BEFORE its
+     * trampoline adopted it (pre-start kill) — reclaim it here so it isn't leaked. */
+    if (proc->spawn_region) {
+        sw_varena_free_all(proc->spawn_region);
+        proc->spawn_region = NULL;
     }
 
     /* Return block and slot to the current scheduler's partition
@@ -1439,6 +1463,11 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
     /* 4. Initialize process with arena block */
     process_init_arena(proc, (uint32_t)block_idx, entry, arg);
 
+    /* GC v2: record the spawn region (if any) BEFORE the child is runnable, so a
+     * pre-trampoline kill still reclaims it in process_destroy. Consumed once. */
+    proc->spawn_region = g_pending_spawn_region;
+    g_pending_spawn_region = NULL;
+
     /* 5. Assign PID (monotonic, lock-free) */
     proc->pid = atomic_fetch_add(&arena->next_pid, 1);
     atomic_fetch_add(&g_swarm->total_spawns, 1);
@@ -1452,6 +1481,25 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
     sw_add_to_runq(&sched->runq, proc);
 
     return proc;
+}
+
+/* GC v2: spawn a process owning `region`. Threads the region to sw_spawn_opts via
+ * a thread-local (consumed before the child is runnable). On failure (NULL proc)
+ * the region was not recorded — the caller reclaims it. */
+sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_arena *region) {
+    g_pending_spawn_region = region;
+    sw_process_t *p = sw_spawn_opts(entry, arg, SW_PRIO_NORMAL);
+    g_pending_spawn_region = NULL;   /* clear if spawn failed before consuming */
+    return p;
+}
+
+/* GC v2: read+clear the current process's spawn_region (called by the child
+ * trampoline so it can adopt the region and destroy won't double-free it). */
+struct sw_value_arena *sw_self_take_spawn_region(void) {
+    if (!tls_current) return NULL;
+    struct sw_value_arena *r = tls_current->spawn_region;
+    tls_current->spawn_region = NULL;
+    return r;
 }
 
 /*
@@ -2679,6 +2727,17 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
     }
+}
+
+/* Ownership v2: like sw_receive_any but ADOPTS a VALUE message's region into the
+ * current process's arena instead of materializing a free-able global copy. For
+ * consumers that incorporate the payload into a returned value (pmap) — the
+ * caller must NOT free the returned payload. */
+void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag) {
+    g_recv_adopt = 1;
+    void *p = sw_receive_any(timeout_ms, out_tag);
+    g_recv_adopt = 0;
+    return p;
 }
 
 /* ============================================================================

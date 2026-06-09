@@ -1261,11 +1261,15 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "typedef struct { sw_val_t *fn; sw_val_t *item; sw_process_t *caller; int idx; } _pmap_w_t;\n"
         "static void _pmap_entry(void *raw) {\n"
         "    _pmap_w_t *w = (_pmap_w_t *)raw;\n"
+        /* Ownership v2: take + adopt the SPAWN region holding fn+item into this
+         * worker's arena (freed at worker exit) instead of leaking global copies. */
+        "    { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();\n"
+        "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n"
         "    sw_val_t *arg[] = {w->item};\n"
         "    sw_val_t *result = sw_val_apply(w->fn, arg, 1);\n"
         "    sw_val_t *ti[] = {sw_val_int(w->idx), result};\n"
         "    sw_val_t *msg = sw_val_tuple(ti, 2);\n"
-        "    sw_send_value(w->caller, 11, msg);\n"  /* GC v1: copy result off the dying worker's arena */
+        "    sw_send_value(w->caller, 11, msg);\n"  /* result → message region the caller adopts */
         "    free(w);\n"
         "}\n"
         "static sw_val_t *_builtin_pmap(sw_val_t **a, int n) {\n"
@@ -1285,16 +1289,21 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    sw_val_t **res = calloc(cnt, sizeof(sw_val_t*));\n"
         "    for (int i = 0; i < cnt; i++) {\n"
         "        _pmap_w_t *w = malloc(sizeof(_pmap_w_t));\n"
-        /* GC v1: copy fn + item off the caller's arena. The caller blocks on
-         * the result, but its receive can time out (5s) and the caller then
-         * exit while a slow worker still holds these pointers. */
-        "        w->fn = sw_val_deep_copy_global(fn); w->item = sw_val_deep_copy_global(lst->v.tuple.items[i]);\n"
+        /* Ownership v2: copy fn + item into a SPAWN region the worker adopts on
+         * entry (freed at worker exit) — no global-heap leak, and safe even if a
+         * worker outlives the caller's 5s collect timeout. GC-off → global copy. */
+        "        sw_value_arena_t *_wr = sw_self_varena() ? sw_varena_create_kind(256, SW_REGION_SPAWN) : (sw_value_arena_t*)0;\n"
+        "        w->fn = _wr ? deep_copy_into(fn, _wr) : sw_val_deep_copy_global(fn);\n"
+        "        w->item = _wr ? deep_copy_into(lst->v.tuple.items[i], _wr) : sw_val_deep_copy_global(lst->v.tuple.items[i]);\n"
         "        w->caller = self; w->idx = i;\n"
-        "        sw_spawn(_pmap_entry, w);\n"
+        "        sw_process_t *_wp = sw_spawn_owned(_pmap_entry, w, _wr);\n"
+        "        if (!_wp) { if (_wr) sw_varena_free_all(_wr); free(w); }\n"
         "    }\n"
         "    for (int i = 0; i < cnt; i++) {\n"
         "        uint64_t tag;\n"
-        "        void *raw = sw_receive_any(5000, &tag);\n"
+        /* Adopt each result region into THIS (caller) arena so the returned list
+         * is self-contained in the caller's lifecycle (no leaked global copies). */
+        "        void *raw = sw_recv_any_adopt(5000, &tag);\n"
         "        if (raw) {\n"
         "            sw_val_t *m = (sw_val_t *)raw;\n"
         "            if (m->type == SW_VAL_TUPLE && m->v.tuple.count == 2\n"
@@ -1351,11 +1360,11 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
     /* Ownership v2: region-carrying lambda spawn. The closure (+ captures) is
      * copied into a SPAWN region the child adopts on entry, then freed at child
      * exit — closing the leak in the `spawn(f)` / `spawn(fn(){...})` form. */
-    fprintf(f, "typedef struct { sw_val_t *fn; sw_value_arena_t *region; } _sw_lam_sp_t;\n");
+    fprintf(f, "typedef struct { sw_val_t *fn; } _sw_lam_sp_t;\n");
     fprintf(f, "static void _sw_lambda_spawn_trampoline2(void *_raw) {\n");
     fprintf(f, "    _sw_lam_sp_t *_s = (_sw_lam_sp_t *)_raw;\n");
-    fprintf(f, "    { sw_value_arena_t *_cv = sw_self_varena();\n");
-    fprintf(f, "      if (_cv && _s->region) sw_varena_adopt(_cv, _s->region); }\n");
+    fprintf(f, "    { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();\n");
+    fprintf(f, "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n");
     fprintf(f, "    if (_s->fn) sw_val_apply(_s->fn, NULL, 0);\n");
     fprintf(f, "    free(_s);\n");
     fprintf(f, "}\n");
@@ -1370,18 +1379,18 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
         fprintf(f, "typedef struct {");
         for (int a = 0; a < sp->nargs; a++)
             fprintf(f, " sw_val_t *a%d;", a);
-        fprintf(f, " sw_value_arena_t *_region;");   /* Ownership v2: spawn region owning the args */
         fprintf(f, " } _%s_sp%d_t;\n", ctx->mod_name, sp->id);
 
         /* Entry function */
         fprintf(f, "static void _%s_sp%d_entry(void *_raw) {\n", ctx->mod_name, sp->id);
         fprintf(f, "    _%s_sp%d_t *_s = (_%s_sp%d_t *)_raw;\n",
                 ctx->mod_name, sp->id, ctx->mod_name, sp->id);
-        /* Ownership v2: adopt the spawn region's chunks (which own the copied
-         * args) into this child's own arena — they're now freed at child exit.
-         * The arg pointers (_s->aN) already point into those chunks. */
-        fprintf(f, "    { sw_value_arena_t *_cv = sw_self_varena();\n");
-        fprintf(f, "      if (_cv && _s->_region) sw_varena_adopt(_cv, _s->_region); }\n");
+        /* Ownership v2: take + adopt the spawn region (which owns the copied args)
+         * into this child's arena — freed at child exit. Taking it (read+clear)
+         * means a later kill won't double-free it. The arg pointers (_s->aN)
+         * already point into the adopted chunks. */
+        fprintf(f, "    { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();\n");
+        fprintf(f, "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n");
         if (sp->nargs > 0) {
             fprintf(f, "    sw_val_t *_a[] = {");
             for (int a = 0; a < sp->nargs; a++) {
@@ -2339,10 +2348,9 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
          * heap. SW_GC_OFF / no-arena → fall back to the v1 global-heap copy. */
         fprintf(f, "    sw_value_arena_t *%s = sw_self_varena() ? sw_varena_create_kind(256, SW_REGION_SPAWN) : NULL;\n", lr);
         fprintf(f, "    _sw_lam_sp_t *%s = malloc(sizeof(_sw_lam_sp_t));\n", ls);
-        fprintf(f, "    %s->region = %s;\n", ls, lr);
         fprintf(f, "    %s->fn = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
                 ls, lr, fn_val, lr, fn_val);
-        fprintf(f, "    sw_process_t *%s = sw_spawn(_sw_lambda_spawn_trampoline2, %s);\n", pv, ls);
+        fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline2, %s, %s);\n", pv, ls, lr);
         fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s); }\n", pv, lr, lr, ls);
         emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
         return;
@@ -2382,7 +2390,6 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
      * process has no arena (SW_GC_OFF / interpreter), fall back to the v1
      * global-heap copy so the A/B path and SW_GC_OFF stay intact. */
     fprintf(f, "    sw_value_arena_t *%s = sw_self_varena() ? sw_varena_create_kind(256, SW_REGION_SPAWN) : NULL;\n", rg);
-    fprintf(f, "    %s->_region = %s;\n", sa, rg);
     for (int i = 0; i < sp->nargs; i++) {
         char arg[32];
         emit_expr(ctx, inner->v.call.args[i], 0, arg, sizeof(arg));
@@ -2392,9 +2399,11 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
 
     char pv[32];
     fresh_var(ctx, pv, sizeof(pv));
-    fprintf(f, "    sw_process_t *%s = sw_spawn(_%s_sp%d_entry, %s);\n",
-            pv, ctx->mod_name, sp_id, sa);
-    /* Spawn failure: the child never started, so reclaim the region + struct here. */
+    /* sw_spawn_owned records the region on the child so a pre-trampoline kill
+     * reclaims it; the child adopts it on entry. */
+    fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_%s_sp%d_entry, %s, %s);\n",
+            pv, ctx->mod_name, sp_id, sa, rg);
+    /* Spawn failure: child never started, region not recorded — reclaim here. */
     fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s); }\n", pv, rg, rg, sa);
     emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
 }

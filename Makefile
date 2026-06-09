@@ -302,16 +302,20 @@ gc-stress: swc libswarmrt
 	@rm -f tests/sw/test_uaf_stress.gen.c $(BIN_DIR)/_gc_stress_emit
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_stress
 
-# GC memory-slope gate: run the escaped-value slope probes at a low and high count
-# (fixed concurrency / mailbox depth) and fail if peak-RSS growth exceeds budget.
-# RED until Ownership v2 reclaims escaped spawn args + messages (the escaped-value
-# leak makes RSS grow ~50 KB/job today). Honors SW_SCHEDULERS / SW_GC_OFF.
+# GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
+# and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
+# growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
+# (scripts/gc_slope.sh enforces this — a crashing/sys_exit(1) probe FAILS). Covers
+# spawn args, value messages, a long-lived tail loop, and pmap. Honors
+# SW_SCHEDULERS / SW_GC_OFF.
 .PHONY: gc-slope
 gc-slope: swc
 	@rc=0; \
-	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw   200 2000 80 spawn || rc=1; \
-	 bash scripts/gc_slope.sh tests/gc/slope_message.sw 500 4000 80 msg   || rc=1; \
-	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded — Ownership v2 target)"; \
+	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw   200 2000   80 spawn || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_message.sw 500 4000   80 msg   || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_turn.sw    5000 100000 80 turn  || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw    200 2000   80 pmap  || rc=1; \
+	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
 # Stress: 80k-spawn microbench across default scheduler count and

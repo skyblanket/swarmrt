@@ -118,6 +118,7 @@ static sw_val_t *_sw_lang_ed25519_verify(sw_val_t **args, int nargs) {
 /* Weak stubs for runtime functions — allows linking swc without the runtime.
  * These are only called by the interpreter, never by the compiler. */
 __attribute__((weak)) void *sw_receive_any(uint64_t t, uint64_t *tag) { (void)t; (void)tag; return NULL; }
+__attribute__((weak)) void *sw_recv_any_adopt(uint64_t t, uint64_t *tag) { (void)t; (void)tag; return NULL; }
 __attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) { (void)to; (void)tag; (void)msg; }
 __attribute__((weak)) void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload, struct sw_value_arena *region) { (void)to; (void)tag; (void)payload; (void)region; }
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
@@ -1968,7 +1969,7 @@ sw_val_t *sw_val_tuple(sw_val_t **items, int count) {
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_TUPLE;
     v->v.tuple.items = val_alloc(sizeof(sw_val_t*) * count);
-    memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
+    if (count > 0) memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
     v->v.tuple.count = count;
     return v;
 }
@@ -1977,7 +1978,7 @@ sw_val_t *sw_val_list(sw_val_t **items, int count) {
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_LIST;
     v->v.tuple.items = val_alloc(sizeof(sw_val_t*) * count);
-    memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
+    if (count > 0) memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
     v->v.tuple.count = count;
     return v;
 }

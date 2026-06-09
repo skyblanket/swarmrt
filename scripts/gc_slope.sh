@@ -3,13 +3,15 @@
 #
 # Compiles <probe.sw> once, runs it at a LOW and a HIGH job/message count (fixed
 # concurrency / depth lives in the probe), measures PEAK RSS of each, and asserts
-# the post-warmup growth (high - low) stays under <budget_mb> MB. The probe leaks
-# proportionally to cumulative work on current main (GC v1 copies escaped values to
-# the global heap and never reclaims them), so a tight budget FAILS now and must
-# PASS after Ownership v2.
+# the post-warmup growth (high - low) stays under <budget_mb> MB.
 #
-#   VERDICT: PASS   growth under budget (near-flat)
-#   VERDICT: FAIL   growth over budget (unbounded slope) — the leak this gate guards
+# HONEST: a run only counts if the program EXITS 0 and prints PROBE_OK. A probe
+# that crashes / sys_exit(1)s / never finishes FAILS the gate (it does not get to
+# report a flat slope). If peak RSS cannot be measured at all, the gate FAILS
+# (never silently passes).
+#
+#   VERDICT: PASS   both runs clean AND growth under budget (near-flat)
+#   VERDICT: FAIL   a run crashed / lacked PROBE_OK, RSS unmeasurable, or slope > budget
 #
 # No hardcoded paths. Honors SW_SCHEDULERS / SW_GC_OFF passed in the environment.
 set -u
@@ -20,36 +22,48 @@ SW="${1:?usage: gc_slope.sh <probe.sw> <low> <high> <budget_mb> [tag]}"
 LOW="${2:?need low count}"; HIGH="${3:?need high count}"; BUDGET="${4:?need budget_mb}"
 TAG="${5:-$$}"; bin="/tmp/gcslope_${TAG}"
 
-# Portable peak-RSS (KB) of a command: prefer GNU time -v, else BSD/macOS time -l.
-peak_rss_kb() {
-  local out
-  if command -v gtime >/dev/null 2>&1; then
-    out=$(gtime -v "$@" 2>&1)
-    echo "$out" | awk -F': ' '/Maximum resident set size/{print $2; found=1} END{if(!found) print -1}'
-  else
-    # macOS /usr/bin/time -l prints "<bytes>  maximum resident set size"
-    out=$(/usr/bin/time -l "$@" 2>&1)
-    echo "$out" | awk '/maximum resident set size/{print int($1/1024)}'
-  fi
+# Pick a peak-RSS timer ONCE, robustly: GNU `time -v` (stock Linux, in the `time`
+# pkg), then BSD `time -l` (macOS), then gtime (coreutils). Empty TIMER = none.
+TIMER=""
+if /usr/bin/time -v true >/dev/null 2>&1; then TIMER="gnu"
+elif /usr/bin/time -l true >/dev/null 2>&1; then TIMER="bsd"
+elif command -v gtime >/dev/null 2>&1; then TIMER="gtime"; fi
+
+# Run the probe at <count>; echo its peak RSS in KB on a clean run (exit 0 +
+# PROBE_OK), else echo "FAIL:<reason>". RSS is parsed per the detected timer.
+measure_kb() {
+  local count="$1" out rc rss
+  case "$TIMER" in
+    gnu)   out=$(SW_RUNTIME_QUIET=1 /usr/bin/time -v "$bin" "$count" 2>&1); rc=$?
+           rss=$(printf '%s\n' "$out" | awk -F': ' '/Maximum resident set size/{print $2}') ;;
+    bsd)   out=$(SW_RUNTIME_QUIET=1 /usr/bin/time -l "$bin" "$count" 2>&1); rc=$?
+           rss=$(printf '%s\n' "$out" | awk '/maximum resident set size/{print int($1/1024)}') ;;
+    gtime) out=$(SW_RUNTIME_QUIET=1 gtime -v "$bin" "$count" 2>&1); rc=$?
+           rss=$(printf '%s\n' "$out" | awk -F': ' '/Maximum resident set size/{print $2}') ;;
+    *)     echo "FAIL:no-rss-timer (install GNU 'time')"; return ;;
+  esac
+  if [ "$rc" -ne 0 ]; then echo "FAIL:exit=$rc"; return; fi
+  if ! printf '%s\n' "$out" | grep -q "PROBE_OK"; then echo "FAIL:no-PROBE_OK"; return; fi
+  if ! [ "${rss:-0}" -gt 0 ] 2>/dev/null; then echo "FAIL:rss-unparsed"; return; fi
+  echo "$rss"
+}
+
+# Min of two clean runs (reduces transient-spike noise). FAIL propagates.
+run_min() {
+  local a b
+  a=$(measure_kb "$1"); case "$a" in FAIL:*) echo "$a"; return;; esac
+  b=$(measure_kb "$1"); case "$b" in FAIL:*) echo "$b"; return;; esac
+  [ "$a" -lt "$b" ] && echo "$a" || echo "$b"
 }
 
 ./bin/swc build "$SW" -o "$bin" >/dev/null 2>"${bin}.err" || {
   echo "VERDICT: FAIL (compile)"; grep -iE "error|cannot" "${bin}.err" | grep -v writable | head; exit 1; }
 
-# Run each twice and take the min RSS (reduces transient-spike noise from other load).
-run_min() {
-  local count="$1" a b
-  a=$(SW_RUNTIME_QUIET=1 peak_rss_kb "$bin" "$count")
-  b=$(SW_RUNTIME_QUIET=1 peak_rss_kb "$bin" "$count")
-  [ "$a" -lt "$b" ] 2>/dev/null && echo "$a" || echo "$b"
-}
-
 LOW_KB=$(run_min "$LOW"); HIGH_KB=$(run_min "$HIGH")
 rm -f "$bin" "${bin}.err"
 
-if ! [ "$LOW_KB" -gt 0 ] 2>/dev/null || ! [ "$HIGH_KB" -gt 0 ] 2>/dev/null; then
-  echo "VERDICT: FAIL (could not measure RSS: low=$LOW_KB high=$HIGH_KB)"; exit 1
-fi
+case "$LOW_KB" in FAIL:*) echo "slope[$(basename "$SW")]: low run bad ($LOW_KB)"; echo "VERDICT: FAIL"; exit 1;; esac
+case "$HIGH_KB" in FAIL:*) echo "slope[$(basename "$SW")]: high run bad ($HIGH_KB)"; echo "VERDICT: FAIL"; exit 1;; esac
 
 GROWTH_KB=$(( HIGH_KB - LOW_KB ))
 BUDGET_KB=$(( BUDGET * 1024 ))
