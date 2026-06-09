@@ -4,6 +4,38 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-09 — process isolation: generated `_sw_error` is per-process, not scheduler-thread-local
+
+**fix(gc): a process can no longer catch another process's error (was a heap-UAF).** The
+generated `error(x)` / `try`/`catch` carrier `_sw_error` was a `__thread` (scheduler-thread)
+variable. `sleep()`/`receive()` inside a `try` compile to a fiber-yielding C call, so a
+process parked in `try { sleep(...); ... }` would resume to find `_sw_error` set by an
+**unrelated** process that ran on the same scheduler thread meanwhile — wrongly entering its
+`catch`. Worse, that foreign error value lived in the *other* process's arena and was freed
+when it exited → **heap-use-after-free** when the wrong catch read it (ASAN: UAF in
+`_builtin_to_string`, freed via `sw_varena_free_all`←`process_destroy`). Fix: `_sw_error`
+is now `(*sw_self_error_slot())` — a per-process `gen_error` slot at the **end** of
+`sw_process_t` (shifts no asm-pinned offset), with a `__thread` fallback only for
+non-process (REPL/C) contexts. The error value lives in the catching process's *own* arena,
+reclaimed with it. Codegen no longer emits the `__thread _sw_error`.
+
+**test(gc): permanent bidirectional gate.** `tests/gc/error_xproc_repro.sw` (now wired into
+`make gc-stress`, run under `SW_SCHEDULERS=1` + ASAN + `-DSW_ARENA_POISON`) parks a victim in
+`try { sleep(300); 'MARKER' }` while 12 short-lived contaminants spew `error(...)` and exit.
+It **FAILS** on the pre-fix thread-local (wrong cross-process catch → exit 1, *and* an ASAN
+heap-UAF) and **PASSES** on the fix (`PROBE_OK`, victim returns its own body). gc-stress
+(both scheduler modes), gc-slope, phases 2-10, test-sw 53/475 all green; library build is
+now literally **zero warnings** (`g_old_sigaction` marked unused on macOS).
+
+**Audited the remaining generated thread-locals — diagnostic-only, not UAF.**
+`_sw_current_line`/`_sw_current_file`/`_sw_trace[]`/`_sw_trace_top`/`_sw_trace_overflowed`
+hold only compile-time literals (`.rodata` strings + ints), written by codegen and read only
+by the panic/stderr path — nothing freeable. Cross-fiber contamination there yields at most a
+**wrong file/line/stack in a panic banner**, never a memory-safety bug. (Moving these to
+per-process for *correct* traces is the next roadmap item, not a blocker.) Two runtime TLS
+slots — `g_pending_spawn_region` and the `sw_self_error_slot` fallback — are safe by the
+"schedulers run only fibers" invariant but flagged for documenting/guarding in hardening.
+
 ## 2026-06-08 — Ownership v2: lifecycle-owned escaped values + scoped turn-checkpoint
 
 **feat(gc): escaped memory is now reclaimed, not just safe.** GC v1 deep-copied escaped

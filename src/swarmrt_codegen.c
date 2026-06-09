@@ -951,7 +951,12 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <sys/time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
 
-    fprintf(f, "__thread sw_val_t *_sw_error = NULL;\n");
+    /* _sw_error is no longer a thread-local: studio.h #defines it as
+     * (*sw_self_error_slot()) — a PER-PROCESS slot — so a try/catch resuming
+     * after a blocking op can't catch another fiber's error (which would UAF
+     * that fiber's freed error value). See sw_self_error_slot in native.c.
+     * (Line/file/trace below remain thread-local — they hold only static strings
+     * + ints, so cross-fiber contamination there is diagnostic, not unsafe.) */
     /* Runtime line / file tracking — codegen emits
      *   `_sw_current_line = N; _sw_current_file = \"src/Mod.sw\";`
      * once per source line so panic() / expect() / failing builtins

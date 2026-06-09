@@ -309,6 +309,16 @@ gc-stress: swc libswarmrt
 	    tests/gc/tls_adopt_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_tls_repro $(LDFLAGS)
 	@rm -f tests/gc/tls_adopt_repro.gen.c $(BIN_DIR)/_tls_emit
 	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_tls_repro
+	@# Cross-process error()/try repro: generated `_sw_error` must be per-process,
+	@# not scheduler-thread-local. A process parked in `try { sleep(...); ... }`
+	@# must NOT catch an unrelated process's error() — whose value lives in that
+	@# process's arena and is freed when it exits (-> heap-UAF in the wrong catch).
+	@# Single-scheduler makes the victim-outlives-contaminants interleave deterministic.
+	@./bin/swc build --emit-c tests/gc/error_xproc_repro.sw -o $(BIN_DIR)/_xperr_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/error_xproc_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_error_repro $(LDFLAGS)
+	@rm -f tests/gc/error_xproc_repro.gen.c $(BIN_DIR)/_xperr_emit
+	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_error_repro
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS

@@ -3602,8 +3602,14 @@ static sw_val_t *_builtin_format(sw_val_t **a, int n) {
  * For UNRECOVERABLE failures (programmer bug, invariant violated,
  * impossible state) use panic(msg) below — it prints and exits.
  */
+/* _sw_error is a PER-PROCESS slot (sw_self_error_slot, swarmrt_native.h), NOT a
+ * thread-local: a scheduler-thread-local leaked across the context switch a
+ * blocking op performs — a try/catch resuming after sleep()/receive() would
+ * catch an UNRELATED process's error, whose value (in that process's arena) is
+ * freed on its exit -> use-after-free. The macro redirects every generated
+ * `_sw_error` (here + the codegen try/catch) to the current process's slot. */
+#define _sw_error (*sw_self_error_slot())
 static sw_val_t *_builtin_error(sw_val_t **a, int n) {
-    extern __thread sw_val_t *_sw_error;
     _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
     return sw_val_nil();
 }

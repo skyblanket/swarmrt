@@ -293,7 +293,9 @@ static HANDLE g_preempt_timer = NULL;
 static timer_t g_preempt_timer;
 #endif
 #ifndef _WIN32
-static struct sigaction g_old_sigaction;
+/* Used only on the non-Apple sigaction preemption path; unused on macOS (which
+ * uses a dispatch_source timer), so mark unused to keep the build warning-clean. */
+static struct sigaction g_old_sigaction __attribute__((unused));
 #endif
 
 /* === Forward Declarations === */
@@ -498,6 +500,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         proc->varena = gc_off ? NULL : sw_varena_create(8192);
     }
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
+    proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
 
     /* Core fields */
     proc->entry = entry;
@@ -1615,6 +1618,16 @@ sw_process_t *sw_self(void) {
  * constructors in swarmrt_lang.c route allocations here. */
 sw_value_arena_t *sw_self_varena(void) {
     return tls_current ? tls_current->varena : NULL;
+}
+
+/* Per-process generated-error slot (the _sw_error macro derefs this). Returns
+ * &proc->gen_error for the running process, else a thread-local fallback (REPL/
+ * interpreter / pre-fiber). Per-process so a try/catch can't catch another
+ * fiber's error across a blocking-op context switch (which would UAF that
+ * fiber's freed error value). */
+struct sw_val **sw_self_error_slot(void) {
+    static __thread struct sw_val *fallback = NULL;
+    return tls_current ? &tls_current->gen_error : &fallback;
 }
 
 /* Ownership v2 turn-checkpoint: install a fresh value arena for the current

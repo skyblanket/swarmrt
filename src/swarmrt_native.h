@@ -63,6 +63,7 @@ struct sw_process;
 struct sw_scheduler;
 struct sw_swarm;
 struct sw_value_arena;   /* GC v1 per-process value arena (swarmrt_varena.h) */
+struct sw_val;           /* generated error slot value (swarmrt_lang.h) */
 typedef struct sw_process sw_process_t;
 typedef struct sw_scheduler sw_scheduler_t;
 typedef struct sw_swarm sw_swarm_t;
@@ -319,6 +320,17 @@ struct sw_process {
      * still lets process_destroy reclaim it. NULL once adopted. Placed LAST so it
      * shifts no field offset (the asm + slot-reuse paths are offset-sensitive). */
     struct sw_value_arena *spawn_region;
+
+    /* Generated-code error slot, PER PROCESS (not thread-local). The generated
+     * `error(x)` writes here and `try/catch` reads/clears it via the _sw_error
+     * macro -> sw_self_error_slot(). Per-process because the alternative — a
+     * scheduler-thread-local — leaks across the context switch a blocking op
+     * performs: a process resuming from sleep()/receive() inside a try would
+     * otherwise catch an UNRELATED process's error, whose value (in that
+     * process's arena) is freed when it exits -> use-after-free. The value lives
+     * in THIS process's arena, so it's reclaimed with the arena on exit. (Placed
+     * at the END so it shifts no asm-pinned offset.) */
+    struct sw_val *gen_error;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -507,6 +519,12 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
 /* Ownership v2: sw_receive_any that adopts a VALUE region into the caller's
  * arena (caller incorporates the payload; must NOT free it). Used by pmap. */
 void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag);
+
+/* Generated-code error slot for the current process (thread-local fallback when
+ * outside a process). The generated `_sw_error` macro is (*sw_self_error_slot()).
+ * Per-process so a try/catch resuming after a blocking op can't catch another
+ * fiber's error (whose value would be freed on that fiber's exit). */
+struct sw_val **sw_self_error_slot(void);
 
 /* Ownership v2: spawn a process that OWNS `region` (its args/captures live in it)
  * until the child's trampoline adopts it. Reclaimed by process_destroy if the
