@@ -94,6 +94,19 @@ jobs:
           make gc-slope
           SW_SCHEDULERS=1 make gc-slope
 
+      - name: LeakSanitizer lifecycle gate (Phase 2.1 — Linux-only LSan)
+        # The slope gates catch UNBOUNDED growth; this catches BOUNDED leaks
+        # under their RSS noise floor. macOS Apple-clang ASAN has no LSan, so
+        # every other ASAN run uses detect_leaks=0 and is leak-blind — this
+        # Linux leg is the only real leak assertion in CI. Churns every
+        # lifecycle owner (timers fired+cancelled, supervisors killed, ETS
+        # replace/delete, spawns, compound messages), exits cleanly, and LSan
+        # asserts zero definitely-lost blocks at exit. Proven bidirectional
+        # (an injected unreachable block fails it). Advisory while it bakes;
+        # promote to blocking once green across a week of pushes.
+        continue-on-error: true
+        run: make lsan-gate
+
       - name: Stress test (high-process-count race guard)
         # Catches regressions in the high-spawn scheduler/mailbox path.
         # The historical ctx-tear race is closed by per-slot generation

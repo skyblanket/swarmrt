@@ -389,6 +389,34 @@ gc-slope: swc
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
+# LeakSanitizer lifecycle gate (Phase 2.1) — Linux only (macOS Apple-clang
+# ASAN ships no LSan; every other ASAN run here uses detect_leaks=0 and is
+# leak-BLIND — see PRODUCTION_ROADMAP.md). Churns every lifecycle owner
+# (timers fired+cancelled, supervisors killed, ETS replace/delete, spawns,
+# compound messages), exits cleanly, and lets LSan assert zero
+# definitely-lost blocks at exit. Parked-fiber stacks can't false-positive
+# because at clean exit every process is gone; globals-reachable singletons
+# are "still reachable" and not reported. Suppressions (each one a
+# documented accepted-minor) live in tests/gc/lsan.supp.
+.PHONY: lsan-gate
+lsan-gate: swc
+	@if [ "$$(uname)" != "Linux" ]; then \
+	  echo "lsan-gate: SKIP (LeakSanitizer requires Linux clang/gcc ASAN)"; exit 0; \
+	fi
+	@./bin/swc build --emit-c tests/gc/lsan_lifecycle.sw -o $(BIN_DIR)/_lsan_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -g -O1 -fno-stack-protector \
+	    tests/gc/lsan_lifecycle.gen.c $(FUZZ_RT) -o $(BIN_DIR)/lsan_gate $(LDFLAGS)
+	@rm -f tests/gc/lsan_lifecycle.gen.c $(BIN_DIR)/_lsan_emit
+	@out=$$(SW_QUIET=1 SW_SCHEDULERS=1 \
+	     ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:exitcode=23 \
+	     LSAN_OPTIONS=suppressions=tests/gc/lsan.supp:print_suppressions=1 \
+	     timeout 240 $(BIN_DIR)/lsan_gate 2>&1); rc=$$?; \
+	 echo "$$out" | tail -25; \
+	 if ! echo "$$out" | grep -q "PROBE_OK"; then echo "lsan-gate: FAIL (probe did not complete)"; exit 1; fi; \
+	 if [ $$rc -eq 23 ] || echo "$$out" | grep -q "definitely lost\|SUMMARY: AddressSanitizer.*leak"; then \
+	   echo "lsan-gate: FAIL (leaks at exit)"; exit 1; fi; \
+	 echo "lsan-gate: PASS (zero unsuppressed leaks at exit)"
+
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
 # run to print `ok 80000`. Requires native Linux x86_64 thread scheduling

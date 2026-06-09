@@ -772,6 +772,17 @@ static void preempt_handler(int sig, siginfo_t *info, void *context) {
     current->fcalls = 0;
 }
 
+/* DEAD CODE — never called (discovered in the Round-7 LSan work, June
+ * 2026). The intended design was a 1ms timer zeroing the running
+ * process's fcalls so CPU-bound code gets descheduled, but no call site
+ * was ever wired and the only real preemption is the reduction check at
+ * compiled tail-loop backedges (sw_check_reds at `goto _tail`). Wiring
+ * this up WOULD tighten preemption latency for long single turns — but
+ * it is a behavior change that needs the full storm/stress battery and
+ * a signal-vs-sanitizer interaction review (a 1ms SIGALRM storm is
+ * hostile to LSan's stop-the-world), so it stays off deliberately.
+ * Kept (not deleted) as the blueprint for that future change. */
+__attribute__((unused))
 static void setup_preemption(void) {
 #ifdef __APPLE__
     g_preempt_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
@@ -1176,13 +1187,30 @@ static void *scheduler_main(void *arg) {
  * + a per-thread sigaltstack lets the handler run on safe ground. Installed
  * by each scheduler thread and the thread that calls sw_init. 64KB static
  * per thread (SIGSTKSZ stopped being a compile-time constant in glibc 2.34). */
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define SW_UNDER_ASAN 1
+#  endif
+#endif
+#if !defined(SW_UNDER_ASAN) && defined(__SANITIZE_ADDRESS__)
+#  define SW_UNDER_ASAN 1
+#endif
+
 static void _sw_install_altstack(void) {
+#ifdef SW_UNDER_ASAN
+    /* ASAN installs (and at thread exit munmaps) its OWN per-thread
+     * alternate signal stack; replacing it with our static buffer makes
+     * its UnsetAlternateSignalStack CHECK-fail ("unable to unmmap").
+     * Under ASAN the crash handler runs on ASAN's altstack anyway. */
+    return;
+#else
     static __thread char altstack_mem[64 * 1024];
     stack_t ss;
     ss.ss_sp = altstack_mem;
     ss.ss_size = sizeof(altstack_mem);
     ss.ss_flags = 0;
     sigaltstack(&ss, NULL);
+#endif
 }
 
 static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
