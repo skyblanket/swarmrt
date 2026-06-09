@@ -223,6 +223,7 @@ examples: swc libswarmrt
 # pass/fail counts across all files. See tests/sw/run_tests.sh.
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
+	@./tests/sw/run_conform.sh
 
 # Security regression: the curl-backed HTTP builtins must not pass
 # caller-supplied URLs / headers through a shell. Builds the injection
