@@ -404,6 +404,27 @@ typedef struct {
     char name[SW_REG_NAME_MAX];
 } sw_dynsup_init_t;
 
+/* Free remaining child nodes + their MASTER closures + the heap state. Armed as
+ * the dynsup process's on_destroy so it runs on EVERY exit path — crucially the
+ * kill path (exit_proc), where the scheduler tears the dynsup down without
+ * resuming its fiber, so the post-receive-loop dynsup_kill_all never runs and
+ * the nodes/masters/st would leak. On STOP/circuit-breaker dynsup_kill_all has
+ * already freed + nulled the list, so this frees only what's left, then st.
+ * Does NOT kill children — they're spawn_link'd and EXIT-propagated when the
+ * dynsup dies (each frees its own per-incarnation copy via its own on_destroy). */
+static void dynsup_state_destroy(void *raw) {
+    sw_dynsup_state_t *st = (sw_dynsup_state_t *)raw;
+    if (!st) return;
+    sw_dynsup_child_t *c = st->children;
+    while (c) {
+        sw_dynsup_child_t *next = c->next;
+        sw_spec_free_start_arg(&c->spec);   /* master (no-op for native specs) */
+        free(c);
+        c = next;
+    }
+    free(st);
+}
+
 static void dynsup_entry(void *arg) {
     sw_dynsup_init_t *init = (sw_dynsup_init_t *)arg;
 
@@ -413,11 +434,19 @@ static void dynsup_entry(void *arg) {
         sw_register(init->name, sw_self());
     }
 
-    sw_dynsup_state_t st;
-    memset(&st, 0, sizeof(st));
-    st.spec = init->spec;
-    strncpy(st.name, init->name, SW_REG_NAME_MAX - 1);
+    /* Heap-allocated (not stack) so the child list is reachable from on_destroy
+     * AFTER this fiber exits — a dynsup killed via exit_proc is torn down without
+     * resuming this fiber (kill_flag checked before swap-in), so the post-loop
+     * teardown never runs and the nodes/masters/st would leak. */
+    sw_dynsup_state_t *st = (sw_dynsup_state_t *)calloc(1, sizeof(sw_dynsup_state_t));
+    if (!st) { free(init); return; }
+    st->spec = init->spec;
+    strncpy(st->name, init->name, SW_REG_NAME_MAX - 1);
     free(init);
+    /* Free remaining child nodes + masters + st in process_destroy on EVERY exit
+     * path (esp. the kill path). Children are spawn_link'd -> a killed dynsup
+     * propagates EXIT to them (they free their own copies via their on_destroy). */
+    { sw_process_t *self = sw_self(); if (self) { self->on_destroy = dynsup_state_destroy; self->on_destroy_arg = st; } }
 
     while (1) {
         uint64_t tag = 0;
@@ -432,9 +461,9 @@ static void dynsup_entry(void *arg) {
             switch (req->op) {
             case SW_DYNSUP_OP_START_CHILD: {
                 /* Check max children */
-                uint32_t max = st.spec.max_children;
+                uint32_t max = st->spec.max_children;
                 if (max == 0) max = SW_DYNSUP_MAX_CHILDREN;
-                if (st.child_count >= max) {
+                if (st->child_count >= max) {
                     sw_send_tagged(call->from, call->ref, NULL);
                     break;
                 }
@@ -465,16 +494,16 @@ static void dynsup_entry(void *arg) {
                 node->spec = req->child_spec;
                 node->proc = child;
                 node->monitor_ref = mref;
-                node->next = st.children;
-                st.children = node;
-                st.child_count++;
+                node->next = st->children;
+                st->children = node;
+                st->child_count++;
 
                 /* Reply with child pointer */
                 sw_send_tagged(call->from, call->ref, child);
                 break;
             }
             case SW_DYNSUP_OP_TERM_CHILD: {
-                sw_dynsup_child_t *node = dynsup_remove_child(&st, req->child);
+                sw_dynsup_child_t *node = dynsup_remove_child(st, req->child);
                 if (node) {
                     dynsup_kill_child(node);
                     sw_spec_free_start_arg(&node->spec);  /* permanent removal: free master */
@@ -488,7 +517,7 @@ static void dynsup_entry(void *arg) {
             }
             case SW_DYNSUP_OP_COUNT:
                 /* Reply with count cast to void* */
-                sw_send_tagged(call->from, call->ref, (void *)(uintptr_t)st.child_count);
+                sw_send_tagged(call->from, call->ref, (void *)(uintptr_t)st->child_count);
                 break;
             }
 
@@ -498,7 +527,7 @@ static void dynsup_entry(void *arg) {
         } else if (tag == SW_TAG_DOWN) {
             sw_signal_t *sig = (sw_signal_t *)msg;
 
-            sw_dynsup_child_t *child = dynsup_find_by_ref(&st, sig->ref);
+            sw_dynsup_child_t *child = dynsup_find_by_ref(st, sig->ref);
             if (child) {
                 int reason = sig->reason;
                 child->proc = NULL;
@@ -518,17 +547,17 @@ static void dynsup_entry(void *arg) {
                 }
 
                 if (should_restart) {
-                    if (dynsup_check_circuit_breaker(&st)) {
+                    if (dynsup_check_circuit_breaker(st)) {
                         fprintf(stderr,
                             "[DynSup] Max restarts (%u/%us) exceeded — shutting down\n",
-                            st.spec.max_restarts, st.spec.max_seconds);
-                        dynsup_kill_all(&st);
+                            st->spec.max_restarts, st->spec.max_seconds);
+                        dynsup_kill_all(st);
                         sw_self()->exit_reason = -2;
                         free(msg);
                         return;
                     }
 
-                    dynsup_record_restart(&st);
+                    dynsup_record_restart(st);
 
                     /* Restart: spawn new with a FRESH closure copy (master stays
                      * in the node), replace in node. */
@@ -544,13 +573,13 @@ static void dynsup_entry(void *arg) {
                         /* Spawn failed — permanent removal: free the unused copy +
                          * the master, then drop the node. */
                         sw_spec_free_child_arg(&child->spec, carg);
-                        dynsup_remove_by_ref(&st, sig->ref);
+                        dynsup_remove_by_ref(st, sig->ref);
                         sw_spec_free_start_arg(&child->spec);
                         free(child);
                     }
                 } else {
                     /* No restart — permanent removal: free the master, drop node. */
-                    dynsup_remove_by_ref(&st, sig->ref);
+                    dynsup_remove_by_ref(st, sig->ref);
                     sw_spec_free_start_arg(&child->spec);
                     free(child);
                 }
@@ -564,7 +593,7 @@ static void dynsup_entry(void *arg) {
 
         } else if (tag == SW_TAG_STOP) {
             if (msg) free(msg);
-            dynsup_kill_all(&st);
+            dynsup_kill_all(st);
             break;
 
         } else {

@@ -38,7 +38,9 @@ fun job_count(a) { if (length(a) >= 2) { to_int(hd(tl(a))) } else { 1500 } }
 
 fun main() {
     rounds = job_count(os_args())
-    cap = big_string("c", 64)            # ~1 KB captured per interval closure
+    cap = big_string("c", 4096)            # ~64 KB captured per interval closure — large so a
+                                           # per-cancel closure leak is RSS-visible (a ~1 KB
+                                           # capture is masked by slope noise; audit w2bqfncq7)
     print("slope_interval rounds=" ++ to_string(rounds))
     loop(rounds, cap)
     print("slope_interval DONE")

@@ -5200,23 +5200,32 @@ static sw_val_t *_builtin_file_temp(sw_val_t **a, int n) {
 
 typedef struct { sw_val_t *fn; uint64_t ms; } _timer_closure_t;
 
+/* Free a timer closure (a deep_copy_global tree). Armed as the timer process's
+ * on_destroy hook so process_destroy reclaims it on EVERY exit path — crucially
+ * the kill-while-parked path: a timer parked in sw_receive_any that is killed is
+ * torn down by the scheduler WITHOUT resuming the fiber (kill_flag is checked
+ * before swap-in, swarmrt_native.c), so a fiber-tail free would never run. */
+static void _free_timer_closure(void *raw) {
+    _timer_closure_t *c = (_timer_closure_t *)raw;
+    if (c) { _sw_free_global_val(c->fn); free(c); }
+}
+
 static void _after_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
+    /* Reclaim the closure in process_destroy (kill-safe) — armed BEFORE we park
+     * in sw_receive_any, so a delay() cancelled while parked still frees it. */
+    sw_process_t *self = sw_self();
+    if (self) { self->on_destroy = _free_timer_closure; self->on_destroy_arg = c; }
     /* Wait via the yielding, kill-aware sw_receive_any (like _builtin_sleep) —
-     * NOT raw usleep, which blocks the whole scheduler OS thread and is
-     * uninterruptible, so a delay() cancelled before firing could neither stop
-     * nor free. sw_receive_any swaps back to the scheduler and returns NULL on
-     * timeout OR kill (it checks kill_flag on resume). */
+     * NOT raw usleep (blocks the scheduler thread, uninterruptible). Returns NULL
+     * on timeout OR kill. */
     uint64_t tag;
     void *m = sw_receive_any(c->ms, &tag);
     if (m) free(m);                       /* discard any spurious message */
-    sw_process_t *self = sw_self();
+    self = sw_self();
     if (!(self && self->kill_flag))       /* fire only if not cancelled mid-wait */
         sw_val_apply(c->fn, NULL, 0);
-    /* One-shot: free the whole closure graph (captures included) either way —
-     * nothing else holds this private deep copy (the apply result is discarded). */
-    _sw_free_global_val(c->fn);
-    free(c);
+    /* closure freed by on_destroy in process_destroy (covers fire AND cancel) */
 }
 
 /* delay(ms, fn) → pid — run fn once after ms milliseconds */
@@ -5228,30 +5237,31 @@ static sw_val_t *_builtin_delay(sw_val_t **a, int n) {
     c->fn = sw_val_deep_copy_global(a[1]);
     c->ms = (uint64_t)a[0]->v.i;
     sw_process_t *p = sw_spawn(_after_entry, c);
-    return p ? sw_val_pid(p) : sw_val_nil();
+    if (!p) { _free_timer_closure(c); return sw_val_nil(); }  /* spawn failed: reclaim */
+    return sw_val_pid(p);
 }
 
 static void _every_entry(void *raw) {
     _timer_closure_t *c = (_timer_closure_t *)raw;
-    /* Yielding, kill-aware loop — NOT raw usleep (which blocks the scheduler OS
-     * thread and is uninterruptible, so a cancelled interval could neither stop
-     * NOR free its closure: kill_flag is never observed and process_destroy
-     * never runs). sw_receive_any yields each tick and returns NULL on kill; we
-     * then unwind so the scheduler reaches process_destroy and we free here. */
+    /* Reclaim the closure in process_destroy (kill-safe) — armed BEFORE we park.
+     * A cancelled interval is killed while parked in sw_receive_any and the
+     * scheduler tears it down without resuming this fiber, so the on_destroy hook
+     * (which process_destroy always fires) is what actually frees the closure. */
+    sw_process_t *self = sw_self();
+    if (self) { self->on_destroy = _free_timer_closure; self->on_destroy_arg = c; }
+    /* Yielding, kill-aware loop — NOT raw usleep (blocks the scheduler thread,
+     * uninterruptible). sw_receive_any yields each tick, returns NULL on kill. */
     for (;;) {
         uint64_t tag;
         void *m = sw_receive_any(c->ms, &tag);
         if (m) free(m);                        /* discard any spurious message */
-        sw_process_t *self = sw_self();
+        self = sw_self();
         if (self && self->kill_flag) break;    /* cancelled during the wait */
         sw_val_apply(c->fn, NULL, 0);
         self = sw_self();
         if (self && self->kill_flag) break;    /* cancelled during/after the tick */
     }
-    /* Owner frees its own closure on cancel (same shape as _after_entry). A
-     * never-cancelled interval keeps its closure for life — bounded, correct. */
-    _sw_free_global_val(c->fn);
-    free(c);
+    /* closure freed by on_destroy in process_destroy */
 }
 
 /* interval(ms, fn) → pid — run fn repeatedly every ms milliseconds */
@@ -5263,7 +5273,8 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
     c->fn = sw_val_deep_copy_global(a[1]);
     c->ms = (uint64_t)a[0]->v.i;
     sw_process_t *p = sw_spawn(_every_entry, c);
-    return p ? sw_val_pid(p) : sw_val_nil();
+    if (!p) { _free_timer_closure(c); return sw_val_nil(); }  /* spawn failed: reclaim */
+    return sw_val_pid(p);
 }
 
 /* === LLM Client === */

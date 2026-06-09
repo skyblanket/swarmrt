@@ -250,12 +250,27 @@ static int sup_start_child(sw_sup_child_rt_t *child) {
     return 0;
 }
 
-/* Free every child spec's MASTER closure on supervisor teardown. Called only at
- * the two free(st) sites — never on a restart (sup_start_child re-copies the
- * master for each incarnation). Iterating children[] covers alive=0 children. */
+/* Free every child spec's MASTER closure (never on a restart — sup_start_child
+ * re-copies the master per incarnation). Iterating children[] covers alive=0. */
 static void sup_free_child_masters(sw_sup_state_t *st) {
     for (uint32_t i = 0; i < st->spec.num_children && i < SW_MAX_CHILDREN; i++)
         sw_spec_free_start_arg(&st->children[i].spec);
+}
+
+/* Supervisor teardown, armed as the supervisor process's on_destroy hook so it
+ * runs on EVERY exit path — including the DOMINANT one: a supervisor killed via
+ * exit_proc is parked in sw_receive_any and the scheduler tears it down WITHOUT
+ * resuming the fiber (kill_flag checked before swap-in), so the post-receive-loop
+ * teardown would never run and every child master + st would leak. Children are
+ * sw_spawn_link'd, so a killed supervisor propagates EXIT to them (they free their
+ * own per-incarnation copies via their own on_destroy); here we free the masters
+ * + st. Idempotent w.r.t. the per-removal master frees (sw_spec_free_start_arg
+ * nulls start_arg). */
+static void sup_state_destroy(void *raw) {
+    sw_sup_state_t *st = (sw_sup_state_t *)raw;
+    if (!st) return;
+    sup_free_child_masters(st);
+    free(st);
 }
 
 static void sup_kill_child(sw_sup_child_rt_t *child) {
@@ -301,6 +316,11 @@ static void supervisor_entry(void *arg) {
     }
 
     free(init);
+
+    /* Free st + child masters in process_destroy on EVERY exit path (esp. the
+     * kill path, which never resumes this fiber). All explicit free(st)/
+     * sup_free_child_masters below are removed in favour of this hook. */
+    { sw_process_t *self = sw_self(); if (self) { self->on_destroy = sup_state_destroy; self->on_destroy_arg = st; } }
 
     /* Start all children */
     for (uint32_t i = 0; i < st->spec.num_children; i++) {
@@ -363,9 +383,7 @@ static void supervisor_entry(void *arg) {
                         }
                         sw_self()->exit_reason = -2; /* shutdown */
                         free(msg);
-                        sup_free_child_masters(st);
-                        free(st);
-                        return;
+                        return;   /* st + masters freed by sup_state_destroy (on_destroy) */
                     }
 
                     sup_record_restart(st);
@@ -428,9 +446,8 @@ static void supervisor_entry(void *arg) {
             if (msg) free(msg);
         }
     }
-
-    sup_free_child_masters(st);
-    free(st);
+    /* st + child masters freed by sup_state_destroy (on_destroy) — runs on this
+     * normal return AND on the kill path that bypasses this fiber. */
 }
 
 sw_process_t *sw_supervisor_start(const char *name, sw_sup_spec_t *spec) {

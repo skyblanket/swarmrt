@@ -353,6 +353,15 @@ gc-stress: swc libswarmrt
 	@# but surface stderr (incl. any ASAN report) if it exits non-zero.
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_sup_restart 8 >/dev/null 2>$(BIN_DIR)/_srr.err || (cat $(BIN_DIR)/_srr.err; rm -f $(BIN_DIR)/_srr.err; exit 1)
 	@rm -f $(BIN_DIR)/_srr.err
+	@# Supervisor KILL-teardown (exit_proc — the only teardown verb sw exposes for a
+	@# bare supervisor): a killed supervisor never resumes its fiber, so teardown
+	@# runs via the supervisor's own on_destroy hook. Checks the kill-path destructor
+	@# frees masters+nodes+st without double-freeing (children freed their copies).
+	@./bin/swc build --emit-c tests/gc/slope_sup_kill.sw -o $(BIN_DIR)/_ssk_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/slope_sup_kill.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_sup_kill $(LDFLAGS)
+	@rm -f tests/gc/slope_sup_kill.gen.c $(BIN_DIR)/_ssk_emit
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_sup_kill 40 >/dev/null
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
@@ -373,8 +382,9 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_timer.sw     2000 20000 8  timer    || rc=1; \
-	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  2000 12000 6  interval || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  200  2000  10 interval || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 

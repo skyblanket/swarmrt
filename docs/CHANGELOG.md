@@ -4,6 +4,48 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-06-10 — fix kill-path leaks in timer + supervisor teardown (adversarial-audit follow-up)
+
+**fix(gc): killing a timer or supervisor no longer leaks its closures/state.** A fresh-eyes
+adversarial audit of Phase 1 found that the timer (`d6ae6a0`) and supervisor (`1ea729c`) fixes
+freed their resources in the fiber's *post-`sw_receive_any` tail* — but `scheduler_loop` checks
+`kill_flag` **before** `sw_safe_swap_into`, so a fiber killed while parked in `sw_receive_any`
+is torn down **without ever resuming**. Since `exit_proc`/kill is the *only* teardown verb sw
+exposes for a bare `interval`/`delay`/`supervise`/`dyn_supervisor` pid, that tail never ran on
+the dominant teardown path:
+- **timer (P1-B):** a cancelled `interval`/`delay` leaked its closure 100% of the time.
+- **supervisor (P1-A):** a killed supervisor leaked every child **master** closure + (dynamic)
+  heap list nodes + the supervisor state.
+
+Both are now reclaimed via the per-process **`on_destroy` hook** (`process_destroy` fires it on
+*every* exit path, including the kill path): the timer arms `_free_timer_closure` before it
+parks; the supervisor arms a teardown destructor (`sup_state_destroy` / `dynsup_state_destroy`)
+that frees child masters + nodes + state — and the dynamic supervisor's state is now
+heap-allocated so it's reachable from `on_destroy` after the fiber exits. Children are
+`spawn_link`'d, so a killed supervisor EXIT-propagates to them and each frees its own
+per-incarnation copy. No double-free (master/copy/state are disjoint; the destructor sees only
+what the per-removal paths left, which null their links). The fiber-tail frees are removed.
+
+**test(gc): the gates were near-no-ops; now they bite.** The audit proved the original
+`slope_interval` PASSED *while every closure leaked* — a ~1 KB capture was masked by RSS slope
+noise under budget (and macOS ASAN has no LeakSanitizer; gates run `detect_leaks=0`). Captures
+are amplified to ~64 KB so a per-cancel/per-kill leak is RSS-visible, and a new kill-path probe
+`tests/gc/slope_sup_kill.sw` (`exit_proc` loop on both static + dynamic supervisors) is added.
+Proven bidirectional: pre-fix `slope_interval` +71 MB and `slope_sup_kill` +98 MB → **FAIL**;
+post-fix both flat → PASS. `slope_sup_kill` also wired into `gc-stress` (ASAN+poison) as a
+kill-path double-free tripwire. gc-stress (9 gates), gc-slope (10 probes), phases 2-10
+(supervisor 14/14 + 12/12), test-sw 53/475 all green; zero warnings.
+
+**Accepted minor residuals (documented):** a supervisor child killed *pre-trampoline* leaks its
+copy (`on_destroy` armed in the child's entry fn; arming at the spawn site would risk a
+fast-completion slot-reuse corruption — worse than the bounded leak); a spurious *compound*
+message sent to a timer pid leaks its nested allocations (`free(m)` is kept over
+`_sw_free_global_val(m)`, which would crash on a RAW non-value payload). Gen-exec isolation was
+re-audited and confirmed genuinely solid. **Lesson: an RSS-slope leak gate is only real if the
+per-iteration object is large enough to clear the noise floor — size the capture to the budget.**
+
+---
+
 ## 2026-06-09 — bounded memory: supervisor child-start closures (master + per-incarnation copy)
 
 **fix(gc): supervisor child-start closures are reclaimed — without racing live children.** A
