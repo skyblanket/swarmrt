@@ -446,6 +446,15 @@ alloc-fault: swc
 	 [ $$rc -eq 0 ] && echo "alloc-fault: PASS (120 fail-points: $$clean clean, $$faults loud-OOM, 0 memory errors)" \
 	                || exit 1
 
+# Soak (Phase 2.6): mixed-workload (actor fan-out + supervisor crash/restart
+# + ETS churn + timers) run for SOAK_SECONDS while sampling RSS. Asserts clean
+# exit + peak RSS under budget — the whole mix stays flat under sustained
+# churn, not just the per-owner slope probes. CI runs the 60s smoke; the full
+# 24h soak is the same binary with SOAK_SECONDS=86400 on a dedicated host.
+.PHONY: soak
+soak: swc libswarmrt
+	@./tests/soak/run_soak.sh
+
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
 # run to print `ok 80000`. Requires native Linux x86_64 thread scheduling

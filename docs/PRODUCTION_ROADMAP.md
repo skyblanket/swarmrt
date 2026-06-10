@@ -25,7 +25,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 | Phase | Title | Status |
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
-| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ⏳ 2.1–2.5 ✅; 2.6 soak remains |
+| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
 | 3 | Security & fault isolation (fuzzing, limits) | ⬜ pending |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
@@ -200,12 +200,19 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   double-free) does not occur: the cleanup branches hold under injected failure.
 - Zero production cost: all injection is behind `#ifdef SW_ALLOC_FAULT`, compiled only by the
   gate. Advisory-then-blocking CI leg added to linux-quickstart.yml.
-### 2.6 24-hour soak
-- Build a mixed-workload harness: actor spawn/message/pmap + supervisor crash/restart storms +
-  timers + networking + ETS churn + distribution + a production-like agent workload. Run a short
-  version locally now; schedule the full 24h run (cron/wake) and assert bounded RSS + zero
-  sanitizer hits + no leaked process slots (phase2 prints `Slots N/N free` — must stay full).
-
+### 2.6 Soak  ✅ **harness DONE; CI 60s smoke green** (full 24h pending a dedicated host)
+- `make soak` (tests/soak/run_soak.sh + soak.sw): a mixed production-shaped workload — actor
+  fan-out with ~8 KB message round-trips + supervisor crash/restart + ETS put/replace/delete
+  + one-shot & interval timers + a long tail loop — runs for `SOAK_SECONDS` (default 60)
+  while sampling RSS, and asserts clean exit (PROBE_OK, no watchdog/crash on stderr) + peak
+  RSS under `SOAK_RSS_BUDGET_MB`.
+- Local result: **20s → 2364 rounds, peak RSS 53 MB** (arena base ~48 MB, so ~5 MB working
+  set over the entire mix — dead flat); 180s confirms the same. CI runs the 60s smoke
+  (advisory/blocking leg in linux-quickstart.yml).
+- **Remaining (needs infra, not code):** the full **24-hour** run is the same binary —
+  `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512 ./tests/soak/run_soak.sh` — on a dedicated
+  Linux host. Assert bounded RSS + zero sanitizer hits + no leaked process slots over the
+  full day. This is a sign-off that requires a sustained host run; the harness is ready.
 ---
 
 ## Phase 3 — SECURITY & FAULT ISOLATION

@@ -38,3 +38,4 @@ tests/sw/.build/
 /2/
 
 tests/stress/.build/
+tests/soak/.build/

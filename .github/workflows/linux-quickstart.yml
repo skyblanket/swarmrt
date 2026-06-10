@@ -121,6 +121,13 @@ jobs:
         # completion or a loud OOM panic.
         run: make alloc-fault
 
+      - name: Soak smoke (Phase 2.6 — 60s mixed workload, bounded RSS)
+        # Actor fan-out + supervisor crash/restart + ETS churn + timers in a
+        # tight loop for 60s; asserts clean exit and peak RSS under budget.
+        # The full 24h soak is the same binary (SOAK_SECONDS=86400) on a
+        # dedicated host — see PRODUCTION_ROADMAP.md 2.6.
+        run: make soak
+
       - name: Scheduler-count matrix (Phase 2.2 — suite under S=1 and oversubscribed)
         # The default-scheduler run above covers nproc; these legs cover the
         # edges. S=1 found a real architecture issue (blocking curl client +
