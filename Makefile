@@ -507,3 +507,32 @@ stats:
 	@echo ""
 	@echo "=== Example Programs ==="
 	@find $(EXAMPLES_DIR) -name "*.sw" | xargs wc -l 2>/dev/null || echo "  (none)"
+
+# ThreadSanitizer gate (Phase 2.3). Builds the depth-1 message ping-pong
+# and the 80k spawn storm under -fsanitize=thread and fails on any
+# unsuppressed race. The fiber runtime is TSan-clean because cross-thread
+# fiber migration synchronizes through the runq's C11 atomics — TSan sees
+# the happens-before edges; no fiber annotations needed. Suppressions
+# (tests/stress/tsan.supp) cover only the documented warn-only watchdog
+# scanner. The storm runs its full 80k spawns — ~2 min under TSan.
+.PHONY: tsan-gate
+tsan-gate: swc
+	@./bin/swc build --emit-c tests/gc/slope_message.sw -o $(BIN_DIR)/_tsm_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
+	    tests/gc/slope_message.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_msg $(LDFLAGS)
+	@./bin/swc build --emit-c tests/stress/bn.sw -o $(BIN_DIR)/_tsb_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
+	    tests/stress/bn.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_storm $(LDFLAGS)
+	@rm -f tests/gc/slope_message.gen.c tests/stress/bn.gen.c $(BIN_DIR)/_tsm_emit $(BIN_DIR)/_tsb_emit
+	@rc=0; \
+	 out1=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_msg 4000 2>&1) || rc=1; \
+	 echo "$$out1" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out1" | head -40; rc=1; }; \
+	 out2=$$(SW_QUIET=1 SW_SPIN_US=30 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_msg 4000 2>&1) || rc=1; \
+	 echo "$$out2" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out2" | head -40; rc=1; }; \
+	 out3=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_storm 2>&1) || rc=1; \
+	 echo "$$out3" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out3" | head -40; rc=1; }; \
+	 [ $$rc -eq 0 ] && echo "tsan-gate: PASS (no unsuppressed races: msg, msg+spin, storm)" \
+	                || { echo "tsan-gate: FAIL"; exit 1; }

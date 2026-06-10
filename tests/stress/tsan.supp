@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions — each entry documents a DELIBERATE
+# benign race; anything not listed here fails the tsan-gate.
+#
+# The deadlock watchdog is a warn-only, lock-free, best-effort scanner
+# BY DESIGN (see watchdog_thread_fn's header comment): it reads process
+# slab fields and io port counts without synchronization, tolerating
+# torn/stale values, because a false positive only mistimes a warning.
+# Making those fields _Atomic is a Phase-2.4 decision (sw_process.state
+# is written on every context switch — hot path). Until then: suppress
+# the scanner, not the runtime.
+race:watchdog_thread_fn
+race:sw_io_active_port_count
