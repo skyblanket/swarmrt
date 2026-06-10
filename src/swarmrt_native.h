@@ -317,16 +317,22 @@ struct sw_process {
     sw_link_t *links;                  /* Bidirectional link list */
     sw_monitor_t *monitors_me;         /* Others monitoring this process */
     sw_monitor_t *my_monitors;         /* Monitors this process created */
-    volatile int kill_flag;            /* Set by exit signal propagation */
-    int exit_reason;                   /* Why this process exited (legacy int) */
+    _Atomic int kill_flag;             /* Set by exit signal propagation (cross-thread;
+                                          was volatile — not synchronization) */
+    _Atomic int exit_reason;           /* Why this process exited. User/runtime code may
+                                          write it directly (sw_self()->exit_reason = N)
+                                          while monitor/process_exit read it — atomic. */
     char *panic_msg;                   /* Human-readable panic message,
                                           set by sw_process_panic, read by
                                           process_exit -> deliver_signal so
                                           {'EXIT', from, MSG_STR} reaches
                                           trap_exit handlers. malloc'd;
-                                          freed in process_destroy. NULL
-                                          if not a panic exit. */
-    sw_reg_entry_t *reg_entry;         /* Registry entry (or NULL) */
+                                          freed in process_destroy UNDER link_lock
+                                          (serialises with a late sw_monitor read).
+                                          NULL if not a panic exit. */
+    _Atomic(sw_reg_entry_t *) reg_entry; /* Registry entry (or NULL). Atomic: a child's
+                                          process_exit reads it while sw_register (from
+                                          sup_start_child on another thread) writes it. */
     void *ets_tables;                  /* Linked list of owned ETS tables */
 
     /* === ABA / arena slot-reuse defense ===

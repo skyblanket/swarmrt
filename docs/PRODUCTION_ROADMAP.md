@@ -25,7 +25,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 | Phase | Title | Status |
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
-| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ⏳ **NEXT** |
+| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ⏳ 2.1–2.4 ✅; 2.5 alloc-fail + 2.6 soak remain |
 | 3 | Security & fault isolation (fuzzing, limits) | ⬜ pending |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
@@ -148,7 +148,7 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   (legal-but-wrong interleaving of the waiting/idle flag handshakes). Root-cause needs
   protocol reasoning / model checking against `tests/stress/spin_wedge_hunt.sh`, not TSan.
 
-### 2.4 Make shared state atomic-or-locked  ⏳ **IN PROGRESS** (the headline race is FIXED; worklist below)
+### 2.4 Make shared state atomic-or-locked  ✅ **DONE** (Round-7 continuation) — runtime TSan-clean
 - **The P1 spin-gated deadlock is root-caused and fixed**: Dekker StoreLoad in the receive
   waiting-flag handshake (release-store `waiting` then acquire-load `sig_head` — no ordering
   across different objects). All `waiting` participants are now seq_cst; 0/300 wedge runs
@@ -168,15 +168,21 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   - Test harness: `static volatile int` flags in test_phase2/4/5 → `_Atomic` (volatile is
     not synchronization), `__sync_*` → C11 `atomic_fetch_add`.
 - **`make tsan-gate` covers msg, msg+spin, 80k storm, phase 2, phase 5 — all clean.**
-- **STILL RED — remaining 2.4 worklist** (real races that surfaced once the test-timing shift
-  perturbed the interleaving; gate phase 4 into tsan-gate once closed):
-  1. `sw_register` / registry buckets: a by-name reader (`whereis` / monitor-by-name) races
-     the rwlock-protected insert — audit the read path for an unlocked bucket walk / a name
-     string whose lifetime overlaps a concurrent unregister.
-  2. `dynsup_entry` (swarmrt_phase4.c ~487/571) + `sup_start_child` (swarmrt_otp.c ~246/250):
-     the dynamic-supervisor child list is mutated by the supervisor fiber while another
-     thread reads it (`sup_count_children` / restart). Needs a per-supervisor lock or an
-     atomic list head.
+- **ALSO FIXED** (the supervisor crash-restart races that surfaced once test timing shifted):
+  - `exit_reason` → `_Atomic`: user/runtime code writes `sw_self()->exit_reason = N`
+    directly (the b3_crasher idiom) while sw_monitor/process_exit read it.
+  - `reg_entry` → `_Atomic`: a child's `process_exit` reads it while `sw_register` (from
+    `sup_start_child` on another scheduler) writes it.
+  - `kill_flag` → `_Atomic` (was volatile): scheduler-loop read vs cross-thread exit-signal
+    write.
+  - `registry_remove_proc` hashes the name UNDER the registry wrlock (was computed before
+    the lock, reading entry->name that a concurrent reuse rewrote).
+  - `process_destroy` frees `panic_msg` under `link_lock`, and sw_monitor's already-dead
+    path COPIES it under the same lock — closes a use-after-free (a late monitor reading a
+    panic_msg the teardown was freeing).
+- **`make tsan-gate` covers msg, msg+spin, 80k storm, AND phase 2/4/5 — all clean.** The
+  runtime is TSan-clean on the GenServer / Supervisor / Agent / DynSup / StateMachine /
+  ProcessGroup paths plus message-passing and the spawn storm.
 - Suppressed by design (tests/stress/tsan.supp): the warn-only watchdog scanner + `sw_stats`
   debug printer.
 - (The former P1 deadlock was a protocol bug, not a data race — TSan stayed silent; found via

@@ -724,9 +724,17 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.priv_tail = NULL;
     proc->mailbox.count = 0;
 
-    /* Free the panic_msg string set by sw_process_panic. */
-    free(proc->panic_msg);
+    /* Free the panic_msg string set by sw_process_panic. UNDER link_lock:
+     * a late sw_monitor on this (already-EXITING/FREE) process reads
+     * panic_msg in its already-dead delivery path under the same lock, so
+     * the free must serialise with it or the monitor reads freed memory.
+     * NULL-under-lock means the monitor sees either a valid pointer or
+     * NULL, never freed-but-non-NULL. */
+    pthread_mutex_lock(&g_swarm->link_lock);
+    char *_pm = proc->panic_msg;
     proc->panic_msg = NULL;
+    pthread_mutex_unlock(&g_swarm->link_lock);
+    free(_pm);
 
     /* GC v1: reclaim this process's whole value arena in O(chunks). Runs after
      * the fiber has returned, so there are no live sw_val_t* C-stack roots.
@@ -2702,10 +2710,15 @@ uint64_t sw_monitor(sw_process_t *target) {
 
     sw_proc_state_t st = atomic_load_explicit(&target->state, memory_order_relaxed);
     if (st == SW_PROC_EXITING || st == SW_PROC_FREE) {
-        int reason = target->exit_reason;
-        char *msg = target->panic_msg;
+        int reason = atomic_load_explicit(&target->exit_reason, memory_order_relaxed);
+        /* COPY panic_msg under the lock: process_destroy frees it under the
+         * same lock, so capturing the bare pointer and using it after the
+         * unlock (deliver_signal strdups it) would race that free. The
+         * copy is ours; free it after delivery. */
+        char *msg = target->panic_msg ? strdup(target->panic_msg) : NULL;
         pthread_mutex_unlock(&g_swarm->link_lock);
         deliver_signal(self, SW_TAG_DOWN, target->pid, ref, reason, msg);
+        free(msg);
         return ref;
     }
 
@@ -2868,17 +2881,22 @@ sw_process_t *sw_whereis(const char *name) {
 }
 
 static void registry_remove_proc(sw_process_t *proc) {
-    if (!proc->reg_entry) return;
+    sw_reg_entry_t *entry = atomic_load_explicit(&proc->reg_entry, memory_order_relaxed);
+    if (!entry) return;
 
     sw_registry_t *reg = &g_swarm->registry;
-    const char *name = proc->reg_entry->name;
-    uint32_t idx = registry_hash(name) % reg->num_buckets;
 
+    /* Hash the name UNDER the wrlock. It was computed before the lock,
+     * reading entry->name — which races a concurrent registration/removal
+     * reusing that entry's storage (TSan-flagged in the supervisor
+     * crash-restart path). The entry is only freed under this lock, so the
+     * name is stable once we hold it. */
     pthread_rwlock_wrlock(&reg->lock);
 
+    uint32_t idx = registry_hash(entry->name) % reg->num_buckets;
     sw_reg_entry_t **pp = &reg->buckets[idx];
     while (*pp) {
-        if (*pp == proc->reg_entry) {
+        if (*pp == entry) {
             sw_reg_entry_t *rm = *pp;
             *pp = rm->next;
             free(rm);
@@ -2886,7 +2904,7 @@ static void registry_remove_proc(sw_process_t *proc) {
         }
         pp = &(*pp)->next;
     }
-    proc->reg_entry = NULL;
+    atomic_store_explicit(&proc->reg_entry, NULL, memory_order_relaxed);
 
     pthread_rwlock_unlock(&reg->lock);
 }
