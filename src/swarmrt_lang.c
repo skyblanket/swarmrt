@@ -5234,6 +5234,7 @@ static sw_val_t *_jd_parse_string(const char **pp) {
     while (**pp && **pp != '"' && len < (int)sizeof(buf) - 5) {
         if (**pp == '\\') {
             (*pp)++;
+            if (!**pp) break;  /* fuzz_json found: truncated escape at NUL -> OOB read */
             switch (**pp) {
                 case 'n': buf[len++] = '\n'; (*pp)++; break;
                 case 't': buf[len++] = '\t'; (*pp)++; break;
@@ -5330,7 +5331,7 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
     while (**pp >= '0' && **pp <= '9') (*pp)++;
     if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
     if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
-    if (*pp == start) { (*pp)++; return sw_val_nil(); }
+    if (*pp == start) { if (**pp) (*pp)++; return sw_val_nil(); }  /* fuzz_json: guard NUL before advance on unrecognized token */
     char tmp[64];
     size_t numlen = *pp - start;
     if (numlen > 63) numlen = 63;
