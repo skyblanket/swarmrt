@@ -626,7 +626,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->ctx.stack_base = (uint64_t)stack_top;
     proc->ctx.stack_limit = (uint64_t)proc->stack_mem;
     sw_spin_unlock(&proc->ctx_lock);
-    proc->state = SW_PROC_RUNNABLE;
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
     proc->priority = SW_PRIO_NORMAL;
     proc->fcalls = SWARM_CONTEXT_REDS;
     proc->flags = 0;
@@ -1290,7 +1290,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
 
             /* Check if this process was killed by an exit signal */
             if (proc->kill_flag) {
-                proc->state = SW_PROC_EXITING;
+                atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
                 process_exit(proc, proc->exit_reason);
                 /* Force whole-binary exit if the ROOT process died
                  * abnormally — checked before process_destroy recycles
@@ -1301,7 +1301,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             }
 
             sched->procs_run++;
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             proc->scheduler = sched;
             proc->fcalls = SWARM_CONTEXT_REDS;
             sched->current = proc;
@@ -1969,7 +1969,7 @@ sw_process_t *sw_find_by_pid_any(uint64_t pid) {
  * Marks process as EXITING and context-swaps back to the scheduler.
  */
 void sw_process_done(sw_process_t *proc) {
-    proc->state = SW_PROC_EXITING;
+    atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Should never reach here */
 }
@@ -1999,7 +1999,7 @@ void sw_process_panic(sw_process_t *proc, int reason, const char *msg) {
         free(proc->panic_msg);
         proc->panic_msg = strdup(msg);
     }
-    proc->state = SW_PROC_EXITING;
+    atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Should never reach here — scheduler tears down the process. */
 }
@@ -2009,7 +2009,7 @@ void sw_yield(void) {
     if (!proc) return;
 
     /* Context swap back to scheduler — scheduler will re-enqueue us */
-    proc->state = SW_PROC_RUNNABLE;
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
     proc->context_switches++;
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Resumed — back on our stack */
@@ -2229,7 +2229,7 @@ void *sw_receive(uint64_t timeout_ms) {
         /* No message — prepare to sleep.
          * Critical ordering: set waiting BEFORE final drain check.
          * This prevents lost wake-ups (see Vyukov MPSC pattern). */
-        proc->state = SW_PROC_WAITING;
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
         atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
         /* Final drain — catch messages sent between first drain and waiting flag.
@@ -2245,7 +2245,7 @@ void *sw_receive(uint64_t timeout_ms) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
                 /* We won — not in runq, safe to self-resume */
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 void *payload = msg_take_payload(m, 0);
                 msg_free(m);
                 proc->messages_recv++;
@@ -2262,7 +2262,7 @@ void *sw_receive(uint64_t timeout_ms) {
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;  /* Loop back — will drain and find the message */
         }
@@ -2277,13 +2277,13 @@ void *sw_receive(uint64_t timeout_ms) {
             if (elapsed >= timeout_ms) {
                 int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
                 if (was_waiting) {
-                    proc->state = SW_PROC_RUNNING;
+                    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                     return NULL;
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
                 sw_context_swap(proc, &proc->scheduler->sched_proc);
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
             uint64_t remaining = timeout_ms - elapsed;
@@ -2294,7 +2294,7 @@ void *sw_receive(uint64_t timeout_ms) {
         sw_context_swap(proc, &proc->scheduler->sched_proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
 
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
@@ -2349,7 +2349,7 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     /* Set waiting flag BEFORE checking signal stack (prevents lost wake-ups) */
-    proc->state = SW_PROC_WAITING;
+    atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
     atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
     /* Check if new signals arrived AFTER we set waiting flag.
@@ -2373,13 +2373,13 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
         /* New messages on signal stack — drain and let caller re-scan */
         int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
         if (was) {
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             mailbox_drain(&proc->mailbox);
             return 1;
         }
         /* Sender already enqueued us — context swap for clean dequeue */
         sw_context_swap(proc, &proc->scheduler->sched_proc);
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         mailbox_drain(&proc->mailbox);
         return 1;
     }
@@ -2393,9 +2393,9 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
                            (now.tv_nsec - start.tv_nsec) / 1000000;
         if (elapsed >= timeout_ms) {
             int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
-            if (was) { proc->state = SW_PROC_RUNNING; return 0; }
+            if (was) { atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed); return 0; }
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             return 0;
         }
         timer_ref = sw_send_after(timeout_ms - elapsed, proc, SW_TAG_NONE, NULL);
@@ -2403,7 +2403,7 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
 
     /* Context swap — will be woken by sender or timer */
     sw_context_swap(proc, &proc->scheduler->sched_proc);
-    proc->state = SW_PROC_RUNNING;
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
 
     if (timer_ref) sw_cancel_timer(timer_ref);
     if (proc->kill_flag) return 0;
@@ -2444,9 +2444,11 @@ static void deliver_signal(sw_process_t *target, uint64_t tag,
 }
 
 static void process_exit(sw_process_t *proc, int reason) {
-    proc->exit_reason = reason;
-
     pthread_mutex_lock(&g_swarm->link_lock);
+    /* Set the terminal reason UNDER link_lock so sw_monitor's
+     * already-dead fast path (which now reads it under the same lock)
+     * sees a consistent value instead of racing this write. */
+    proc->exit_reason = reason;
 
     /* 1. Propagate to linked processes */
     sw_link_t *link = proc->links;
@@ -2688,9 +2690,22 @@ uint64_t sw_monitor(sw_process_t *target) {
 
     uint64_t ref = atomic_fetch_add(&g_swarm->next_monitor_ref, 1);
 
-    if (target->state == SW_PROC_EXITING || target->state == SW_PROC_FREE) {
-        /* Target already dead — deliver DOWN immediately */
-        deliver_signal(self, SW_TAG_DOWN, target->pid, ref, target->exit_reason, target->panic_msg);
+    /* The dead-check, the terminal-reason read, AND the registration all
+     * happen under link_lock — the same lock process_exit holds while it
+     * finalizes exit_reason and walks monitors_me. This (a) closes the
+     * data race on exit_reason/panic_msg (TSan-flagged: monitoring a
+     * process at its exact death instant), and (b) makes delivery
+     * exactly-once: if we register before process_exit locks, it finds us
+     * and delivers DOWN; if the target is already EXITING/FREE when we
+     * lock, we deliver DOWN ourselves and do NOT register. */
+    pthread_mutex_lock(&g_swarm->link_lock);
+
+    sw_proc_state_t st = atomic_load_explicit(&target->state, memory_order_relaxed);
+    if (st == SW_PROC_EXITING || st == SW_PROC_FREE) {
+        int reason = target->exit_reason;
+        char *msg = target->panic_msg;
+        pthread_mutex_unlock(&g_swarm->link_lock);
+        deliver_signal(self, SW_TAG_DOWN, target->pid, ref, reason, msg);
         return ref;
     }
 
@@ -2698,8 +2713,6 @@ uint64_t sw_monitor(sw_process_t *target) {
     mon->ref = ref;
     mon->watcher = self;
     mon->watched = target;
-
-    pthread_mutex_lock(&g_swarm->link_lock);
 
     /* Add to watcher's my_monitors */
     mon->next_in_watcher = self->my_monitors;
@@ -2954,12 +2967,16 @@ static void fire_timers(void) {
 
     sw_timer_list_t *tl = &g_swarm->timers;
 
-    /* Quick check without lock — sorted list, head is earliest */
-    if (!tl->head) return;
-
+    /* Peek under the lock. The old unlocked `if (!tl->head) return` raced
+     * the locked insert in sw_send_after (TSan-flagged; benign on x86/arm64
+     * where aligned pointer loads are atomic, but UB on paper). The lock is
+     * uncontended in the common no-timer case — taken once per scheduler
+     * idle pass, contended only while a timer is actually being
+     * inserted/cancelled (rare) — so the correctness is free in practice. */
     uint64_t now = now_ns();
 
     pthread_mutex_lock(&tl->lock);
+    if (!tl->head) { pthread_mutex_unlock(&tl->lock); return; }
     while (tl->head && tl->head->fire_at_ns <= now) {
         sw_timer_t *t = tl->head;
         tl->head = t->next;
@@ -3053,7 +3070,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         if (timeout_ms == 0) return NULL;
 
         /* No match — prepare to sleep */
-        proc->state = SW_PROC_WAITING;
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
         atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
         /* Final drain — catch messages sent between first drain and waiting flag.
@@ -3064,7 +3081,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         if (m) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 void *payload = msg_take_payload(m, 0);
                 msg_free(m);
                 proc->messages_recv++;
@@ -3078,7 +3095,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;
         }
@@ -3093,13 +3110,13 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             if (elapsed_ms >= timeout_ms) {
                 int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
                 if (was_waiting) {
-                    proc->state = SW_PROC_RUNNING;
+                    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                     return NULL;
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
                 sw_context_swap(proc, &proc->scheduler->sched_proc);
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
             uint64_t remaining = timeout_ms - elapsed_ms;
@@ -3109,7 +3126,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         sw_context_swap(proc, &proc->scheduler->sched_proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
     }
@@ -3145,7 +3162,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
         if (timeout_ms == 0) return NULL;
 
         /* No message — prepare to sleep */
-        proc->state = SW_PROC_WAITING;
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
         atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
         /* Final drain — catch messages sent between first drain and waiting flag.
@@ -3156,7 +3173,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
         if (m) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 if (out_tag) *out_tag = m->tag;
                 void *payload = msg_take_payload(m, adopt);
                 msg_free(m);
@@ -3171,7 +3188,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;
         }
@@ -3186,13 +3203,13 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             if (elapsed >= timeout_ms) {
                 int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
                 if (was_waiting) {
-                    proc->state = SW_PROC_RUNNING;
+                    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                     return NULL;
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
                 sw_context_swap(proc, &proc->scheduler->sched_proc);
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
             uint64_t remaining = timeout_ms - elapsed;
@@ -3202,7 +3219,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
         sw_context_swap(proc, &proc->scheduler->sched_proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
     }

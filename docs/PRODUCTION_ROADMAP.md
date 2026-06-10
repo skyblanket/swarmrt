@@ -155,26 +155,32 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   post-fix; spin default back ON (cross-sched ping-pong 58.4 → 3.0 µs/rt, 19×). The wedge
   AUTOPSY (`SW_SCHED_TRACE=1/2`: stall detector + state dump + event ring) stays in the
   runtime as the standing diagnosis tool. Gate: `tests/stress/spin_wedge_hunt.sh`.
-- TSan audit run across msg ping-pong, spawn storm, and phase 2/4/5 binaries (GenServer,
-  supervisor crash/restart, DynSup, StateMachine, ProcessGroups). Mailbox wakeups + runq are
-  CLEAN (proper C11 atomics). Scheduler/swarm control flags fixed in 2.3.
-- **Worklist (each needs a TSan-clean rerun of the phase binaries):**
-  1. `sw_process.state` is plain int accessed cross-thread (scheduler swap-in writes vs
-     kill/monitor/wake readers — the dominant flagged site). Convert to `_Atomic int` with
-     EXPLICIT RELAXED accessors: zero cost on x86/arm64 (plain mov), same layout (the
-     asm-offset `_Static_assert`s verify), ~50 mechanical sites.
-  2. Timer list: an unlocked reader races the mutex-protected insert (`sw_send_after`) —
-     find the lock-free peek (likely fire_timers) and either take the lock or make the head
-     load/store atomic.
-  3. `registry_hash` flagged reading a name buffer — determine whether a registered name's
-     string can be freed/rewritten concurrently with `whereis` (lifetime question, possibly
-     UAF-adjacent, possibly allocator-recycling misattribution).
-  4. Test-code counters in test_phase2.c (test globals written by genserver callbacks, read
-     by asserts) — fix the tests with atomics, don't suppress.
-- Suppressed by design (documented in tests/stress/tsan.supp): the warn-only watchdog scanner
-  and the `sw_stats` debug printer.
-- (The former P1 deadlock was exactly such a protocol bug — found via the autopsy, fixed
-  with seq_cst, see above. TSan stayed silent on it throughout: ordering, not racing.)
+- **FIXED this round** (TSan-driven, verified clean + perf-neutral):
+  - `sw_process.state` → `_Atomic` with the 30 hot writes as explicit `atomic_store relaxed`
+    (free codegen, reads stay implicit/free on x86; same layout — the asm-offset
+    `_Static_assert`s pass). Closed the scheduler-swap-vs-`sw_monitor`/`sw_send_after`
+    races. Perf unchanged: spawn 4.2 µs, ping-pong 2.6 µs.
+  - Timer list: `fire_timers`' unlocked head-peek now reads under `tl->lock` (raced the
+    locked insert; uncontended in the common no-timer case).
+  - Monitor-at-death: `sw_monitor`'s already-dead path reads `exit_reason`/`panic_msg` and
+    registers all under `link_lock`, and `process_exit` finalizes `exit_reason` under the
+    same lock — closes the data race AND makes DOWN delivery exactly-once.
+  - Test harness: `static volatile int` flags in test_phase2/4/5 → `_Atomic` (volatile is
+    not synchronization), `__sync_*` → C11 `atomic_fetch_add`.
+- **`make tsan-gate` covers msg, msg+spin, 80k storm, phase 2, phase 5 — all clean.**
+- **STILL RED — remaining 2.4 worklist** (real races that surfaced once the test-timing shift
+  perturbed the interleaving; gate phase 4 into tsan-gate once closed):
+  1. `sw_register` / registry buckets: a by-name reader (`whereis` / monitor-by-name) races
+     the rwlock-protected insert — audit the read path for an unlocked bucket walk / a name
+     string whose lifetime overlaps a concurrent unregister.
+  2. `dynsup_entry` (swarmrt_phase4.c ~487/571) + `sup_start_child` (swarmrt_otp.c ~246/250):
+     the dynamic-supervisor child list is mutated by the supervisor fiber while another
+     thread reads it (`sup_count_children` / restart). Needs a per-supervisor lock or an
+     atomic list head.
+- Suppressed by design (tests/stress/tsan.supp): the warn-only watchdog scanner + `sw_stats`
+  debug printer.
+- (The former P1 deadlock was a protocol bug, not a data race — TSan stayed silent; found via
+  the autopsy + seq_cst fix, see above.)
 
 ### 2.5 Allocation-failure safety
 - Inject deterministic `malloc`/arena-create failures. Ensure **every** path either returns an

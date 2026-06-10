@@ -268,7 +268,14 @@ struct sw_process {
     uint32_t flags;           /* Process flags */
     
     /* === Scheduling (cache line 1) === */
-    sw_proc_state_t state;
+    /* _Atomic: the scheduler thread writes state on every swap-in/out
+     * while OTHER threads read it cross-thread (sw_monitor's
+     * already-dead check, sw_send_after, the watchdog scanner) — TSan
+     * flagged the unsynchronized accesses. Implicit accesses are seq_cst,
+     * which is correct; the only hot writer is the scheduler swap-in.
+     * Size/alignment of the enum are unchanged, so the asm-pinned ctx
+     * offset (0x70) is preserved — the _Static_assert in the .c verifies. */
+    _Atomic sw_proc_state_t state;
     sw_priority_t priority;
     sw_scheduler_t *scheduler;/* Current scheduler */
     uint64_t pid;
