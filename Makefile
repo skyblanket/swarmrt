@@ -417,6 +417,35 @@ lsan-gate: swc
 	   echo "lsan-gate: FAIL (leaks at exit)"; exit 1; fi; \
 	 echo "lsan-gate: PASS (zero unsuppressed leaks at exit)"
 
+# Allocation-failure injection gate (Phase 2.5). Builds the workload with
+# -DSW_ALLOC_FAULT + ASAN and runs it once per fail-point N (SW_FAIL_ALLOC_AT),
+# so the Nth value/region allocation fails exactly once. Each run must exit
+# 0 (clean) or 1 (loud OOM/spawn panic) — BOTH fine. The gate FAILS only on
+# an ASAN report (use-after-free / double-free / heap overflow): a fault that
+# corrupted memory instead of unwinding. Sweeps a range that covers the
+# spawn/send/supervise/ETS ownership-transfer sites. Linux/ASAN only.
+.PHONY: alloc-fault
+alloc-fault: swc
+	@if [ "$$(uname)" != "Linux" ]; then echo "alloc-fault: SKIP (needs Linux ASAN)"; exit 0; fi
+	@./bin/swc build --emit-c tests/gc/alloc_fault.sw -o $(BIN_DIR)/_af_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -DSW_ALLOC_FAULT -g -O1 -fno-stack-protector \
+	    tests/gc/alloc_fault.gen.c $(FUZZ_RT) -o $(BIN_DIR)/alloc_fault $(LDFLAGS)
+	@rm -f tests/gc/alloc_fault.gen.c $(BIN_DIR)/_af_emit
+	@rc=0; faults=0; clean=0; \
+	 for n in $$(seq 1 120); do \
+	   out=$$(SW_QUIET=1 SW_SCHEDULERS=1 SW_FAIL_ALLOC_AT=$$n \
+	          ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+	          timeout 30 $(BIN_DIR)/alloc_fault 2>&1); \
+	   ec=$$?; \
+	   if echo "$$out" | grep -qE "AddressSanitizer|runtime error:|heap-use-after-free|double-free"; then \
+	     echo "alloc-fault: FAIL at SW_FAIL_ALLOC_AT=$$n (memory error)"; \
+	     echo "$$out" | grep -A8 "AddressSanitizer" | head -20; rc=1; break; \
+	   fi; \
+	   if echo "$$out" | grep -q "alloc_fault DONE"; then clean=$$((clean+1)); else faults=$$((faults+1)); fi; \
+	 done; \
+	 [ $$rc -eq 0 ] && echo "alloc-fault: PASS (120 fail-points: $$clean clean, $$faults loud-OOM, 0 memory errors)" \
+	                || exit 1
+
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
 # run to print `ok 80000`. Requires native Linux x86_64 thread scheduling

@@ -107,6 +107,20 @@ jobs:
         continue-on-error: true
         run: make lsan-gate
 
+      - name: ThreadSanitizer race gate (Phase 2.3/2.4 — msg, storm, phase 2/4/5)
+        # Runtime must be free of C11 data races on the message, spawn-storm,
+        # and GenServer/Supervisor/Agent/DynSup/StateMachine/ProcessGroup
+        # paths. Suppresses only the by-design warn-only watchdog scanner +
+        # sw_stats printer (tests/stress/tsan.supp).
+        run: make tsan-gate
+
+      - name: Allocation-failure injection (Phase 2.5 — no UAF/double-free on OOM)
+        # Fails the Nth value/region allocation across a 120-point sweep and
+        # asserts the ownership-transfer cleanup (spawn region, message copy,
+        # supervisor closures, ETS) never corrupts memory — only ever a clean
+        # completion or a loud OOM panic.
+        run: make alloc-fault
+
       - name: Scheduler-count matrix (Phase 2.2 — suite under S=1 and oversubscribed)
         # The default-scheduler run above covers nproc; these legs cover the
         # edges. S=1 found a real architecture issue (blocking curl client +

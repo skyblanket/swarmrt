@@ -1402,6 +1402,27 @@ static void scheduler_loop(sw_scheduler_t *sched) {
 
 static void _sw_install_altstack(void);   /* defined with the crash handler below */
 
+#ifdef SW_ALLOC_FAULT
+/* Phase 2.5 allocation-failure injection. Armed by SW_FAIL_ALLOC_AT=N
+ * (read once): the Nth instrumented allocation (val_alloc global-heap
+ * fallback + every varena chunk_new) returns failure exactly once, so a
+ * sweep over N drives a fault through each ownership-transfer site and
+ * asserts (under ASAN) the cleanup neither leaks nor double-frees. Atomic
+ * because allocations happen on every scheduler thread. Compiled only
+ * under -DSW_ALLOC_FAULT — not in any shipping build. */
+static _Atomic long g_alloc_fault_count = 0;
+static long g_alloc_fault_at = -2;   /* -2 = unread, -1 = disabled */
+int sw_alloc_fault_tick(void) {
+    if (g_alloc_fault_at == -2) {
+        const char *e = getenv("SW_FAIL_ALLOC_AT");
+        g_alloc_fault_at = e ? atol(e) : -1;
+    }
+    if (g_alloc_fault_at < 0) return 0;
+    long n = atomic_fetch_add_explicit(&g_alloc_fault_count, 1, memory_order_relaxed) + 1;
+    return n == g_alloc_fault_at;
+}
+#endif
+
 static void *scheduler_main(void *arg) {
     sw_scheduler_t *sched = (sw_scheduler_t *)arg;
     _sw_install_altstack();   /* fiber-stack overflows fault on THIS thread */

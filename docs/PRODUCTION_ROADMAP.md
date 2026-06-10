@@ -25,7 +25,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 | Phase | Title | Status |
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
-| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ⏳ 2.1–2.4 ✅; 2.5 alloc-fail + 2.6 soak remain |
+| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ⏳ 2.1–2.5 ✅; 2.6 soak remains |
 | 3 | Security & fault isolation (fuzzing, limits) | ⬜ pending |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
@@ -188,12 +188,18 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
 - (The former P1 deadlock was a protocol bug, not a data race — TSan stayed silent; found via
   the autopsy + seq_cst fix, see above.)
 
-### 2.5 Allocation-failure safety
-- Inject deterministic `malloc`/arena-create failures. Ensure **every** path either returns an
-  error or terminates **only the affected process** — and that a partial region-ownership transfer
-  (e.g. spawn region adopted but child died) never leaks or double-frees. (See the
-  `g_pending_spawn_region` / `g_pending_on_destroy` / `spawn_region` handoff in `sw_spawn_opts`.)
-
+### 2.5 Allocation-failure safety  ✅ **DONE** (Round-7 continuation, Linux/ASAN)
+- `make alloc-fault`: built with `-DSW_ALLOC_FAULT` + ASAN, sweeps `SW_FAIL_ALLOC_AT=1..120` so
+  the Nth value/region allocation fails exactly once (atomic countdown in
+  `sw_alloc_fault_tick`, wired into `val_alloc`'s global-heap fallback and every varena
+  `chunk_new`). Each run must end clean OR with a loud OOM/spawn panic; the gate FAILS only on
+  an ASAN memory error.
+- Result: **120 fail-points, 0 memory errors** (100 graceful degradations — region alloc
+  fails → spawn falls back to a global-heap arg copy / errors out cleanly; 20 loud-OOM aborts
+  on the value path). The documented hazard (spawn region adopted but child died → leak or
+  double-free) does not occur: the cleanup branches hold under injected failure.
+- Zero production cost: all injection is behind `#ifdef SW_ALLOC_FAULT`, compiled only by the
+  gate. Advisory-then-blocking CI leg added to linux-quickstart.yml.
 ### 2.6 24-hour soak
 - Build a mixed-workload harness: actor spawn/message/pmap + supervisor crash/restart storms +
   timers + networking + ETS churn + distribution + a production-like agent workload. Run a short

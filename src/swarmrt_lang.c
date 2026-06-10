@@ -2164,6 +2164,10 @@ static void *val_alloc_oom(size_t n) {
     abort();
 }
 
+#ifdef SW_ALLOC_FAULT
+int sw_alloc_fault_tick(void);   /* Phase 2.5 fault injection — see swarmrt_native.c */
+#endif
+
 static inline void *val_alloc(size_t n) {
     if (!g_alloc_force_global) {
         sw_value_arena_t *a = g_alloc_target ? g_alloc_target : sw_self_varena();
@@ -2172,6 +2176,11 @@ static inline void *val_alloc(size_t n) {
             if (p) { memset(p, 0, n); return p; }
         }
     }
+#ifdef SW_ALLOC_FAULT
+    /* Inject a global-heap value-allocation failure: exercises the
+     * loud-OOM path AND any caller that must unwind a half-built value. */
+    if (sw_alloc_fault_tick()) return val_alloc_oom(n);
+#endif
     void *p = calloc(1, n);
     return p ? p : val_alloc_oom(n);
 }

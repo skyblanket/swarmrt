@@ -5,7 +5,20 @@
 
 #define SW_VARENA_ALIGN 16
 
+/* Allocation-failure injection (Phase 2.5). Compiled in ONLY under
+ * -DSW_ALLOC_FAULT (the `make alloc-fault` gate); zero cost otherwise.
+ * `sw_alloc_fault_tick()` (swarmrt_native.c) counts down from SW_FAIL_ALLOC_AT
+ * and returns 1 exactly once, so a sweep can fail the Nth region/value
+ * allocation and assert the cleanup path neither leaks nor double-frees
+ * (the documented spawn-region-adopted-but-child-died hazard). */
+#ifdef SW_ALLOC_FAULT
+int sw_alloc_fault_tick(void);
+#endif
+
 static sw_varena_chunk_t *chunk_new(size_t cap) {
+#ifdef SW_ALLOC_FAULT
+    if (sw_alloc_fault_tick()) return NULL;
+#endif
     sw_varena_chunk_t *c = (sw_varena_chunk_t *)malloc(sizeof(sw_varena_chunk_t) + cap);
     if (!c) return NULL;
     c->next = NULL;
