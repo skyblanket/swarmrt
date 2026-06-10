@@ -427,8 +427,15 @@ struct sw_scheduler {
     volatile uint64_t idle_waits;    /* Debug: times entered idle wait */
 
     /* State */
-    volatile int active;
-    volatile int should_exit;
+    /* _Atomic (was volatile): TSan-clean cross-thread flags. volatile is
+     * not synchronization in C11 — main's readiness spin reads `active`
+     * while the scheduler thread writes it, and sw_shutdown writes
+     * `should_exit`/`running` while scheduler loops read them. Plain
+     * loads/stores on _Atomic int are seq_cst; these are cold flags, the
+     * cost is irrelevant. (sw_scheduler is NOT asm-offset-pinned — only
+     * sw_process is — so the layout change is safe.) */
+    _Atomic int active;
+    _Atomic int should_exit;
 
 };
 
@@ -436,7 +443,7 @@ struct sw_scheduler {
 struct sw_swarm {
     char name[32];
     uint32_t num_schedulers;
-    volatile int running;
+    _Atomic int running;   /* see active/should_exit note above */
 
     /* Arena allocator (replaces process table, free list, PID lock) */
     sw_arena_t arena;

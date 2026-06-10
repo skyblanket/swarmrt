@@ -1418,6 +1418,9 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     strncpy(g_swarm->name, name, 31);
     g_swarm->num_schedulers = num_schedulers;
     g_swarm->running = 1;
+    sched_trace_maybe_start();   /* BEFORE scheduler threads exist — the flag
+                                  * is then ordered by pthread_create (TSan-
+                                  * clean); scheds read it on every enqueue. */
 
     /* Initialize arena — single mmap, covers everything.
      *
@@ -1536,8 +1539,6 @@ int sw_init(const char *name, uint32_t num_schedulers) {
                name, num_schedulers);
         fflush(stderr);
     }
-
-    sched_trace_maybe_start();   /* SW_SCHED_TRACE=1 → 1Hz counters on stderr */
 
     /* Install crash handler so segfaults produce a backtrace instead of
      * a bare "segmentation fault" message.  macOS provides backtrace()
