@@ -131,11 +131,22 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   **opt-in (`SW_SPIN_US`, default 0/off)** with reproducer `tests/stress/spin_wedge_hunt.sh`
   and `SW_SCHED_TRACE=1` telemetry. Root-cause in 2.3/2.4, then flip the default back on.
 
-### 2.3 ThreadSanitizer build + race test
-- macOS clang has TSan. Build the runtime under `-fsanitize=thread` and run a multi-scheduler
-  spawn/message/kill + supervisor-crash storm. **Caveat:** TSan may false-positive on the custom
-  asm context-switch (`swarmrt_asm.S`) the way ASAN does on the fiber stacks — characterize and
-  suppress the coroutine noise, keep the real-race signal.
+### 2.3 ThreadSanitizer build + race test  ✅ **DONE** (Round-7 continuation, on Linux)
+- `make tsan-gate`: depth-1 message ping-pong (spin off AND on) + the full 80k spawn storm
+  under `-fsanitize=thread`; fails on any unsuppressed race. **The feared fiber false-positive
+  storm did not materialize**: cross-thread fiber migration synchronizes through the runq's C11
+  atomics, so TSan sees the happens-before edges — no fiber annotations needed.
+- Three real C11 races found and fixed: `sched->active` / `should_exit` / `g_swarm->running`
+  were `volatile int` (not synchronization) — now `_Atomic int` (sw_scheduler is not
+  asm-offset-pinned; cold flags, cost irrelevant); the sched-trace flag initialized after
+  thread creation — now before.
+- Suppressions (`tests/stress/tsan.supp`): ONLY the documented warn-only lock-free watchdog
+  scanner (`watchdog_thread_fn`, `sw_io_active_port_count`). Atomicizing `sw_process.state`
+  for a scanner-clean runtime is a 2.4 decision (it is written on every context switch).
+- The spin-gated P1 deadlock does NOT reproduce under TSan (40/40 clean, spin on — timing
+  perturbation suppresses the interleave) and shows no C11 race: it is a PROTOCOL bug
+  (legal-but-wrong interleaving of the waiting/idle flag handshakes). Root-cause needs
+  protocol reasoning / model checking against `tests/stress/spin_wedge_hunt.sh`, not TSan.
 
 ### 2.4 Make shared state atomic-or-locked
 - Audit and fix races on: **kill flags**, **process lifecycle state**, **registry + monitor
