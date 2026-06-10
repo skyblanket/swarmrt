@@ -107,6 +107,14 @@ static __thread sw_scheduler_t *tls_spawn_override = NULL;
 static pthread_t        g_watchdog_thread;
 static volatile int     g_watchdog_stop = 0;
 static int              g_watchdog_enabled = 1;   /* 0 when SW_DEADLOCK_DETECT=0 */
+/* Shutdown wake for the watchdog. It used to sleep its interval in 100ms
+ * nanosleep chunks polling g_watchdog_stop — so EVERY binary paid an avg
+ * ~50ms (worst 100ms) at exit joining it. For a CLI tool whose whole run
+ * is 10ms, that chunk WAS the startup-time story (Round-7 O5: hello
+ * measured 110-145ms wall, ~99ms of it this join). A condvar makes
+ * shutdown instant and removes the idle wakeups entirely. */
+static pthread_mutex_t  g_watchdog_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   g_watchdog_cond = PTHREAD_COND_INITIALIZER;
 
 /* Defined in swarmrt_io.c. Forward-declared here (rather than pulling in
  * swarmrt_io.h with its full port/event structs) so the watchdog can ask
@@ -141,16 +149,19 @@ static void *watchdog_thread_fn(void *arg) {
     }
 
     while (!g_watchdog_stop) {
-        /* Sleep in 100 ms chunks so shutdown is responsive. */
-        unsigned long slept = 0;
-        while (slept < interval_ms && !g_watchdog_stop) {
-            unsigned long chunk = interval_ms - slept;
-            if (chunk > 100) chunk = 100;
-            struct timespec ts = { (time_t)(chunk / 1000),
-                                   (long)((chunk % 1000) * 1000000L) };
-            nanosleep(&ts, NULL);
-            slept += chunk;
+        /* Wait one interval OR an instant shutdown signal — no chunked
+         * polling (see g_watchdog_cond above for the boot-time story). */
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += (time_t)(interval_ms / 1000);
+        dl.tv_nsec += (long)((interval_ms % 1000) * 1000000L);
+        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        pthread_mutex_lock(&g_watchdog_lock);
+        while (!g_watchdog_stop) {
+            if (pthread_cond_timedwait(&g_watchdog_cond, &g_watchdog_lock, &dl) != 0)
+                break;   /* interval elapsed (ETIMEDOUT) — go scan */
         }
+        pthread_mutex_unlock(&g_watchdog_lock);
         if (g_watchdog_stop) break;
 
         sw_swarm_t *sw = g_swarm;
@@ -854,6 +865,49 @@ int sw_check_reds(void) {
  * gets a unique "prev" to link through. The subsequent store to prev->rq_next
  * completes the link (consumer waits for this to become non-NULL).
  */
+/* SW_SCHED_TRACE=1 — 1Hz scheduler counter telemetry on stderr, for
+ * diffing a wedged run against a healthy one (the slope_message
+ * phase-lock hunt). Relaxed atomic counters, all increments gated behind
+ * the flag; zero cost when off. */
+static int g_sched_trace = -1;
+static _Atomic uint64_t g_tr_enq, g_tr_sig, g_tr_idle_seen,
+                        g_tr_park, g_tr_park_signal, g_tr_park_timeout,
+                        g_tr_spin_hit, g_tr_guard_hit;
+static void *sched_trace_fn(void *arg) {
+    (void)arg;
+    uint64_t p[8] = {0};
+    while (g_swarm && g_swarm->running) {
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+        uint64_t c[8] = {
+            atomic_load(&g_tr_enq), atomic_load(&g_tr_sig),
+            atomic_load(&g_tr_idle_seen), atomic_load(&g_tr_park),
+            atomic_load(&g_tr_park_signal), atomic_load(&g_tr_park_timeout),
+            atomic_load(&g_tr_spin_hit), atomic_load(&g_tr_guard_hit),
+        };
+        fprintf(stderr,
+            "[sched-trace] enq=%llu sig=%llu idle_seen=%llu park=%llu "
+            "park_sig=%llu park_to=%llu spin_hit=%llu guard_hit=%llu\n",
+            (unsigned long long)(c[0]-p[0]), (unsigned long long)(c[1]-p[1]),
+            (unsigned long long)(c[2]-p[2]), (unsigned long long)(c[3]-p[3]),
+            (unsigned long long)(c[4]-p[4]), (unsigned long long)(c[5]-p[5]),
+            (unsigned long long)(c[6]-p[6]), (unsigned long long)(c[7]-p[7]));
+        memcpy(p, c, sizeof(p));
+    }
+    return NULL;
+}
+static void sched_trace_maybe_start(void) {
+    if (g_sched_trace < 0) {
+        const char *e = getenv("SW_SCHED_TRACE");
+        g_sched_trace = (e && e[0] == '1') ? 1 : 0;
+        if (g_sched_trace) {
+            pthread_t t;
+            pthread_create(&t, NULL, sched_trace_fn, NULL);
+            pthread_detach(t);
+        }
+    }
+}
+
 void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     uint32_t prio = proc->priority;
     if (prio >= SW_PRIO_NUM) prio = SW_PRIO_NORMAL;
@@ -869,10 +923,13 @@ void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     atomic_store_explicit(&prev->rq_next, proc, memory_order_release);
 
     /* Wake scheduler if it was idle (rare — only when queue was empty) */
+    if (g_sched_trace == 1) atomic_fetch_add_explicit(&g_tr_enq, 1, memory_order_relaxed);
     if (atomic_load_explicit(&rq->idle, memory_order_relaxed)) {
+        if (g_sched_trace == 1) atomic_fetch_add_explicit(&g_tr_idle_seen, 1, memory_order_relaxed);
         pthread_mutex_lock(&rq->idle_lock);
         pthread_cond_signal(&rq->idle_cond);
         pthread_mutex_unlock(&rq->idle_lock);
+        if (g_sched_trace == 1) atomic_fetch_add_explicit(&g_tr_sig, 1, memory_order_relaxed);
     }
 }
 
@@ -1087,15 +1144,25 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * found the peer's scheduler PARKED). Spin-poll local + steal
          * for a bounded window first: while spinning, rq->idle stays 0,
          * so the producer's sw_add_to_runq pays NOTHING (no lock, no
-         * signal) and the consumer picks the work up within ~ns. Budget
-         * is per-idle-transition, env-tunable: SW_SPIN_US (default 30,
-         * 0 disables). Burns at most that many us of CPU per scheduler
-         * per idle transition; the 0.5ms park below is unchanged. */
+         * signal) and the consumer picks the work up within ~ns.
+         *
+         * *** OPT-IN (SW_SPIN_US, default 0/off) until the spin-gated
+         * scheduler race is fixed: with spin enabled, a depth-1
+         * cross-scheduler ping-pong (gc-slope message probe, 32KB
+         * payloads) deadlocks ~15% of runs — both fibers parked WAITING,
+         * all runqs empty, zero enqueues forever (sched-trace telemetry:
+         * enq=0, park_to~6600/s). 0/60 wedges with spin off, 9/60 with
+         * spin on; the publish-idle-then-repoll guard below does NOT
+         * close it, so the lost work is upstream of the park (runq push
+         * vs spinning-pick, or the receive waiting-flag handoff).
+         * Repro: tests/stress/spin_wedge_hunt.sh. Root-cause with TSan
+         * (Phase 2.3/2.4); measured upside when safe: 58.4 -> 4.5us/rt.
+         * SW_SPIN_US=30 to opt in for measurement. *** */
         if (!proc) {
             static int spin_iters = -1;
             if (spin_iters < 0) {
                 const char *e = getenv("SW_SPIN_US");
-                int us = e ? atoi(e) : 30;
+                int us = e ? atoi(e) : 0;   /* DEFAULT OFF — see above */
                 if (us < 0) us = 0;
                 if (us > 1000) us = 1000;
                 /* ~25 pause-loop iterations per us on contemporary cores
@@ -1115,6 +1182,8 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 __asm__ volatile("pause");
 #endif
             }
+            if (proc && g_sched_trace == 1)
+                atomic_fetch_add_explicit(&g_tr_spin_hit, 1, memory_order_relaxed);
         }
 
         if (proc) {
@@ -1183,18 +1252,46 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             sched->idle_waits++;
             /* Mark as idle and sleep until woken by a producer.
              * The idle flag is checked by sw_add_to_runq — if set,
-             * it signals the condvar to wake us. */
+             * it signals the condvar to wake us.
+             *
+             * LOST-WAKEUP GUARD (standard sleeper protocol): a producer
+             * that enqueues between our last failed pick and the idle=1
+             * store sees idle==0 and SKIPS the signal — the work then
+             * sits for the full 0.5ms timeout. A serial message chain
+             * can phase-lock into that miss on EVERY hop: observed as a
+             * gc-slope message probe degrading from ~100ms to 25+
+             * MINUTES (each hop eating a 0.5ms park). Publish idle=1
+             * first, then RE-POLL once; only park if still empty. The
+             * producer now either sees idle=1 (and signals) or its
+             * enqueue happens-before our re-poll (and we find it). */
             sw_runq_t *rq = &sched->runq;
             pthread_mutex_lock(&rq->idle_lock);
             atomic_store_explicit(&rq->idle, 1, memory_order_release);
+            sw_process_t *late = sw_pick_next(sched);
+            if (!late) late = sw_steal_work(sched);
+            if (late) {
+                atomic_store_explicit(&rq->idle, 0, memory_order_release);
+                pthread_mutex_unlock(&rq->idle_lock);
+                if (g_sched_trace == 1)
+                    atomic_fetch_add_explicit(&g_tr_guard_hit, 1, memory_order_relaxed);
+                /* Hand it back to our queue and loop — the next pick
+                 * runs it through the normal path immediately. */
+                sw_add_to_runq(rq, late);
+                continue;
+            }
+            if (g_sched_trace == 1)
+                atomic_fetch_add_explicit(&g_tr_park, 1, memory_order_relaxed);
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 500000;  /* +0.5ms (tighter poll for responsiveness) */
+            ts.tv_nsec += 500000;  /* +0.5ms (safety net; signals do the work) */
             if (ts.tv_nsec >= 1000000000) {
                 ts.tv_sec++;
                 ts.tv_nsec -= 1000000000;
             }
-            pthread_cond_timedwait(&rq->idle_cond, &rq->idle_lock, &ts);
+            int _twrc = pthread_cond_timedwait(&rq->idle_cond, &rq->idle_lock, &ts);
+            if (g_sched_trace == 1)
+                atomic_fetch_add_explicit(_twrc == 0 ? &g_tr_park_signal : &g_tr_park_timeout,
+                                          1, memory_order_relaxed);
             atomic_store_explicit(&rq->idle, 0, memory_order_release);
             pthread_mutex_unlock(&rq->idle_lock);
         }
@@ -1440,6 +1537,8 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         fflush(stderr);
     }
 
+    sched_trace_maybe_start();   /* SW_SCHED_TRACE=1 → 1Hz counters on stderr */
+
     /* Install crash handler so segfaults produce a backtrace instead of
      * a bare "segmentation fault" message.  macOS provides backtrace()
      * in <execinfo.h> which gives us symbol names + offsets. */
@@ -1477,9 +1576,14 @@ void sw_shutdown(int swarm_id) {
 
     g_swarm->running = 0;
 
-    /* Stop deadlock watchdog (if running) before tearing down the arena. */
+    /* Stop deadlock watchdog (if running) before tearing down the arena.
+     * Signal under the lock so the join returns immediately instead of
+     * after the tail of a sleep interval (was ~50-100ms on every exit). */
     if (g_watchdog_enabled) {
+        pthread_mutex_lock(&g_watchdog_lock);
         g_watchdog_stop = 1;
+        pthread_cond_signal(&g_watchdog_cond);
+        pthread_mutex_unlock(&g_watchdog_lock);
         pthread_join(g_watchdog_thread, NULL);
         g_watchdog_enabled = 0;
     }
