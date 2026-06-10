@@ -148,7 +148,13 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   (legal-but-wrong interleaving of the waiting/idle flag handshakes). Root-cause needs
   protocol reasoning / model checking against `tests/stress/spin_wedge_hunt.sh`, not TSan.
 
-### 2.4 Make shared state atomic-or-locked  ⏳ **IN PROGRESS** (audit complete, worklist below)
+### 2.4 Make shared state atomic-or-locked  ⏳ **IN PROGRESS** (the headline race is FIXED; worklist below)
+- **The P1 spin-gated deadlock is root-caused and fixed**: Dekker StoreLoad in the receive
+  waiting-flag handshake (release-store `waiting` then acquire-load `sig_head` — no ordering
+  across different objects). All `waiting` participants are now seq_cst; 0/300 wedge runs
+  post-fix; spin default back ON (cross-sched ping-pong 58.4 → 3.0 µs/rt, 19×). The wedge
+  AUTOPSY (`SW_SCHED_TRACE=1/2`: stall detector + state dump + event ring) stays in the
+  runtime as the standing diagnosis tool. Gate: `tests/stress/spin_wedge_hunt.sh`.
 - TSan audit run across msg ping-pong, spawn storm, and phase 2/4/5 binaries (GenServer,
   supervisor crash/restart, DynSup, StateMachine, ProcessGroups). Mailbox wakeups + runq are
   CLEAN (proper C11 atomics). Scheduler/swarm control flags fixed in 2.3.
@@ -167,7 +173,8 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
      by asserts) — fix the tests with atomics, don't suppress.
 - Suppressed by design (documented in tests/stress/tsan.supp): the warn-only watchdog scanner
   and the `sw_stats` debug printer.
-- The spin-gated P1 deadlock is NOT in this class (no C11 race — protocol bug; see 2.2/2.3).
+- (The former P1 deadlock was exactly such a protocol bug — found via the autopsy, fixed
+  with seq_cst, see above. TSan stayed silent on it throughout: ordering, not racing.)
 
 ### 2.5 Allocation-failure safety
 - Inject deterministic `malloc`/arena-create failures. Ensure **every** path either returns an

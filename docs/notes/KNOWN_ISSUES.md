@@ -31,26 +31,6 @@ unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
 **Impact:** recursion-heavy programs must be compiled. **Workaround:**
 `swc build` — the interpreter is for short scripts, tests, and the REPL.
 
-### P1 (latent): spin-gated scheduler deadlock under depth-1 cross-scheduler ping-pong
-
-With the idle-loop spin enabled (`SW_SPIN_US>0`), a depth-1 ping-pong
-between two processes on different schedulers (~32KB payloads — the
-gc-slope message probe shape) deadlocks in ~15% of runs: both fibers
-parked WAITING, every runq empty, and ZERO enqueues from then on
-(sched-trace telemetry: `enq=0`, `park_to≈6600/s`; the ~27% CPU of a
-wedged process is pure park churn). 0/60 wedges with spin off, 9/60
-with spin on. The publish-idle-then-repoll guard in the park path does
-NOT close it, so the in-flight message/wake is lost upstream of the
-park — suspects: the runq Vyukov push racing the spinning consumer's
-pick, or the receive waiting-flag handoff. The spin therefore ships
-**opt-in, default off**; the measured upside once fixed is 58.4 →
-4.5µs per cross-scheduler round trip.
-
-**Repro:** `tests/stress/spin_wedge_hunt.sh` (first wedge exits 1).
-**Diagnosis aid:** `SW_SCHED_TRACE=1` prints 1Hz scheduler counters.
-**Fix path:** TSan build + atomics audit (roadmap Phase 2.3/2.4); wire
-the hunt script into the stress gate once the race is closed.
-
 ### Blocking C-call builtins occupy their scheduler OS thread
 
 The curl-backed HTTP client builtins (`http_get` / `http_post` /
@@ -102,6 +82,39 @@ errors. This is a deliberate tradeoff (matching the dynamic, Erlang-shaped
 model), recorded here so the behavior is not a surprise.
 
 ## Recently cleared
+
+### Spin-gated scheduler deadlock — root-caused: Dekker StoreLoad bug in the receive handshake
+
+Cleared 2026-06-10. The ~15%-incidence total deadlock under depth-1
+cross-scheduler ping-pong (both fibers parked WAITING, zero enqueues
+forever) was a one-line memory-ordering bug, not a data race:
+`sw_receive_any`'s fast path did
+
+```c
+atomic_store_explicit(&waiting, 1, memory_order_release);
+sig = atomic_load_explicit(&sig_head, memory_order_acquire);   // different var!
+```
+
+— Dekker's pattern. The store sat in the receiver's store buffer past
+the load (x86 StoreLoad reordering; C11 gives release→acquire on
+DIFFERENT objects no ordering at all), so the receiver saw a pre-push
+`sig_head` and parked, while the sender's wake-xchg read `waiting==0`
+from memory and skipped the enqueue. Both sides lost; the message sat
+in the mailbox forever. The wedge autopsy (`SW_SCHED_TRACE`) showed the
+exact corpse: parked, `waiting=1`, `sig_head!=NULL`. TSan was silent
+throughout — every access was atomic; the bug was pure ordering. The
+three sibling receive paths survived on x86 only because
+`mailbox_drain`'s locked xchg is a full fence — NOT a guarantee on
+arm64 (the macOS daily driver), so they were latent there too.
+
+Fix: every `waiting` participant is seq_cst (all four stores, the
+sig_head probe load, `mailbox_wake`'s exchange) — total-order
+correctness on every architecture, nanosecond cost on cold paths.
+Verified: **0/300** wedge-hunt runs post-fix (~45 expected at the old
+incidence), full battery + matrix green, tsan-gate clean. The idle-loop
+spin (`SW_SPIN_US`) defaults ON again: cross-scheduler ping-pong
+measured **58.4 → 3.0 µs/rt (19×)**. Regression gate:
+`tests/stress/spin_wedge_hunt.sh`.
 
 ### `try/catch` caught builtin panics in the interpreter but not compiled
 
