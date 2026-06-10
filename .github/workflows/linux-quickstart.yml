@@ -148,3 +148,11 @@ jobs:
         # counters + ctx_lock; the later spawn-storm crash cleared on
         # native Linux x86_64 May 29, so any miss here is a regression.
         run: make stress
+
+      - name: Fuzz (Phase 3 — untrusted-input boundaries under ASAN/UBSAN)
+        # 20k mutations per target over parser, JSON decoder (agent-facing
+        # boundary), distribution unmarshal, and HTTP header parser. Every
+        # external-input surface must be memory-safe on arbitrary bytes.
+        # fuzz-json found two real heap-overflows (number force-advance past
+        # NUL, backslash-at-EOF) on the first run — so this gate earns its keep.
+        run: make fuzz

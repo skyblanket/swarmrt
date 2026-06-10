@@ -2557,6 +2557,14 @@ void sw_val_free(sw_val_t *v) {
         free(v->v.tuple.items); break;
     case SW_VAL_FUN: /* don't free closure env -- owned by interpreter */ break;
     case SW_VAL_MAP:
+        /* Recurse into key/val nodes (mirrors the tuple/list case) — the
+         * arrays alone left every entry's value node leaked. Safe: all
+         * callers free fully-owned trees (json_decode output, test args);
+         * none alias map sub-values. */
+        for (int i = 0; i < v->v.map.count; i++) {
+            sw_val_free(v->v.map.keys[i]);
+            sw_val_free(v->v.map.vals[i]);
+        }
         free(v->v.map.keys); free(v->v.map.vals); break;
     case SW_VAL_BYTES: free(v->v.bytes.data); break;  /* always own a block (len>=1 alloc) */
     default: break;
@@ -5620,6 +5628,11 @@ static sw_val_t *_jd_parse_string(const char **pp) {
     while (**pp && **pp != '"' && len < (int)sizeof(buf) - 5) {
         if (**pp == '\\') {
             (*pp)++;
+            /* A backslash as the last byte before the NUL: stop. Otherwise
+             * the switch's default/simple cases copy the NUL and (*pp)++
+             * step PAST the terminator → heap-buffer-overflow on the next
+             * loop read (found by fuzz-json). The while gate ends the loop. */
+            if (**pp == '\0') break;
             switch (**pp) {
                 case 'n': buf[len++] = '\n'; (*pp)++; break;
                 case 't': buf[len++] = '\t'; (*pp)++; break;
@@ -5716,7 +5729,15 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
     while (**pp >= '0' && **pp <= '9') (*pp)++;
     if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
     if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
-    if (*pp == start) { (*pp)++; return sw_val_nil(); }
+    if (*pp == start) {
+        /* Unparseable char where a value was expected. Force progress so
+         * callers' loops can't spin — but NEVER past the NUL terminator:
+         * at end-of-input (e.g. `{"a":` then EOF) stepping past `\0` is a
+         * heap-buffer-overflow (found by fuzz-json). The enclosing array/
+         * object loops gate on `**pp`, so leaving pp at the NUL ends them. */
+        if (**pp != '\0') (*pp)++;
+        return sw_val_nil();
+    }
     char tmp[64];
     size_t numlen = *pp - start;
     if (numlen > 63) numlen = 63;

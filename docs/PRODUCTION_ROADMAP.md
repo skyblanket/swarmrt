@@ -26,7 +26,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
 | 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
-| 3 | Security & fault isolation (fuzzing, limits) | ⬜ pending |
+| 3 | Security & fault isolation (fuzzing, limits) | ⏳ fuzz boundaries ✅ (parser/JSON/dist/HTTP, depth-guarded); quotas/backpressure remain |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
 
@@ -215,14 +215,25 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   full day. This is a sign-off that requires a sustained host run; the harness is ready.
 ---
 
-## Phase 3 — SECURITY & FAULT ISOLATION
-- Fuzz every external-input boundary: parser/compiler, JSON, distribution protocol, HTTP/WebSocket,
-  node unmarshalling, database + file builtins. (`make fuzz` already covers parse/marshal/http —
-  extend it.)
-- Harden limits: max message size, mailbox limits + backpressure, process + memory quotas,
-  recursion/decode depth (JSON depth guard `g_json_depth` exists — audit the rest), connection +
-  request timeouts.
-- Prove malformed input cannot crash the runtime or another process.
+## Phase 3 — SECURITY & FAULT ISOLATION  ⏳ (fuzz + depth limits DONE; quotas/backpressure remain)
+
+**Done (Round-7 continuation):**
+- Fuzz every external-input boundary under ASAN/UBSAN, 20k mutations each, wired into CI
+  (`make fuzz`): parser, **JSON decoder** (the agent-facing boundary), distribution
+  `sw_unmarshal`, HTTP header parser. fuzz-json found and fixed **two real heap-buffer-overflows**
+  on its first run (number force-advance past NUL; backslash-as-last-byte in a string), plus a
+  latent incomplete-free in `sw_val_free`'s map case.
+- Recursion/decode-depth guards verified on every recursive decoder: parser
+  (`SW_PARSE_MAX_DEPTH` + node budget + stack-headroom probe), JSON (`SW_JD_MAX_DEPTH` /
+  compiled `SW_JSON_MAX_DEPTH`), distribution unmarshal (`SW_UNMARSH_MAX_DEPTH`).
+- Parser can't OOM swc (the receive-clause spin fix + per-parse node budget, Phase-3 fuzz item).
+
+**Remaining (feature work, mostly product decisions):**
+- Limits/quotas: max message size, mailbox depth limit + backpressure, per-node process +
+  memory quotas, connection/request timeouts. (`SW_MAX_PROCS` process ceiling exists; the rest
+  are policy knobs to design.)
+- Extend fuzz to the WebSocket frame parser + the `db_*`/SQLite arg path.
+- Prove malformed input cannot crash another process (cross-process isolation under fuzz).
 
 ## Phase 4 — OPERATIONAL READINESS
 - Observability: per-process memory / mailbox depth / reductions, spawn/crash/restart counters,

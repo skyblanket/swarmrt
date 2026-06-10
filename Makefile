@@ -268,11 +268,20 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 
-.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http
+.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json
 fuzz-parse: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
+
+# JSON decoder — the agent-facing input boundary (every LLM tool-call
+# response / parsed HTTP body). Proves no crash/over-read/stack-overflow
+# on malformed or adversarially-nested input (the corpus includes a
+# 5000-deep array; g_jd_depth must bound it).
+fuzz-json: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
+	    tests/fuzz/fuzz_json.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_json $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
 
 fuzz-marshal: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
@@ -287,7 +296,7 @@ fuzz-http: dirs
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
 
-fuzz: fuzz-parse fuzz-marshal fuzz-http
+fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http
 
 # GC v1 correctness gate: the copy-on-escape stress harness compiled with ASAN +
 # SW_ARENA_POISON. Workers build compound values in their per-process arenas,
