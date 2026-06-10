@@ -516,7 +516,20 @@ static tok_t lnext(lex_t *l) {
  * AST (types defined in swarmrt_lang.h)
  * ========================================================================= */
 
+/* Per-parse AST-node budget. EVERY node (mknode + node_dup) is counted;
+ * par_init resets the counter, and par_primary aborts the parse with a
+ * clean error once it is exceeded. This is the O(1) backstop against any
+ * pathological parser loop — a malformed `.sw` that drives a
+ * non-advancing or unbounded loop (found by `make fuzz`: a single mutated
+ * input allocated ~16 GB of nodes and OOM-killed swc) now fails parsing
+ * instead of taking the host down. 4M nodes ≈ a 100k+-line program; far
+ * beyond any real source, well under a memory problem (~256 MB of node
+ * structs). Thread-local: parsers run per-thread (tool registry, LSP). */
+#define SW_PARSE_MAX_NODES 4000000
+static __thread long g_parse_node_count;
+
 static node_t *mknode(node_type_t type, int line) {
+    g_parse_node_count++;
     node_t *n = calloc(1, sizeof(node_t));
     n->type = type; n->line = line;
     return n;
@@ -592,6 +605,7 @@ static void node_free(node_t *n) {
  * the flat `*out = *n` struct copy; we then re-dup the pointer children. */
 static node_t *node_dup(node_t *n) {
     if (!n) return NULL;
+    g_parse_node_count++;
     node_t *out = calloc(1, sizeof(node_t));
     *out = *n;  /* copies scalars + char[] fields + (stale) child pointers */
     switch (n->type) {
@@ -668,12 +682,21 @@ typedef struct {
     tok_t cur;
     int err;
     char errmsg[256];
+    /* Expression-nesting guard: the recursive-descent chain
+     * (par_expr -> ... -> par_primary -> par_expr) consumes C stack per
+     * nesting level, and adversarial input like ((((((... overflowed it
+     * (found by make fuzz, first run, ASAN stack-overflow in
+     * par_primary). 500 levels is far beyond any real program and well
+     * inside a few hundred KB of stack. */
+    int depth;
 } par_t;
 
 static void par_init(par_t *p, const char *src) {
     lex_init(&p->lex, src);
     p->cur = lnext(&p->lex);
     p->err = 0; p->errmsg[0] = 0;
+    p->depth = 0;
+    g_parse_node_count = 0;   /* reset the per-parse node budget */
 }
 
 static tok_t par_adv(par_t *p) {
@@ -701,6 +724,7 @@ static tok_t par_expect(par_t *p, tok_type_t t, const char *msg) {
 
 /* Forward declarations */
 static node_t *par_expr(par_t *p);
+static node_t *par_primary_inner(par_t *p);
 static node_t *par_stmt(par_t *p);
 static node_t *par_block(par_t *p);
 
@@ -710,7 +734,7 @@ static void restore_hash_sentinels(char *s) {
 }
 
 /* String interpolation: "hello #{name}!" -> concat chain */
-static node_t *parse_interp_string(const char *text, int line) {
+static node_t *parse_interp_string(const char *text, int line, int parent_depth) {
     if (!strstr(text, "#{")) return NULL;
     node_t *result = NULL;
     const char *pos = text;
@@ -753,6 +777,10 @@ static node_t *parse_interp_string(const char *text, int line) {
         if (elen >= (int)sizeof(expr_text)) elen = (int)sizeof(expr_text) - 1;
         memcpy(expr_text, interp, elen); expr_text[elen] = 0;
         par_t ep; par_init(&ep, expr_text);
+        /* Inherit the caller's nesting budget: each interpolation level
+         * previously got a FRESH parser (depth=0), so nested f-strings
+         * recursed through unbounded new parser instances. */
+        ep.depth = parent_depth;
         /* The sub-parser lexes the extracted text from scratch, so every
          * node it makes carries line 1 — and any diagnostic against an
          * interpolated expression ("unknown function ... at line 1")
@@ -896,7 +924,52 @@ done:
 }
 
 /* Primary expression */
+/* 128: beyond any real program (128 nested parens/calls), and small
+ * enough that even ASAN-inflated parser frames (~30KB/cycle observed)
+ * stay well inside an 8MB stack. */
+#define SW_PARSE_MAX_DEPTH 128
+
+static int interp_stack_near_limit(void);   /* defined with the interpreter below */
+
 static node_t *par_primary(par_t *p) {
+    /* Node-budget backstop FIRST — before the err short-circuit below — so
+     * a pathological loop that keeps re-entering par_primary while p->err
+     * is already set (the receive-clause spin) is still bounded. par_primary
+     * is on the path of every expression; once we force the message the
+     * enclosing loops drain on their !err guards. */
+    if (g_parse_node_count > SW_PARSE_MAX_NODES) {
+        if (!p->err) {
+            snprintf(p->errmsg, sizeof(p->errmsg),
+                     "line %d: program too large (parse exceeded %d AST nodes)",
+                     p->cur.line, SW_PARSE_MAX_NODES);
+            p->err = 1;
+        }
+        return mknode(N_INT, p->cur.line);
+    }
+    /* After ANY parse error, stop descending — callers don't all check
+     * p->err and could re-enter on the unconsumed token, growing C stack
+     * even with the depth budget exhausted-and-decremented. */
+    if (p->err) return mknode(N_INT, p->cur.line);
+    /* Two guards: a fixed nesting budget AND the real-headroom probe —
+     * parser frames are enormous (tok_t carries an 8KB text buffer and
+     * gets copied per frame; ASAN multiplies further), so a count alone
+     * can lie about safety on small stacks. */
+    if (++p->depth > SW_PARSE_MAX_DEPTH || interp_stack_near_limit()) {
+        if (!p->err) {
+            snprintf(p->errmsg, sizeof(p->errmsg),
+                     "line %d: expression nesting too deep (max %d levels)",
+                     p->cur.line, SW_PARSE_MAX_DEPTH);
+            p->err = 1;
+        }
+        p->depth--;
+        return mknode(N_INT, p->cur.line);   /* placeholder; parse failed */
+    }
+    node_t *_r = par_primary_inner(p);
+    p->depth--;
+    return _r;
+}
+
+static node_t *par_primary_inner(par_t *p) {
     tok_t t = p->cur;
 
     if (t.type == TOK_NUMBER) {
@@ -914,7 +987,7 @@ static node_t *par_primary(par_t *p) {
 
     if (t.type == TOK_STRING) {
         par_adv(p);
-        node_t *interp = parse_interp_string(t.text, t.line);
+        node_t *interp = parse_interp_string(t.text, t.line, p->depth);
         if (interp) return interp;
         node_t *n = mknode(N_STRING, t.line);
         strncpy(n->v.sval, t.text, sizeof(n->v.sval)-1);
@@ -1335,7 +1408,14 @@ static node_t *par_primary(par_t *p) {
         recv->v.recv.after_body = NULL;
         recv->v.recv.after_ms = -1;  /* sentinel: no after clause */
 
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF) {
+        /* `&& !p->err`: once a clause fails to parse, the cursor stops
+         * advancing (par_primary/par_expect short-circuit on err) but is
+         * not necessarily on RBRACE/AFTER/EOF — without the err guard the
+         * loop spins forever appending empty clauses (a stray token inside
+         * a receive arm OOM'd swc; found by `make fuzz`). par_case's clause
+         * loop already had this guard; par_receive's did not. */
+        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER &&
+               p->cur.type != TOK_EOF && !p->err) {
             node_t *cl = mknode(N_CLAUSE, p->cur.line);
             cl->v.clause.pattern = par_expr(p);
             cl->v.clause.guard = NULL;
@@ -5120,6 +5200,13 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
 /* =========================================================================
  * Public API
  * ========================================================================= */
+
+/* Free an AST returned by sw_lang_parse. Public so callers that parse
+ * but never interpret (fuzz harness, linters, one-shot tooling) can
+ * reclaim it — node_free is otherwise file-static. */
+void sw_lang_free_ast(void *ast) {
+    if (ast) node_free((node_t *)ast);
+}
 
 void *sw_lang_parse(const char *source) {
     par_t p;

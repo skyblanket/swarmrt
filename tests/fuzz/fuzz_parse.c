@@ -18,6 +18,7 @@
 
 /* From swarmrt_lang.h */
 void *sw_lang_parse(const char *source);
+void sw_lang_free_ast(void *ast);
 
 #include "fuzz_standalone.h"
 
@@ -31,7 +32,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* Parser must not crash on any input. Result (AST or NULL) is
      * intentionally discarded — we only care about memory safety. */
     void *ast = sw_lang_parse(src);
-    (void)ast;
+    /* Reclaim the AST: the harness runs detect_leaks=0 (the runtime
+     * itself parse-and-discards on the long-lived path), so without
+     * this each of 20k iterations leaked a whole AST and a mutation
+     * producing a large tree drove cumulative RSS to OOM (~16GB). A
+     * SINGLE parse is bounded; freeing per-iteration keeps the loop so.
+     * A pathological per-parse balloon is now caught by the parser's
+     * own depth + stack-headroom guard, not by the harness running the
+     * host out of memory. */
+    sw_lang_free_ast(ast);
 
     free(src);
     return 0;

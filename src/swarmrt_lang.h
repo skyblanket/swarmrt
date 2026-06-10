@@ -127,6 +127,8 @@ typedef struct {
 
 /* Parse source code, returns module AST (or NULL on error) */
 void *sw_lang_parse(const char *source);
+/* Free an AST from sw_lang_parse (parse-only callers; node_free is static). */
+void sw_lang_free_ast(void *ast);
 
 /* 1 if the parsed module defines a function named `name` (for validating a
  * parsed module before use, e.g. the tool registry checking for `run`). */
