@@ -124,9 +124,12 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   Documented in KNOWN_ISSUES; those tests SKIP at S=1; `run_tests.sh` now bounds every test
   with a 180s timeout so a hang FAILS instead of wedging the suite. Real fix is the Phase-3
   item below (blocking transports → I/O thread pool with fiber park/wake, like `wsc_*`).
-- Cross-scheduler wake cost (Round-7 O4): bounded spin-before-park in the scheduler idle loop
-  (`SW_SPIN_US`, default 30, 0 disables). Measured: cross-sched ping-pong **58.4 → 4.5 µs/rt
-  (13×)**; spawn/exit cycles −26%; same-sched and single-sched unchanged.
+- Cross-scheduler wake cost (Round-7 O4): bounded spin-before-park in the scheduler idle loop.
+  Measured: cross-sched ping-pong **58.4 → 4.5 µs/rt (13×)**; spawn/exit −26%. **BUT the spin
+  gates a latent scheduler race** — depth-1 ping-pong deadlocks ~15% of runs with spin on
+  (0/60 off, 9/60 on; both fibers WAITING, zero enqueues — see KNOWN_ISSUES P1). Shipped
+  **opt-in (`SW_SPIN_US`, default 0/off)** with reproducer `tests/stress/spin_wedge_hunt.sh`
+  and `SW_SCHED_TRACE=1` telemetry. Root-cause in 2.3/2.4, then flip the default back on.
 
 ### 2.3 ThreadSanitizer build + race test
 - macOS clang has TSan. Build the runtime under `-fsanitize=thread` and run a multi-scheduler

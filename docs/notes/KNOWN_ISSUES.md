@@ -31,6 +31,26 @@ unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
 **Impact:** recursion-heavy programs must be compiled. **Workaround:**
 `swc build` — the interpreter is for short scripts, tests, and the REPL.
 
+### P1 (latent): spin-gated scheduler deadlock under depth-1 cross-scheduler ping-pong
+
+With the idle-loop spin enabled (`SW_SPIN_US>0`), a depth-1 ping-pong
+between two processes on different schedulers (~32KB payloads — the
+gc-slope message probe shape) deadlocks in ~15% of runs: both fibers
+parked WAITING, every runq empty, and ZERO enqueues from then on
+(sched-trace telemetry: `enq=0`, `park_to≈6600/s`; the ~27% CPU of a
+wedged process is pure park churn). 0/60 wedges with spin off, 9/60
+with spin on. The publish-idle-then-repoll guard in the park path does
+NOT close it, so the in-flight message/wake is lost upstream of the
+park — suspects: the runq Vyukov push racing the spinning consumer's
+pick, or the receive waiting-flag handoff. The spin therefore ships
+**opt-in, default off**; the measured upside once fixed is 58.4 →
+4.5µs per cross-scheduler round trip.
+
+**Repro:** `tests/stress/spin_wedge_hunt.sh` (first wedge exits 1).
+**Diagnosis aid:** `SW_SCHED_TRACE=1` prints 1Hz scheduler counters.
+**Fix path:** TSan build + atomics audit (roadmap Phase 2.3/2.4); wire
+the hunt script into the stress gate once the race is closed.
+
 ### Blocking C-call builtins occupy their scheduler OS thread
 
 The curl-backed HTTP client builtins (`http_get` / `http_post` /
