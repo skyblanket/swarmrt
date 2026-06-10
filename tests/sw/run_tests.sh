@@ -54,8 +54,12 @@ for sw in "$TESTS_DIR"/test_*.sw; do
         continue
     fi
 
-    # Run
-    if "$bin" >"$log" 2>&1; then
+    # Run. Bounded: a hung test must FAIL the suite loudly, not wedge it
+    # forever — the Phase-2.2 scheduler matrix found test_http_request
+    # deadlocking under SW_SCHEDULERS=1 (blocking curl client starves the
+    # in-process server fiber on the only scheduler) and the suite sat on
+    # it indefinitely. 180s is ~20x the slowest healthy test.
+    if timeout 180 "$bin" >"$log" 2>&1; then
         # Pull the summary line + count any PASS lines for the rollup.
         passes=$(grep -c '^PASS ' "$log" || true)
         total_assertions=$((total_assertions + passes))

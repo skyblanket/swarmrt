@@ -3028,9 +3028,10 @@ static sw_val_t *_builtin_supervise(sw_val_t **a, int n) {
     sup_spec.max_seconds = 5;
     sup_spec.children = specs;
     sup_spec.num_children = valid;
+    sup_spec.owns_children = 1;   /* heap specs[]: the supervisor frees it post-copy */
 
     sw_process_t *sup = sw_supervisor_start("sw_sup", &sup_spec);
-    /* specs not freed — supervisor holds a shallow copy of the pointer */
+    if (!sup) free(specs);   /* spawn failed: no supervisor to take ownership */
     return sup ? sw_val_pid(sup) : sw_val_nil();
 }
 
@@ -3684,8 +3685,26 @@ static sw_val_t *_builtin_format(sw_val_t **a, int n) {
  * freed on its exit -> use-after-free. The macro redirects every generated
  * `_sw_error` (here + the codegen try/catch) to the current process's slot. */
 #define _sw_error (*sw_self_error_slot())
+
+/* Compiled try/catch frame. The generated N_TRY allocates one as a C local —
+ * it lives on the process's FIBER stack, so the setjmp state survives a
+ * mid-try yield + resume on another scheduler thread — links it through the
+ * per-process chain head (sw_self_try_chain), and setjmps. error() unwinds by
+ * longjmp to the innermost frame: full dynamic extent, so an error() raised
+ * in a CALLEE lands in the caller's catch, matching the interpreter and every
+ * exception system users come from. With no live frame, error() keeps the
+ * documented no-try behavior: silent, execution continues with nil. Panics
+ * never use this chain — they stay uncatchable (process death). */
+#include <setjmp.h>
+typedef struct _sw_try_frame {
+    jmp_buf jb;
+    struct _sw_try_frame *prev;
+} _sw_try_frame_t;
+#define _sw_try_chain (*(_sw_try_frame_t **)sw_self_try_chain())
+
 static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
+    if (_sw_try_chain) longjmp(_sw_try_chain->jb, 1);
     return sw_val_nil();
 }
 
@@ -3799,11 +3818,15 @@ static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
         sw_val_t *args[1] = { msg };
         return _builtin_panic(args, 1);
     }
-    int is_nil = (!a[0] || a[0]->type == SW_VAL_NIL ||
-                  (a[0]->type == SW_VAL_ATOM && a[0]->v.str &&
-                   strcmp(a[0]->v.str, "nil") == 0));
-    if (!is_nil) return a[0];
-    sw_val_t *msg = (n >= 2) ? a[1] : sw_val_string("expected non-nil value, got nil");
+    /* Falsy = nil OR the 'false' atom — interpreter parity (its expect
+     * always treated 'false' as a failure; this one only caught nil, so
+     * expect(x == y, msg) compiled to a no-op pass-through on mismatch). */
+    int is_falsy = (!a[0] || a[0]->type == SW_VAL_NIL ||
+                    (a[0]->type == SW_VAL_ATOM && a[0]->v.str &&
+                     (strcmp(a[0]->v.str, "nil") == 0 ||
+                      strcmp(a[0]->v.str, "false") == 0)));
+    if (!is_falsy) return a[0];
+    sw_val_t *msg = (n >= 2) ? a[1] : sw_val_string("expected non-nil value, got nil/false");
     sw_val_t *args[1] = { msg };
     return _builtin_panic(args, 1);
 }
@@ -8442,6 +8465,45 @@ static sw_val_t *_builtin_bytes_concat(sw_val_t **a, int n) {
 static sw_val_t *_builtin_string_to_bytes(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     return sw_val_bytes((const uint8_t *)a[0]->v.str, strlen(a[0]->v.str));
+}
+
+/* UTF-8 sequence length from the lead byte (1–4); 1 for invalid leads so a
+ * malformed byte degrades to one char instead of desyncing the walk. */
+static int _sw_utf8_seq_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+/* string_chars(s) → list of single-CODEPOINT strings. The codepoint-aware
+ * complement to byte-oriented string_length/string_sub: slicing UTF-8 text
+ * by bytes corrupts multi-byte runes (Round-7 audit O7), and agent code
+ * handles non-ASCII text constantly. length(string_chars(s)) is the
+ * codepoint length; reassemble slices with Std.join(chars, ""). Walks raw
+ * UTF-8 sequence lengths (no grapheme clustering — combining marks stay
+ * separate codepoints, documented). */
+static sw_val_t *_builtin_string_chars(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_list(NULL, 0);
+    const char *s = a[0]->v.str ? a[0]->v.str : "";
+    size_t len = strlen(s);
+    int cap = (int)len + 1;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+    int cnt = 0;
+    size_t i = 0;
+    while (i < len) {
+        int sl = _sw_utf8_seq_len((unsigned char)s[i]);
+        if (i + (size_t)sl > len) sl = 1;   /* truncated tail sequence */
+        char buf[8];
+        memcpy(buf, s + i, sl);
+        buf[sl] = 0;
+        items[cnt++] = sw_val_string(buf);
+        i += (size_t)sl;
+    }
+    sw_val_t *r = sw_val_list(items, cnt);
+    free(items);
+    return r;
 }
 
 /* bytes_to_string(b) → string. Renders bytes as a string; truncates at the

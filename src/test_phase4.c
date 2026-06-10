@@ -36,7 +36,7 @@ static void *a1_get_value(void *state, void *arg) {
     return state; /* Return state directly (it's just an int cast to void*) */
 }
 
-static volatile int a1_passed = 0;
+static _Atomic int a1_passed = 0;
 
 static void a1_runner(void *arg) {
     (void)arg;
@@ -72,7 +72,7 @@ static void *a2_get_value(void *state, void *arg) {
     return state;
 }
 
-static volatile int a2_passed = 0;
+static _Atomic int a2_passed = 0;
 
 static void a2_runner(void *arg) {
     (void)arg;
@@ -116,7 +116,7 @@ static void *a3_get_value(void *state, void *arg) {
     return state;
 }
 
-static volatile int a3_passed = 0;
+static _Atomic int a3_passed = 0;
 
 static void a3_runner(void *arg) {
     (void)arg;
@@ -146,7 +146,7 @@ static void test_agent_get_and_update(void) {
  * A4: Agent start_link (linked to parent, receives EXIT)
  * ========================================================================= */
 
-static volatile int a4_passed = 0;
+static _Atomic int a4_passed = 0;
 
 static void a4_runner(void *arg) {
     (void)arg;
@@ -187,7 +187,7 @@ static void *a5_get_value(void *state, void *arg) {
     return state;
 }
 
-static volatile int a5_workers_done = 0;
+static _Atomic int a5_workers_done = 0;
 
 static void a5_worker(void *arg) {
     (void)arg;
@@ -195,10 +195,10 @@ static void a5_worker(void *arg) {
         /* Use get_and_update for atomic increment (call = synchronized) */
         sw_agent_get_and_update("a5_agent", (sw_agent_gau_fn)a3_inc_and_return, NULL, 5000);
     }
-    __sync_fetch_and_add(&a5_workers_done, 1);
+    atomic_fetch_add(&a5_workers_done, 1);
 }
 
-static volatile int a5_passed = 0;
+static _Atomic int a5_passed = 0;
 
 static void a5_runner(void *arg) {
     (void)arg;
@@ -239,8 +239,8 @@ static void test_agent_concurrent(void) {
  * B1: Application start/stop
  * ========================================================================= */
 
-static volatile int b1_worker_a_running = 0;
-static volatile int b1_worker_b_running = 0;
+static _Atomic int b1_worker_a_running = 0;
+static _Atomic int b1_worker_b_running = 0;
 
 static void b1_worker_a(void *arg) {
     (void)arg;
@@ -256,7 +256,7 @@ static void b1_worker_b(void *arg) {
     sw_receive((uint64_t)-1);
 }
 
-static volatile int b1_passed = 0;
+static _Atomic int b1_passed = 0;
 
 static void test_app_start_stop(void) {
     printf("\n=== B1: Application start/stop ===\n");
@@ -297,7 +297,7 @@ static void test_app_start_stop(void) {
  * B2: Application get_supervisor
  * ========================================================================= */
 
-static volatile int b2_worker_running = 0;
+static _Atomic int b2_worker_running = 0;
 
 static void b2_worker(void *arg) {
     (void)arg;
@@ -336,11 +336,11 @@ static void test_app_get_supervisor(void) {
  * B3: Application supervisor restarts children
  * ========================================================================= */
 
-static volatile int b3_starts = 0;
+static _Atomic int b3_starts = 0;
 
 static void b3_crasher(void *arg) {
     (void)arg;
-    int n = __sync_fetch_and_add(&b3_starts, 1);
+    int n = atomic_fetch_add(&b3_starts, 1);
     if (n == 0) {
         /* First start: crash */
         sw_self()->exit_reason = 1;
@@ -382,7 +382,7 @@ static void test_app_restart(void) {
  * D1: DynamicSupervisor start child
  * ========================================================================= */
 
-static volatile int d1_child_running = 0;
+static _Atomic int d1_child_running = 0;
 
 static void d1_worker(void *arg) {
     (void)arg;
@@ -390,7 +390,7 @@ static void d1_worker(void *arg) {
     sw_receive((uint64_t)-1);
 }
 
-static volatile int d1_passed = 0;
+static _Atomic int d1_passed = 0;
 
 static void d1_runner(void *arg) {
     (void)arg;
@@ -425,15 +425,15 @@ static void test_dynsup_start_child(void) {
  * D2: DynamicSupervisor multiple children
  * ========================================================================= */
 
-static volatile int d2_count = 0;
+static _Atomic int d2_count = 0;
 
 static void d2_worker(void *arg) {
     (void)arg;
-    __sync_fetch_and_add(&d2_count, 1);
+    atomic_fetch_add(&d2_count, 1);
     sw_receive((uint64_t)-1);
 }
 
-static volatile int d2_passed = 0;
+static _Atomic int d2_passed = 0;
 
 static void d2_runner(void *arg) {
     (void)arg;
@@ -468,11 +468,11 @@ static void test_dynsup_multiple(void) {
  * D3: DynamicSupervisor child crash + restart (permanent)
  * ========================================================================= */
 
-static volatile int d3_starts = 0;
+static _Atomic int d3_starts = 0;
 
 static void d3_crasher(void *arg) {
     (void)arg;
-    int n = __sync_fetch_and_add(&d3_starts, 1);
+    int n = atomic_fetch_add(&d3_starts, 1);
     if (n == 0) {
         sw_self()->exit_reason = 1;
         return;
@@ -480,7 +480,7 @@ static void d3_crasher(void *arg) {
     sw_receive((uint64_t)-1);
 }
 
-static volatile int d3_passed = 0;
+static _Atomic int d3_passed = 0;
 
 static void d3_runner(void *arg) {
     (void)arg;
@@ -513,15 +513,15 @@ static void test_dynsup_crash_restart(void) {
  * D4: DynamicSupervisor child crash, temporary (no restart)
  * ========================================================================= */
 
-static volatile int d4_starts = 0;
+static _Atomic int d4_starts = 0;
 
 static void d4_temp_crasher(void *arg) {
     (void)arg;
-    __sync_fetch_and_add(&d4_starts, 1);
+    atomic_fetch_add(&d4_starts, 1);
     sw_self()->exit_reason = 1;
 }
 
-static volatile int d4_passed = 0;
+static _Atomic int d4_passed = 0;
 
 static void d4_runner(void *arg) {
     (void)arg;
@@ -554,7 +554,7 @@ static void test_dynsup_temporary(void) {
  * D5: DynamicSupervisor terminate child
  * ========================================================================= */
 
-static volatile int d5_passed = 0;
+static _Atomic int d5_passed = 0;
 
 static void d5_worker(void *arg) {
     (void)arg;
@@ -596,11 +596,11 @@ static void test_dynsup_terminate(void) {
  * D6: DynamicSupervisor circuit breaker
  * ========================================================================= */
 
-static volatile int d6_starts = 0;
+static _Atomic int d6_starts = 0;
 
 static void d6_always_crash(void *arg) {
     (void)arg;
-    __sync_fetch_and_add(&d6_starts, 1);
+    atomic_fetch_add(&d6_starts, 1);
     sw_self()->exit_reason = 1;
 }
 

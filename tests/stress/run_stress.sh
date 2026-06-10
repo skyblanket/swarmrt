@@ -30,6 +30,17 @@ fi
 
 mkdir -p "$(dirname "$BIN")"
 
+# Print the host limits this gate is sensitive to (O8, Round-7): the
+# verdict used to depend SILENTLY on vm.max_map_count — 80k live fiber
+# stacks need ~160k VMAs, over the stock-Linux 65530 default but under
+# Ubuntu-24.04's ~1M and GitHub-runner values, so the same commit passed
+# on CI and crashed locally. The backedge-yield fix removed that failure
+# mode; printing the limits keeps any future env-dependence diagnosable.
+if [ "$(uname)" = "Linux" ]; then
+    echo "host limits: vm.max_map_count=$(sysctl -n vm.max_map_count 2>/dev/null || echo '?')" \
+         "nproc=$(nproc) ulimit-v=$(ulimit -v) ulimit-n=$(ulimit -n)"
+fi
+
 cat > "$SWARMRT_ROOT/tests/stress/bn.sw" << 'EOF'
 module Bisect
 export [main]

@@ -318,6 +318,18 @@ static void supervisor_entry(void *arg) {
         st->children[i].alive = 0;
     }
 
+    /* The caller's heap children[] array is fully consumed now (every spec was
+     * copied into st->children[] above). The supervisor is its owner — the
+     * caller can't free it (init-race: it doesn't know when we'd finished
+     * copying). Only free when the caller flagged heap ownership; stack/static
+     * children arrays (phase4 root sup, C tests) leave owns_children == 0.
+     * Null st->spec.children so nothing reads the freed array (teardown walks
+     * st->children[], not st->spec.children). */
+    if (init->spec.owns_children) {
+        free(init->spec.children);
+        st->spec.children = NULL;
+    }
+
     free(init);
 
     /* Free st + child masters in process_destroy on EVERY exit path (esp. the

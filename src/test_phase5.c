@@ -59,7 +59,7 @@ static sw_sm_result_t light_handle(sw_sm_event_type_t type, void *event,
     return r;
 }
 
-static volatile int s1_passed = 0;
+static _Atomic int s1_passed = 0;
 
 static void s1_runner(void *arg) {
     (void)arg;
@@ -131,7 +131,7 @@ static sw_sm_result_t s2_handle(sw_sm_event_type_t type, void *event,
     return r;
 }
 
-static volatile int s2_passed = 0;
+static _Atomic int s2_passed = 0;
 
 static void s2_runner(void *arg) {
     (void)arg;
@@ -172,7 +172,7 @@ static void test_sm_timeout(void) {
  * S3: State machine stop from handler
  * ========================================================================= */
 
-static volatile int s3_terminated = 0;
+static _Atomic int s3_terminated = 0;
 
 static void *s3_init(void *arg, int *state) {
     *state = 0;
@@ -198,7 +198,7 @@ static void s3_terminate(int state, void *data, int reason) {
     s3_terminated = 1;
 }
 
-static volatile int s3_passed = 0;
+static _Atomic int s3_passed = 0;
 
 static void s3_runner(void *arg) {
     (void)arg;
@@ -285,7 +285,7 @@ static void s4_terminate(int state, void *data, int reason) {
     free(data);
 }
 
-static volatile int s4_passed = 0;
+static _Atomic int s4_passed = 0;
 
 static void s4_runner(void *arg) {
     (void)arg;
@@ -330,7 +330,7 @@ static void test_sm_data(void) {
  * S5: State machine start_link
  * ========================================================================= */
 
-static volatile int s5_passed = 0;
+static _Atomic int s5_passed = 0;
 
 static void *s5_init(void *arg, int *state) { *state = 0; return arg; }
 static sw_sm_result_t s5_handle(sw_sm_event_type_t type, void *event,
@@ -368,7 +368,7 @@ static void test_sm_start_link(void) {
  * S6: State machine call with reply
  * ========================================================================= */
 
-static volatile int s6_passed = 0;
+static _Atomic int s6_passed = 0;
 
 static void *s6_init(void *arg, int *state) { *state = 0; return arg; }
 
@@ -415,7 +415,7 @@ static void test_sm_call_reply(void) {
  * P1: Process group join + dispatch
  * ========================================================================= */
 
-static volatile int p1_received = 0;
+static _Atomic int p1_received = 0;
 
 static void p1_worker(void *arg) {
     (void)arg;
@@ -424,12 +424,12 @@ static void p1_worker(void *arg) {
     uint64_t tag = 0;
     void *msg = sw_receive_any(5000, &tag);
     if (tag == SW_TAG_CAST) {
-        __sync_fetch_and_add(&p1_received, 1);
+        atomic_fetch_add(&p1_received, 1);
     }
     if (msg) free(msg);
 }
 
-static volatile int p1_passed = 0;
+static _Atomic int p1_passed = 0;
 
 static void p1_runner(void *arg) {
     (void)arg;
@@ -464,7 +464,7 @@ static void test_pg_join_dispatch(void) {
  * P2: Process group leave
  * ========================================================================= */
 
-static volatile int p2_passed = 0;
+static _Atomic int p2_passed = 0;
 
 static void p2_worker(void *arg) {
     (void)arg;
@@ -499,7 +499,7 @@ static void test_pg_leave(void) {
  * P3: Process group members list
  * ========================================================================= */
 
-static volatile int p3_passed = 0;
+static _Atomic int p3_passed = 0;
 
 static void p3_worker(void *arg) {
     (void)arg;
@@ -536,7 +536,7 @@ static void test_pg_members(void) {
  * P4: Process group auto-cleanup on death
  * ========================================================================= */
 
-static volatile int p4_passed = 0;
+static _Atomic int p4_passed = 0;
 
 static void p4_mortal(void *arg) {
     (void)arg;
@@ -569,7 +569,7 @@ static void test_pg_cleanup(void) {
  * P5: Multiple groups
  * ========================================================================= */
 
-static volatile int p5_passed = 0;
+static _Atomic int p5_passed = 0;
 
 static void p5_multi_worker(void *arg) {
     (void)arg;

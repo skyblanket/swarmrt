@@ -77,7 +77,7 @@ static void counter_terminate(void *state, int reason) {
 }
 
 /* Caller process — runs call/cast operations against the counter */
-static volatile int gs_test_passed = 0;
+static _Atomic int gs_test_passed = 0;
 
 static void counter_caller(void *arg) {
     (void)arg;
@@ -145,7 +145,7 @@ static void test_genserver_counter(void) {
  * the linked parent gets an EXIT signal.
  * ========================================================================= */
 
-static volatile int gs_link_exit_received = 0;
+static _Atomic int gs_link_exit_received = 0;
 
 static void *noop_init(void *arg) { return arg; }
 
@@ -205,7 +205,7 @@ static void test_genserver_link(void) {
 
 static _Atomic int worker_a_starts = 0;
 static _Atomic int worker_b_starts = 0;
-static volatile int worker_a_should_crash = 1;
+static _Atomic int worker_a_should_crash = 1;
 
 static void sup_worker_a(void *arg) {
     (void)arg;
@@ -323,7 +323,7 @@ static void test_supervisor_circuit_breaker(void) {
  * ========================================================================= */
 
 static _Atomic int transient_starts = 0;
-static volatile int transient_should_fail = 1;
+static _Atomic int transient_should_fail = 1;
 
 static void transient_worker(void *arg) {
     (void)arg;
@@ -375,8 +375,8 @@ static void test_supervisor_transient(void) {
  * Call a non-existent server → should return NULL (timeout or not found).
  * ========================================================================= */
 
-static volatile int timeout_test_done = 0;
-static volatile int timeout_test_passed = 0;
+static _Atomic int timeout_test_done = 0;
+static _Atomic int timeout_test_passed = 0;
 
 static void timeout_caller(void *arg) {
     (void)arg;

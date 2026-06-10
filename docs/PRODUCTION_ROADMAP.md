@@ -25,8 +25,8 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 | Phase | Title | Status |
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
-| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ⏳ **NEXT** |
-| 3 | Security & fault isolation (fuzzing, limits) | ⬜ pending |
+| 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
+| 3 | Security & fault isolation (fuzzing, limits) | ⏳ fuzz boundaries ✅ (parser/JSON/dist/HTTP, depth-guarded); quotas/backpressure remain |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
 
@@ -105,53 +105,135 @@ Generated-code process isolation is proven and every long-lived ownership path i
 
 Do these in roughly this order. Each is "verify locally, then branch → ff-merge to main → push".
 
-### 2.1 Linux LeakSanitizer CI leg  *(highest leverage — closes the leak-blindness above)*
-- Add a job/leg to `.github/workflows/linux-quickstart.yml` that builds the `gc-stress`/`gc-slope`
-  probes on Linux and runs them with `ASAN_OPTIONS=detect_leaks=1` (real LSan, which macOS lacks).
-  This would have caught the kill-path leaks that passed a green slope. Cannot be verified on the
-  macOS dev box — keep the config minimal and low-risk; gate it as advisory first, promote to
-  blocking once green.
-- Bonus: a small standalone C harness (mirror `gc_ets_alias`) that spins the runtime, runs
-  create→cancel/kill→reap loops for timers + supervisors, `sw_swarm_shutdown()`, and lets LSan
-  assert **zero leaks at exit** — a precise, non-noisy leak gate.
+### 2.1 Linux LeakSanitizer CI leg  ✅ **DONE** (Round-7 continuation, 2026-06-09, on Linux)
+- `make lsan-gate` (Linux-only): `tests/gc/lsan_lifecycle.sw` churns every lifecycle owner
+  (timers fired + cancelled incl. pre-trampoline kill, static + dynamic supervisors killed,
+  ETS replace/delete, spawns, compound messages; ~64 KB captures), exits cleanly, and LSan
+  asserts zero definitely-lost blocks at exit. Suppressions in `tests/gc/lsan.supp`, each tied
+  to a documented accepted-minor. **Proven bidirectional** (an injected unreachable block fails
+  it). Advisory CI leg added to linux-quickstart.yml — promote to blocking once green a week.
+- Phase-1 validation: 40 rounds of full lifecycle churn → **zero unsuppressed leaks**.
+- Canary-writing lesson: at `-O1` clang elides an unused `malloc` — escape the pointer through
+  a `volatile` global or your leak canary tests nothing.
 
-### 2.2 Scheduler-count matrix  *(locally verifiable)*
-- Run `make gc-stress`, `make test-sw`, and the phase tests under `SW_SCHEDULERS=1`, `2`, `$(nproc)`,
-  and oversubscribed (`2×nproc`). Fix anything that breaks; wire the matrix into CI.
+### 2.2 Scheduler-count matrix  ✅ **DONE** (same session) — found a real architecture issue
+- Suite + conformance run under `SW_SCHEDULERS=1/2/4/8`. **Finding:** the curl-backed HTTP
+  client builtins block their scheduler OS THREAD, so self-loopback tests (in-process server +
+  blocking client) **deadlock forever under SW_SCHEDULERS=1** — invisible at default counts,
+  and the deadlock watchdog does not flag it (the thread is busy in libcurl, not parked).
+  Documented in KNOWN_ISSUES; those tests SKIP at S=1; `run_tests.sh` now bounds every test
+  with a 180s timeout so a hang FAILS instead of wedging the suite. Real fix is the Phase-3
+  item below (blocking transports → I/O thread pool with fiber park/wake, like `wsc_*`).
+- Cross-scheduler wake cost (Round-7 O4): bounded spin-before-park in the scheduler idle loop.
+  Measured: cross-sched ping-pong **58.4 → 4.5 µs/rt (13×)**; spawn/exit −26%. **BUT the spin
+  gates a latent scheduler race** — depth-1 ping-pong deadlocks ~15% of runs with spin on
+  (0/60 off, 9/60 on; both fibers WAITING, zero enqueues — see KNOWN_ISSUES P1). Shipped
+  **opt-in (`SW_SPIN_US`, default 0/off)** with reproducer `tests/stress/spin_wedge_hunt.sh`
+  and `SW_SCHED_TRACE=1` telemetry. Root-cause in 2.3/2.4, then flip the default back on.
 
-### 2.3 ThreadSanitizer build + race test
-- macOS clang has TSan. Build the runtime under `-fsanitize=thread` and run a multi-scheduler
-  spawn/message/kill + supervisor-crash storm. **Caveat:** TSan may false-positive on the custom
-  asm context-switch (`swarmrt_asm.S`) the way ASAN does on the fiber stacks — characterize and
-  suppress the coroutine noise, keep the real-race signal.
+### 2.3 ThreadSanitizer build + race test  ✅ **DONE** (Round-7 continuation, on Linux)
+- `make tsan-gate`: depth-1 message ping-pong (spin off AND on) + the full 80k spawn storm
+  under `-fsanitize=thread`; fails on any unsuppressed race. **The feared fiber false-positive
+  storm did not materialize**: cross-thread fiber migration synchronizes through the runq's C11
+  atomics, so TSan sees the happens-before edges — no fiber annotations needed.
+- Three real C11 races found and fixed: `sched->active` / `should_exit` / `g_swarm->running`
+  were `volatile int` (not synchronization) — now `_Atomic int` (sw_scheduler is not
+  asm-offset-pinned; cold flags, cost irrelevant); the sched-trace flag initialized after
+  thread creation — now before.
+- Suppressions (`tests/stress/tsan.supp`): ONLY the documented warn-only lock-free watchdog
+  scanner (`watchdog_thread_fn`, `sw_io_active_port_count`). Atomicizing `sw_process.state`
+  for a scanner-clean runtime is a 2.4 decision (it is written on every context switch).
+- The spin-gated P1 deadlock does NOT reproduce under TSan (40/40 clean, spin on — timing
+  perturbation suppresses the interleave) and shows no C11 race: it is a PROTOCOL bug
+  (legal-but-wrong interleaving of the waiting/idle flag handshakes). Root-cause needs
+  protocol reasoning / model checking against `tests/stress/spin_wedge_hunt.sh`, not TSan.
 
-### 2.4 Make shared state atomic-or-locked
-- Audit and fix races on: **kill flags**, **process lifecycle state**, **registry + monitor
-  references**, **timer cancellation**, **mailbox wakeups**. (The kill path interacts with all of
-  these — see the kill_flag-before-swap note above.) Each fix needs a TSan-clean repro.
+### 2.4 Make shared state atomic-or-locked  ✅ **DONE** (Round-7 continuation) — runtime TSan-clean
+- **The P1 spin-gated deadlock is root-caused and fixed**: Dekker StoreLoad in the receive
+  waiting-flag handshake (release-store `waiting` then acquire-load `sig_head` — no ordering
+  across different objects). All `waiting` participants are now seq_cst; 0/300 wedge runs
+  post-fix; spin default back ON (cross-sched ping-pong 58.4 → 3.0 µs/rt, 19×). The wedge
+  AUTOPSY (`SW_SCHED_TRACE=1/2`: stall detector + state dump + event ring) stays in the
+  runtime as the standing diagnosis tool. Gate: `tests/stress/spin_wedge_hunt.sh`.
+- **FIXED this round** (TSan-driven, verified clean + perf-neutral):
+  - `sw_process.state` → `_Atomic` with the 30 hot writes as explicit `atomic_store relaxed`
+    (free codegen, reads stay implicit/free on x86; same layout — the asm-offset
+    `_Static_assert`s pass). Closed the scheduler-swap-vs-`sw_monitor`/`sw_send_after`
+    races. Perf unchanged: spawn 4.2 µs, ping-pong 2.6 µs.
+  - Timer list: `fire_timers`' unlocked head-peek now reads under `tl->lock` (raced the
+    locked insert; uncontended in the common no-timer case).
+  - Monitor-at-death: `sw_monitor`'s already-dead path reads `exit_reason`/`panic_msg` and
+    registers all under `link_lock`, and `process_exit` finalizes `exit_reason` under the
+    same lock — closes the data race AND makes DOWN delivery exactly-once.
+  - Test harness: `static volatile int` flags in test_phase2/4/5 → `_Atomic` (volatile is
+    not synchronization), `__sync_*` → C11 `atomic_fetch_add`.
+- **`make tsan-gate` covers msg, msg+spin, 80k storm, phase 2, phase 5 — all clean.**
+- **ALSO FIXED** (the supervisor crash-restart races that surfaced once test timing shifted):
+  - `exit_reason` → `_Atomic`: user/runtime code writes `sw_self()->exit_reason = N`
+    directly (the b3_crasher idiom) while sw_monitor/process_exit read it.
+  - `reg_entry` → `_Atomic`: a child's `process_exit` reads it while `sw_register` (from
+    `sup_start_child` on another scheduler) writes it.
+  - `kill_flag` → `_Atomic` (was volatile): scheduler-loop read vs cross-thread exit-signal
+    write.
+  - `registry_remove_proc` hashes the name UNDER the registry wrlock (was computed before
+    the lock, reading entry->name that a concurrent reuse rewrote).
+  - `process_destroy` frees `panic_msg` under `link_lock`, and sw_monitor's already-dead
+    path COPIES it under the same lock — closes a use-after-free (a late monitor reading a
+    panic_msg the teardown was freeing).
+- **`make tsan-gate` covers msg, msg+spin, 80k storm, AND phase 2/4/5 — all clean.** The
+  runtime is TSan-clean on the GenServer / Supervisor / Agent / DynSup / StateMachine /
+  ProcessGroup paths plus message-passing and the spawn storm.
+- Suppressed by design (tests/stress/tsan.supp): the warn-only watchdog scanner + `sw_stats`
+  debug printer.
+- (The former P1 deadlock was a protocol bug, not a data race — TSan stayed silent; found via
+  the autopsy + seq_cst fix, see above.)
 
-### 2.5 Allocation-failure safety
-- Inject deterministic `malloc`/arena-create failures. Ensure **every** path either returns an
-  error or terminates **only the affected process** — and that a partial region-ownership transfer
-  (e.g. spawn region adopted but child died) never leaks or double-frees. (See the
-  `g_pending_spawn_region` / `g_pending_on_destroy` / `spawn_region` handoff in `sw_spawn_opts`.)
-
-### 2.6 24-hour soak
-- Build a mixed-workload harness: actor spawn/message/pmap + supervisor crash/restart storms +
-  timers + networking + ETS churn + distribution + a production-like agent workload. Run a short
-  version locally now; schedule the full 24h run (cron/wake) and assert bounded RSS + zero
-  sanitizer hits + no leaked process slots (phase2 prints `Slots N/N free` — must stay full).
-
+### 2.5 Allocation-failure safety  ✅ **DONE** (Round-7 continuation, Linux/ASAN)
+- `make alloc-fault`: built with `-DSW_ALLOC_FAULT` + ASAN, sweeps `SW_FAIL_ALLOC_AT=1..120` so
+  the Nth value/region allocation fails exactly once (atomic countdown in
+  `sw_alloc_fault_tick`, wired into `val_alloc`'s global-heap fallback and every varena
+  `chunk_new`). Each run must end clean OR with a loud OOM/spawn panic; the gate FAILS only on
+  an ASAN memory error.
+- Result: **120 fail-points, 0 memory errors** (100 graceful degradations — region alloc
+  fails → spawn falls back to a global-heap arg copy / errors out cleanly; 20 loud-OOM aborts
+  on the value path). The documented hazard (spawn region adopted but child died → leak or
+  double-free) does not occur: the cleanup branches hold under injected failure.
+- Zero production cost: all injection is behind `#ifdef SW_ALLOC_FAULT`, compiled only by the
+  gate. Advisory-then-blocking CI leg added to linux-quickstart.yml.
+### 2.6 Soak  ✅ **harness DONE; CI 60s smoke green** (full 24h pending a dedicated host)
+- `make soak` (tests/soak/run_soak.sh + soak.sw): a mixed production-shaped workload — actor
+  fan-out with ~8 KB message round-trips + supervisor crash/restart + ETS put/replace/delete
+  + one-shot & interval timers + a long tail loop — runs for `SOAK_SECONDS` (default 60)
+  while sampling RSS, and asserts clean exit (PROBE_OK, no watchdog/crash on stderr) + peak
+  RSS under `SOAK_RSS_BUDGET_MB`.
+- Local result: **20s → 2364 rounds, peak RSS 53 MB** (arena base ~48 MB, so ~5 MB working
+  set over the entire mix — dead flat); 180s confirms the same. CI runs the 60s smoke
+  (advisory/blocking leg in linux-quickstart.yml).
+- **Remaining (needs infra, not code):** the full **24-hour** run is the same binary —
+  `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512 ./tests/soak/run_soak.sh` — on a dedicated
+  Linux host. Assert bounded RSS + zero sanitizer hits + no leaked process slots over the
+  full day. This is a sign-off that requires a sustained host run; the harness is ready.
 ---
 
-## Phase 3 — SECURITY & FAULT ISOLATION
-- Fuzz every external-input boundary: parser/compiler, JSON, distribution protocol, HTTP/WebSocket,
-  node unmarshalling, database + file builtins. (`make fuzz` already covers parse/marshal/http —
-  extend it.)
-- Harden limits: max message size, mailbox limits + backpressure, process + memory quotas,
-  recursion/decode depth (JSON depth guard `g_json_depth` exists — audit the rest), connection +
-  request timeouts.
-- Prove malformed input cannot crash the runtime or another process.
+## Phase 3 — SECURITY & FAULT ISOLATION  ⏳ (fuzz + depth limits DONE; quotas/backpressure remain)
+
+**Done (Round-7 continuation):**
+- Fuzz every external-input boundary under ASAN/UBSAN, 20k mutations each, wired into CI
+  (`make fuzz`): parser, **JSON decoder** (the agent-facing boundary), distribution
+  `sw_unmarshal`, HTTP header parser. fuzz-json found and fixed **two real heap-buffer-overflows**
+  on its first run (number force-advance past NUL; backslash-as-last-byte in a string), plus a
+  latent incomplete-free in `sw_val_free`'s map case.
+- Recursion/decode-depth guards verified on every recursive decoder: parser
+  (`SW_PARSE_MAX_DEPTH` + node budget + stack-headroom probe), JSON (`SW_JD_MAX_DEPTH` /
+  compiled `SW_JSON_MAX_DEPTH`), distribution unmarshal (`SW_UNMARSH_MAX_DEPTH`).
+- Parser can't OOM swc (the receive-clause spin fix + per-parse node budget, Phase-3 fuzz item).
+
+**Remaining (feature work, mostly product decisions):**
+- Limits/quotas: max message size, mailbox depth limit + backpressure, per-node process +
+  memory quotas, connection/request timeouts. (`SW_MAX_PROCS` process ceiling exists; the rest
+  are policy knobs to design.)
+- Extend fuzz to the WebSocket frame parser + the `db_*`/SQLite arg path.
+- Prove malformed input cannot crash another process (cross-process isolation under fuzz).
 
 ## Phase 4 — OPERATIONAL READINESS
 - Observability: per-process memory / mailbox depth / reductions, spawn/crash/restart counters,

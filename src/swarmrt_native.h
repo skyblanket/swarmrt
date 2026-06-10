@@ -268,7 +268,14 @@ struct sw_process {
     uint32_t flags;           /* Process flags */
     
     /* === Scheduling (cache line 1) === */
-    sw_proc_state_t state;
+    /* _Atomic: the scheduler thread writes state on every swap-in/out
+     * while OTHER threads read it cross-thread (sw_monitor's
+     * already-dead check, sw_send_after, the watchdog scanner) — TSan
+     * flagged the unsynchronized accesses. Implicit accesses are seq_cst,
+     * which is correct; the only hot writer is the scheduler swap-in.
+     * Size/alignment of the enum are unchanged, so the asm-pinned ctx
+     * offset (0x70) is preserved — the _Static_assert in the .c verifies. */
+    _Atomic sw_proc_state_t state;
     sw_priority_t priority;
     sw_scheduler_t *scheduler;/* Current scheduler */
     uint64_t pid;
@@ -310,16 +317,22 @@ struct sw_process {
     sw_link_t *links;                  /* Bidirectional link list */
     sw_monitor_t *monitors_me;         /* Others monitoring this process */
     sw_monitor_t *my_monitors;         /* Monitors this process created */
-    volatile int kill_flag;            /* Set by exit signal propagation */
-    int exit_reason;                   /* Why this process exited (legacy int) */
+    _Atomic int kill_flag;             /* Set by exit signal propagation (cross-thread;
+                                          was volatile — not synchronization) */
+    _Atomic int exit_reason;           /* Why this process exited. User/runtime code may
+                                          write it directly (sw_self()->exit_reason = N)
+                                          while monitor/process_exit read it — atomic. */
     char *panic_msg;                   /* Human-readable panic message,
                                           set by sw_process_panic, read by
                                           process_exit -> deliver_signal so
                                           {'EXIT', from, MSG_STR} reaches
                                           trap_exit handlers. malloc'd;
-                                          freed in process_destroy. NULL
-                                          if not a panic exit. */
-    sw_reg_entry_t *reg_entry;         /* Registry entry (or NULL) */
+                                          freed in process_destroy UNDER link_lock
+                                          (serialises with a late sw_monitor read).
+                                          NULL if not a panic exit. */
+    _Atomic(sw_reg_entry_t *) reg_entry; /* Registry entry (or NULL). Atomic: a child's
+                                          process_exit reads it while sw_register (from
+                                          sup_start_child on another thread) writes it. */
     void *ets_tables;                  /* Linked list of owned ETS tables */
 
     /* === ABA / arena slot-reuse defense ===
@@ -372,6 +385,19 @@ struct sw_process {
      * no hook. At struct END so it shifts no asm-pinned offset. */
     void (*on_destroy)(void *);
     void *on_destroy_arg;
+
+    /* Innermost live try/catch frame for the COMPILED path, PER PROCESS for
+     * the same reason as gen_error: a fiber can yield (receive/sleep) inside a
+     * try and resume on another scheduler thread, so a thread-local would
+     * unwind the wrong process. The frame itself (jmp_buf + prev link) is a C
+     * local in the generated function, i.e. it lives on this process's fiber
+     * stack — setjmp/longjmp state is fiber-contained and survives scheduler
+     * migration. error() longjmps to this frame (full dynamic unwind, callee
+     * errors land in the nearest enclosing catch); with no frame it stays the
+     * documented "silent, continue with nil". Panics NEVER use this chain —
+     * they remain uncatchable and kill the process. NULL when no try is live.
+     * At struct END so it shifts no asm-pinned offset. */
+    void *try_chain;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -414,8 +440,15 @@ struct sw_scheduler {
     volatile uint64_t idle_waits;    /* Debug: times entered idle wait */
 
     /* State */
-    volatile int active;
-    volatile int should_exit;
+    /* _Atomic (was volatile): TSan-clean cross-thread flags. volatile is
+     * not synchronization in C11 — main's readiness spin reads `active`
+     * while the scheduler thread writes it, and sw_shutdown writes
+     * `should_exit`/`running` while scheduler loops read them. Plain
+     * loads/stores on _Atomic int are seq_cst; these are cold flags, the
+     * cost is irrelevant. (sw_scheduler is NOT asm-offset-pinned — only
+     * sw_process is — so the layout change is safe.) */
+    _Atomic int active;
+    _Atomic int should_exit;
 
 };
 
@@ -423,7 +456,7 @@ struct sw_scheduler {
 struct sw_swarm {
     char name[32];
     uint32_t num_schedulers;
-    volatile int running;
+    _Atomic int running;   /* see active/should_exit note above */
 
     /* Arena allocator (replaces process table, free list, PID lock) */
     sw_arena_t arena;
@@ -566,6 +599,12 @@ void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag);
  * Per-process so a try/catch resuming after a blocking op can't catch another
  * fiber's error (whose value would be freed on that fiber's exit). */
 struct sw_val **sw_self_error_slot(void);
+
+/* Innermost live compiled try/catch frame for the current process
+ * (thread-local fallback outside a process). Same per-process rationale as
+ * sw_self_error_slot; see the try_chain field comment in struct sw_process.
+ * Holds a _sw_try_frame_t* (defined in the studio builtins header). */
+void **sw_self_try_chain(void);
 
 /* Ownership v2: spawn a process that OWNS `region` (its args/captures live in it)
  * until the child's trampoline adopts it. Reclaimed by process_destroy if the

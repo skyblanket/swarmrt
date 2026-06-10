@@ -319,6 +319,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "byte_slice") == 0 ||
            strcmp(name, "bytes_concat") == 0 ||
            strcmp(name, "string_to_bytes") == 0 ||
+           strcmp(name, "string_chars") == 0 ||
            strcmp(name, "bytes_to_string") == 0 ||
            strcmp(name, "bytes_from_ints") == 0 ||
            strcmp(name, "byte") == 0 ||
@@ -1221,8 +1222,14 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f,
         "static sw_val_t *_builtin_reduce(sw_val_t **a, int n) {\n"
         "    if (n < 3) return sw_val_nil();\n"
-        "    sw_val_t *fn = a[0];\n"
-        "    sw_val_t *lst = a[1];\n"
+        "    /* Accept reduce(fn, list, acc) or reduce(list, fn, acc) — the\n"
+        "     * latter is what the pipe produces (xs |> reduce(f, 0)). map and\n"
+        "     * filter already had this tolerance; reduce lacking it made a\n"
+        "     * piped reduce return its init value untouched. */\n"
+        "    sw_val_t *fn, *lst;\n"
+        "    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }\n"
+        "    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }\n"
+        "    else { fn = a[0]; lst = a[1]; }\n"
         "    sw_val_t *acc = a[2];\n"
         "    if (!lst || lst->type != SW_VAL_LIST) return acc;\n"
         "    for (int i = 0; i < lst->v.tuple.count; i++) {\n"
@@ -1824,6 +1831,7 @@ static const char *_common_builtins[] = {
     "base64_encode", "base64_decode",
     "bytes_from_base64", "bytes_to_base64", "byte_size", "byte_at",
     "byte_slice", "bytes_concat", "string_to_bytes", "bytes_to_string",
+    "string_chars",
     "bytes_from_ints", "byte", "ord", "codepoint_at", "to_float",
     "to_int", "uuid", "now_iso",
     "math_sqrt", "math_sin", "math_cos", "math_pow", "math_exp", "math_log",
@@ -1953,6 +1961,62 @@ static void did_you_mean(cg_ctx_t *ctx, const char *fname, int line) {
     fprintf(stderr, "\n");
 }
 
+/* Module → function-name table for cross-module call validation.
+ * Populated by sw_codegen_multi (every compiled module, entry +
+ * imports) so `Module.func(...)` against a module we ARE compiling can
+ * be checked at codegen time with a proper did-you-mean, instead of
+ * leaking a raw cc implicit-declaration warning + linker
+ * `undefined reference to 'Module_func'` (the worst diagnostic in the
+ * compiler — found in the Round-7 audit, O6). A qualified call whose
+ * module is NOT in the table (not compiled in) is left alone. */
+#define CG_MAX_MODS 24
+static struct {
+    char name[128];
+    char funs[CG_MAX_FUNCS][128];
+    int nfuns;
+} g_mod_table[CG_MAX_MODS];
+static int g_nmod_table;
+
+static void mod_table_add(node_t *mod) {
+    if (!mod || mod->type != N_MODULE || g_nmod_table >= CG_MAX_MODS) return;
+    int t = g_nmod_table++;
+    strncpy(g_mod_table[t].name, mod->v.mod.name, 127);
+    g_mod_table[t].name[127] = '\0';
+    g_mod_table[t].nfuns = 0;
+    for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
+        strncpy(g_mod_table[t].funs[i], mod->v.mod.funs[i]->v.fun.name, 127);
+        g_mod_table[t].funs[i][127] = '\0';
+        g_mod_table[t].nfuns++;
+    }
+}
+
+/* Validate Module.func against the table. Returns 0 (and prints the
+ * diagnostic) when the module is known and the function is not. */
+static int check_qualified_call(cg_ctx_t *ctx, const char *mod,
+                                const char *func, int line) {
+    int t = -1;
+    for (int i = 0; i < g_nmod_table; i++)
+        if (strcmp(g_mod_table[i].name, mod) == 0) { t = i; break; }
+    if (t < 0) return 1;   /* module not compiled in — leave to the linker */
+    for (int i = 0; i < g_mod_table[t].nfuns; i++)
+        if (strcmp(g_mod_table[t].funs[i], func) == 0) return 1;
+
+    ctx->had_unknown_fn = 1;
+    int flen = (int)strlen(func);
+    int threshold = flen >= 8 ? 3 : (flen >= 3 ? 2 : 1);
+    const char *best = NULL; int best_d = threshold + 1;
+    for (int i = 0; i < g_mod_table[t].nfuns; i++) {
+        int d = _lev_distance(func, g_mod_table[t].funs[i]);
+        if (d < best_d) { best_d = d; best = g_mod_table[t].funs[i]; }
+    }
+    fprintf(stderr, "swc: %s:%d: module %s has no function '%s'",
+            guess_sw_path(ctx->mod_name), line > 0 ? line : 0, mod, func);
+    if (best)
+        fprintf(stderr, " \xe2\x80\x94 did you mean '%s.%s'?", mod, best);
+    fprintf(stderr, "\n");
+    return 0;
+}
+
 static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
     const char *fname = n->v.call.func->v.sval;
@@ -2011,6 +2075,16 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "        %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
         fprintf(f, "      }\n");
         fprintf(f, "    }\n");
+        /* Reduction check at the loop backedge. A self-tail-call is the
+         * language's only unbounded loop, and without this the compiled
+         * loop never yields: a spawn storm on one scheduler kept every
+         * child queued behind the running parent (80K live 128KB stacks
+         * = ~160K VMAs, over Linux's default vm.max_map_count 65530 —
+         * mmap/calloc then fail and the storm dies by SIGSEGV instead
+         * of fairness). One TLS decrement per turn; yields every
+         * SWARM_CONTEXT_REDS turns, same budget receive-blocking uses.
+         * Both calls are no-ops outside a fiber (interpreter path). */
+        fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
         fprintf(f, "    goto _tail;\n");
         out[0] = '\0';
         return;
@@ -2037,19 +2111,24 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         char mod[128], func[128];
         int mlen = (int)(dot - fname);
         strncpy(mod, fname, mlen); mod[mlen] = '\0';
-        /* Gleam-style hint for the `Std.map(...)` / `Std.filter(...)` reflex:
-         * map/filter/reduce/pmap are GLOBAL builtins, not module functions.
-         * Without this the qualified form leaks a raw cc "undeclared function
-         * Std_map". Small hard-coded denylist — not a general per-module export
-         * check. NOTE: `each` is deliberately NOT here — it is a real Std module
-         * function (lib/Std.sw, list-first `each(lst, fn)`), so `Std.each(...)`
-         * must keep compiling. */
+        /* Gleam-style hint for the qualified-builtin reflex. Std.map and
+         * Std.filter are REAL module functions now (lib/Std.sw aliases over
+         * the global builtins — the Elixir-shaped guess models emit), so
+         * only the names with no Std alias stay on this denylist:
+         * Std.reduce can't exist (Std's own sum/product call the global
+         * `reduce` bare; a same-named module fun would shadow it) and pmap
+         * has no alias either. */
         const char *gf = dot + 1;
-        if (strcmp(gf, "map") == 0 || strcmp(gf, "filter") == 0 ||
-            strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) {
-            fprintf(stderr, "swc: src/%s.sw:%d: %s/filter/reduce are global builtins \xe2\x80\x94 write %s(fn, list), not %s(...)\n",
+        if ((strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) &&
+            strcmp(mod, "Std") == 0) {
+            fprintf(stderr, "swc: src/%s.sw:%d: %s is a global builtin \xe2\x80\x94 write %s(fn, list, ...), not %s(...)\n",
                     ctx->mod_name, n->line, gf, gf, fname);
             ctx->had_unknown_fn = 1;
+        } else {
+            /* General check: a qualified call into a module we're compiling
+             * must name a real function — with a did-you-mean, instead of a
+             * raw linker error. */
+            check_qualified_call(ctx, mod, gf, n->line);
         }
         strncpy(func, dot + 1, sizeof(func) - 1);
         if (nargs > 0)
@@ -2181,6 +2260,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "byte_slice") == 0 ||
              strcmp(fname, "bytes_concat") == 0 ||
              strcmp(fname, "string_to_bytes") == 0 ||
+             strcmp(fname, "string_chars") == 0 ||
              strcmp(fname, "bytes_to_string") == 0 ||
              strcmp(fname, "bytes_from_ints") == 0 ||
              strcmp(fname, "byte") == 0 ||
@@ -2349,7 +2429,10 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         fprintf(f, "    %s->fn = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
                 ls, lr, fn_val, lr, fn_val);
         fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline2, %s, %s);\n", pv, ls, lr);
-        fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s); }\n", pv, lr, lr, ls);
+        /* Spawn failure must be LOUD. Continuing with a pid wrapping NULL
+         * made sends silently vanish at the SW_MAX_PROCS ceiling. */
+        fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
+        fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
         emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
         return;
     }
@@ -2401,8 +2484,11 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
      * reclaims it; the child adopts it on entry. */
     fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_%s_sp%d_entry, %s, %s);\n",
             pv, ctx->mod_name, sp_id, sa, rg);
-    /* Spawn failure: child never started, region not recorded — reclaim here. */
-    fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s); }\n", pv, rg, rg, sa);
+    /* Spawn failure: child never started, region not recorded — reclaim,
+     * then panic LOUDLY. Continuing with a pid wrapping NULL made every
+     * send to it silently vanish at the SW_MAX_PROCS ceiling. */
+    fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, rg, rg, sa);
+    fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
     emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
 }
 
@@ -2606,8 +2692,18 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
  * both `n`s are separate). */
 static void emit_case(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
-    char subj[32], res[32];
-    emit_expr(ctx, n->v.casex.subject, 0, subj, sizeof(subj));
+    char subj0[32], subj[32], res[32];
+    emit_expr(ctx, n->v.casex.subject, 0, subj0, sizeof(subj0));
+    /* Snapshot the subject into a fresh temp before any arm binds. When
+     * the subject is a plain variable and an arm re-binds the same name
+     * (`case n { n when n > 0 -> ... }`), binding straight off the
+     * subject emitted `sw_val_t *n = n;` — C self-initialization, so the
+     * arm-local n read indeterminate memory (wrong guard results at
+     * best, SIGSEGV at worst). Tuple/cons/map sub-binds had the same
+     * hazard through `n->v.tuple.items[i]`. One pointer copy fixes the
+     * whole class; `with` desugars to case, so it is covered too. */
+    fresh_var(ctx, subj, sizeof(subj));
+    fprintf(f, "    sw_val_t *%s = %s;\n", subj, subj0);
     fresh_var(ctx, res, sizeof(res));
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
 
@@ -3107,27 +3203,52 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     case N_TRY: {
         /* try { body } catch e { handler }
          *
-         * The C `if (_sw_error) { ... }` block is its own lexical
-         * scope, so the err_var declaration belongs only to it.
-         * Snapshot ndeclared before the catch and restore after, the
-         * same pattern emit_if uses for branch scopes — without this,
-         * a second try/catch with the same err_var name would emit
-         * `e = _sw_error;` instead of `sw_val_t *e = _sw_error;` and
-         * fail with "use of undeclared identifier 'e'". */
+         * error() must abort the REST of the try body and the dynamic
+         * extent below it (an error() inside a callee lands here too),
+         * exactly like the interpreter. The old shape ran the whole
+         * body and tested _sw_error once at the end — so the statement
+         * AFTER an error() still executed (and could panic, killing
+         * the process before the catch was ever consulted).
+         *
+         * Now: push a _sw_try_frame_t (a C local — fiber-stack-
+         * resident, so a mid-try yield + resume on another scheduler
+         * is safe) onto the per-process chain and setjmp. error()
+         * longjmps to the innermost frame. The frame is popped on BOTH
+         * arms — at the top of the catch arm so an error() raised
+         * INSIDE the catch body propagates to the enclosing try, not
+         * back into this one (infinite loop otherwise).
+         *
+         * The result var is written after setjmp returns (either
+         * entry), never read across the longjmp, so the setjmp
+         * indeterminate-locals rule doesn't bite it.
+         *
+         * The catch block is its own lexical scope; snapshot ndeclared
+         * around it (same pattern as emit_if) so a second try with the
+         * same err_var re-declares rather than colliding. */
         char v[32]; fresh_var(ctx, v, sizeof(v));
+        char fr[32]; fresh_var(ctx, fr, sizeof(fr));
+        fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", v);
+        fprintf(f, "    _sw_try_frame_t _tf%s; _tf%s.prev = _sw_try_chain; _sw_try_chain = &_tf%s;\n",
+                fr, fr, fr);
         fprintf(f, "    _sw_error = NULL;\n");
+        fprintf(f, "    if (setjmp(_tf%s.jb) == 0) {\n", fr);
         char body_res[32];
         emit_expr(ctx, n->v.trycatch.body, 0, body_res, sizeof(body_res));
-        fprintf(f, "    sw_val_t *%s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
+        fprintf(f, "        %s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
+        fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
+        /* Belt-and-braces: a stale sentinel set by a chain-less error()
+         * deeper in the call tree (no live frame at that moment) still
+         * routes to catch here, preserving the old end-check behavior. */
+        fprintf(f, "    }\n");
         fprintf(f, "    if (_sw_error) {\n");
+        fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
         int saved_ndeclared = ctx->ndeclared;
         fprintf(f, "        sw_val_t *%s = _sw_error;\n", mangle_for_c(n->v.trycatch.err_var));
         declare_var(ctx, n->v.trycatch.err_var);
         fprintf(f, "        _sw_error = NULL;\n");
         char catch_res[32];
         emit_expr(ctx, n->v.trycatch.catch_body, 0, catch_res, sizeof(catch_res));
-        if (catch_res[0])
-            fprintf(f, "        %s = %s;\n", v, catch_res);
+        fprintf(f, "        %s = %s;\n", v, catch_res[0] ? catch_res : "sw_val_nil()");
         fprintf(f, "    }\n");
         ctx->ndeclared = saved_ndeclared;
         strncpy(out, v, osz - 1);
@@ -3161,13 +3282,39 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
  * Function emission
  * ========================================================================= */
 
-/* Map a module name to its likely source path. Convention: most
- * modules live at src/<ModName>.sw (case preserved), with the
- * exception of `Main` → `src/main.sw` (lowercase). swc.c uses the
- * same fallback when resolving imports. Returned in a static buffer
- * — caller copies if needed. */
+/* Module → REAL source path registry, filled by swc.c as it reads each
+ * file (entry inputs + resolved imports). Diagnostics and #line
+ * directives previously FABRICATED `src/<Mod>.sw` from the naming
+ * convention, which lied whenever the file lived anywhere else
+ * (`swc build /tmp/foo.sw` errors pointed at a nonexistent src/Foo.sw
+ * — Round-7 audit, O6). Convention stays as the fallback for embedders
+ * that call sw_codegen without registering paths. */
+#define CG_MAX_PATHS 64
+static struct { char mod[128]; char path[512]; } g_mod_paths[CG_MAX_PATHS];
+static int g_nmod_paths;
+
+void sw_codegen_register_source(const char *mod_name, const char *path) {
+    if (!mod_name || !path) return;
+    /* Re-registering a module updates it (REPL / repeated builds). */
+    for (int i = 0; i < g_nmod_paths; i++)
+        if (strcmp(g_mod_paths[i].mod, mod_name) == 0) {
+            strncpy(g_mod_paths[i].path, path, sizeof(g_mod_paths[i].path) - 1);
+            return;
+        }
+    if (g_nmod_paths >= CG_MAX_PATHS) return;
+    strncpy(g_mod_paths[g_nmod_paths].mod, mod_name, 127);
+    strncpy(g_mod_paths[g_nmod_paths].path, path, 511);
+    g_nmod_paths++;
+}
+
+/* Real registered path if swc told us; else the src/<ModName>.sw
+ * convention (`Main` → src/main.sw, legacy). Static buffer — copy if
+ * you keep it. */
 static const char *guess_sw_path(const char *mod_name) {
-    static char path[256];
+    static char path[512];
+    for (int i = 0; i < g_nmod_paths; i++)
+        if (strcmp(g_mod_paths[i].mod, mod_name) == 0)
+            return g_mod_paths[i].path;
     /* Special-case Main → main.sw (legacy convention). */
     if (strcmp(mod_name, "Main") == 0) {
         snprintf(path, sizeof(path), "src/main.sw");
@@ -3346,6 +3493,11 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     node_t *mod = (node_t *)ast;
     if (mod->type != N_MODULE) return -1;
 
+    /* Single-module build: the qualified-call table holds just this
+     * module (a self-qualified call still validates). */
+    g_nmod_table = 0;
+    mod_table_add(mod);
+
     cg_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.out = out;
@@ -3454,6 +3606,12 @@ int sw_codegen_module(void *ast, FILE *out) {
 int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
     if (!modules || nmodules <= 0 || !out) return -1;
     if (main_idx < 0 || main_idx >= nmodules) return -1;
+
+    /* Module → function table for qualified-call validation (every
+     * compiled module, entry + imports). Reset per invocation. */
+    g_nmod_table = 0;
+    for (int m = 0; m < nmodules; m++)
+        mod_table_add((node_t *)modules[m]);
 
     /* Emit preamble once (from the main module's context) */
     cg_ctx_t preamble_ctx;

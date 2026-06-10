@@ -32,13 +32,19 @@ elif command -v gtime >/dev/null 2>&1; then TIMER="gtime"; fi
 # Run the probe at <count>; echo its peak RSS in KB on a clean run (exit 0 +
 # PROBE_OK), else echo "FAIL:<reason>". RSS is parsed per the detected timer.
 measure_kb() {
+  # Bounded: a wedged probe must FAIL the gate, not hang it forever. The
+  # scheduler lost-wakeup phase-lock (June 2026) ground the msg probe from
+  # ~100ms to 25+ minutes and the gate just sat on it. 600s >> any healthy
+  # probe; timeout exits 124 which lands in the FAIL:exit path below.
   local count="$1" out rc rss
+  local TO="timeout 600"
+  command -v timeout >/dev/null 2>&1 || TO=""
   case "$TIMER" in
-    gnu)   out=$(SW_RUNTIME_QUIET=1 /usr/bin/time -v "$bin" "$count" 2>&1); rc=$?
+    gnu)   out=$(SW_RUNTIME_QUIET=1 $TO /usr/bin/time -v "$bin" "$count" 2>&1); rc=$?
            rss=$(printf '%s\n' "$out" | awk -F': ' '/Maximum resident set size/{print $2}') ;;
-    bsd)   out=$(SW_RUNTIME_QUIET=1 /usr/bin/time -l "$bin" "$count" 2>&1); rc=$?
+    bsd)   out=$(SW_RUNTIME_QUIET=1 $TO /usr/bin/time -l "$bin" "$count" 2>&1); rc=$?
            rss=$(printf '%s\n' "$out" | awk '/maximum resident set size/{print int($1/1024)}') ;;
-    gtime) out=$(SW_RUNTIME_QUIET=1 gtime -v "$bin" "$count" 2>&1); rc=$?
+    gtime) out=$(SW_RUNTIME_QUIET=1 $TO gtime -v "$bin" "$count" 2>&1); rc=$?
            rss=$(printf '%s\n' "$out" | awk -F': ' '/Maximum resident set size/{print $2}') ;;
     *)     echo "FAIL:no-rss-timer (install GNU 'time')"; return ;;
   esac

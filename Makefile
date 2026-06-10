@@ -223,6 +223,7 @@ examples: swc libswarmrt
 # pass/fail counts across all files. See tests/sw/run_tests.sh.
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
+	@./tests/sw/run_conform.sh
 
 # Security regression: the curl-backed HTTP builtins must not pass
 # caller-supplied URLs / headers through a shell. Builds the injection
@@ -267,11 +268,20 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 
-.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http
+.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json
 fuzz-parse: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
+
+# JSON decoder — the agent-facing input boundary (every LLM tool-call
+# response / parsed HTTP body). Proves no crash/over-read/stack-overflow
+# on malformed or adversarially-nested input (the corpus includes a
+# 5000-deep array; g_jd_depth must bound it).
+fuzz-json: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
+	    tests/fuzz/fuzz_json.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_json $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
 
 fuzz-marshal: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
@@ -286,7 +296,7 @@ fuzz-http: dirs
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
 
-fuzz: fuzz-parse fuzz-marshal fuzz-http
+fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http
 
 # GC v1 correctness gate: the copy-on-escape stress harness compiled with ASAN +
 # SW_ARENA_POISON. Workers build compound values in their per-process arenas,
@@ -388,6 +398,72 @@ gc-slope: swc
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
+# LeakSanitizer lifecycle gate (Phase 2.1) — Linux only (macOS Apple-clang
+# ASAN ships no LSan; every other ASAN run here uses detect_leaks=0 and is
+# leak-BLIND — see PRODUCTION_ROADMAP.md). Churns every lifecycle owner
+# (timers fired+cancelled, supervisors killed, ETS replace/delete, spawns,
+# compound messages), exits cleanly, and lets LSan assert zero
+# definitely-lost blocks at exit. Parked-fiber stacks can't false-positive
+# because at clean exit every process is gone; globals-reachable singletons
+# are "still reachable" and not reported. Suppressions (each one a
+# documented accepted-minor) live in tests/gc/lsan.supp.
+.PHONY: lsan-gate
+lsan-gate: swc
+	@if [ "$$(uname)" != "Linux" ]; then \
+	  echo "lsan-gate: SKIP (LeakSanitizer requires Linux clang/gcc ASAN)"; exit 0; \
+	fi
+	@./bin/swc build --emit-c tests/gc/lsan_lifecycle.sw -o $(BIN_DIR)/_lsan_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -g -O1 -fno-stack-protector \
+	    tests/gc/lsan_lifecycle.gen.c $(FUZZ_RT) -o $(BIN_DIR)/lsan_gate $(LDFLAGS)
+	@rm -f tests/gc/lsan_lifecycle.gen.c $(BIN_DIR)/_lsan_emit
+	@out=$$(SW_QUIET=1 SW_SCHEDULERS=1 \
+	     ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:exitcode=23 \
+	     LSAN_OPTIONS=suppressions=tests/gc/lsan.supp:print_suppressions=1 \
+	     timeout 240 $(BIN_DIR)/lsan_gate 2>&1); rc=$$?; \
+	 echo "$$out" | tail -25; \
+	 if ! echo "$$out" | grep -q "PROBE_OK"; then echo "lsan-gate: FAIL (probe did not complete)"; exit 1; fi; \
+	 if [ $$rc -eq 23 ] || echo "$$out" | grep -q "definitely lost\|SUMMARY: AddressSanitizer.*leak"; then \
+	   echo "lsan-gate: FAIL (leaks at exit)"; exit 1; fi; \
+	 echo "lsan-gate: PASS (zero unsuppressed leaks at exit)"
+
+# Allocation-failure injection gate (Phase 2.5). Builds the workload with
+# -DSW_ALLOC_FAULT + ASAN and runs it once per fail-point N (SW_FAIL_ALLOC_AT),
+# so the Nth value/region allocation fails exactly once. Each run must exit
+# 0 (clean) or 1 (loud OOM/spawn panic) — BOTH fine. The gate FAILS only on
+# an ASAN report (use-after-free / double-free / heap overflow): a fault that
+# corrupted memory instead of unwinding. Sweeps a range that covers the
+# spawn/send/supervise/ETS ownership-transfer sites. Linux/ASAN only.
+.PHONY: alloc-fault
+alloc-fault: swc
+	@if [ "$$(uname)" != "Linux" ]; then echo "alloc-fault: SKIP (needs Linux ASAN)"; exit 0; fi
+	@./bin/swc build --emit-c tests/gc/alloc_fault.sw -o $(BIN_DIR)/_af_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -DSW_ALLOC_FAULT -g -O1 -fno-stack-protector \
+	    tests/gc/alloc_fault.gen.c $(FUZZ_RT) -o $(BIN_DIR)/alloc_fault $(LDFLAGS)
+	@rm -f tests/gc/alloc_fault.gen.c $(BIN_DIR)/_af_emit
+	@rc=0; faults=0; clean=0; \
+	 for n in $$(seq 1 120); do \
+	   out=$$(SW_QUIET=1 SW_SCHEDULERS=1 SW_FAIL_ALLOC_AT=$$n \
+	          ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+	          timeout 30 $(BIN_DIR)/alloc_fault 2>&1); \
+	   ec=$$?; \
+	   if echo "$$out" | grep -qE "AddressSanitizer|runtime error:|heap-use-after-free|double-free"; then \
+	     echo "alloc-fault: FAIL at SW_FAIL_ALLOC_AT=$$n (memory error)"; \
+	     echo "$$out" | grep -A8 "AddressSanitizer" | head -20; rc=1; break; \
+	   fi; \
+	   if echo "$$out" | grep -q "alloc_fault DONE"; then clean=$$((clean+1)); else faults=$$((faults+1)); fi; \
+	 done; \
+	 [ $$rc -eq 0 ] && echo "alloc-fault: PASS (120 fail-points: $$clean clean, $$faults loud-OOM, 0 memory errors)" \
+	                || exit 1
+
+# Soak (Phase 2.6): mixed-workload (actor fan-out + supervisor crash/restart
+# + ETS churn + timers) run for SOAK_SECONDS while sampling RSS. Asserts clean
+# exit + peak RSS under budget — the whole mix stays flat under sustained
+# churn, not just the per-owner slope probes. CI runs the 60s smoke; the full
+# 24h soak is the same binary with SOAK_SECONDS=86400 on a dedicated host.
+.PHONY: soak
+soak: swc libswarmrt
+	@./tests/soak/run_soak.sh
+
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every
 # run to print `ok 80000`. Requires native Linux x86_64 thread scheduling
@@ -478,3 +554,44 @@ stats:
 	@echo ""
 	@echo "=== Example Programs ==="
 	@find $(EXAMPLES_DIR) -name "*.sw" | xargs wc -l 2>/dev/null || echo "  (none)"
+
+# ThreadSanitizer gate (Phase 2.3). Builds the depth-1 message ping-pong
+# and the 80k spawn storm under -fsanitize=thread and fails on any
+# unsuppressed race. The fiber runtime is TSan-clean because cross-thread
+# fiber migration synchronizes through the runq's C11 atomics — TSan sees
+# the happens-before edges; no fiber annotations needed. Suppressions
+# (tests/stress/tsan.supp) cover only the documented warn-only watchdog
+# scanner. The storm runs its full 80k spawns — ~2 min under TSan.
+.PHONY: tsan-gate
+tsan-gate: swc
+	@./bin/swc build --emit-c tests/gc/slope_message.sw -o $(BIN_DIR)/_tsm_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
+	    tests/gc/slope_message.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_msg $(LDFLAGS)
+	@./bin/swc build --emit-c tests/stress/bn.sw -o $(BIN_DIR)/_tsb_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
+	    tests/stress/bn.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_storm $(LDFLAGS)
+	@rm -f tests/gc/slope_message.gen.c tests/stress/bn.gen.c $(BIN_DIR)/_tsm_emit $(BIN_DIR)/_tsb_emit
+	@# phase 2 (GenServer/Supervisor), 4 (Agent/DynSup), 5 (StateMachine/PG) are
+	@# all TSan-clean and gated here.
+	@for p in 2 4 5; do \
+	   $(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
+	     $(SRC_DIR)/test_phase$$p.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_phase$$p $(LDFLAGS); \
+	 done
+	@rc=0; \
+	 out1=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_msg 4000 2>&1) || rc=1; \
+	 echo "$$out1" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out1" | head -40; rc=1; }; \
+	 out2=$$(SW_QUIET=1 SW_SPIN_US=30 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_msg 4000 2>&1) || rc=1; \
+	 echo "$$out2" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out2" | head -40; rc=1; }; \
+	 out3=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_storm 2>&1) || rc=1; \
+	 echo "$$out3" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out3" | head -40; rc=1; }; \
+	 for p in 2 4 5; do \
+	   outp=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	           timeout 300 $(BIN_DIR)/tsan_phase$$p 2>&1) || rc=1; \
+	   echo "$$outp" | grep -q "WARNING: ThreadSanitizer" && { echo "phase$$p:"; echo "$$outp" | grep -A6 WARNING | head -28; rc=1; }; \
+	 done; \
+	 rm -f $(BIN_DIR)/tsan_phase2 $(BIN_DIR)/tsan_phase4 $(BIN_DIR)/tsan_phase5; \
+	 [ $$rc -eq 0 ] && echo "tsan-gate: PASS (no unsuppressed races: msg, msg+spin, storm, phase 2/4/5)" \
+	                || { echo "tsan-gate: FAIL"; exit 1; }

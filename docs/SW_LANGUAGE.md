@@ -103,7 +103,7 @@ fun greet(name) {
 - Body is one or more expressions; the last expression's value is the return value.
 - Parameters are positional; default values: `fun greet(name = "world") { ... }`.
 - No explicit `return` — Erlang-style trailing-expression-is-the-value.
-- Recursion is the loop construct (no `for`/`while`). Tail calls are detected and optimised by the codegen, so unbounded tail recursion doesn't blow the stack.
+- Recursion is the loop construct (no `for`/`while`). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
 
 ```sw
 fun count_down(n) {
@@ -256,7 +256,7 @@ receive {
 - Each arm is `pattern -> body`.
 - `_` matches anything; specific tuples / atoms / values match exactly.
 - Bound names (`prompt`, `reply_to`) capture parts of the message.
-- `after MS { body }` fires if no message arrives within MS milliseconds.
+- `after MS { body }` fires if no message arrives within MS milliseconds. The Erlang-style arrow form `after MS -> body` is accepted too (the body runs to the receive's closing brace — `after` is always the last clause).
 - Selective receive: messages that don't match any arm STAY in the mailbox for the next `receive`.
 
 Inside receive arm bodies, `;` DOES separate statements (it's a recognised statement separator within arm bodies).
@@ -266,6 +266,20 @@ Inside receive arm bodies, `;` DOES separate statements (it's a recognised state
 ## 7. Pattern matching
 
 Patterns appear in `receive` arms, `case` expressions, and some other binding contexts. Supported:
+
+### Tuple-destructuring assignment
+
+A statement may bind several names from a tuple at once:
+
+```sw
+{a, b} = {1, 2}                 # a=1, b=2
+{x, _, z} = three_tuple()       # `_` skips an element
+{'ok', body} = http_fetch(url)  # literal positions ASSERT-match (panic on
+                                # {'error', _}), ident positions bind
+{200, html} = fetch_page()      # ints/strings/floats assert too
+```
+
+Statement position only (not inside a larger expression). Elements may be identifiers (bind), `_` (skip), or literal atoms/ints/floats/strings (match-assert with a `destructuring mismatch` panic — the Erlang `=` contract for the `{'ok', v}` idiom). A too-short or non-tuple right side panics through `elem`'s existing range/type check; extra trailing elements are tolerated. It desugars at parse time (temp + `elem()` binds + `expect()` asserts), so `swc run` and compiled binaries behave identically. List and nested-tuple left sides are not supported — use `case` for those.
 
 | Pattern | Matches |
 |---|---|
@@ -345,6 +359,16 @@ fun main() {
 ```
 
 `with` desugars at parse time into nested `case`, so it has the same pattern-matching power (tuples, maps, lists, literals) and the exact same behavior in `swc run` and a compiled binary. There are no per-bind `when` guards — match a pattern instead. A single bind (`with p <- e { ... } else { o -> ... }`) is fine; it's just a one-arm chain.
+
+The `else` block takes one or more `pattern [when guard] -> body` arms, exactly like `case` — the first non-`{'ok', _}` value falls through them in order:
+
+```sw
+} else {
+    {'error', k} when k == 'host' -> "no host configured"
+    {'error', k} -> f"missing: {k}"
+    _ -> "unknown failure"
+}
+```
 
 ---
 
@@ -510,6 +534,7 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | `byte_slice(b, start, len)` | subrange; `len` clamps to end |
 | `bytes_concat(a, b)` | new bytes `a ++ b` |
 | `string_to_bytes(s)` | string chars → bytes |
+| `string_chars(s)` | list of single-**codepoint** strings (UTF-8 aware — `string_length` is bytes; `length(string_chars(s))` is codepoints; rejoin slices with `Std.join(cs, "")`). No grapheme clustering: combining marks stay separate codepoints |
 | `bytes_to_string(b)` | bytes → string (truncates at first NUL by design) |
 | `audio_ulaw_to_pcm16_b(b)` | mu-law bytes → PCM16 bytes (codec twin) |
 | `audio_pcm16_to_ulaw_b(b)` | PCM16 bytes → mu-law bytes (codec twin) |
@@ -801,7 +826,7 @@ r = try {
 }
 ```
 
-`error(msg)` sets a thread-local error sentinel that `try { ... } catch e { ... }` catches. Outside a `try`, `error()` is silent (the calling code continues with `nil`), which makes try/catch the explicit "I want to handle failure" marker.
+`error(msg)` aborts the rest of the `try` body and lands in the nearest enclosing `catch` — through function calls too: an `error()` raised inside a callee unwinds to the caller's `catch`, and the statements after the raise do not run. Outside any `try`, `error()` is silent (the calling code continues with `nil`), which makes try/catch the explicit "I want to handle failure" marker. Identical in `swc run` and compiled binaries (gated by `tests/sw/run_conform.sh`).
 
 ### Unrecoverable failures: `panic` + `expect`
 
@@ -825,7 +850,7 @@ panic: hit the bottom
     [3] Trace.main at src/Trace.sw:16
 ```
 
-`expect(value, msg)` is the idiomatic "unwrap" pattern — passes the value through if non-nil, otherwise panics with `msg`. Saves the explicit `if (x == nil) { panic(...) }` boilerplate.
+`expect(value, msg)` is the idiomatic "unwrap" pattern — passes the value through unless it is **nil or `'false'`**, in which case it panics with `msg`. Saves the explicit `if (x == nil) { panic(...) }` boilerplate, and `expect(a == b, msg)` works as an assert (comparisons return `'true'`/`'false'`).
 
 ### Builtins that panic (instead of returning nil silently)
 

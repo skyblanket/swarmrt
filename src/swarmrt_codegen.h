@@ -63,6 +63,12 @@ int sw_codegen_module(void *ast, FILE *out);
  */
 int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out);
 
+/* Register the REAL source path for a module before codegen, so
+ * diagnostics and #line directives reference the actual file instead of
+ * the src/<ModName>.sw naming convention. Call once per parsed file
+ * (entry inputs and resolved imports); re-registering updates. */
+void sw_codegen_register_source(const char *mod_name, const char *path);
+
 char *sw_obfuscate(const char *code, const char *mod_name,
                    const char **func_names, int nfuncs);
 

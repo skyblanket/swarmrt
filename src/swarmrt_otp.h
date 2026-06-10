@@ -149,6 +149,11 @@ typedef struct {
     uint32_t max_seconds;        /* Time window for circuit breaker */
     sw_child_spec_t *children;
     uint32_t num_children;
+    /* When 1, `children` is a heap array the supervisor must free() once it has
+     * copied each spec into its inline st->children[] — the caller can't free it
+     * (it doesn't know when the async-spawned supervisor finished consuming it).
+     * Callers with a stack/static children array leave this 0 (memset default). */
+    int owns_children;
 } sw_sup_spec_t;
 
 /* Start a Supervisor */

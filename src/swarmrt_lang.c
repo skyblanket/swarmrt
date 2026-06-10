@@ -516,7 +516,20 @@ static tok_t lnext(lex_t *l) {
  * AST (types defined in swarmrt_lang.h)
  * ========================================================================= */
 
+/* Per-parse AST-node budget. EVERY node (mknode + node_dup) is counted;
+ * par_init resets the counter, and par_primary aborts the parse with a
+ * clean error once it is exceeded. This is the O(1) backstop against any
+ * pathological parser loop — a malformed `.sw` that drives a
+ * non-advancing or unbounded loop (found by `make fuzz`: a single mutated
+ * input allocated ~16 GB of nodes and OOM-killed swc) now fails parsing
+ * instead of taking the host down. 4M nodes ≈ a 100k+-line program; far
+ * beyond any real source, well under a memory problem (~256 MB of node
+ * structs). Thread-local: parsers run per-thread (tool registry, LSP). */
+#define SW_PARSE_MAX_NODES 4000000
+static __thread long g_parse_node_count;
+
 static node_t *mknode(node_type_t type, int line) {
+    g_parse_node_count++;
     node_t *n = calloc(1, sizeof(node_t));
     n->type = type; n->line = line;
     return n;
@@ -592,6 +605,7 @@ static void node_free(node_t *n) {
  * the flat `*out = *n` struct copy; we then re-dup the pointer children. */
 static node_t *node_dup(node_t *n) {
     if (!n) return NULL;
+    g_parse_node_count++;
     node_t *out = calloc(1, sizeof(node_t));
     *out = *n;  /* copies scalars + char[] fields + (stale) child pointers */
     switch (n->type) {
@@ -668,12 +682,21 @@ typedef struct {
     tok_t cur;
     int err;
     char errmsg[256];
+    /* Expression-nesting guard: the recursive-descent chain
+     * (par_expr -> ... -> par_primary -> par_expr) consumes C stack per
+     * nesting level, and adversarial input like ((((((... overflowed it
+     * (found by make fuzz, first run, ASAN stack-overflow in
+     * par_primary). 500 levels is far beyond any real program and well
+     * inside a few hundred KB of stack. */
+    int depth;
 } par_t;
 
 static void par_init(par_t *p, const char *src) {
     lex_init(&p->lex, src);
     p->cur = lnext(&p->lex);
     p->err = 0; p->errmsg[0] = 0;
+    p->depth = 0;
+    g_parse_node_count = 0;   /* reset the per-parse node budget */
 }
 
 static tok_t par_adv(par_t *p) {
@@ -701,6 +724,7 @@ static tok_t par_expect(par_t *p, tok_type_t t, const char *msg) {
 
 /* Forward declarations */
 static node_t *par_expr(par_t *p);
+static node_t *par_primary_inner(par_t *p);
 static node_t *par_stmt(par_t *p);
 static node_t *par_block(par_t *p);
 
@@ -710,7 +734,7 @@ static void restore_hash_sentinels(char *s) {
 }
 
 /* String interpolation: "hello #{name}!" -> concat chain */
-static node_t *parse_interp_string(const char *text, int line) {
+static node_t *parse_interp_string(const char *text, int line, int parent_depth) {
     if (!strstr(text, "#{")) return NULL;
     node_t *result = NULL;
     const char *pos = text;
@@ -753,6 +777,17 @@ static node_t *parse_interp_string(const char *text, int line) {
         if (elen >= (int)sizeof(expr_text)) elen = (int)sizeof(expr_text) - 1;
         memcpy(expr_text, interp, elen); expr_text[elen] = 0;
         par_t ep; par_init(&ep, expr_text);
+        /* Inherit the caller's nesting budget: each interpolation level
+         * previously got a FRESH parser (depth=0), so nested f-strings
+         * recursed through unbounded new parser instances. */
+        ep.depth = parent_depth;
+        /* The sub-parser lexes the extracted text from scratch, so every
+         * node it makes carries line 1 — and any diagnostic against an
+         * interpolated expression ("unknown function ... at line 1")
+         * pointed at the top of the file. Seed it with the f-string's
+         * real line. */
+        ep.lex.line = line;
+        ep.cur.line = line;
         node_t *expr = par_expr(&ep);
         node_t *call = mknode(N_CALL, line);
         node_t *fn_node = mknode(N_IDENT, line);
@@ -889,7 +924,52 @@ done:
 }
 
 /* Primary expression */
+/* 128: beyond any real program (128 nested parens/calls), and small
+ * enough that even ASAN-inflated parser frames (~30KB/cycle observed)
+ * stay well inside an 8MB stack. */
+#define SW_PARSE_MAX_DEPTH 128
+
+static int interp_stack_near_limit(void);   /* defined with the interpreter below */
+
 static node_t *par_primary(par_t *p) {
+    /* Node-budget backstop FIRST — before the err short-circuit below — so
+     * a pathological loop that keeps re-entering par_primary while p->err
+     * is already set (the receive-clause spin) is still bounded. par_primary
+     * is on the path of every expression; once we force the message the
+     * enclosing loops drain on their !err guards. */
+    if (g_parse_node_count > SW_PARSE_MAX_NODES) {
+        if (!p->err) {
+            snprintf(p->errmsg, sizeof(p->errmsg),
+                     "line %d: program too large (parse exceeded %d AST nodes)",
+                     p->cur.line, SW_PARSE_MAX_NODES);
+            p->err = 1;
+        }
+        return mknode(N_INT, p->cur.line);
+    }
+    /* After ANY parse error, stop descending — callers don't all check
+     * p->err and could re-enter on the unconsumed token, growing C stack
+     * even with the depth budget exhausted-and-decremented. */
+    if (p->err) return mknode(N_INT, p->cur.line);
+    /* Two guards: a fixed nesting budget AND the real-headroom probe —
+     * parser frames are enormous (tok_t carries an 8KB text buffer and
+     * gets copied per frame; ASAN multiplies further), so a count alone
+     * can lie about safety on small stacks. */
+    if (++p->depth > SW_PARSE_MAX_DEPTH || interp_stack_near_limit()) {
+        if (!p->err) {
+            snprintf(p->errmsg, sizeof(p->errmsg),
+                     "line %d: expression nesting too deep (max %d levels)",
+                     p->cur.line, SW_PARSE_MAX_DEPTH);
+            p->err = 1;
+        }
+        p->depth--;
+        return mknode(N_INT, p->cur.line);   /* placeholder; parse failed */
+    }
+    node_t *_r = par_primary_inner(p);
+    p->depth--;
+    return _r;
+}
+
+static node_t *par_primary_inner(par_t *p) {
     tok_t t = p->cur;
 
     if (t.type == TOK_NUMBER) {
@@ -907,7 +987,7 @@ static node_t *par_primary(par_t *p) {
 
     if (t.type == TOK_STRING) {
         par_adv(p);
-        node_t *interp = parse_interp_string(t.text, t.line);
+        node_t *interp = parse_interp_string(t.text, t.line, p->depth);
         if (interp) return interp;
         node_t *n = mknode(N_STRING, t.line);
         strncpy(n->v.sval, t.text, sizeof(n->v.sval)-1);
@@ -1164,15 +1244,81 @@ static node_t *par_primary(par_t *p) {
         par_expect(p, TOK_RBRACE, "'}'");
         par_expect(p, TOK_ELSE, "'else'");
         par_expect(p, TOK_LBRACE, "'{'");
-        /* else arm: a single `o -> E` clause (o binds the non-matching value). */
-        node_t *else_pat = par_expr(p);
-        par_expect(p, TOK_ARROW, "'->'");
-        node_t *else_body = par_block(p);
+        /* else arms: one or more `pat [when guard] -> body` clauses, exactly
+         * like case arms (Elixir's with/else shape — a single-arm else was
+         * accepted before, but a second arm was a parse error and models
+         * write multi-arm else constantly). Each non-matching bind value
+         * falls through these arms in order. */
+        node_t *e_pats[16]; node_t *e_guards[16]; node_t *e_bodies[16];
+        int nelse = 0;
+        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+            while (p->cur.type == TOK_SEMI) par_adv(p);
+            if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+            if (nelse >= 16) {
+                snprintf(p->errmsg, sizeof(p->errmsg),
+                         "line %d: too many `else` arms (max 16)", t.line);
+                p->err = 1;
+                break;
+            }
+            e_pats[nelse] = par_expr(p);
+            e_guards[nelse] = NULL;
+            if (p->cur.type == TOK_WHEN) {
+                par_adv(p);
+                e_guards[nelse] = par_expr(p);
+            }
+            par_expect(p, TOK_ARROW, "'->'");
+            /* Arm body: same tri-shape as a case arm — bare tuple result,
+             * explicit { block }, or statements up to the next `pat ->` /
+             * `pat when` / closing brace. */
+            node_t *ebody;
+            if (p->cur.type == TOK_LBRACE && par_arm_brace_is_tuple(p)) {
+                ebody = par_expr(p);
+            } else if (p->cur.type == TOK_LBRACE) {
+                par_adv(p);
+                ebody = par_block(p);
+                par_expect(p, TOK_RBRACE, "'}'");
+            } else {
+                ebody = mknode(N_BLOCK, p->cur.line);
+                ebody->v.block.stmts = NULL;
+                ebody->v.block.nstmts = 0;
+                while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+                    while (p->cur.type == TOK_SEMI) par_adv(p);
+                    if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+                    lex_t save_lex = p->lex;
+                    tok_t save_cur = p->cur;
+                    int save_err = p->err;
+                    node_t *expr = par_stmt(p);
+                    if (p->cur.type == TOK_ARROW || p->cur.type == TOK_WHEN) {
+                        p->lex = save_lex;
+                        p->cur = save_cur;
+                        p->err = save_err;
+                        node_free(expr);
+                        break;
+                    }
+                    ebody->v.block.nstmts++;
+                    ebody->v.block.stmts = realloc(ebody->v.block.stmts,
+                        sizeof(node_t*) * ebody->v.block.nstmts);
+                    ebody->v.block.stmts[ebody->v.block.nstmts - 1] = expr;
+                }
+            }
+            e_bodies[nelse] = ebody;
+            nelse++;
+        }
         par_expect(p, TOK_RBRACE, "'}'");
+        if (!p->err && nelse == 0) {
+            snprintf(p->errmsg, sizeof(p->errmsg),
+                     "line %d: `else` needs at least one `pattern -> body` arm", t.line);
+            p->err = 1;
+        }
 
         if (p->err) {
             for (int i = 0; i < nbinds; i++) { node_free(pats[i]); node_free(exprs[i]); }
-            node_free(body); node_free(else_pat); node_free(else_body);
+            node_free(body);
+            for (int i = 0; i < nelse; i++) {
+                node_free(e_pats[i]);
+                if (e_guards[i]) node_free(e_guards[i]);
+                node_free(e_bodies[i]);
+            }
             return mknode(N_INT, t.line);
         }
 
@@ -1183,26 +1329,31 @@ static node_t *par_primary(par_t *p) {
         for (int i = nbinds - 1; i >= 0; i--) {
             node_t *cx = mknode(N_CASE, exprs[i]->line);
             cx->v.casex.subject = exprs[i];
-            cx->v.casex.nclauses = 2;
-            cx->v.casex.clauses = malloc(sizeof(node_t*) * 2);
+            cx->v.casex.nclauses = 1 + nelse;
+            cx->v.casex.clauses = malloc(sizeof(node_t*) * (1 + nelse));
             /* happy arm: pat_i -> inner */
             node_t *ok = mknode(N_CLAUSE, pats[i]->line);
             ok->v.clause.pattern = pats[i];
             ok->v.clause.guard = NULL;
             ok->v.clause.body = inner;
-            /* fallback arm: o -> E  (fresh copy per level) */
-            node_t *fb = mknode(N_CLAUSE, else_pat->line);
-            fb->v.clause.pattern = node_dup(else_pat);
-            fb->v.clause.guard = NULL;
-            fb->v.clause.body = node_dup(else_body);
             cx->v.casex.clauses[0] = ok;
-            cx->v.casex.clauses[1] = fb;
+            /* fallback arms: every else clause, in order (fresh copies per
+             * bind level — each desugared case owns its own subtree). */
+            for (int j = 0; j < nelse; j++) {
+                node_t *fb = mknode(N_CLAUSE, e_pats[j]->line);
+                fb->v.clause.pattern = node_dup(e_pats[j]);
+                fb->v.clause.guard = e_guards[j] ? node_dup(e_guards[j]) : NULL;
+                fb->v.clause.body = node_dup(e_bodies[j]);
+                cx->v.casex.clauses[1 + j] = fb;
+            }
             inner = cx;
         }
-        /* The originals (else_pat/else_body) were only templates for the
-         * per-level dups — free them. */
-        node_free(else_pat);
-        node_free(else_body);
+        /* The originals were only templates for the per-level dups. */
+        for (int i = 0; i < nelse; i++) {
+            node_free(e_pats[i]);
+            if (e_guards[i]) node_free(e_guards[i]);
+            node_free(e_bodies[i]);
+        }
         return inner;
     }
 
@@ -1257,7 +1408,14 @@ static node_t *par_primary(par_t *p) {
         recv->v.recv.after_body = NULL;
         recv->v.recv.after_ms = -1;  /* sentinel: no after clause */
 
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER && p->cur.type != TOK_EOF) {
+        /* `&& !p->err`: once a clause fails to parse, the cursor stops
+         * advancing (par_primary/par_expect short-circuit on err) but is
+         * not necessarily on RBRACE/AFTER/EOF — without the err guard the
+         * loop spins forever appending empty clauses (a stray token inside
+         * a receive arm OOM'd swc; found by `make fuzz`). par_case's clause
+         * loop already had this guard; par_receive's did not. */
+        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_AFTER &&
+               p->cur.type != TOK_EOF && !p->err) {
             node_t *cl = mknode(N_CLAUSE, p->cur.line);
             cl->v.clause.pattern = par_expr(p);
             cl->v.clause.guard = NULL;
@@ -1330,12 +1488,22 @@ static node_t *par_primary(par_t *p) {
                 recv->v.recv.after_ms = -1;
                 recv->v.recv.after_expr = timeout_expr;
             }
-            par_expect(p, TOK_LBRACE, "'{'");
-            /* Use par_block so multi-statement after bodies work — the
-             * common pattern is `after N { fn() ; loop(...) }` and
-             * par_expr would only consume `fn()`. */
-            recv->v.recv.after_body = par_block(p);
-            par_expect(p, TOK_RBRACE, "'}'");
+            /* Both body shapes are accepted: the canonical block form
+             * `after MS { body }` and the Erlang-reflex arrow form
+             * `after MS -> body` (every receive ARM is `pat -> body`, so
+             * models emit the arrow here constantly; rejecting it bought
+             * nothing). The arrow body runs to the closing brace of the
+             * receive — `after` is necessarily the last clause. */
+            if (par_match(p, TOK_ARROW)) {
+                recv->v.recv.after_body = par_block(p);
+            } else {
+                par_expect(p, TOK_LBRACE, "'{'");
+                /* Use par_block so multi-statement after bodies work — the
+                 * common pattern is `after N { fn() ; loop(...) }` and
+                 * par_expr would only consume `fn()`. */
+                recv->v.recv.after_body = par_block(p);
+                par_expect(p, TOK_RBRACE, "'}'");
+            }
         }
 
         par_expect(p, TOK_RBRACE, "'}'");
@@ -1652,6 +1820,107 @@ static node_t *par_expr(par_t *p) {
 
 /* Statement: assignment or expression */
 static node_t *par_stmt(par_t *p) {
+    /* Tuple-destructuring assignment: `{a, b} = expr` (and `{'ok', v} = ...`
+     * muscle memory aside, only plain identifiers and `_` may appear on the
+     * left). Desugars at PARSE time into a temp + per-element elem() binds,
+     * so the interpreter and codegen get identical semantics for free:
+     *
+     *     __destruct_N = expr
+     *     a = elem(__destruct_N, 0)
+     *     b = elem(__destruct_N, 1)
+     *     __destruct_N                  <- the whole statement's value
+     *
+     * A too-short tuple (or a non-tuple) panics through elem's existing
+     * out-of-range/type panic; extra trailing elements are tolerated. */
+    if (p->cur.type == TOK_LBRACE) {
+        lex_t save_lex = p->lex;
+        tok_t save_cur = p->cur;
+        int save_err = p->err;
+        node_t *lhs = par_expr(p);
+        if (!p->err && lhs && lhs->type == N_TUPLE && p->cur.type == TOK_ASSIGN) {
+            /* Destructurable: identifiers (bind), `_` (skip), and literal
+             * atoms/ints/floats/strings (assert-match, Erlang-style — so
+             * `{'ok', v} = fetch()` binds v AND panics on {'error', _}). */
+            int all_idents = 1;
+            for (int i = 0; i < lhs->v.coll.count; i++) {
+                node_type_t it = lhs->v.coll.items[i]->type;
+                if (it != N_IDENT && it != N_ATOM && it != N_INT &&
+                    it != N_FLOAT && it != N_STRING) { all_idents = 0; break; }
+            }
+            if (all_idents && lhs->v.coll.count > 0) {
+                par_adv(p);   /* consume '=' */
+                int line = save_cur.line;
+                static int dt_ctr = 0;
+                char tmp[32];
+                snprintf(tmp, sizeof(tmp), "__destruct_%d", dt_ctr++);
+
+                node_t *blk = mknode(N_BLOCK, line);
+                blk->v.block.nstmts = 0;
+                blk->v.block.stmts = malloc(sizeof(node_t*) * (lhs->v.coll.count + 2));
+
+                node_t *bind = mknode(N_ASSIGN, line);
+                strncpy(bind->v.assign.name, tmp, sizeof(bind->v.assign.name) - 1);
+                bind->v.assign.value = par_expr(p);
+                blk->v.block.stmts[blk->v.block.nstmts++] = bind;
+
+                for (int i = 0; i < lhs->v.coll.count; i++) {
+                    node_t *item = lhs->v.coll.items[i];
+                    if (item->type == N_IDENT && strcmp(item->v.sval, "_") == 0)
+                        continue;
+                    /* elem(__destruct_N, i) */
+                    node_t *get = mknode(N_CALL, line);
+                    node_t *fn_id = mknode(N_IDENT, line);
+                    strcpy(fn_id->v.sval, "elem");
+                    get->v.call.func = fn_id;
+                    get->v.call.args = malloc(sizeof(node_t*) * 2);
+                    node_t *src_id = mknode(N_IDENT, line);
+                    strncpy(src_id->v.sval, tmp, sizeof(src_id->v.sval) - 1);
+                    node_t *idx = mknode(N_INT, line);
+                    idx->v.ival = i;
+                    get->v.call.args[0] = src_id;
+                    get->v.call.args[1] = idx;
+                    get->v.call.nargs = 2;
+                    if (item->type == N_IDENT) {
+                        /* bind: name = elem(tmp, i) */
+                        node_t *as = mknode(N_ASSIGN, line);
+                        strncpy(as->v.assign.name, item->v.sval,
+                                sizeof(as->v.assign.name) - 1);
+                        as->v.assign.value = get;
+                        blk->v.block.stmts[blk->v.block.nstmts++] = as;
+                    } else {
+                        /* literal: expect(elem(tmp, i) == lit, msg) — panics
+                         * on mismatch, Erlang match semantics. */
+                        node_t *cmp = mknode(N_BINOP, line);
+                        strcpy(cmp->v.binop.op, "==");
+                        cmp->v.binop.left = get;
+                        cmp->v.binop.right = node_dup(item);
+                        node_t *msg = mknode(N_STRING, line);
+                        snprintf(msg->v.sval, sizeof(msg->v.sval),
+                                 "destructuring mismatch at element %d", i);
+                        node_t *chk = mknode(N_CALL, line);
+                        node_t *exp_id = mknode(N_IDENT, line);
+                        strcpy(exp_id->v.sval, "expect");
+                        chk->v.call.func = exp_id;
+                        chk->v.call.args = malloc(sizeof(node_t*) * 2);
+                        chk->v.call.args[0] = cmp;
+                        chk->v.call.args[1] = msg;
+                        chk->v.call.nargs = 2;
+                        blk->v.block.stmts[blk->v.block.nstmts++] = chk;
+                    }
+                }
+                node_t *valret = mknode(N_IDENT, line);
+                strncpy(valret->v.sval, tmp, sizeof(valret->v.sval) - 1);
+                blk->v.block.stmts[blk->v.block.nstmts++] = valret;
+                node_free(lhs);
+                return blk;
+            }
+        }
+        /* Not a destructuring assignment — backtrack and parse normally. */
+        node_free(lhs);
+        p->lex = save_lex;
+        p->cur = save_cur;
+        p->err = save_err;
+    }
     if (p->cur.type == TOK_IDENT) {
         /* Peek: is next token '=' (but not '==')? */
         tok_t id = p->cur;
@@ -1879,6 +2148,26 @@ static __thread sw_value_arena_t *g_alloc_target = NULL;
  * heap; an explicit target region (deep_copy_into) → that region; the running
  * process's arena (compiled backend, freed at process exit) → that; else the
  * global heap (interpreter / pre-fiber). val_alloc zeroes (calloc semantics). */
+/* Heap exhaustion is not recoverable from inside a value constructor (every
+ * sw_val_* caller writes fields through the result unchecked), so fail LOUD
+ * with the likely cause instead of letting the first write SIGSEGV at nil.
+ * Observed in the wild: a single-scheduler 80K spawn storm runs the host out
+ * of VMAs (each live fiber stack is its own mmap; Linux's default
+ * vm.max_map_count is 65530), at which point mmap AND calloc return NULL. */
+static void *val_alloc_oom(size_t n) {
+    fprintf(stderr,
+            "\n\x1b[1;31mpanic\x1b[0m: out of memory: value allocation of %zu bytes failed\n"
+            "  (under a spawn storm on Linux this is often VMA exhaustion — each live\n"
+            "   process stack is an mmap; check `sysctl vm.max_map_count` and the\n"
+            "   number of simultaneously-live processes)\n",
+            n);
+    abort();
+}
+
+#ifdef SW_ALLOC_FAULT
+int sw_alloc_fault_tick(void);   /* Phase 2.5 fault injection — see swarmrt_native.c */
+#endif
+
 static inline void *val_alloc(size_t n) {
     if (!g_alloc_force_global) {
         sw_value_arena_t *a = g_alloc_target ? g_alloc_target : sw_self_varena();
@@ -1887,7 +2176,13 @@ static inline void *val_alloc(size_t n) {
             if (p) { memset(p, 0, n); return p; }
         }
     }
-    return calloc(1, n);
+#ifdef SW_ALLOC_FAULT
+    /* Inject a global-heap value-allocation failure: exercises the
+     * loud-OOM path AND any caller that must unwind a half-built value. */
+    if (sw_alloc_fault_tick()) return val_alloc_oom(n);
+#endif
+    void *p = calloc(1, n);
+    return p ? p : val_alloc_oom(n);
 }
 
 static inline char *val_strdup(const char *s) {
@@ -1899,7 +2194,8 @@ static inline char *val_strdup(const char *s) {
             if (p) return p;
         }
     }
-    return strdup(s);
+    char *p = strdup(s);
+    return p ? p : (char *)val_alloc_oom(strlen(s) + 1);
 }
 
 sw_val_t *sw_val_nil(void) {
@@ -2261,6 +2557,14 @@ void sw_val_free(sw_val_t *v) {
         free(v->v.tuple.items); break;
     case SW_VAL_FUN: /* don't free closure env -- owned by interpreter */ break;
     case SW_VAL_MAP:
+        /* Recurse into key/val nodes (mirrors the tuple/list case) — the
+         * arrays alone left every entry's value node leaked. Safe: all
+         * callers free fully-owned trees (json_decode output, test args);
+         * none alias map sub-values. */
+        for (int i = 0; i < v->v.map.count; i++) {
+            sw_val_free(v->v.map.keys[i]);
+            sw_val_free(v->v.map.vals[i]);
+        }
         free(v->v.map.keys); free(v->v.map.vals); break;
     case SW_VAL_BYTES: free(v->v.bytes.data); break;  /* always own a block (len>=1 alloc) */
     default: break;
@@ -2612,6 +2916,7 @@ static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, .
     (void)line;
     snprintf(interp->error_msg, sizeof(interp->error_msg), "panic: %s", msg);
     interp->error = 1;
+    interp->panicking = 1;   /* uncatchable — N_TRY must not absorb a panic */
 }
 
 /* Recursion-depth guard for the tree-walker.
@@ -2923,12 +3228,20 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
 
     /* Save current error state so nested assert_raises work correctly. */
     int saved_error = interp->error;
+    int saved_panicking = interp->panicking;
     char saved_error_msg[256];
     memcpy(saved_error_msg, interp->error_msg, sizeof(saved_error_msg));
 
     /* Clear error so the lambda runs fresh. */
     interp->error = 0;
+    interp->panicking = 0;
     interp->error_msg[0] = '\0';
+
+    /* assert_raises is semantically a try: error() inside the probe fn must
+     * register (try_depth gates the outside-a-try silent path), and the
+     * panic interception below is this helper's sanctioned, documented
+     * exception to "panics are uncatchable". */
+    interp->try_depth++;
 
     /* Call the lambda body.  Mirrors the dynamic-dispatch closure pattern
      * (eval N_CALL, "Dynamic dispatch: variable holds a closure"). */
@@ -2940,12 +3253,15 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
     (void)eval(interp, fn_node->v.fun.body, fenv);
     env_free(fenv);
 
+    interp->try_depth--;
+
     int did_error = interp->error;
     char actual_msg[256];
     memcpy(actual_msg, interp->error_msg, sizeof(actual_msg));
 
-    /* Restore outer error state. */
+    /* Restore outer error state (panic interception included). */
     interp->error = saved_error;
+    interp->panicking = saved_panicking;
     memcpy(interp->error_msg, saved_error_msg, sizeof(interp->error_msg));
 
     if (!did_error) {
@@ -3118,7 +3434,12 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return r;
     }
     if (strcmp(fname, "reduce") == 0 && nargs >= 3) {
-        sw_val_t *fn = args[0], *lst = args[1], *acc = args[2];
+        /* (fn, list, acc) or the piped (list, fn, acc) — codegen parity. */
+        sw_val_t *fn, *lst;
+        if (args[0] && args[0]->type == SW_VAL_FUN)      { fn = args[0]; lst = args[1]; }
+        else if (args[1] && args[1]->type == SW_VAL_FUN) { lst = args[0]; fn = args[1]; }
+        else { fn = args[0]; lst = args[1]; }
+        sw_val_t *acc = args[2];
         if (!lst || lst->type != SW_VAL_LIST) return acc;
         for (int i = 0; i < lst->v.tuple.count; i++) {
             sw_val_t *a2[2] = { acc, lst->v.tuple.items[i] };
@@ -3174,13 +3495,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             else fputs("panic", m);
             fclose(m);
         }
-        /* In the interpreter/test runner, turn panic into a catchable error
-         * so assert_raises() can inspect it.  The message is prefixed with
-         * "panic: " to distinguish it from a bare error() call. */
+        /* Panic: uncatchable (panicking flag bypasses N_TRY), aborts the run
+         * with exit 1 at top level — same meaning as the compiled path. Only
+         * assert_raises (the documented test seam) intercepts it. */
         snprintf(interp->error_msg, sizeof(interp->error_msg),
                  "panic: %s", buf ? buf : "(no message)");
         free(buf);
         interp->error = 1;
+        interp->panicking = 1;
         return sw_val_nil();
     }
     if (strcmp(fname, "expect") == 0 && nargs >= 1) {
@@ -3189,17 +3511,27 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (falsy) {
             const char *msg = (nargs >= 2 && args[1]->type == SW_VAL_STRING)
                                 ? args[1]->v.str : "expect failed";
-            fprintf(stderr, "expect at line %d: %s\n", line, msg);
-            exit(1);
+            /* A failed expect IS a panic (compiled parity): uncatchable,
+             * exit 1 at top level, interceptable only by assert_raises —
+             * not a hard exit(1) here, which bypassed assert_raises and
+             * skipped the uniform top-level panic report. */
+            interp_raise_panic(interp, line, "%s", msg);
+            return sw_val_nil();
         }
         return args[0];
     }
     if (strcmp(fname, "error") == 0) {
-        interp->error = 1;
-        if (nargs > 0 && (args[0]->type == SW_VAL_STRING || args[0]->type == SW_VAL_ATOM))
-            snprintf(interp->error_msg, sizeof(interp->error_msg), "%s", args[0]->v.str);
-        else
-            snprintf(interp->error_msg, sizeof(interp->error_msg), "error");
+        /* Outside any dynamically-enclosing try (or assert_raises), error()
+         * is documented as silent — execution continues with nil. Setting
+         * the flag here used to silently unwind the entire rest of the
+         * program instead (every eval short-circuits on interp->error). */
+        if (interp->try_depth > 0) {
+            interp->error = 1;
+            if (nargs > 0 && (args[0]->type == SW_VAL_STRING || args[0]->type == SW_VAL_ATOM))
+                snprintf(interp->error_msg, sizeof(interp->error_msg), "%s", args[0]->v.str);
+            else
+                snprintf(interp->error_msg, sizeof(interp->error_msg), "error");
+        }
         return sw_val_nil();
     }
 
@@ -3954,6 +4286,32 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "string_to_bytes") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         return sw_val_bytes((const uint8_t *)args[0]->v.str, strlen(args[0]->v.str));
     }
+    if (strcmp(fname, "string_chars") == 0 && nargs >= 1) {
+        /* Codepoint-aware split — twin of _builtin_string_chars (studio.h):
+         * list of single-codepoint strings via UTF-8 lead-byte lengths;
+         * invalid leads degrade to one byte. Conform gate t04 holds the
+         * two paths identical. */
+        if (args[0]->type != SW_VAL_STRING) return sw_val_list(NULL, 0);
+        const char *s = args[0]->v.str ? args[0]->v.str : "";
+        size_t len = strlen(s);
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (len + 1));
+        int cnt = 0;
+        size_t i = 0;
+        while (i < len) {
+            unsigned char c = (unsigned char)s[i];
+            int sl = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2 :
+                     ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xF8) == 0xF0) ? 4 : 1;
+            if (i + (size_t)sl > len) sl = 1;
+            char buf[8];
+            memcpy(buf, s + i, sl);
+            buf[sl] = 0;
+            items[cnt++] = sw_val_string(buf);
+            i += (size_t)sl;
+        }
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
+    }
     if (strcmp(fname, "bytes_to_string") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
         size_t len = args[0]->v.bytes.len;
         char *tmp = (char *)malloc(len + 1);
@@ -4326,23 +4684,29 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     }
 
     case N_PIPE: {
-        /* val |> func  →  func(val) */
+        /* val |> func  →  func(val, ...extra) with the SAME dispatch chain
+         * as N_CALL: module functions, the primary builtins, the
+         * extra-builtin bridge (map/filter/reduce, strings, files, json,
+         * Std-support, ...), then lambda-valued variables. The previous
+         * whitelist (print/length/asserts only) silently returned the piped
+         * value unchanged for everything else — `xs |> filter(f)` was a
+         * NO-OP under `swc run` while working compiled (dual-path gate
+         * tests/sw/conform/t06 holds this closed). */
         sw_val_t *val = eval(interp, n->v.pipe.val, env);
-        /* func should be a call or ident — apply val as first arg */
+        if (interp->error) return sw_val_nil();
         if (n->v.pipe.func->type == N_CALL) {
-            /* Add val as first arg */
             node_t *call = n->v.pipe.func;
-            sw_val_t *func_name_val = eval(interp, call->v.call.func, env);
-            (void)func_name_val;
             const char *fname = call->v.call.func->v.sval;
 
             sw_val_t *args[17];
             args[0] = val;
             int nargs = 1;
-            for (int i = 0; i < call->v.call.nargs && nargs < 16; i++)
+            for (int i = 0; i < call->v.call.nargs && nargs < 16; i++) {
                 args[nargs++] = eval(interp, call->v.call.args[i], env);
+                if (interp->error) return sw_val_nil();
+            }
 
-            /* Look up function in module */
+            /* Module function (covers Module.qualified names too). */
             node_t *fn = find_fun(interp->module_ast, fname);
             if (fn) {
                 if (interp_recursion_blocked(interp)) return sw_val_nil();
@@ -4355,13 +4719,22 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                 env_free(fenv);
                 return r;
             }
-            /* Builtins */
+            /* Primary builtins (N_CALL's head chain). */
             if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
             if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
             if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
             if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
             if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
             if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
+            /* The codegen-surface bridge: map/filter/reduce + the rest. */
+            {
+                sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
+                if (xr) return xr;
+            }
+            /* Lambda held in a variable: x |> f(...) */
+            sw_val_t *fv = env_get(env, fname);
+            if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body)
+                return interp_apply_fn(interp, fv, args, nargs);
         }
         return val;
     }
@@ -4373,6 +4746,11 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (nargs > 16) nargs = 16;
         for (int i = 0; i < nargs; i++)
             args[i] = eval(interp, n->v.call.args[i], env);
+        /* An error/panic raised while evaluating an argument must abort
+         * this call, not feed nil into it. Without this, a panic inside
+         * an f-string interpolation was laundered into the string "nil"
+         * by the desugared to_string(...) and the program sailed on. */
+        if (interp->error) return sw_val_nil();
 
         /* Built-ins */
         if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
@@ -4747,8 +5125,17 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     }
 
     case N_TRY: {
+        /* try_depth gates error()'s outside-a-try silent path; see the
+         * error builtin. Decrement BEFORE running the catch body so an
+         * error() raised inside catch propagates to the ENCLOSING try
+         * (compiled-path parity), not back into this one. */
+        interp->try_depth++;
         sw_val_t *result = eval(interp, n->v.trycatch.body, env);
-        if (interp->error) {
+        interp->try_depth--;
+        /* A panic is uncatchable: leave both flags set so every enclosing
+         * eval keeps short-circuiting and the top level exits 1. Only
+         * error() lands in catch — same split as the compiled path. */
+        if (interp->error && !interp->panicking) {
             interp->error = 0;
             sw_env_t *catch_env = env_new(env);
             env_set(catch_env, n->v.trycatch.err_var, sw_val_string(interp->error_msg));
@@ -4831,6 +5218,13 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
  * Public API
  * ========================================================================= */
 
+/* Free an AST returned by sw_lang_parse. Public so callers that parse
+ * but never interpret (fuzz harness, linters, one-shot tooling) can
+ * reclaim it — node_free is otherwise file-static. */
+void sw_lang_free_ast(void *ast) {
+    if (ast) node_free((node_t *)ast);
+}
+
 void *sw_lang_parse(const char *source) {
     par_t p;
     par_init(&p, source);
@@ -4894,7 +5288,7 @@ static const char *k_interp_builtins[] = {
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
     "random_int","reduce","shell","shell_sandboxed","sleep","string_replace",
-    "string_sub","string_to_bytes","string_truncate","sys_exit","to_float",
+    "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
     NULL
 };
@@ -5234,7 +5628,11 @@ static sw_val_t *_jd_parse_string(const char **pp) {
     while (**pp && **pp != '"' && len < (int)sizeof(buf) - 5) {
         if (**pp == '\\') {
             (*pp)++;
-            if (!**pp) break;  /* fuzz_json found: truncated escape at NUL -> OOB read */
+            /* A backslash as the last byte before the NUL: stop. Otherwise
+             * the switch's default/simple cases copy the NUL and (*pp)++
+             * step PAST the terminator → heap-buffer-overflow on the next
+             * loop read (found by fuzz-json). The while gate ends the loop. */
+            if (**pp == '\0') break;
             switch (**pp) {
                 case 'n': buf[len++] = '\n'; (*pp)++; break;
                 case 't': buf[len++] = '\t'; (*pp)++; break;
@@ -5331,7 +5729,15 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
     while (**pp >= '0' && **pp <= '9') (*pp)++;
     if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
     if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
-    if (*pp == start) { if (**pp) (*pp)++; return sw_val_nil(); }  /* fuzz_json: guard NUL before advance on unrecognized token */
+    if (*pp == start) {
+        /* Unparseable char where a value was expected. Force progress so
+         * callers' loops can't spin — but NEVER past the NUL terminator:
+         * at end-of-input (e.g. `{"a":` then EOF) stepping past `\0` is a
+         * heap-buffer-overflow (found by fuzz-json). The enclosing array/
+         * object loops gate on `**pp`, so leaving pp at the NUL ends them. */
+        if (**pp != '\0') (*pp)++;
+        return sw_val_nil();
+    }
     char tmp[64];
     size_t numlen = *pp - start;
     if (numlen > 63) numlen = 63;

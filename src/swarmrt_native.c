@@ -107,6 +107,14 @@ static __thread sw_scheduler_t *tls_spawn_override = NULL;
 static pthread_t        g_watchdog_thread;
 static volatile int     g_watchdog_stop = 0;
 static int              g_watchdog_enabled = 1;   /* 0 when SW_DEADLOCK_DETECT=0 */
+/* Shutdown wake for the watchdog. It used to sleep its interval in 100ms
+ * nanosleep chunks polling g_watchdog_stop — so EVERY binary paid an avg
+ * ~50ms (worst 100ms) at exit joining it. For a CLI tool whose whole run
+ * is 10ms, that chunk WAS the startup-time story (Round-7 O5: hello
+ * measured 110-145ms wall, ~99ms of it this join). A condvar makes
+ * shutdown instant and removes the idle wakeups entirely. */
+static pthread_mutex_t  g_watchdog_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   g_watchdog_cond = PTHREAD_COND_INITIALIZER;
 
 /* Defined in swarmrt_io.c. Forward-declared here (rather than pulling in
  * swarmrt_io.h with its full port/event structs) so the watchdog can ask
@@ -141,16 +149,19 @@ static void *watchdog_thread_fn(void *arg) {
     }
 
     while (!g_watchdog_stop) {
-        /* Sleep in 100 ms chunks so shutdown is responsive. */
-        unsigned long slept = 0;
-        while (slept < interval_ms && !g_watchdog_stop) {
-            unsigned long chunk = interval_ms - slept;
-            if (chunk > 100) chunk = 100;
-            struct timespec ts = { (time_t)(chunk / 1000),
-                                   (long)((chunk % 1000) * 1000000L) };
-            nanosleep(&ts, NULL);
-            slept += chunk;
+        /* Wait one interval OR an instant shutdown signal — no chunked
+         * polling (see g_watchdog_cond above for the boot-time story). */
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += (time_t)(interval_ms / 1000);
+        dl.tv_nsec += (long)((interval_ms % 1000) * 1000000L);
+        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        pthread_mutex_lock(&g_watchdog_lock);
+        while (!g_watchdog_stop) {
+            if (pthread_cond_timedwait(&g_watchdog_cond, &g_watchdog_lock, &dl) != 0)
+                break;   /* interval elapsed (ETIMEDOUT) — go scan */
         }
+        pthread_mutex_unlock(&g_watchdog_lock);
         if (g_watchdog_stop) break;
 
         sw_swarm_t *sw = g_swarm;
@@ -529,6 +540,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     }
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
+    proc->try_chain = NULL;      /* per-process compiled try/catch chain (see sw_self_try_chain) */
 
     /* Per-process generated line/file/call-trace state. Lazily allocated and KEPT
      * WITH THE SLAB SLOT across lifetimes (like stack_mem below): reset here, freed
@@ -614,7 +626,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->ctx.stack_base = (uint64_t)stack_top;
     proc->ctx.stack_limit = (uint64_t)proc->stack_mem;
     sw_spin_unlock(&proc->ctx_lock);
-    proc->state = SW_PROC_RUNNABLE;
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
     proc->priority = SW_PRIO_NORMAL;
     proc->fcalls = SWARM_CONTEXT_REDS;
     proc->flags = 0;
@@ -712,9 +724,17 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.priv_tail = NULL;
     proc->mailbox.count = 0;
 
-    /* Free the panic_msg string set by sw_process_panic. */
-    free(proc->panic_msg);
+    /* Free the panic_msg string set by sw_process_panic. UNDER link_lock:
+     * a late sw_monitor on this (already-EXITING/FREE) process reads
+     * panic_msg in its already-dead delivery path under the same lock, so
+     * the free must serialise with it or the monitor reads freed memory.
+     * NULL-under-lock means the monitor sees either a valid pointer or
+     * NULL, never freed-but-non-NULL. */
+    pthread_mutex_lock(&g_swarm->link_lock);
+    char *_pm = proc->panic_msg;
     proc->panic_msg = NULL;
+    pthread_mutex_unlock(&g_swarm->link_lock);
+    free(_pm);
 
     /* GC v1: reclaim this process's whole value arena in O(chunks). Runs after
      * the fiber has returned, so there are no live sw_val_t* C-stack roots.
@@ -771,6 +791,17 @@ static void preempt_handler(int sig, siginfo_t *info, void *context) {
     current->fcalls = 0;
 }
 
+/* DEAD CODE — never called (discovered in the Round-7 LSan work, June
+ * 2026). The intended design was a 1ms timer zeroing the running
+ * process's fcalls so CPU-bound code gets descheduled, but no call site
+ * was ever wired and the only real preemption is the reduction check at
+ * compiled tail-loop backedges (sw_check_reds at `goto _tail`). Wiring
+ * this up WOULD tighten preemption latency for long single turns — but
+ * it is a behavior change that needs the full storm/stress battery and
+ * a signal-vs-sanitizer interaction review (a 1ms SIGALRM storm is
+ * hostile to LSan's stop-the-world), so it stays off deliberately.
+ * Kept (not deleted) as the blueprint for that future change. */
+__attribute__((unused))
 static void setup_preemption(void) {
 #ifdef __APPLE__
     g_preempt_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
@@ -842,6 +873,146 @@ int sw_check_reds(void) {
  * gets a unique "prev" to link through. The subsequent store to prev->rq_next
  * completes the link (consumer waits for this to become non-NULL).
  */
+/* SW_SCHED_TRACE=1 — 1Hz scheduler counter telemetry on stderr, for
+ * diffing a wedged run against a healthy one (the slope_message
+ * phase-lock hunt). Relaxed atomic counters, all increments gated behind
+ * the flag; zero cost when off. */
+static int g_sched_trace = -1;
+static _Atomic uint64_t g_tr_enq, g_tr_sig, g_tr_idle_seen,
+                        g_tr_park, g_tr_park_signal, g_tr_park_timeout,
+                        g_tr_spin_hit, g_tr_guard_hit;
+/* Wedge autopsy: when SW_SCHED_TRACE=1 and enqueues flatline for 3
+ * consecutive seconds while live processes exist, dump every live
+ * process's lifecycle state, waiting flag, and mailbox pointers, plus
+ * each scheduler's runq internals — the exact stuck state of the
+ * spin-gated P1 deadlock, labeled. Walks the slab unsynchronized
+ * (stall-time only; same warn-only contract as the watchdog). */
+/* SW_SCHED_TRACE=2: lock-free event ring for the P1 hunt. Every
+ * protocol-relevant transition appends {seq, ev, pid, aux}; the autopsy
+ * dumps the tail. Relaxed fetch_add slot claim — order is the global
+ * seq, exactly what the interleaving analysis needs. */
+#define SW_TRACE_RING 4096
+typedef struct { uint64_t seq; uint8_t ev; uint64_t pid; uint64_t aux; } sw_trev_t;
+static sw_trev_t g_trev[SW_TRACE_RING];
+static _Atomic uint64_t g_trev_seq;
+enum { TREV_PUSH = 1, TREV_WAKE1, TREV_WAKE0, TREV_WSET, TREV_WCLR_SELF,
+       TREV_DRAIN_HIT, TREV_DRAIN_MISS, TREV_PARKSWAP, TREV_ENQ,
+       TREV_PICK, TREV_SWAPFAIL, TREV_RUN };
+static inline void trev(uint8_t ev, uint64_t pid, uint64_t aux) {
+    if (g_sched_trace < 2) return;
+    uint64_t s = atomic_fetch_add_explicit(&g_trev_seq, 1, memory_order_relaxed);
+    sw_trev_t *e = &g_trev[s % SW_TRACE_RING];
+    e->seq = s; e->ev = ev; e->pid = pid; e->aux = aux;
+}
+static const char *trev_name(uint8_t ev) {
+    switch (ev) {
+    case TREV_PUSH: return "PUSH";       case TREV_WAKE1: return "WAKE->enq";
+    case TREV_WAKE0: return "WAKE-noop"; case TREV_WSET: return "WSET";
+    case TREV_WCLR_SELF: return "WCLR-self"; case TREV_DRAIN_HIT: return "DRAIN-hit";
+    case TREV_DRAIN_MISS: return "DRAIN-miss"; case TREV_PARKSWAP: return "PARK-swap";
+    case TREV_ENQ: return "ENQ";         case TREV_PICK: return "PICK";
+    case TREV_SWAPFAIL: return "SWAPFAIL"; case TREV_RUN: return "RUN";
+    default: return "?";
+    }
+}
+static void trev_dump(void) {
+    uint64_t end = atomic_load_explicit(&g_trev_seq, memory_order_relaxed);
+    uint64_t start = end > 64 ? end - 64 : 0;
+    fprintf(stderr, "[sched-autopsy] last %llu protocol events:\n",
+            (unsigned long long)(end - start));
+    for (uint64_t s = start; s < end; s++) {
+        sw_trev_t e = g_trev[s % SW_TRACE_RING];
+        if (e.seq != s) continue;   /* overwritten mid-read */
+        fprintf(stderr, "  #%llu %-10s pid=%llu aux=%llu\n",
+                (unsigned long long)e.seq, trev_name(e.ev),
+                (unsigned long long)e.pid, (unsigned long long)e.aux);
+    }
+}
+
+static void sched_trace_autopsy(void) {
+    if (!g_swarm) return;
+    sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+    if (!slab) return;
+    uint32_t cap = g_swarm->arena.proc_capacity;
+    fprintf(stderr, "[sched-autopsy] === enqueues flatlined; dumping live state ===\n");
+    for (uint32_t i = 0; i < cap; i++) {
+        if (slab[i].state == SW_PROC_FREE) continue;
+        int is_stub = 0;
+        for (uint32_t s = 0; s < g_swarm->num_schedulers; s++)
+            if (g_swarm->schedulers[s] && &g_swarm->schedulers[s]->sched_proc == &slab[i]) is_stub = 1;
+        if (is_stub) continue;
+        fprintf(stderr,
+            "[sched-autopsy] slot=%u pid=%llu state=%d waiting=%d sig_head=%p "
+            "priv_head=%p count=%u kill=%d sched=%u rq_next=%p\n",
+            i, (unsigned long long)slab[i].pid, (int)slab[i].state,
+            atomic_load_explicit(&slab[i].mailbox.waiting, memory_order_relaxed),
+            (void *)atomic_load_explicit(&slab[i].mailbox.sig_head, memory_order_relaxed),
+            (void *)slab[i].mailbox.priv_head, slab[i].mailbox.count,
+            slab[i].kill_flag,
+            slab[i].scheduler ? slab[i].scheduler->id : 9999,
+            (void *)atomic_load_explicit(&slab[i].rq_next, memory_order_relaxed));
+    }
+    for (uint32_t s = 0; s < g_swarm->num_schedulers; s++) {
+        sw_scheduler_t *sc = g_swarm->schedulers[s];
+        if (!sc) continue;
+        for (int prio = 0; prio < SW_PRIO_NUM; prio++) {
+            sw_process_t *head = sc->runq.heads[prio];
+            sw_process_t *tail = atomic_load_explicit(&sc->runq.tails[prio], memory_order_relaxed);
+            int head_is_stub = (head == &sc->runq.stubs[prio]);
+            if (!head_is_stub || tail != head)
+                fprintf(stderr,
+                    "[sched-autopsy] sched=%u prio=%d head=%p%s tail=%p head->rq_next=%p idle=%d\n",
+                    s, prio, (void *)head, head_is_stub ? "(stub)" : "",
+                    (void *)tail,
+                    head ? (void *)atomic_load_explicit(&head->rq_next, memory_order_relaxed) : NULL,
+                    atomic_load_explicit(&sc->runq.idle, memory_order_relaxed));
+        }
+    }
+    fprintf(stderr, "[sched-autopsy] === end ===\n");
+}
+
+static void *sched_trace_fn(void *arg) {
+    (void)arg;
+    uint64_t p[8] = {0};
+    int flat_secs = 0, autopsied = 0;
+    while (g_swarm && g_swarm->running) {
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+        uint64_t c[8] = {
+            atomic_load(&g_tr_enq), atomic_load(&g_tr_sig),
+            atomic_load(&g_tr_idle_seen), atomic_load(&g_tr_park),
+            atomic_load(&g_tr_park_signal), atomic_load(&g_tr_park_timeout),
+            atomic_load(&g_tr_spin_hit), atomic_load(&g_tr_guard_hit),
+        };
+        fprintf(stderr,
+            "[sched-trace] enq=%llu sig=%llu idle_seen=%llu park=%llu "
+            "park_sig=%llu park_to=%llu spin_hit=%llu guard_hit=%llu\n",
+            (unsigned long long)(c[0]-p[0]), (unsigned long long)(c[1]-p[1]),
+            (unsigned long long)(c[2]-p[2]), (unsigned long long)(c[3]-p[3]),
+            (unsigned long long)(c[4]-p[4]), (unsigned long long)(c[5]-p[5]),
+            (unsigned long long)(c[6]-p[6]), (unsigned long long)(c[7]-p[7]));
+        /* Stall detector → one autopsy per episode (enq delta == 0). */
+        if (c[0] - p[0] == 0) {
+            if (++flat_secs >= 3 && !autopsied) { sched_trace_autopsy(); autopsied = 1; }
+        } else {
+            flat_secs = 0; autopsied = 0;
+        }
+        memcpy(p, c, sizeof(p));
+    }
+    return NULL;
+}
+static void sched_trace_maybe_start(void) {
+    if (g_sched_trace < 0) {
+        const char *e = getenv("SW_SCHED_TRACE");
+        g_sched_trace = e ? atoi(e) : 0;   /* 1=counters, 2=+event ring */
+        if (g_sched_trace) {
+            pthread_t t;
+            pthread_create(&t, NULL, sched_trace_fn, NULL);
+            pthread_detach(t);
+        }
+    }
+}
+
 void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     uint32_t prio = proc->priority;
     if (prio >= SW_PRIO_NUM) prio = SW_PRIO_NORMAL;
@@ -857,10 +1028,14 @@ void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     atomic_store_explicit(&prev->rq_next, proc, memory_order_release);
 
     /* Wake scheduler if it was idle (rare — only when queue was empty) */
+    if (g_sched_trace >= 1) atomic_fetch_add_explicit(&g_tr_enq, 1, memory_order_relaxed);
+    trev(TREV_ENQ, proc->pid, (uint64_t)(uintptr_t)rq);
     if (atomic_load_explicit(&rq->idle, memory_order_relaxed)) {
+        if (g_sched_trace >= 1) atomic_fetch_add_explicit(&g_tr_idle_seen, 1, memory_order_relaxed);
         pthread_mutex_lock(&rq->idle_lock);
         pthread_cond_signal(&rq->idle_cond);
         pthread_mutex_unlock(&rq->idle_lock);
+        if (g_sched_trace >= 1) atomic_fetch_add_explicit(&g_tr_sig, 1, memory_order_relaxed);
     }
 }
 
@@ -1069,6 +1244,50 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             proc = sw_steal_work(sched);
         }
 
+        /* Adaptive spin before parking (O4, Round-7: cross-scheduler
+         * ping-pong paid a full mutex+condvar+futex wake per message —
+         * ~53us/round-trip vs ~1us same-scheduler, because each send
+         * found the peer's scheduler PARKED). Spin-poll local + steal
+         * for a bounded window first: while spinning, rq->idle stays 0,
+         * so the producer's sw_add_to_runq pays NOTHING (no lock, no
+         * signal) and the consumer picks the work up within ~ns.
+         * Budget is per-idle-transition, env-tunable: SW_SPIN_US
+         * (default 30, 0 disables, capped 1000); the 0.5ms park below is
+         * the safety net. Default ON since the deadlock that briefly
+         * forced it opt-in was root-caused to the Dekker StoreLoad bug
+         * in the receive waiting-flag handshake (see sw_receive_any) and
+         * fixed with seq_cst — 0/200 wedge-hunt runs post-fix vs ~15%
+         * incidence before. Regression gate:
+         * tests/stress/spin_wedge_hunt.sh. Measured win: cross-scheduler
+         * ping-pong 58.4 -> 4.5us/rt. */
+        if (!proc) {
+            static int spin_iters = -1;
+            if (spin_iters < 0) {
+                const char *e = getenv("SW_SPIN_US");
+                int us = e ? atoi(e) : 30;
+                if (us < 0) us = 0;
+                if (us > 1000) us = 1000;
+                /* ~25 pause-loop iterations per us on contemporary cores
+                 * (pause ~25-40ns + two acquire loads). Coarse is fine. */
+                spin_iters = us * 25;
+            }
+            for (int i = 0; i < spin_iters && !sched->should_exit; i++) {
+                proc = sw_pick_next(sched);
+                if (proc) break;
+                if ((i & 63) == 63) {   /* steal probe every ~64 spins */
+                    proc = sw_steal_work(sched);
+                    if (proc) break;
+                }
+#ifdef __aarch64__
+                __asm__ volatile("yield");
+#else
+                __asm__ volatile("pause");
+#endif
+            }
+            if (proc && g_sched_trace >= 1)
+                atomic_fetch_add_explicit(&g_tr_spin_hit, 1, memory_order_relaxed);
+        }
+
         if (proc) {
             /* Sample the generation BEFORE any side effect. If another
              * scheduler reuses this slot between pick and swap, the
@@ -1079,7 +1298,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
 
             /* Check if this process was killed by an exit signal */
             if (proc->kill_flag) {
-                proc->state = SW_PROC_EXITING;
+                atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
                 process_exit(proc, proc->exit_reason);
                 /* Force whole-binary exit if the ROOT process died
                  * abnormally — checked before process_destroy recycles
@@ -1090,7 +1309,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             }
 
             sched->procs_run++;
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             proc->scheduler = sched;
             proc->fcalls = SWARM_CONTEXT_REDS;
             sched->current = proc;
@@ -1135,26 +1354,78 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             sched->idle_waits++;
             /* Mark as idle and sleep until woken by a producer.
              * The idle flag is checked by sw_add_to_runq — if set,
-             * it signals the condvar to wake us. */
+             * it signals the condvar to wake us.
+             *
+             * LOST-WAKEUP GUARD (standard sleeper protocol): a producer
+             * that enqueues between our last failed pick and the idle=1
+             * store sees idle==0 and SKIPS the signal — the work then
+             * sits for the full 0.5ms timeout. A serial message chain
+             * can phase-lock into that miss on EVERY hop: observed as a
+             * gc-slope message probe degrading from ~100ms to 25+
+             * MINUTES (each hop eating a 0.5ms park). Publish idle=1
+             * first, then RE-POLL once; only park if still empty. The
+             * producer now either sees idle=1 (and signals) or its
+             * enqueue happens-before our re-poll (and we find it). */
             sw_runq_t *rq = &sched->runq;
             pthread_mutex_lock(&rq->idle_lock);
             atomic_store_explicit(&rq->idle, 1, memory_order_release);
+            sw_process_t *late = sw_pick_next(sched);
+            if (!late) late = sw_steal_work(sched);
+            if (late) {
+                atomic_store_explicit(&rq->idle, 0, memory_order_release);
+                pthread_mutex_unlock(&rq->idle_lock);
+                if (g_sched_trace >= 1)
+                    atomic_fetch_add_explicit(&g_tr_guard_hit, 1, memory_order_relaxed);
+                /* Hand it back to our queue and loop — the next pick
+                 * runs it through the normal path immediately. */
+                sw_add_to_runq(rq, late);
+                continue;
+            }
+            if (g_sched_trace >= 1)
+                atomic_fetch_add_explicit(&g_tr_park, 1, memory_order_relaxed);
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 500000;  /* +0.5ms (tighter poll for responsiveness) */
+            ts.tv_nsec += 500000;  /* +0.5ms (safety net; signals do the work) */
             if (ts.tv_nsec >= 1000000000) {
                 ts.tv_sec++;
                 ts.tv_nsec -= 1000000000;
             }
-            pthread_cond_timedwait(&rq->idle_cond, &rq->idle_lock, &ts);
+            int _twrc = pthread_cond_timedwait(&rq->idle_cond, &rq->idle_lock, &ts);
+            if (g_sched_trace >= 1)
+                atomic_fetch_add_explicit(_twrc == 0 ? &g_tr_park_signal : &g_tr_park_timeout,
+                                          1, memory_order_relaxed);
             atomic_store_explicit(&rq->idle, 0, memory_order_release);
             pthread_mutex_unlock(&rq->idle_lock);
         }
     }
 }
 
+static void _sw_install_altstack(void);   /* defined with the crash handler below */
+
+#ifdef SW_ALLOC_FAULT
+/* Phase 2.5 allocation-failure injection. Armed by SW_FAIL_ALLOC_AT=N
+ * (read once): the Nth instrumented allocation (val_alloc global-heap
+ * fallback + every varena chunk_new) returns failure exactly once, so a
+ * sweep over N drives a fault through each ownership-transfer site and
+ * asserts (under ASAN) the cleanup neither leaks nor double-frees. Atomic
+ * because allocations happen on every scheduler thread. Compiled only
+ * under -DSW_ALLOC_FAULT — not in any shipping build. */
+static _Atomic long g_alloc_fault_count = 0;
+static long g_alloc_fault_at = -2;   /* -2 = unread, -1 = disabled */
+int sw_alloc_fault_tick(void) {
+    if (g_alloc_fault_at == -2) {
+        const char *e = getenv("SW_FAIL_ALLOC_AT");
+        g_alloc_fault_at = e ? atol(e) : -1;
+    }
+    if (g_alloc_fault_at < 0) return 0;
+    long n = atomic_fetch_add_explicit(&g_alloc_fault_count, 1, memory_order_relaxed) + 1;
+    return n == g_alloc_fault_at;
+}
+#endif
+
 static void *scheduler_main(void *arg) {
     sw_scheduler_t *sched = (sw_scheduler_t *)arg;
+    _sw_install_altstack();   /* fiber-stack overflows fault on THIS thread */
     sched->active = 1;
     scheduler_loop(sched);
     return NULL;
@@ -1165,6 +1436,39 @@ static void *scheduler_main(void *arg) {
  * ============================================================================ */
 #include <execinfo.h>
 
+/* Per-thread alternate signal stack. A fiber-stack OVERFLOW faults on the
+ * guard page with the stack pointer already at the cliff edge — the handler
+ * itself then faults trying to push a frame, and the process dies with NO
+ * output at all (observed: deep mutual recursion exited silently). SA_ONSTACK
+ * + a per-thread sigaltstack lets the handler run on safe ground. Installed
+ * by each scheduler thread and the thread that calls sw_init. 64KB static
+ * per thread (SIGSTKSZ stopped being a compile-time constant in glibc 2.34). */
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define SW_UNDER_ASAN 1
+#  endif
+#endif
+#if !defined(SW_UNDER_ASAN) && defined(__SANITIZE_ADDRESS__)
+#  define SW_UNDER_ASAN 1
+#endif
+
+static void _sw_install_altstack(void) {
+#ifdef SW_UNDER_ASAN
+    /* ASAN installs (and at thread exit munmaps) its OWN per-thread
+     * alternate signal stack; replacing it with our static buffer makes
+     * its UnsetAlternateSignalStack CHECK-fail ("unable to unmmap").
+     * Under ASAN the crash handler runs on ASAN's altstack anyway. */
+    return;
+#else
+    static __thread char altstack_mem[64 * 1024];
+    stack_t ss;
+    ss.ss_sp = altstack_mem;
+    ss.ss_size = sizeof(altstack_mem);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+#endif
+}
+
 static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     const char *signame = (sig == SIGSEGV) ? "SIGSEGV" :
@@ -1173,7 +1477,33 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
 
     /* Use write() not printf() — async-signal-safe */
     char msg[512];
-    int len = snprintf(msg, sizeof(msg),
+    int len;
+
+    /* Stack overflow detection: a fault inside (or within a page below) the
+     * RUNNING process's guard page means its 128KB fiber stack overflowed —
+     * almost always deep non-self recursion (mutual tail calls are not
+     * TCO'd; self-tail-calls compile to a flat loop). Say so, instead of
+     * leaving a bare SIGSEGV to be mistaken for a runtime bug. */
+    sw_process_t *cur = tls_current;
+    if (sig == SIGSEGV && cur && cur->stack_mem && info->si_addr) {
+        uintptr_t fault = (uintptr_t)info->si_addr;
+        uintptr_t guard_top = (uintptr_t)cur->stack_mem;       /* guard page is just below */
+        uintptr_t guard_bot = guard_top - 8192;                /* guard page + one page slack */
+        if (fault < guard_top && fault >= guard_bot) {
+            len = snprintf(msg, sizeof(msg),
+                "\n\033[1;31mpanic\033[0m: stack overflow in process #%llu (128KB fiber stack)\n"
+                "  likely cause: deep NON-SELF recursion — mutual tail calls are not\n"
+                "  TCO'd (self-tail-calls are). Keep the loop in one function, or see\n"
+                "  docs/notes/KNOWN_ISSUES.md.\n",
+                (unsigned long long)cur->pid);
+            write(STDERR_FILENO, msg, len);
+            signal(sig, SIG_DFL);
+            raise(sig);
+            return;
+        }
+    }
+
+    len = snprintf(msg, sizeof(msg),
         "\n\033[31m[SwarmRT] CRASH: %s at address %p\033[0m\n"
         "Backtrace:\n",
         signame, info->si_addr);
@@ -1211,6 +1541,9 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     strncpy(g_swarm->name, name, 31);
     g_swarm->num_schedulers = num_schedulers;
     g_swarm->running = 1;
+    sched_trace_maybe_start();   /* BEFORE scheduler threads exist — the flag
+                                  * is then ordered by pthread_create (TSan-
+                                  * clean); scheds read it on every enqueue. */
 
     /* Initialize arena — single mmap, covers everything.
      *
@@ -1337,10 +1670,14 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         struct sigaction crash_sa;
         memset(&crash_sa, 0, sizeof(crash_sa));
         crash_sa.sa_sigaction = _sw_crash_handler;
-        crash_sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        /* SA_ONSTACK: run on the per-thread sigaltstack. On a fiber-stack
+         * overflow the faulting stack has no headroom — without this the
+         * handler itself faulted and the process died with no output. */
+        crash_sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
         sigaction(SIGSEGV, &crash_sa, NULL);
         sigaction(SIGBUS,  &crash_sa, NULL);
         sigaction(SIGABRT, &crash_sa, NULL);
+        _sw_install_altstack();   /* this thread; schedulers install their own */
     }
 
     /* Start deadlock watchdog unless SW_DEADLOCK_DETECT=0. */
@@ -1363,9 +1700,14 @@ void sw_shutdown(int swarm_id) {
 
     g_swarm->running = 0;
 
-    /* Stop deadlock watchdog (if running) before tearing down the arena. */
+    /* Stop deadlock watchdog (if running) before tearing down the arena.
+     * Signal under the lock so the join returns immediately instead of
+     * after the tail of a sleep interval (was ~50-100ms on every exit). */
     if (g_watchdog_enabled) {
+        pthread_mutex_lock(&g_watchdog_lock);
         g_watchdog_stop = 1;
+        pthread_cond_signal(&g_watchdog_cond);
+        pthread_mutex_unlock(&g_watchdog_lock);
         pthread_join(g_watchdog_thread, NULL);
         g_watchdog_enabled = 0;
     }
@@ -1656,7 +1998,7 @@ sw_process_t *sw_find_by_pid_any(uint64_t pid) {
  * Marks process as EXITING and context-swaps back to the scheduler.
  */
 void sw_process_done(sw_process_t *proc) {
-    proc->state = SW_PROC_EXITING;
+    atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Should never reach here */
 }
@@ -1686,7 +2028,7 @@ void sw_process_panic(sw_process_t *proc, int reason, const char *msg) {
         free(proc->panic_msg);
         proc->panic_msg = strdup(msg);
     }
-    proc->state = SW_PROC_EXITING;
+    atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Should never reach here — scheduler tears down the process. */
 }
@@ -1696,7 +2038,7 @@ void sw_yield(void) {
     if (!proc) return;
 
     /* Context swap back to scheduler — scheduler will re-enqueue us */
-    proc->state = SW_PROC_RUNNABLE;
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
     proc->context_switches++;
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Resumed — back on our stack */
@@ -1731,6 +2073,14 @@ sw_value_arena_t *sw_self_varena(void) {
 struct sw_val **sw_self_error_slot(void) {
     static __thread struct sw_val *fallback = NULL;
     return tls_current ? &tls_current->gen_error : &fallback;
+}
+
+/* Innermost live compiled try frame (see try_chain in struct sw_process).
+ * Thread-local fallback covers the pre-fiber/main-thread path the same way
+ * sw_self_error_slot's does. */
+void **sw_self_try_chain(void) {
+    static __thread void *fallback = NULL;
+    return tls_current ? &tls_current->try_chain : &fallback;
 }
 
 /* Ownership v2 turn-checkpoint: install a fresh value arena for the current
@@ -1844,13 +2194,18 @@ static inline sw_msg_t *mailbox_pop_tagged(sw_mailbox_t *mb, uint64_t tag) {
  * of ping-pong messaging between two processes.
  */
 static inline void mailbox_wake(sw_process_t *to) {
-    if (atomic_exchange_explicit(&to->mailbox.waiting, 0, memory_order_acq_rel)) {
+    /* seq_cst: pairs with the seq_cst waiting-stores + sig_head probe in
+     * the receive paths (Dekker — see sw_receive_any). */
+    if (atomic_exchange_explicit(&to->mailbox.waiting, 0, memory_order_seq_cst)) {
+        trev(TREV_WAKE1, to->pid, 0);
         /* Was waiting — re-enqueue to run queue.
          * Do NOT set state here. The receiver may be in its final drain
          * and could set state=WAITING for context-swap. If we also write
          * state=RUNNABLE, the scheduler's post-swap handler would re-enqueue,
          * causing a double-enqueue. Let the scheduler set RUNNING on dequeue. */
         sw_add_to_runq(&to->scheduler->runq, to);
+    } else {
+        trev(TREV_WAKE0, to->pid, 0);
     }
 }
 
@@ -1870,6 +2225,7 @@ void sw_send(sw_process_t *to, void *msg) {
 
     /* Lock-free MPSC push */
     mailbox_push(&to->mailbox, m);
+    trev(TREV_PUSH, to->pid, m->from_pid);
 
     /* Wake if waiting (lock-free) */
     mailbox_wake(to);
@@ -1902,10 +2258,12 @@ void *sw_receive(uint64_t timeout_ms) {
         /* No message — prepare to sleep.
          * Critical ordering: set waiting BEFORE final drain check.
          * This prevents lost wake-ups (see Vyukov MPSC pattern). */
-        proc->state = SW_PROC_WAITING;
-        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_release);
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
-        /* Final drain — catch messages sent between first drain and waiting flag */
+        /* Final drain — catch messages sent between first drain and waiting flag.
+         * (seq_cst store: see the Dekker note in sw_receive_any — on x86 the
+         * drain's locked xchg fenced this anyway; on arm64 it did not.) */
         mailbox_drain(&proc->mailbox);
         m = mailbox_pop_first(&proc->mailbox);
         if (m) {
@@ -1916,7 +2274,7 @@ void *sw_receive(uint64_t timeout_ms) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
                 /* We won — not in runq, safe to self-resume */
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 void *payload = msg_take_payload(m, 0);
                 msg_free(m);
                 proc->messages_recv++;
@@ -1933,7 +2291,7 @@ void *sw_receive(uint64_t timeout_ms) {
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;  /* Loop back — will drain and find the message */
         }
@@ -1948,13 +2306,13 @@ void *sw_receive(uint64_t timeout_ms) {
             if (elapsed >= timeout_ms) {
                 int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
                 if (was_waiting) {
-                    proc->state = SW_PROC_RUNNING;
+                    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                     return NULL;
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
                 sw_context_swap(proc, &proc->scheduler->sched_proc);
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
             uint64_t remaining = timeout_ms - elapsed;
@@ -1965,7 +2323,7 @@ void *sw_receive(uint64_t timeout_ms) {
         sw_context_swap(proc, &proc->scheduler->sched_proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
 
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
@@ -2020,22 +2378,37 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     /* Set waiting flag BEFORE checking signal stack (prevents lost wake-ups) */
-    proc->state = SW_PROC_WAITING;
-    atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_release);
+    atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+    atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
-    /* Check if new signals arrived AFTER we set waiting flag */
-    sw_msg_t *sig = atomic_load_explicit(&proc->mailbox.sig_head, memory_order_acquire);
+    /* Check if new signals arrived AFTER we set waiting flag.
+     *
+     * BOTH the store above and this load are seq_cst ON PURPOSE — this
+     * is Dekker's pattern (store one var, load a DIFFERENT var, with a
+     * peer doing the mirror image in sw_send/mailbox_wake). With the
+     * original release-store + acquire-load the store sat in the store
+     * buffer past the load (x86 StoreLoad reordering): the receiver saw
+     * a pre-push sig_head and parked, while the sender's wake-xchg read
+     * waiting==0 and skipped the enqueue — BOTH sides lost, a permanent
+     * deadlock with the message sitting in the mailbox. That is the
+     * spin-gated P1: parked, waiting=1, sig_head!=NULL (autopsy-proven,
+     * ~15%% of depth-1 cross-scheduler ping-pong runs with spin on).
+     * TSan is silent — no data race, pure ordering. The three sibling
+     * receive paths survive on x86 only because mailbox_drain's locked
+     * xchg is a full fence — NOT a guarantee on arm64, so all four
+     * waiting-stores and mailbox_wake's xchg are seq_cst now. */
+    sw_msg_t *sig = atomic_load_explicit(&proc->mailbox.sig_head, memory_order_seq_cst);
     if (sig) {
         /* New messages on signal stack — drain and let caller re-scan */
         int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
         if (was) {
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             mailbox_drain(&proc->mailbox);
             return 1;
         }
         /* Sender already enqueued us — context swap for clean dequeue */
         sw_context_swap(proc, &proc->scheduler->sched_proc);
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         mailbox_drain(&proc->mailbox);
         return 1;
     }
@@ -2049,9 +2422,9 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
                            (now.tv_nsec - start.tv_nsec) / 1000000;
         if (elapsed >= timeout_ms) {
             int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
-            if (was) { proc->state = SW_PROC_RUNNING; return 0; }
+            if (was) { atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed); return 0; }
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             return 0;
         }
         timer_ref = sw_send_after(timeout_ms - elapsed, proc, SW_TAG_NONE, NULL);
@@ -2059,7 +2432,7 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
 
     /* Context swap — will be woken by sender or timer */
     sw_context_swap(proc, &proc->scheduler->sched_proc);
-    proc->state = SW_PROC_RUNNING;
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
 
     if (timer_ref) sw_cancel_timer(timer_ref);
     if (proc->kill_flag) return 0;
@@ -2100,9 +2473,11 @@ static void deliver_signal(sw_process_t *target, uint64_t tag,
 }
 
 static void process_exit(sw_process_t *proc, int reason) {
-    proc->exit_reason = reason;
-
     pthread_mutex_lock(&g_swarm->link_lock);
+    /* Set the terminal reason UNDER link_lock so sw_monitor's
+     * already-dead fast path (which now reads it under the same lock)
+     * sees a consistent value instead of racing this write. */
+    proc->exit_reason = reason;
 
     /* 1. Propagate to linked processes */
     sw_link_t *link = proc->links;
@@ -2344,9 +2719,27 @@ uint64_t sw_monitor(sw_process_t *target) {
 
     uint64_t ref = atomic_fetch_add(&g_swarm->next_monitor_ref, 1);
 
-    if (target->state == SW_PROC_EXITING || target->state == SW_PROC_FREE) {
-        /* Target already dead — deliver DOWN immediately */
-        deliver_signal(self, SW_TAG_DOWN, target->pid, ref, target->exit_reason, target->panic_msg);
+    /* The dead-check, the terminal-reason read, AND the registration all
+     * happen under link_lock — the same lock process_exit holds while it
+     * finalizes exit_reason and walks monitors_me. This (a) closes the
+     * data race on exit_reason/panic_msg (TSan-flagged: monitoring a
+     * process at its exact death instant), and (b) makes delivery
+     * exactly-once: if we register before process_exit locks, it finds us
+     * and delivers DOWN; if the target is already EXITING/FREE when we
+     * lock, we deliver DOWN ourselves and do NOT register. */
+    pthread_mutex_lock(&g_swarm->link_lock);
+
+    sw_proc_state_t st = atomic_load_explicit(&target->state, memory_order_relaxed);
+    if (st == SW_PROC_EXITING || st == SW_PROC_FREE) {
+        int reason = atomic_load_explicit(&target->exit_reason, memory_order_relaxed);
+        /* COPY panic_msg under the lock: process_destroy frees it under the
+         * same lock, so capturing the bare pointer and using it after the
+         * unlock (deliver_signal strdups it) would race that free. The
+         * copy is ours; free it after delivery. */
+        char *msg = target->panic_msg ? strdup(target->panic_msg) : NULL;
+        pthread_mutex_unlock(&g_swarm->link_lock);
+        deliver_signal(self, SW_TAG_DOWN, target->pid, ref, reason, msg);
+        free(msg);
         return ref;
     }
 
@@ -2354,8 +2747,6 @@ uint64_t sw_monitor(sw_process_t *target) {
     mon->ref = ref;
     mon->watcher = self;
     mon->watched = target;
-
-    pthread_mutex_lock(&g_swarm->link_lock);
 
     /* Add to watcher's my_monitors */
     mon->next_in_watcher = self->my_monitors;
@@ -2511,17 +2902,22 @@ sw_process_t *sw_whereis(const char *name) {
 }
 
 static void registry_remove_proc(sw_process_t *proc) {
-    if (!proc->reg_entry) return;
+    sw_reg_entry_t *entry = atomic_load_explicit(&proc->reg_entry, memory_order_relaxed);
+    if (!entry) return;
 
     sw_registry_t *reg = &g_swarm->registry;
-    const char *name = proc->reg_entry->name;
-    uint32_t idx = registry_hash(name) % reg->num_buckets;
 
+    /* Hash the name UNDER the wrlock. It was computed before the lock,
+     * reading entry->name — which races a concurrent registration/removal
+     * reusing that entry's storage (TSan-flagged in the supervisor
+     * crash-restart path). The entry is only freed under this lock, so the
+     * name is stable once we hold it. */
     pthread_rwlock_wrlock(&reg->lock);
 
+    uint32_t idx = registry_hash(entry->name) % reg->num_buckets;
     sw_reg_entry_t **pp = &reg->buckets[idx];
     while (*pp) {
-        if (*pp == proc->reg_entry) {
+        if (*pp == entry) {
             sw_reg_entry_t *rm = *pp;
             *pp = rm->next;
             free(rm);
@@ -2529,7 +2925,7 @@ static void registry_remove_proc(sw_process_t *proc) {
         }
         pp = &(*pp)->next;
     }
-    proc->reg_entry = NULL;
+    atomic_store_explicit(&proc->reg_entry, NULL, memory_order_relaxed);
 
     pthread_rwlock_unlock(&reg->lock);
 }
@@ -2610,12 +3006,16 @@ static void fire_timers(void) {
 
     sw_timer_list_t *tl = &g_swarm->timers;
 
-    /* Quick check without lock — sorted list, head is earliest */
-    if (!tl->head) return;
-
+    /* Peek under the lock. The old unlocked `if (!tl->head) return` raced
+     * the locked insert in sw_send_after (TSan-flagged; benign on x86/arm64
+     * where aligned pointer loads are atomic, but UB on paper). The lock is
+     * uncontended in the common no-timer case — taken once per scheduler
+     * idle pass, contended only while a timer is actually being
+     * inserted/cancelled (rare) — so the correctness is free in practice. */
     uint64_t now = now_ns();
 
     pthread_mutex_lock(&tl->lock);
+    if (!tl->head) { pthread_mutex_unlock(&tl->lock); return; }
     while (tl->head && tl->head->fire_at_ns <= now) {
         sw_timer_t *t = tl->head;
         tl->head = t->next;
@@ -2709,16 +3109,18 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         if (timeout_ms == 0) return NULL;
 
         /* No match — prepare to sleep */
-        proc->state = SW_PROC_WAITING;
-        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_release);
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
-        /* Final drain — catch messages sent between first drain and waiting flag */
+        /* Final drain — catch messages sent between first drain and waiting flag.
+         * (seq_cst store: see the Dekker note in sw_receive_any — on x86 the
+         * drain's locked xchg fenced this anyway; on arm64 it did not.) */
         mailbox_drain(&proc->mailbox);
         m = mailbox_pop_tagged(&proc->mailbox, tag);
         if (m) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 void *payload = msg_take_payload(m, 0);
                 msg_free(m);
                 proc->messages_recv++;
@@ -2732,7 +3134,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;
         }
@@ -2747,13 +3149,13 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             if (elapsed_ms >= timeout_ms) {
                 int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
                 if (was_waiting) {
-                    proc->state = SW_PROC_RUNNING;
+                    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                     return NULL;
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
                 sw_context_swap(proc, &proc->scheduler->sched_proc);
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
             uint64_t remaining = timeout_ms - elapsed_ms;
@@ -2763,7 +3165,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         sw_context_swap(proc, &proc->scheduler->sched_proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
     }
@@ -2799,16 +3201,18 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
         if (timeout_ms == 0) return NULL;
 
         /* No message — prepare to sleep */
-        proc->state = SW_PROC_WAITING;
-        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_release);
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
 
-        /* Final drain — catch messages sent between first drain and waiting flag */
+        /* Final drain — catch messages sent between first drain and waiting flag.
+         * (seq_cst store: see the Dekker note in sw_receive_any — on x86 the
+         * drain's locked xchg fenced this anyway; on arm64 it did not.) */
         mailbox_drain(&proc->mailbox);
         m = mailbox_pop_first(&proc->mailbox);
         if (m) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 if (out_tag) *out_tag = m->tag;
                 void *payload = msg_take_payload(m, adopt);
                 msg_free(m);
@@ -2823,7 +3227,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             sw_context_swap(proc, &proc->scheduler->sched_proc);
-            proc->state = SW_PROC_RUNNING;
+            atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;
         }
@@ -2838,13 +3242,13 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             if (elapsed >= timeout_ms) {
                 int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
                 if (was_waiting) {
-                    proc->state = SW_PROC_RUNNING;
+                    atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                     return NULL;
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
                 sw_context_swap(proc, &proc->scheduler->sched_proc);
-                proc->state = SW_PROC_RUNNING;
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
             uint64_t remaining = timeout_ms - elapsed;
@@ -2854,7 +3258,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
         sw_context_swap(proc, &proc->scheduler->sched_proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
-        proc->state = SW_PROC_RUNNING;
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
     }

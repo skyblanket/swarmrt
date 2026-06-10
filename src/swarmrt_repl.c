@@ -193,6 +193,7 @@ int sw_repl_start(void) {
 
         /* Evaluate */
         interp->error = 0;
+        interp->panicking = 0;   /* one panic must not poison the session */
         interp->error_msg[0] = '\0';
         sw_val_t *result = sw_lang_eval_repl(interp, buf);
 

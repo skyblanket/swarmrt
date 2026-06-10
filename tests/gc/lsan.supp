@@ -1,0 +1,9 @@
+# LeakSanitizer suppressions for the lsan-gate lifecycle probe.
+# Every entry here must correspond to a DOCUMENTED accepted-minor in
+# PRODUCTION_ROADMAP.md / CHANGELOG — a suppression without a paper trail
+# is a hidden leak. Keep this list short; shrinking it is Phase-2 work.
+
+# (empty) — the _builtin_supervise specs[] leak is now root-caused: the
+# supervisor owns and frees the heap children[] array post-copy via the
+# sw_sup_spec_t.owns_children flag (the "async init-race" is resolved by
+# moving the free into the consumer). No suppressions currently required.

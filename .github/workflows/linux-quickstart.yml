@@ -94,9 +94,65 @@ jobs:
           make gc-slope
           SW_SCHEDULERS=1 make gc-slope
 
+      - name: LeakSanitizer lifecycle gate (Phase 2.1 — Linux-only LSan)
+        # The slope gates catch UNBOUNDED growth; this catches BOUNDED leaks
+        # under their RSS noise floor. macOS Apple-clang ASAN has no LSan, so
+        # every other ASAN run uses detect_leaks=0 and is leak-blind — this
+        # Linux leg is the only real leak assertion in CI. Churns every
+        # lifecycle owner (timers fired+cancelled, supervisors killed, ETS
+        # replace/delete, spawns, compound messages), exits cleanly, and LSan
+        # asserts zero definitely-lost blocks at exit. Proven bidirectional
+        # (an injected unreachable block fails it). Advisory while it bakes;
+        # promote to blocking once green across a week of pushes.
+        continue-on-error: true
+        run: make lsan-gate
+
+      - name: ThreadSanitizer race gate (Phase 2.3/2.4 — msg, storm, phase 2/4/5)
+        # Runtime must be free of C11 data races on the message, spawn-storm,
+        # and GenServer/Supervisor/Agent/DynSup/StateMachine/ProcessGroup
+        # paths. Suppresses only the by-design warn-only watchdog scanner +
+        # sw_stats printer (tests/stress/tsan.supp).
+        run: make tsan-gate
+
+      - name: Allocation-failure injection (Phase 2.5 — no UAF/double-free on OOM)
+        # Fails the Nth value/region allocation across a 120-point sweep and
+        # asserts the ownership-transfer cleanup (spawn region, message copy,
+        # supervisor closures, ETS) never corrupts memory — only ever a clean
+        # completion or a loud OOM panic.
+        run: make alloc-fault
+
+      - name: Soak smoke (Phase 2.6 — 60s mixed workload, bounded RSS)
+        # Actor fan-out + supervisor crash/restart + ETS churn + timers in a
+        # tight loop for 60s; asserts clean exit and peak RSS under budget.
+        # The full 24h soak is the same binary (SOAK_SECONDS=86400) on a
+        # dedicated host — see PRODUCTION_ROADMAP.md 2.6.
+        run: make soak
+
+      - name: Scheduler-count matrix (Phase 2.2 — suite under S=1 and oversubscribed)
+        # The default-scheduler run above covers nproc; these legs cover the
+        # edges. S=1 found a real architecture issue (blocking curl client +
+        # in-process server deadlocks — the affected tests SKIP below 3
+        # schedulers, see KNOWN_ISSUES); S=8 oversubscribes the runner's
+        # cores so cross-scheduler interleavings get exercised. The per-test
+        # 180s timeout in run_tests.sh turns any future hang into a loud FAIL.
+        run: |
+          set -e
+          SW_SCHEDULERS=1 ./tests/sw/run_tests.sh
+          SW_SCHEDULERS=1 ./tests/sw/run_conform.sh
+          SW_SCHEDULERS=8 ./tests/sw/run_tests.sh
+          SW_SCHEDULERS=8 ./tests/sw/run_conform.sh
+
       - name: Stress test (high-process-count race guard)
         # Catches regressions in the high-spawn scheduler/mailbox path.
         # The historical ctx-tear race is closed by per-slot generation
         # counters + ctx_lock; the later spawn-storm crash cleared on
         # native Linux x86_64 May 29, so any miss here is a regression.
         run: make stress
+
+      - name: Fuzz (Phase 3 — untrusted-input boundaries under ASAN/UBSAN)
+        # 20k mutations per target over parser, JSON decoder (agent-facing
+        # boundary), distribution unmarshal, and HTTP header parser. Every
+        # external-input surface must be memory-safe on arbitrary bytes.
+        # fuzz-json found two real heap-overflows (number force-advance past
+        # NUL, backslash-at-EOF) on the first run — so this gate earns its keep.
+        run: make fuzz
