@@ -3028,9 +3028,10 @@ static sw_val_t *_builtin_supervise(sw_val_t **a, int n) {
     sup_spec.max_seconds = 5;
     sup_spec.children = specs;
     sup_spec.num_children = valid;
+    sup_spec.owns_children = 1;   /* heap specs[]: the supervisor frees it post-copy */
 
     sw_process_t *sup = sw_supervisor_start("sw_sup", &sup_spec);
-    /* specs not freed — supervisor holds a shallow copy of the pointer */
+    if (!sup) free(specs);   /* spawn failed: no supervisor to take ownership */
     return sup ? sw_val_pid(sup) : sw_val_nil();
 }
 

@@ -3,7 +3,7 @@
 # PRODUCTION_ROADMAP.md / CHANGELOG — a suppression without a paper trail
 # is a hidden leak. Keep this list short; shrinking it is Phase-2 work.
 
-# _builtin_supervise's caller-side specs[] array: a one-time ~N*sizeof(spec)
-# allocation per supervise() call; an async init-race makes freeing it
-# unsafe (documented accepted-minor, Phase 1).
-leak:_builtin_supervise
+# (empty) — the _builtin_supervise specs[] leak is now root-caused: the
+# supervisor owns and frees the heap children[] array post-copy via the
+# sw_sup_spec_t.owns_children flag (the "async init-race" is resolved by
+# moving the free into the consumer). No suppressions currently required.
