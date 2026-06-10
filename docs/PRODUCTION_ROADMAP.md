@@ -148,10 +148,26 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   (legal-but-wrong interleaving of the waiting/idle flag handshakes). Root-cause needs
   protocol reasoning / model checking against `tests/stress/spin_wedge_hunt.sh`, not TSan.
 
-### 2.4 Make shared state atomic-or-locked
-- Audit and fix races on: **kill flags**, **process lifecycle state**, **registry + monitor
-  references**, **timer cancellation**, **mailbox wakeups**. (The kill path interacts with all of
-  these — see the kill_flag-before-swap note above.) Each fix needs a TSan-clean repro.
+### 2.4 Make shared state atomic-or-locked  ⏳ **IN PROGRESS** (audit complete, worklist below)
+- TSan audit run across msg ping-pong, spawn storm, and phase 2/4/5 binaries (GenServer,
+  supervisor crash/restart, DynSup, StateMachine, ProcessGroups). Mailbox wakeups + runq are
+  CLEAN (proper C11 atomics). Scheduler/swarm control flags fixed in 2.3.
+- **Worklist (each needs a TSan-clean rerun of the phase binaries):**
+  1. `sw_process.state` is plain int accessed cross-thread (scheduler swap-in writes vs
+     kill/monitor/wake readers — the dominant flagged site). Convert to `_Atomic int` with
+     EXPLICIT RELAXED accessors: zero cost on x86/arm64 (plain mov), same layout (the
+     asm-offset `_Static_assert`s verify), ~50 mechanical sites.
+  2. Timer list: an unlocked reader races the mutex-protected insert (`sw_send_after`) —
+     find the lock-free peek (likely fire_timers) and either take the lock or make the head
+     load/store atomic.
+  3. `registry_hash` flagged reading a name buffer — determine whether a registered name's
+     string can be freed/rewritten concurrently with `whereis` (lifetime question, possibly
+     UAF-adjacent, possibly allocator-recycling misattribution).
+  4. Test-code counters in test_phase2.c (test globals written by genserver callbacks, read
+     by asserts) — fix the tests with atomics, don't suppress.
+- Suppressed by design (documented in tests/stress/tsan.supp): the warn-only watchdog scanner
+  and the `sw_stats` debug printer.
+- The spin-gated P1 deadlock is NOT in this class (no C11 race — protocol bug; see 2.2/2.3).
 
 ### 2.5 Allocation-failure safety
 - Inject deterministic `malloc`/arena-create failures. Ensure **every** path either returns an

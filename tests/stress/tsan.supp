@@ -10,3 +10,8 @@
 # the scanner, not the runtime.
 race:watchdog_thread_fn
 race:sw_io_active_port_count
+
+# sw_stats is the same warn-only class: a debug stats printer reading the
+# volatile per-scheduler counters (procs_run / idle_waits / ...) without
+# synchronization, tolerating torn values by design.
+race:sw_stats
