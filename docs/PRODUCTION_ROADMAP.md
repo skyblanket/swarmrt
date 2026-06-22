@@ -227,11 +227,30 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   (`SW_PARSE_MAX_DEPTH` + node budget + stack-headroom probe), JSON (`SW_JD_MAX_DEPTH` /
   compiled `SW_JSON_MAX_DEPTH`), distribution unmarshal (`SW_UNMARSH_MAX_DEPTH`).
 - Parser can't OOM swc (the receive-clause spin fix + per-parse node budget, Phase-3 fuzz item).
+- **Mailbox depth cap** (`SW_MAILBOX_MAX`, default 1M, `0` disables): every USER send
+  (`sw_send`/`sw_send_tagged`/`sw_send_tagged_msg`, which covers local, dist-inbound and HTTP
+  deliveries) is admission-checked against a per-process counter (`proc->mb_len`, at struct END —
+  asm offsets). Over-cap messages are DROPPED, loudly (global `sw_mailbox_dropped()` counter +
+  rate-limited stderr) and leak-free (VALUE region bulk-freed / RAW payload freed, mirroring
+  process_destroy's unread-queue ownership), and the receiver is still woken (a skipped wake =
+  livelock). **Exempt**: EXIT/DOWN signals (deliver_signal) and timer fires — supervision and
+  `receive … after` survive a flood; a dropped gen_server CALL surfaces as the caller's existing
+  receive timeout, never a hang. Cap is approximate under concurrency (overshoot ≤ #concurrent
+  senders). Semantics deviation from BEAM (which penalizes senders instead of dropping) is
+  deliberate: drop-with-counter is the bounded-memory choice for untrusted inbound. Gate:
+  `make mailbox-flood` (bidirectional: capped run proves exact-cap admission + exemptions;
+  `SW_MAILBOX_MAX=0` run proves zero false drops and full delivery).
+- **HTTP request-size cap** (`SW_HTTP_MAX_REQUEST`, default 32MB, min 4096): bounds the
+  per-connection rx buffer growth in `conn_on_data` (was unbounded `realloc` — one client could
+  force ~4GB RSS) and rejects oversized declared `Content-Length` with a 413. WS frames were
+  already capped at 16MB.
 
 **Remaining (feature work, mostly product decisions):**
-- Limits/quotas: max message size, mailbox depth limit + backpressure, per-node process +
-  memory quotas, connection/request timeouts. (`SW_MAX_PROCS` process ceiling exists; the rest
-  are policy knobs to design.)
+- Limits/quotas: max LOCAL message size (dist frames already capped at `SW_NODE_MAX_FRAME`),
+  sender-side backpressure (current mailbox cap drops instead of throttling), per-process
+  memory quota (hook exists: `varena->total_bytes` is tracked but unchecked), per-node memory
+  quotas, HTTP connection/request **idle timeouts** (slow-loris can still pin all
+  `SW_HTTP_MAX_CONNS=256` slots — needs timer integration in the bridge loop).
 - Extend fuzz to the WebSocket frame parser + the `db_*`/SQLite arg path.
 - Prove malformed input cannot crash another process (cross-process isolation under fuzz).
 

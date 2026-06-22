@@ -372,6 +372,36 @@ gc-stress: swc libswarmrt
 	    tests/gc/slope_sup_kill.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_sup_kill $(LDFLAGS)
 	@rm -f tests/gc/slope_sup_kill.gen.c $(BIN_DIR)/_ssk_emit
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_sup_kill 40 >/dev/null
+	@# process_info() reg_entry UAF: _builtin_process_info must read
+	@# proc->reg_entry->name UNDER registry.lock — registry_remove_proc free()s
+	@# that entry under the wrlock when a registered process exits. 64 named
+	@# guards crash-restart (free+realloc of reg_entry) while 8 fibers hammer
+	@# process_info() on every pid. Pre-fix: ASan heap-use-after-free in strlen
+	@# within ~4s. The introspection builtins (process_info/process_list/
+	@# registered) are exercised by no other gc-stress repro, which is exactly
+	@# why this UAF shipped. Guards panic on purpose — hide the banners, surface
+	@# any ASan report on failure.
+	@./bin/swc build --emit-c tests/gc/process_info_uaf_repro.sw -o $(BIN_DIR)/_piu_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/process_info_uaf_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_process_info_uaf $(LDFLAGS)
+	@rm -f tests/gc/process_info_uaf_repro.gen.c $(BIN_DIR)/_piu_emit
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_process_info_uaf >/dev/null 2>$(BIN_DIR)/_piu.err || (cat $(BIN_DIR)/_piu.err; rm -f $(BIN_DIR)/_piu.err; exit 1)
+	@rm -f $(BIN_DIR)/_piu.err
+
+# Mailbox depth-cap gate (SW_MAILBOX_MAX) — bidirectional. Capped run: a 200k
+# flood into a parked receiver admits exactly the cap, the rest is dropped
+# (counter-exact), the receiver survives, sw_call into a flooded server times
+# out instead of hanging, and the EXIT/timer cap exemptions hold. Uncapped
+# run (SW_MAILBOX_MAX=0): zero drops and ALL 200k arrive — the same
+# assertions fail on a runtime without the cap, so the gate is bidirectional.
+# Built under ASAN: also proves the drop path frees RAW payloads and VALUE
+# regions (no leak / UAF / double-free on rejection).
+.PHONY: mailbox-flood
+mailbox-flood: dirs
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) \
+	    tests/stress/mailbox_flood.c $(FUZZ_RT) -o $(BIN_DIR)/mailbox_flood $(LDFLAGS)
+	@SW_MAILBOX_MAX=1000 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood capped
+	@SW_MAILBOX_MAX=0 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood uncapped
 
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS

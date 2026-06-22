@@ -4,6 +4,21 @@ name: Linux quickstart
 # job is red, the README is lying — fix the README (or the build) before
 # pushing. Surfaced after a Linux user filed a review where every README
 # step failed; this guards against that regression coming back.
+#
+# Split into three PARALLEL jobs (June 2026) after run 27312711773's
+# hosted runner went dark inside the fuzz step ("The hosted runner lost
+# communication with the server"): the fuzz_json harness leaked per
+# iteration and peaked ~42 GB RSS — far past the 16 GB on a hosted
+# runner — and the no-swap OOM thrash starved the runner agent itself,
+# so GitHub force-failed the job 46 minutes later with no logs past the
+# previous step. The harness leak is fixed separately (tests/fuzz frees
+# per iteration); this split is hygiene so one heavy gate can never take
+# the README-truth signal down with it, and each job gets a fresh runner,
+# its own timeout, and diagnostics that survive a dying VM.
+#
+#   quickstart       — fast README-honesty gate (~4 min)
+#   hardening-gates  — sanitizer / soak / stress gates (~9 min)
+#   fuzz             — ASAN/UBSAN fuzz targets on a runner all to itself
 
 on:
   push:
@@ -11,9 +26,19 @@ on:
   pull_request:
     branches: [main]
 
+# Rapid back-to-back pushes to main used to stack full runs (d6ab760 at
+# 23:11 then c8c4d86 at 23:20 ran concurrently). This is a truth gate on
+# the latest code, not an archive — cancel the superseded run. Trade-off:
+# cancel-in-progress can kill a legitimate in-flight main run on rapid
+# pushes; acceptable, the newer run re-covers everything.
+concurrency:
+  group: linux-quickstart-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quickstart:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -78,6 +103,33 @@ jobs:
             make test-phase$p
           done
 
+  hardening-gates:
+    # No `needs: quickstart` — runs in parallel for fastest signal. A
+    # README regression and a sanitizer regression are independent facts;
+    # serializing them only delays whichever one you broke.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install README-listed system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Build swc + libswarmrt
+        run: make swc libswarmrt
+
+      - name: Runner diagnostics (pre-gates)
+        # Public ubuntu-24.04 runners are 4 vCPU / 16 GB RAM / ~14 GB free
+        # SSD, no swap. Snapshot before the heavy gates so a later OOM or
+        # disk-full death has a baseline to diff against in the log.
+        run: |
+          df -h /
+          free -m
+          nproc
+
       - name: GC copy-on-escape gate (ASAN + arena poison)
         # Compiles the copy-on-escape stress harness under -fsanitize=address +
         # -DSW_ARENA_POISON; a missed deep-copy on any send/spawn/ETS boundary
@@ -91,7 +143,7 @@ jobs:
         # single-scheduler so adopt/reset/destroy ordering bugs surface too.
         #
         # ADVISORY on CI: peak-RSS is a coarse proxy that is noise-sensitive on
-        # the 2-core GitHub runner (a borderline probe tips to "unbounded" here
+        # the 4-vCPU GitHub runner (a borderline probe tips to "unbounded" here
         # while passing comfortably on real multi-core hardware). The precise,
         # deterministic leak assertion is the LeakSanitizer lifecycle gate below
         # (which actually frees-and-counts) — that is the authoritative blocking
@@ -136,6 +188,14 @@ jobs:
         # dedicated host — see PRODUCTION_ROADMAP.md 2.6.
         run: make soak
 
+      - name: Runner diagnostics (post-soak)
+        # Second snapshot after the longest-running gate: catches future
+        # disk/memory accumulation across gates before it gets big enough
+        # to kill the runner the way the fuzz leak did.
+        run: |
+          df -h /
+          free -m
+
       - name: Scheduler-count matrix (Phase 2.2 — suite under S=1 and oversubscribed)
         # The default-scheduler run above covers nproc; these legs cover the
         # edges. S=1 found a real architecture issue (blocking curl client +
@@ -156,6 +216,40 @@ jobs:
         # counters + ctx_lock; the later spawn-storm crash cleared on
         # native Linux x86_64 May 29, so any miss here is a regression.
         run: make stress
+
+  fuzz:
+    # Fuzz gets a fresh 16 GB runner entirely to itself. Run 27312711773
+    # proved that a single RSS-hungry gate sharing a runner with everything
+    # else turns a harness regression into a dead VM with no logs past the
+    # preceding step. NOTE: the split alone does NOT make fuzz fit — the
+    # pre-fix fuzz_json run needed ~42 GB (measured), so this job depends
+    # on the per-iteration frees in tests/fuzz/fuzz_json.c +
+    # fuzz_marshal.c landing in the same change.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuzz-target system dependencies
+        # Same packages as the README deps step: the fuzz-* targets compile
+        # the runtime sources directly with clang (`fuzz-json: dirs` in the
+        # Makefile — no swc/libswarmrt prerequisite) but still link
+        # -lz -lsqlite3 -lssl -lcrypto. Skipping `make swc libswarmrt`
+        # here saves about a minute of wall clock.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Runner diagnostics
+        # RSS is the resource that killed this gate's runner historically —
+        # snapshot memory, disk, and top consumers up front so a future
+        # regression is diagnosable from the log even if the VM dies
+        # mid-step and GitHub never receives the step's own output.
+        run: |
+          df -h /
+          free -m
+          ps aux --sort=-rss | head -15
 
       - name: Fuzz (Phase 3 — untrusted-input boundaries under ASAN/UBSAN)
         # 20k mutations per target over parser, JSON decoder (agent-facing

@@ -4,10 +4,13 @@ module Conform_arith
 # mixed-type promotion, comparisons), closures (capture), higher-order
 # functions, the pipe operator, bounded recursion.
 #
-# Depth is 2000 here, NOT unbounded: the interpreter is a C-stack
+# Depth is 100 here, NOT unbounded: the interpreter is a C-stack
 # tree-walker with a stack guard and no TCO (documented), while compiled
-# code TCO-loops self-calls flat. Unbounded-depth flatness is gated on
-# the compiled path in tests/sw/test_tco_depth.sw.
+# code TCO-loops self-calls flat. Measured interpreter ceiling for this
+# call shape is ~350-390 frames (Linux, 8MB main stack, -O2, 256KB guard
+# margin, ~21KB C stack per sw frame) — keep depth well below that or
+# this gate diverges (interpreter panics, compiled succeeds). Unbounded-
+# depth flatness is gated on the compiled path in tests/sw/test_tco_depth.sw.
 
 fun make_adder(k) { fun(x) { x + k } }
 
@@ -28,5 +31,5 @@ fun main() {
         |> reduce(fun(a, x) { a + x }, 0)
     print(f"pipeline={out}")
 
-    print(f"recursion={count(400, 0)}")
+    print(f"recursion={count(100, 0)}")
 }

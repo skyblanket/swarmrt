@@ -18,6 +18,18 @@
 /* Maximum concurrent HTTP/WS connections */
 #define SW_HTTP_MAX_CONNS 256
 
+/* Maximum bytes buffered for a single HTTP request (request line + headers +
+ * body) AND maximum accepted Content-Length. Without this one client could
+ * stream bytes forever and make the server buffer up to ~4GB (the old
+ * `realloc((buf_len+len+1)*2)` growth had no ceiling). Override with the
+ * SW_HTTP_MAX_REQUEST env var (bytes, min 4096; parsed once, on first use).
+ * Chosen above the 16MB WebSocket frame/reassembly cap so WS traffic is
+ * never the binding constraint. Oversized declared bodies get a 413;
+ * a buffer that outgrows the cap without a parseable request gets the
+ * connection closed. NOTE: idle/slow-loris TIMEOUTS are a separate,
+ * still-open TODO (needs timer integration in the bridge loop). */
+#define SW_HTTP_MAX_REQUEST_DEFAULT (32u * 1024u * 1024u)
+
 /* Connection modes */
 typedef enum {
     SW_HTTP_MODE_HTTP,      /* Awaiting HTTP request */

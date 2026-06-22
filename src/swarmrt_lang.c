@@ -3754,6 +3754,43 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         free(k); free(v); return r;
     }
 
+    /* read_key: the interpreter has no raw-mode stdin watch — report "no key".
+     * Compiled binaries use the real _builtin_read_key. */
+    if (strcmp(fname, "read_key") == 0) { return sw_val_nil(); }
+
+    /* shell_managed: the interpreter has no select loop, so behave like a
+     * blocking shell and report interrupted='false'. The COMPILED binary
+     * (swarm-code) uses the real interruptible _builtin_shell_managed from
+     * swarmrt_builtins_studio.h; this path only keeps `swc run`/REPL of
+     * tools.sw resolving the name and returning the 3-tuple shape. */
+    if (strcmp(fname, "shell_managed") == 0) {
+        if (nargs < 1 || !args[0] || args[0]->type != SW_VAL_STRING) {
+            /* Match the compiled builtin's arg-guard 3-tuple instead of
+             * falling through to an "undefined function" error. */
+            sw_val_t *ae[3];
+            ae[0] = sw_val_int(-1);
+            ae[1] = sw_val_string("error: shell_managed needs a string command");
+            ae[2] = sw_val_atom("false");
+            return sw_val_tuple(ae, 3);
+        }
+        sw_val_t *base = interp_extra_builtin(interp, "shell", args, nargs, line);
+        if (base && base->type == SW_VAL_TUPLE && base->v.tuple.count == 2) {
+            sw_val_t *it[3];
+            it[0] = base->v.tuple.items[0];
+            it[1] = base->v.tuple.items[1];
+            it[2] = sw_val_atom("false");
+            return sw_val_tuple(it, 3);
+        }
+        /* shell delegate failed (popen returned nil) — normalize to the same
+         * launch-failure 3-tuple the compiled builtin emits so elem(r,0/1/2)
+         * stays safe under `swc run`/REPL as well. */
+        sw_val_t *ef[3];
+        ef[0] = sw_val_int(-1);
+        ef[1] = sw_val_string("error: failed to launch command");
+        ef[2] = sw_val_atom("false");
+        return sw_val_tuple(ef, 3);
+    }
+
     /* === Shell ================================================= */
     if (strcmp(fname, "shell") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         size_t buflen = strlen(args[0]->v.str) + 16;
@@ -5287,7 +5324,7 @@ static const char *k_interp_builtins[] = {
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
-    "random_int","reduce","shell","shell_sandboxed","sleep","string_replace",
+    "random_int","read_key","reduce","shell","shell_managed","shell_sandboxed","sleep","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
     NULL
@@ -5304,6 +5341,7 @@ static const char *lint_required_cap(const char *name) {
     if (strncmp(name, "file_", 5) == 0) return "file";
     if (strncmp(name, "db_", 3) == 0)   return "db";
     if (strcmp(name, "shell") == 0 || strcmp(name, "shell_sandboxed") == 0 ||
+        strcmp(name, "shell_managed") == 0 ||
         strcmp(name, "exec_argv") == 0) return "shell";
     return NULL;
 }

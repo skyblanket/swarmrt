@@ -24,8 +24,12 @@ when compiled. **Workaround:** add an explicit `after MS -> ...` clause to any
 The interpreter (`swc run` / REPL / `swc test`) evaluates on the C stack with
 a stack-margin guard and no tail-call optimisation; deep recursion raises a
 clean, uncatchable `interpreter recursion depth exceeded` panic (exit 1). The
-exact ceiling is environment-dependent (real stack headroom is measured);
-assume a few hundred frames. Compiled binaries TCO self-tail-calls to
+exact ceiling is environment-dependent (real stack headroom is measured, so it
+shifts with RLIMIT_STACK, compiler frame layout, and any new large locals in
+`eval()`); measured ~350-390 frames for a simple self-recursive two-arg
+function at -O2 on an 8MB main stack (~21KB of C stack per sw call frame —
+each sw call nests several `eval()` frames). Cheaper call shapes go somewhat
+deeper; assume a few hundred frames. Compiled binaries TCO self-tail-calls to
 unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
 
 **Impact:** recursion-heavy programs must be compiled. **Workaround:**

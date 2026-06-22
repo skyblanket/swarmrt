@@ -40,6 +40,27 @@
 static sw_http_conn_t g_http_conns[SW_HTTP_MAX_CONNS];
 static pthread_mutex_t g_http_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* === Request-size cap (SW_HTTP_MAX_REQUEST) ===
+ * 0 = not yet parsed; first caller resolves env → default. _Atomic because
+ * two listeners mean two bridge fibers on different scheduler threads can
+ * race the lazy init (both compute the same value; atomics keep it TSan-
+ * clean). Values below 4096 are rejected (a cap smaller than one read
+ * buffer would break every request). */
+static _Atomic uint32_t g_http_max_request;
+
+static uint32_t http_max_request(void) {
+    uint32_t v = atomic_load_explicit(&g_http_max_request, memory_order_relaxed);
+    if (v) return v;
+    unsigned long long n = SW_HTTP_MAX_REQUEST_DEFAULT;
+    const char *e = getenv("SW_HTTP_MAX_REQUEST");
+    if (e && *e) {
+        unsigned long long p = strtoull(e, NULL, 10);
+        if (p >= 4096ULL && p <= 0xFFFFFFFFULL) n = p;
+    }
+    atomic_store_explicit(&g_http_max_request, (uint32_t)n, memory_order_relaxed);
+    return (uint32_t)n;
+}
+
 /* === Connection Management === */
 
 static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
@@ -460,6 +481,20 @@ static void http_try_parse(int cid) {
         line = line_end + 2;
     }
 
+    /* Reject oversized declared bodies up front with a 413 instead of
+     * buffering toward the conn_on_data cap: strtoul gave the client a
+     * free uint32-range Content-Length, i.e. a request to buffer ~4GB.
+     * keep_alive=0 makes sw_http_respond close + conn_free the slot. */
+    if (has_content_length && content_length > http_max_request()) {
+        fprintf(stderr,
+            "swarmrt_http: rejecting %s %s — Content-Length %u exceeds "
+            "SW_HTTP_MAX_REQUEST (%u bytes)\n",
+            method, path, content_length, http_max_request());
+        c->keep_alive = 0;
+        sw_http_respond(cid, 413, NULL, "Payload Too Large");
+        return;
+    }
+
     /* Build the request-header MAP now, while c->buf is still intact (the
      * consume/memmove below mutates it). `line` after the request line is
      * the first header; hdr_end is the start of the terminating CRLF CRLF.
@@ -616,6 +651,28 @@ deliver_body:
 static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
+    /* Request-size cap: one client must not be able to grow this buffer
+     * without bound (headers that never terminate, a body the client keeps
+     * streaming, WS bytes piling up behind a stalled parse). 64-bit sum so
+     * buf_len+len can't wrap. Close + free the slot — same defensive shape
+     * as the WS oversize rejection, but conn_free'd so the slot and buffer
+     * are actually reclaimed. Rate-limited stderr keeps the drop LOUD. */
+    if ((uint64_t)c->buf_len + (uint64_t)len + 1 > (uint64_t)http_max_request()) {
+        static _Atomic uint32_t g_http_oversize_drops;
+        uint32_t d = atomic_fetch_add_explicit(&g_http_oversize_drops, 1,
+                                               memory_order_relaxed);
+        if ((d & 0xFF) == 0) {
+            fprintf(stderr,
+                "swarmrt_http: closing conn %d — request buffer would exceed "
+                "SW_HTTP_MAX_REQUEST (%u bytes); %u oversize connections "
+                "dropped so far\n",
+                cid, http_max_request(), d + 1);
+        }
+        if (c->port) sw_port_close(c->port);
+        conn_free(cid);
+        return;
+    }
+
     /* Append to buffer. Reserve one extra byte beyond buf_len so we can
      * always NUL-terminate: http_try_parse() scans c->buf with sscanf /
      * strchr / strstr, which over-read past the allocation when an inbound
@@ -729,6 +786,7 @@ int sw_http_respond(int conn_id, int status, const char *headers, const char *bo
     case 304: status_text = "Not Modified"; break;
     case 400: status_text = "Bad Request"; break;
     case 404: status_text = "Not Found"; break;
+    case 413: status_text = "Payload Too Large"; break;
     case 500: status_text = "Internal Server Error"; break;
     default:  status_text = "OK"; break;
     }

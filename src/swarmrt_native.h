@@ -28,6 +28,14 @@
 #define SWARM_CONTEXT_REDS     2000      /* Reductions per time slice */
 #define SWARM_TIME_SLICE_US    1000      /* 1ms max time slice */
 
+/* Default mailbox depth cap (pending messages per process). Override with the
+ * SW_MAILBOX_MAX env var (parsed once in sw_init; 0 = unbounded). USER sends
+ * over the cap are DROPPED (loud — counter + rate-limited stderr warning);
+ * EXIT/DOWN signals and timer fires are exempt so supervision and
+ * receive-after semantics stay intact. The cap is approximate under
+ * concurrency (overshoot bounded by #concurrent senders). */
+#define SW_MAILBOX_MAX_DEFAULT 1000000
+
 /* === Deadlock watchdog ===
  * A background thread that wakes every SW_DEADLOCK_MS milliseconds (default
  * 5000) and checks whether every live non-scheduler process is blocked in
@@ -398,6 +406,18 @@ struct sw_process {
      * they remain uncatchable and kill the process. NULL when no try is live.
      * At struct END so it shifts no asm-pinned offset. */
     void *try_chain;
+
+    /* Pending-message count for the SW_MAILBOX_MAX depth cap: incremented by
+     * every producer (sw_send / sw_send_tagged[_msg] / deliver_signal / timer
+     * fires), decremented on every pop/remove, re-incremented at the
+     * push-back-to-front race-recovery sites. Deliberately NOT inside
+     * sw_mailbox_t — the mailbox sits mid-struct and growing it would shift
+     * the offset-sensitive fields after it (slot-reuse paths; see the
+     * spawn_region comment). int64 (not uint32) so an accounting bug shows up
+     * as a visible negative instead of wrapping into permanent-drop mode.
+     * Producer-side check is approximate by design (relaxed atomics).
+     * At struct END so it shifts no asm-pinned offset. */
+    _Atomic int64_t mb_len;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -619,6 +639,11 @@ sw_process_t *sw_spawn_link_dtor(void (*entry)(void*), void *arg, void (*dtor)(v
 /* Called by the child trampoline: atomically take (read+clear) this process's
  * spawn_region so it can adopt it and process_destroy won't double-free. */
 struct sw_value_arena *sw_self_take_spawn_region(void);
+
+/* Total messages dropped by the SW_MAILBOX_MAX depth cap since boot
+ * (monotonic, process-global). 0 when the cap is disabled or never hit.
+ * Observability hook for tests/ops — see SW_MAILBOX_MAX_DEFAULT above. */
+uint64_t sw_mailbox_dropped(void);
 
 /* Selective receive: scan mailbox without consuming, remove matched msg */
 void sw_mailbox_drain_signals(void);         /* Drain signal stack → private queue */

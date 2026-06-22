@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SwarmScope — SwarmRT Runtime Observatory</title>
+  <style>
+    :root {
+      --bg: #05070a;
+      --bg2: #070a0e;
+      --panel: rgba(13, 18, 25, .72);
+      --panel-solid: #0b0f14;
+      --line: rgba(158, 205, 255, .11);
+      --line-strong: rgba(158, 205, 255, .2);
+      --muted: #6f7d91;
+      --muted2: #95a4b8;
+      --text: #eaf1f9;
+      --cyan: #56d7ff;
+      --green: #55f2a2;
+      --violet: #a98cff;
+      --red: #ff6577;
+      --amber: #ffc857;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(900px 520px at 12% -8%, rgba(34, 121, 162, .16), transparent 70%),
+        radial-gradient(820px 480px at 92% 4%, rgba(120, 70, 200, .13), transparent 70%),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    .mono { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; }
+
+    /* ---------- header ---------- */
+    header {
+      height: 64px; padding: 0 22px;
+      display: flex; align-items: center; justify-content: space-between; gap: 20px;
+      border-bottom: 1px solid var(--line); background: rgba(5, 7, 10, .66);
+      backdrop-filter: blur(20px); position: sticky; top: 0; z-index: 30;
+    }
+    .brand { display: flex; align-items: center; gap: 13px; }
+    .mark {
+      width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center;
+      background: linear-gradient(160deg, rgba(86,215,255,.16), rgba(86,215,255,.02));
+      border: 1px solid rgba(86,215,255,.4);
+      box-shadow: inset 0 0 18px rgba(86,215,255,.12), 0 0 22px rgba(86,215,255,.07);
+      color: var(--cyan); font: 700 11px/1 ui-monospace, monospace; letter-spacing: -.06em;
+    }
+    h1 { font-size: 15px; margin: 0; letter-spacing: .015em; font-weight: 650; }
+    .sub { color: var(--muted); font-size: 10.5px; margin-top: 2px; letter-spacing: .02em; }
+    .conn { display: flex; align-items: center; gap: 16px; }
+    .pill {
+      display: flex; align-items: center; gap: 8px; padding: 6px 11px; border-radius: 999px;
+      border: 1px solid var(--line); background: rgba(255,255,255,.02);
+      color: var(--muted2); font: 11px ui-monospace, monospace;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 10px currentColor; color: var(--amber); }
+    .dot.live { background: var(--green); color: var(--green); animation: blink 2.4s ease-in-out infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.45} }
+    #clock { color: var(--muted); font: 11px ui-monospace, monospace; }
+
+    .shell { padding: 16px 18px 26px; max-width: 1840px; margin: auto; }
+
+    /* ---------- KPI strip ---------- */
+    .kpis { display: grid; grid-template-columns: repeat(6, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .panel {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
+      box-shadow: inset 0 1px rgba(255,255,255,.025), 0 22px 60px rgba(0,0,0,.22);
+      backdrop-filter: blur(13px);
+    }
+    .kpi { padding: 13px 15px 14px; position: relative; overflow: hidden; }
+    .kpi::before { content:""; position:absolute; left:0; top:14px; bottom:14px; width:2px; border-radius:2px; background: var(--accent, var(--cyan)); box-shadow: 0 0 14px var(--accent, var(--cyan)); opacity:.85; }
+    .kpi .label { color: var(--muted); font: 10px/1.2 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .13em; }
+    .kpi .value { font: 600 27px/1 ui-monospace, monospace; margin-top: 11px; letter-spacing: -.04em; }
+    .kpi .detail { color: var(--muted2); font: 10px ui-monospace, monospace; margin-top: 6px; opacity: .85; }
+
+    /* ---------- main grid ---------- */
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; align-items: start; }
+    .panel-head {
+      padding: 12px 15px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .13em; color: #cdd9e6; }
+    .panel-note { color: var(--muted); font: 10px ui-monospace, monospace; }
+
+    /* hero mesh */
+    .hero { position: relative; }
+    .mesh-wrap { position: relative; height: 560px; border-radius: 0 0 15px 15px; overflow: hidden; }
+    #mesh { width: 100%; height: 100%; display: block; }
+    .hud { position: absolute; pointer-events: none; font: 10px ui-monospace, monospace; }
+    .hud.tl { left: 14px; top: 13px; color: var(--muted2); }
+    .hud.tr { right: 16px; top: 13px; text-align: right; }
+    .hud.tr .big { font-size: 22px; font-weight: 600; letter-spacing: -.03em; color: var(--text); }
+    .hud.tr .cap { color: var(--muted); margin-top: 2px; }
+    .legend {
+      position: absolute; left: 14px; bottom: 13px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+      padding: 8px 12px; border: 1px solid var(--line); border-radius: 11px; background: rgba(5,7,10,.7);
+      color: var(--muted2); font: 9.5px ui-monospace, monospace; backdrop-filter: blur(8px);
+    }
+    .legend i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; box-shadow: 0 0 8px currentColor; vertical-align: middle; }
+    .legend .streak { width: 16px; height: 2px; border-radius: 2px; box-shadow: 0 0 8px currentColor; background: currentColor; }
+    .explain { padding: 11px 16px; color: var(--muted2); font: 11px/1.5 ui-sans-serif, system-ui; border-top: 1px solid var(--line); background: rgba(255,255,255,.012); }
+    .explain b { color: #cdd9e6; font-weight: 600; }
+
+    /* right rail */
+    .rail { display: grid; gap: 12px; }
+
+    /* load gauge */
+    .gauge-wrap { padding: 14px 15px 16px; }
+    .gauge-top { display: flex; align-items: baseline; justify-content: space-between; }
+    .band { font: 700 17px/1 ui-monospace, monospace; letter-spacing: .02em; }
+    .band-sub { color: var(--muted); font: 10px ui-monospace, monospace; }
+    #gauge { width: 100%; height: 92px; display: block; margin: 4px 0 2px; }
+    .gauge-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }
+    .gstat { text-align: center; padding: 8px 4px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.015); }
+    .gstat .gv { font: 600 14px/1 ui-monospace, monospace; }
+    .gstat .gl { color: var(--muted); font: 9px ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; margin-top: 5px; }
+
+    /* controls */
+    .controls { padding: 13px 14px 14px; display: grid; gap: 8px; }
+    .control-hint { color: var(--muted); font: 9.5px/1.4 ui-monospace, monospace; margin: -2px 0 3px; }
+    .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    button {
+      border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.022);
+      color: #b9c7d6; font: 10px ui-monospace, monospace; padding: 10px 6px; cursor: pointer;
+      transition: .16s ease; letter-spacing: .02em;
+    }
+    button:hover { border-color: rgba(86,215,255,.45); background: rgba(86,215,255,.08); color: #fff; transform: translateY(-1px); }
+    button.act { border-color: rgba(86,215,255,.5); background: rgba(86,215,255,.1); color:#fff; }
+    button.wide { padding: 11px 8px; }
+    button.danger { color: #ffc1ca; }
+    button.danger:hover { border-color: rgba(255,101,119,.6); background: rgba(255,101,119,.1); color:#fff; }
+
+    /* state bars */
+    .state-wrap { padding: 14px 15px; display: grid; gap: 11px; }
+    .state-row { display: grid; grid-template-columns: 70px 1fr 46px; gap: 10px; align-items: center; color: var(--muted2); font: 10px ui-monospace, monospace; }
+    .track { height: 6px; background: rgba(255,255,255,.045); border-radius: 9px; overflow: hidden; }
+    .fill { width: 0; height: 100%; background: var(--c); border-radius: inherit; box-shadow: 0 0 12px var(--c); transition: width .4s cubic-bezier(.4,0,.2,1); }
+    .state-row .n { text-align: right; color: #cdd9e6; }
+
+    .chart { height: 120px; }
+    #rateChart { width: 100%; height: 100%; display: block; }
+
+    .events { height: 128px; overflow: hidden; padding: 10px 14px; display: flex; flex-direction: column; justify-content: flex-end; gap: 5px; }
+    .event { color: var(--muted); font: 9.5px/1.4 ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .event b { font-weight: 600; }
+
+    /* table */
+    .table-panel { margin-top: 12px; }
+    table { width: 100%; border-collapse: collapse; font: 10.5px ui-monospace, monospace; }
+    th { color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .08em; text-align: left; }
+    th, td { padding: 9px 15px; border-bottom: 1px solid rgba(158,205,255,.06); }
+    tbody tr:hover { background: rgba(86,215,255,.03); }
+    td.statuscell { color: var(--c); }
+    .barcell { color: var(--muted2); }
+
+    .footer-note { padding: 13px 4px 0; color: #46525f; font: 9.5px ui-monospace, monospace; text-align: right; }
+
+    @media (max-width: 1180px) {
+      .kpis { grid-template-columns: repeat(3, 1fr); }
+      .grid { grid-template-columns: 1fr; }
+      .rail { grid-template-columns: repeat(2, 1fr); }
+      .rail .span2 { grid-column: 1 / -1; }
+    }
+    @media (max-width: 680px) {
+      .kpis { grid-template-columns: repeat(2, 1fr); }
+      .rail { grid-template-columns: 1fr; }
+      .mesh-wrap { height: 420px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="mark">SRT</div>
+      <div><h1>SwarmScope</h1><div class="sub">live message-flow observatory · SwarmRT</div></div>
+    </div>
+    <div class="conn">
+      <div class="pill"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+      <span id="clock" class="mono"></span>
+    </div>
+  </header>
+
+  <main class="shell">
+    <!-- KPI strip -->
+    <section class="kpis">
+      <div class="panel kpi" style="--accent:var(--cyan)">
+        <div class="label">Live actors</div><div class="value mono" id="processes">--</div>
+        <div class="detail" id="pairs">lightweight processes</div>
+      </div>
+      <div class="panel kpi" style="--accent:var(--green)">
+        <div class="label">Messages / sec</div><div class="value mono" id="rate">--</div>
+        <div class="detail">real ping·pong traffic</div>
+      </div>
+      <div class="panel kpi" style="--accent:var(--violet)">
+        <div class="label">Total messages</div><div class="value mono" id="messages">--</div>
+        <div class="detail" id="roundtrips">-- round trips</div>
+      </div>
+      <div class="panel kpi" style="--accent:var(--amber)">
+        <div class="label">Avg round-trip</div><div class="value mono" id="latency">--</div>
+        <div class="detail">send → reply latency</div>
+      </div>
+      <div class="panel kpi" style="--accent:var(--red)">
+        <div class="label">Queued msgs</div><div class="value mono" id="queued">--</div>
+        <div class="detail">unread in mailboxes</div>
+      </div>
+      <div class="panel kpi" style="--accent:var(--cyan)">
+        <div class="label">CPU / memory</div><div class="value mono" id="cpu">--</div>
+        <div class="detail" id="rss">-- RSS</div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <!-- HERO: message mesh -->
+      <div class="panel hero">
+        <div class="panel-head">
+          <div class="panel-title">Message Mesh</div>
+          <div class="panel-note" id="meshNote">awaiting runtime snapshot</div>
+        </div>
+        <div class="mesh-wrap">
+          <canvas id="mesh"></canvas>
+          <div class="hud tl">LIVE ACTOR NETWORK</div>
+          <div class="hud tr"><div class="big mono" id="hudRate">--</div><div class="cap">messages / sec</div></div>
+          <div class="legend">
+            <span><i style="color:var(--green)"></i>running</span>
+            <span><i style="color:var(--cyan)"></i>runnable</span>
+            <span><i style="color:var(--violet)"></i>waiting</span>
+            <span><i style="color:var(--red)"></i>exiting</span>
+            <span style="opacity:.55">|</span>
+            <span><span class="streak" style="color:var(--cyan)"></span> message in flight</span>
+          </div>
+        </div>
+        <div class="explain">
+          <b>What you're seeing:</b> each dot is one live actor (a SwarmRT process). Each streak is a real message
+          travelling from sender to receiver. The field <b>heats up</b> — cyan → amber → red — as the runtime works
+          harder. Scale up to watch it grow and spread; inject crashes to watch the supervisor heal it.
+        </div>
+      </div>
+
+      <!-- RIGHT RAIL -->
+      <aside class="rail">
+        <div class="panel span2">
+          <div class="panel-head"><div class="panel-title">System Load</div><div class="panel-note">live stress</div></div>
+          <div class="gauge-wrap">
+            <div class="gauge-top">
+              <div class="band mono" id="band" style="color:var(--cyan)">CALM</div>
+              <div class="band-sub mono" id="bandPct">0%</div>
+            </div>
+            <canvas id="gauge"></canvas>
+            <div class="gauge-stats">
+              <div class="gstat"><div class="gv mono" id="gCpu" style="color:var(--cyan)">--</div><div class="gl">CPU</div></div>
+              <div class="gstat"><div class="gv mono" id="gQueue" style="color:var(--cyan)">--</div><div class="gl">Queue</div></div>
+              <div class="gstat"><div class="gv mono" id="gPeak" style="color:var(--cyan)">--</div><div class="gl">Peak m/s</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel span2">
+          <div class="panel-head"><div class="panel-title">Load Controls</div><div class="panel-note">watch the mesh react</div></div>
+          <div class="controls">
+            <div class="control-hint">set total workload (real ping·pong actor pairs)</div>
+            <div class="seg">
+              <button data-scale="250">500</button><button data-scale="500">1K</button><button data-scale="1000" class="act">2K</button>
+              <button data-scale="2000">4K</button><button data-scale="3000">6K</button><button data-scale="4000">8K</button>
+            </div>
+            <button class="wide" id="burst">⚡ Burst · spawn 2,000 transient actors</button>
+            <button class="wide danger" id="chaos">💥 Chaos · crash 16 workers (watch them heal)</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><div class="panel-title">Process states</div><div class="panel-note" id="schedulerCount">sched: auto</div></div>
+          <div class="state-wrap">
+            <div class="state-row"><span>running</span><div class="track"><div class="fill" id="runningBar" style="--c:var(--green)"></div></div><span class="n mono" id="runningN">0</span></div>
+            <div class="state-row"><span>runnable</span><div class="track"><div class="fill" id="runnableBar" style="--c:var(--cyan)"></div></div><span class="n mono" id="runnableN">0</span></div>
+            <div class="state-row"><span>waiting</span><div class="track"><div class="fill" id="waitingBar" style="--c:var(--violet)"></div></div><span class="n mono" id="waitingN">0</span></div>
+            <div class="state-row"><span>exiting</span><div class="track"><div class="fill" id="exitingBar" style="--c:var(--red)"></div></div><span class="n mono" id="exitingN">0</span></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><div class="panel-title">Throughput</div><div class="panel-note">last 60s</div></div>
+          <div class="chart"><canvas id="rateChart"></canvas></div>
+        </div>
+
+        <div class="panel span2">
+          <div class="panel-head"><div class="panel-title">Runtime events</div><div class="panel-note" id="uptime">uptime --</div></div>
+          <div class="events" id="events"></div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="panel-head"><div class="panel-title">Hottest actors</div><div class="panel-note">direct process_info() samples · busiest first</div></div>
+      <table>
+        <thead><tr><th>PID</th><th>Name</th><th>Status</th><th>Reductions</th><th>Mailbox</th><th>Heap</th></tr></thead>
+        <tbody id="hotRows"></tbody>
+      </table>
+    </section>
+    <div class="footer-note">SwarmScope is served entirely by SwarmRT HTTP + WebSocket actors. No Node, no sidecar runtime.</div>
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const fmt = n => {
+      n = Number(n || 0);
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+      return String(Math.round(n));
+    };
+    const STATUS = { running:[85,242,162], runnable:[86,215,255], waiting:[169,140,255], exiting:[255,101,119], unknown:[111,125,145] };
+    const css = { running:"#55f2a2", runnable:"#56d7ff", waiting:"#a98cff", exiting:"#ff6577", unknown:"#6f7d91" };
+
+    // stress colour ramp: cyan -> green -> amber -> red
+    const RAMP = [[86,215,255],[85,242,162],[255,200,87],[255,101,119]];
+    function ramp(t){
+      t = Math.max(0, Math.min(1, t)); const s = t*(RAMP.length-1); const i = Math.floor(s); const f = s-i;
+      const a = RAMP[i], b = RAMP[Math.min(RAMP.length-1, i+1)];
+      return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
+    }
+    const rgba = (c,a) => `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`;
+    function hash(n){ const x = Math.sin(n*12.9898)*43758.5453; return x - Math.floor(x); }
+
+    let ws, latest=null, last={}, rateHistory=[], eventLines=[];
+    let load=0, loadDisp=0, rateMax=1, cpuMax=100;
+
+    function event(text, strong="", color="var(--cyan)"){
+      const stamp = new Date().toLocaleTimeString([], {hour12:false});
+      eventLines.unshift(`<span style="color:#5a6675">${stamp}</span> ${strong?`<b style="color:${color}">${strong}</b> `:""}${text}`);
+      eventLines = eventLines.slice(0, 7);
+      $("events").innerHTML = eventLines.map(x=>`<div class="event">${x}</div>`).reverse().join("");
+    }
+
+    function connect(){
+      ws = new WebSocket(`${location.protocol==="https:"?"wss":"ws"}://${location.host}/scope/ws`);
+      ws.onopen = () => { $("connDot").classList.add("live"); $("connText").textContent="runtime connected"; event("telemetry stream connected","WS","var(--green)"); };
+      ws.onclose = () => { $("connDot").classList.remove("live"); $("connText").textContent="reconnecting…"; setTimeout(connect, 800); };
+      ws.onmessage = e => { const d = JSON.parse(e.data); if (d.type==="snapshot") update(d); };
+    }
+    function command(action, value=0){ if (ws && ws.readyState===1) ws.send(JSON.stringify({action, value})); }
+    document.querySelectorAll("[data-scale]").forEach(b => b.onclick = () => {
+      document.querySelectorAll("[data-scale]").forEach(x=>x.classList.remove("act")); b.classList.add("act");
+      command("scale", Number(b.dataset.scale));
+      event(`workload → ${fmt(Number(b.dataset.scale)*2)} actors`, "SCALE");
+      growth(1.0);
+    });
+    $("burst").onclick = () => { command("burst", 2000); event("spawned 2,000 transient compute actors","BURST","var(--amber)"); growth(.8); };
+    $("chaos").onclick = () => { command("chaos"); event("injected failures into supervised workers","CHAOS","var(--red)"); };
+
+    // ---------- mesh visualization ----------
+    const mesh = $("mesh"), m = mesh.getContext("2d");
+    const K = 7;                      // clusters
+    let nodes = [], packets = [], waves = [], W=0, H=0, DPR=1;
+    let clusters = [];
+
+    function buildClusters(){
+      clusters = [];
+      clusters.push({x:.5, y:.5});    // core
+      for (let k=0;k<K-1;k++){ const a = (k/(K-1))*Math.PI*2 - Math.PI/2; clusters.push({x:.5+Math.cos(a)*.31, y:.5+Math.sin(a)*.34}); }
+    }
+    buildClusters();
+
+    function rebuildNodes(count){
+      count = Math.max(1, Math.min(560, count));
+      if (nodes.length === count) return;
+      if (nodes.length < count){
+        for (let i=nodes.length; i<count; i++){
+          const cl = i % K, c = clusters[cl];
+          const rr = Math.pow(hash(i*1.7), .62) * (cl===0? .2 : .15);
+          const ang = hash(i*3.3) * Math.PI*2;
+          nodes.push({
+            cl, status:"waiting",
+            nx: c.x + Math.cos(ang)*rr*0.92,
+            ny: c.y + Math.sin(ang)*rr,
+            ph: hash(i*5.1)*6.28,
+            drift: .004 + hash(i*9.4)*.006,
+            heat: 0, flash: 0, born: 1, nb: (i+K<count? i+K : Math.max(0,i-K))
+          });
+        }
+      } else {
+        nodes.length = count;
+        nodes.forEach(n => { if (n.nb >= count) n.nb = Math.max(0, n.cl); });
+      }
+    }
+    function assignStatus(d){
+      const tot = Math.max(1, d.processes);
+      nodes.forEach((n,i) => {
+        const r = hash(i + d.running*0.13 + d.exiting*0.7) * tot;
+        n.status = r < d.running ? "running"
+          : r < d.running + d.runnable ? "runnable"
+          : r < d.running + d.runnable + d.waiting ? "waiting" : "exiting";
+      });
+    }
+    function nodePos(n, t){
+      return [ (n.nx + Math.sin(t*.0004 + n.ph)*n.drift) * W,
+               (n.ny + Math.cos(t*.00045 + n.ph*1.3)*n.drift) * H ];
+    }
+    function growth(strength){      // expanding ring from core + light up new nodes
+      waves.push({ cx:.5, cy:.5, t:0, life:1100, color:[86,215,255], max:.62, w:2.4*strength });
+    }
+    function spawnPacket(t){
+      if (nodes.length < 2) return;
+      const from = (Math.random()*nodes.length)|0;
+      let to;
+      if (Math.random() < 0.72){ to = nodes[from].nb; }            // local chatter
+      else { to = (Math.random()*nodes.length)|0; }                // long-range spread
+      if (to === from) to = (from+1) % nodes.length;
+      const dur = 520 / (0.55 + loadDisp*1.4);
+      packets.push({ from, to, t0:t, dur, c: ramp(0.12 + loadDisp*0.85) });
+    }
+
+    function drawMesh(t){
+      const r = mesh.getBoundingClientRect();
+      DPR = devicePixelRatio || 1;
+      if (mesh.width !== (r.width*DPR|0) || mesh.height !== (r.height*DPR|0)){
+        mesh.width = r.width*DPR; mesh.height = r.height*DPR; m.setTransform(DPR,0,0,DPR,0,0);
+      }
+      W = r.width; H = r.height;
+
+      // motion-blur fade -> leaves message trails
+      m.globalCompositeOperation = "source-over";
+      m.fillStyle = "rgba(6,9,13,0.30)";
+      m.fillRect(0,0,W,H);
+
+      loadDisp += (load - loadDisp) * 0.06;
+      const heatCol = ramp(loadDisp);
+
+      // ambient heat glow grows with stress
+      const gg = m.createRadialGradient(W*.5,H*.5,0,W*.5,H*.5,Math.max(W,H)*.6);
+      gg.addColorStop(0, rgba(heatCol, 0.05 + loadDisp*0.10));
+      gg.addColorStop(1, "rgba(0,0,0,0)");
+      m.fillStyle = gg; m.fillRect(0,0,W,H);
+
+      // faint structural web (one link per node to a cluster-mate)
+      m.lineWidth = 1;
+      for (let i=0;i<nodes.length;i+=1){
+        const n = nodes[i], nb = nodes[n.nb]; if (!nb) continue;
+        if ((i & 1) && loadDisp < .5) continue;   // thin it out when calm
+        const [x1,y1] = nodePos(n,t), [x2,y2] = nodePos(nb,t);
+        m.strokeStyle = rgba(heatCol, 0.018 + loadDisp*0.02);
+        m.beginPath(); m.moveTo(x1,y1); m.lineTo(x2,y2); m.stroke();
+      }
+
+      // shockwaves (growth + chaos)
+      waves = waves.filter(w => (t - (w.t0 ?? (w.t0=t))) < w.life);
+      waves.forEach(w => {
+        const p = (t - w.t0) / w.life;
+        const r0 = p * w.max * Math.min(W,H);
+        m.strokeStyle = rgba(w.color, (1-p)*0.5);
+        m.lineWidth = (w.w||2) * (1-p);
+        m.beginPath(); m.arc(w.cx*W, w.cy*H, r0, 0, Math.PI*2); m.stroke();
+      });
+
+      // packets (messages in flight)
+      packets = packets.filter(p => (t - p.t0) < p.dur);
+      for (const p of packets){
+        const a = nodes[p.from], b = nodes[p.to]; if (!a||!b) continue;
+        let pr = (t - p.t0) / p.dur; const e = pr<.5 ? 2*pr*pr : 1-Math.pow(-2*pr+2,2)/2;
+        const [ax,ay]=nodePos(a,t),[bx,by]=nodePos(b,t);
+        const x = ax+(bx-ax)*e, y = ay+(by-ay)*e;
+        // short bright head + glow
+        m.strokeStyle = rgba(p.c, 0.5*(1-pr)+0.2);
+        m.lineWidth = 1.4;
+        const tx = ax+(bx-ax)*Math.max(0,e-0.06), ty = ay+(by-ay)*Math.max(0,e-0.06);
+        m.beginPath(); m.moveTo(tx,ty); m.lineTo(x,y); m.stroke();
+        m.fillStyle = rgba(p.c, 0.95); m.beginPath(); m.arc(x,y,1.7,0,Math.PI*2); m.fill();
+        if (pr > 0.985){ b.heat = Math.min(1, b.heat + 0.5); }   // arrival → receiver lights up
+      }
+
+      // nodes
+      for (let i=0;i<nodes.length;i++){
+        const n = nodes[i]; const [x,y] = nodePos(n,t);
+        if (n.born < 1) n.born = Math.min(1, n.born + 0.05);
+        n.heat *= 0.92; n.flash *= 0.90;
+        const base = STATUS[n.status] || STATUS.unknown;
+        const pulse = 1 + Math.sin(t*.003 + n.ph)*0.25;
+        let col = base, glow = 0;
+        if (n.flash > 0.02){ col = [255,101,119]; glow = n.flash; }
+        else if (n.heat > 0.04){ col = [255,255,255].map((c,k)=>c*n.heat + base[k]*(1-n.heat)); glow = n.heat; }
+        const sz = (n.status==="waiting"?1.3:1.7) * pulse * n.born;
+        if (glow > 0.05){
+          m.fillStyle = rgba(col, 0.10*glow); m.beginPath(); m.arc(x,y, sz+5*glow, 0, Math.PI*2); m.fill();
+        }
+        m.globalAlpha = (n.status==="waiting"? .5 : .9) * n.born;
+        m.fillStyle = rgba(col, 1); m.beginPath(); m.arc(x,y, sz, 0, Math.PI*2); m.fill();
+      }
+      m.globalAlpha = 1;
+
+      // emit packets at a rate driven by real throughput + stress
+      const target = Math.min(190, 8 + loadDisp*150 + (latest? Math.min(120, latest.message_rate/600):0));
+      let spawn = (target - packets.length) * 0.16;
+      while (spawn-- > 0 && packets.length < 220) spawnPacket(t);
+
+      requestAnimationFrame(drawMesh);
+    }
+
+    // ---------- stress gauge ----------
+    const gauge = $("gauge"), gx = gauge.getContext("2d");
+    function drawGauge(){
+      const r = gauge.getBoundingClientRect(), dpr = devicePixelRatio||1;
+      if (gauge.width !== r.width*dpr|0){ gauge.width=r.width*dpr; gauge.height=r.height*dpr; gx.setTransform(dpr,0,0,dpr,0,0); }
+      const w=r.width,h=r.height, cx=w/2, cy=h*0.96, rad=Math.min(w*0.46,h*0.92);
+      gx.clearRect(0,0,w,h);
+      const a0 = Math.PI, a1 = Math.PI*2;
+      gx.lineWidth = 10; gx.lineCap="round";
+      gx.strokeStyle = "rgba(255,255,255,.05)";
+      gx.beginPath(); gx.arc(cx,cy,rad,a0,a1); gx.stroke();
+      const col = ramp(loadDisp);
+      gx.strokeStyle = rgba(col, .95); gx.shadowBlur=14; gx.shadowColor = rgba(col,.6);
+      gx.beginPath(); gx.arc(cx,cy,rad,a0,a0+(a1-a0)*loadDisp); gx.stroke();
+      gx.shadowBlur=0;
+      // ticks
+      for (let i=0;i<=4;i++){ const a=a0+(a1-a0)*(i/4); const r1=rad+8,r2=rad+13;
+        gx.strokeStyle="rgba(158,205,255,.18)"; gx.lineWidth=1;
+        gx.beginPath(); gx.moveTo(cx+Math.cos(a)*r1, cy+Math.sin(a)*r1); gx.lineTo(cx+Math.cos(a)*r2, cy+Math.sin(a)*r2); gx.stroke();
+      }
+      requestAnimationFrame(drawGauge);
+    }
+
+    // ---------- throughput sparkline ----------
+    const chart = $("rateChart"), c = chart.getContext("2d");
+    function drawChart(){
+      const r=chart.getBoundingClientRect(), dpr=devicePixelRatio||1;
+      if (chart.width!==r.width*dpr|0){ chart.width=r.width*dpr; chart.height=r.height*dpr; c.setTransform(dpr,0,0,dpr,0,0); }
+      const w=r.width,h=r.height; c.clearRect(0,0,w,h);
+      if (rateHistory.length<2){ requestAnimationFrame(drawChart); return; }
+      const max=Math.max(...rateHistory,1), step=w/Math.max(1,rateHistory.length-1);
+      const col = ramp(loadDisp);
+      const grad=c.createLinearGradient(0,0,0,h); grad.addColorStop(0,rgba(col,.24)); grad.addColorStop(1,rgba(col,0));
+      c.beginPath(); rateHistory.forEach((v,i)=>{ const x=i*step,y=h-9-(v/max)*(h-22); i?c.lineTo(x,y):c.moveTo(x,y); });
+      c.lineTo(w,h); c.lineTo(0,h); c.closePath(); c.fillStyle=grad; c.fill();
+      c.beginPath(); rateHistory.forEach((v,i)=>{ const x=i*step,y=h-9-(v/max)*(h-22); i?c.lineTo(x,y):c.moveTo(x,y); });
+      c.strokeStyle=rgba(col,1); c.lineWidth=1.4; c.stroke();
+      c.fillStyle="#5a6675"; c.font="9px ui-monospace, monospace"; c.fillText(`${fmt(max)} peak`,9,13);
+      requestAnimationFrame(drawChart);
+    }
+
+    // ---------- snapshot handler ----------
+    function update(d){
+      latest = d;
+      $("processes").textContent = fmt(d.processes);
+      $("pairs").textContent = `${fmt(d.workload_pairs*2)} ping·pong + runtime`;
+      $("rate").textContent = fmt(d.message_rate);
+      $("hudRate").textContent = fmt(d.message_rate);
+      $("messages").textContent = fmt(d.messages_total);
+      $("roundtrips").textContent = `${fmt(d.roundtrips_total)} round trips`;
+      $("latency").textContent = `${d.avg_latency_ms||0} ms`;
+      $("queued").textContent = fmt(d.queued);
+      $("cpu").textContent = `${Number(d.cpu_pct||0).toFixed(0)}%`;
+      $("rss").textContent = `${(Number(d.rss_kb||0)/1024).toFixed(0)} MB RSS`;
+      $("schedulerCount").textContent = `sched: ${d.schedulers}`;
+      $("uptime").textContent = `uptime ${duration(d.uptime_ms)}`;
+      $("meshNote").textContent = `${fmt(d.processes)} live · ${fmt(d.registered)} registered · ${fmt(d.samples.length)} sampled`;
+
+      stateBar("running", d.running, d.processes);
+      stateBar("runnable", d.runnable, d.processes);
+      stateBar("waiting", d.waiting, d.processes);
+      stateBar("exiting", d.exiting, d.processes);
+
+      rateHistory.push(Number(d.message_rate||0)); rateHistory = rateHistory.slice(-60);
+
+      // ---- stress model (absolute references → gauge is meaningful from t=0) ----
+      rateMax = Math.max(rateMax, d.message_rate, 1);        // peak, for display only
+      const cpuLoad  = Math.min(1, (d.cpu_pct||0) / 800);    // ~8 saturated schedulers ≈ full
+      const rateLoad = Math.min(1, d.message_rate / 200000); // soft throughput ceiling
+      const qLoad    = Math.min(1, d.queued / 200);          // mailbox backpressure
+      const target   = Math.max(0, Math.min(1, cpuLoad*0.45 + rateLoad*0.40 + qLoad*0.15));
+      load += (target - load) * 0.3;                         // smooth the needle
+      const band = load<.25?["CALM","var(--cyan)",0]:load<.5?["BUSY","var(--green)",1]:load<.75?["HEAVY","var(--amber)",2]:["CRITICAL","var(--red)",3];
+      $("band").textContent = band[0]; $("band").style.color = band[1];
+      $("bandPct").textContent = `${Math.round(load*100)}% load`;
+      const gc = `rgb(${ramp(load).map(x=>x|0).join(",")})`;
+      $("gCpu").textContent = `${Number(d.cpu_pct||0).toFixed(0)}%`; $("gCpu").style.color = gc;
+      $("gQueue").textContent = fmt(d.queued); $("gQueue").style.color = gc;
+      $("gPeak").textContent = fmt(rateMax); $("gPeak").style.color = gc;
+
+      // mesh sync
+      rebuildNodes(d.processes); assignStatus(d);
+      renderRows(d.samples);
+
+      // reactions
+      if (last.processes !== undefined && d.processes > last.processes + 80) growth(Math.min(1.2,(d.processes-last.processes)/1500+.4));
+      if (last.crashes_total !== undefined && d.crashes_total > last.crashes_total){
+        const n = d.crashes_total - last.crashes_total; chaosBurst(n);
+        event(`${n} actors crashed → supervisor restarted them (${fmt(d.guard_starts)} total starts)`, "HEAL", "var(--green)");
+      }
+      if (last.burst_completed !== undefined && d.burst_completed > last.burst_completed)
+        event(`${fmt(d.burst_completed - last.burst_completed)} transient actors finished & exited`, "EXIT", "var(--violet)");
+      last = d;
+    }
+    function chaosBurst(n){
+      const k = Math.min(nodes.length, 16);
+      for (let i=0;i<k;i++){ const idx=(Math.random()*nodes.length)|0; const nd=nodes[idx]; if(!nd) continue;
+        nd.flash = 1; nd.born = 0.0;       // crash → red flash, then fade back in (reborn)
+        waves.push({ cx:nd.nx, cy:nd.ny, t0:performance.now(), life:850, color:[255,101,119], max:.16, w:2 });
+      }
+      waves.push({ cx:.5, cy:.5, t0:performance.now(), life:1200, color:[255,101,119], max:.66, w:2.6 });
+    }
+    function stateBar(name,n,total){ $(`${name}N`).textContent = fmt(n); $(`${name}Bar`).style.width = `${Math.min(100,(n/Math.max(1,total))*100)}%`; }
+    function duration(ms){ const s=Math.floor(ms/1000),h=Math.floor(s/3600),mn=Math.floor((s%3600)/60); return h?`${h}h ${mn}m`:`${mn}m ${s%60}s`; }
+    function renderRows(samples){
+      const rows = [...samples].sort((a,b)=>(b.reductions+b.messages*100)-(a.reductions+a.messages*100)).slice(0,9);
+      $("hotRows").innerHTML = rows.map(p=>`<tr>
+        <td>${p.pid}</td><td>${p.name||"—"}</td>
+        <td class="statuscell" style="--c:${css[p.status]||css.unknown}">${p.status}</td>
+        <td>${fmt(p.reductions)}</td><td class="barcell">${fmt(p.messages)}</td><td class="barcell">${fmt(p.heap)}</td>
+      </tr>`).join("");
+    }
+
+    setInterval(()=> $("clock").textContent = new Date().toLocaleTimeString([], {hour12:false}), 1000);
+    connect();
+    requestAnimationFrame(drawMesh);
+    requestAnimationFrame(drawGauge);
+    requestAnimationFrame(drawChart);
+  </script>
+</body>
+</html>

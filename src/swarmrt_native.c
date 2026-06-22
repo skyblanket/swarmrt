@@ -66,6 +66,17 @@ static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread sw_scheduler_t *tls_scheduler = NULL;
 static __thread sw_process_t *tls_current = NULL;
 
+/* Mailbox depth cap (see SW_MAILBOX_MAX_DEFAULT in the header). Plain global:
+ * written exactly once in sw_init BEFORE any scheduler thread exists (ordered
+ * by pthread_create), read-only afterwards — no atomics needed. 0 = unbounded. */
+static int64_t g_mailbox_max = SW_MAILBOX_MAX_DEFAULT;
+/* Total messages dropped by the cap (LOUD: also rate-limited stderr below). */
+static _Atomic uint64_t g_mb_dropped;
+
+uint64_t sw_mailbox_dropped(void) {
+    return atomic_load_explicit(&g_mb_dropped, memory_order_relaxed);
+}
+
 /* Generated-code execution state (line/file/call-trace), PER PROCESS. `_sw_gen`
  * is pointed at the running process's gen_exec block on every context switch in
  * (below), so the generated _sw_current_line/_sw_current_file/_sw_trace* macros
@@ -475,6 +486,7 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
         mb->priv_tail = NULL;
         atomic_store(&mb->waiting, 0);
         mb->count = 0;
+        atomic_store(&slab[i].mb_len, 0);
 
         /* Per-slot ctx_lock + generation — guards process_init_arena
          * against concurrent swap-in. See sw_safe_swap_into for the
@@ -637,6 +649,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->mailbox.priv_tail = NULL;
     atomic_store(&proc->mailbox.waiting, 0);
     proc->mailbox.count = 0;
+    atomic_store_explicit(&proc->mb_len, 0, memory_order_relaxed);
 
     /* rq_next/rq_prev are NOT set here — they're set by sw_add_to_runq
      * under the run queue lock. Setting them here races with the queue
@@ -723,6 +736,7 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.priv_head = NULL;
     proc->mailbox.priv_tail = NULL;
     proc->mailbox.count = 0;
+    atomic_store_explicit(&proc->mb_len, 0, memory_order_relaxed);
 
     /* Free the panic_msg string set by sw_process_panic. UNDER link_lock:
      * a late sw_monitor on this (already-EXITING/FREE) process reads
@@ -1564,6 +1578,15 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         long n = strtol(max_procs_env, NULL, 10);
         if (n >= 16 && n <= (long)SWARM_MAX_PROCESSES) max_procs = (uint32_t)n;
     }
+
+    /* Mailbox depth cap — SW_MAILBOX_MAX overrides the 1M default, 0 disables.
+     * Parsed here, before the scheduler threads start, so the plain global is
+     * safely published by pthread_create. Negative/garbage input is ignored. */
+    const char *mb_max_env = getenv("SW_MAILBOX_MAX");
+    if (mb_max_env && *mb_max_env) {
+        long long n = strtoll(mb_max_env, NULL, 10);
+        if (n >= 0) g_mailbox_max = (int64_t)n;
+    }
     if (sw_arena_init(&g_swarm->arena, max_procs) != 0) {
         free(g_swarm);
         g_swarm = NULL;
@@ -2149,8 +2172,12 @@ static void mailbox_drain(sw_mailbox_t *mb) {
 /*
  * mailbox_pop_first: Pop first message from private queue.
  * Returns NULL if private queue is empty (caller should drain first).
+ * Takes the PROCESS (not the mailbox) so the depth counter (proc->mb_len,
+ * kept outside sw_mailbox_t for asm-offset reasons) stays in lockstep
+ * with mb->count.
  */
-static inline sw_msg_t *mailbox_pop_first(sw_mailbox_t *mb) {
+static inline sw_msg_t *mailbox_pop_first(sw_process_t *proc) {
+    sw_mailbox_t *mb = &proc->mailbox;
     sw_msg_t *m = mb->priv_head;
     if (!m) return NULL;
 
@@ -2160,6 +2187,7 @@ static inline sw_msg_t *mailbox_pop_first(sw_mailbox_t *mb) {
     else
         mb->priv_tail = NULL;
     mb->count--;
+    atomic_fetch_sub_explicit(&proc->mb_len, 1, memory_order_relaxed);
     return m;
 }
 
@@ -2167,7 +2195,8 @@ static inline sw_msg_t *mailbox_pop_first(sw_mailbox_t *mb) {
  * mailbox_pop_tagged: Scan private queue for first message with matching tag.
  * Removes and returns it. Non-matching messages stay in place.
  */
-static inline sw_msg_t *mailbox_pop_tagged(sw_mailbox_t *mb, uint64_t tag) {
+static inline sw_msg_t *mailbox_pop_tagged(sw_process_t *proc, uint64_t tag) {
+    sw_mailbox_t *mb = &proc->mailbox;
     sw_msg_t *m = mb->priv_head;
     while (m) {
         if (m->tag == tag) {
@@ -2177,6 +2206,7 @@ static inline sw_msg_t *mailbox_pop_tagged(sw_mailbox_t *mb, uint64_t tag) {
             if (m->next) m->next->prev = m->prev;
             else mb->priv_tail = m->prev;
             mb->count--;
+            atomic_fetch_sub_explicit(&proc->mb_len, 1, memory_order_relaxed);
             return m;
         }
         m = m->next;
@@ -2213,8 +2243,75 @@ static inline void mailbox_wake(sw_process_t *to) {
  * MESSAGE PASSING
  * ============================================================================ */
 
+/*
+ * mailbox_admit: depth-cap admission for USER messages (SW_MAILBOX_MAX).
+ * Optimistically reserves a slot (fetch_add) and backs out on overflow, so
+ * the cap is APPROXIMATE under concurrency — transient overshoot is bounded
+ * by the number of concurrent senders, which is exactly the precision a
+ * flood guard needs. Returns 1 = admitted (mb_len reserved), 0 = full
+ * (reservation rolled back; caller must take the drop path, never enqueue).
+ * Runs BEFORE msg_alloc so a rejected send allocates no envelope.
+ */
+static inline int mailbox_admit(sw_process_t *to) {
+    int64_t n = atomic_fetch_add_explicit(&to->mb_len, 1, memory_order_relaxed);
+    if (g_mailbox_max && n >= g_mailbox_max) {
+        atomic_fetch_sub_explicit(&to->mb_len, 1, memory_order_relaxed);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * mailbox_overflow_drop: LOUD, leak-free, deadlock-free rejection of a send
+ * that failed admission. Payload ownership transfers at send (the exact
+ * invariant process_destroy already relies on when freeing a dead process's
+ * unread queue), so we free it here, mirroring process_destroy's shape:
+ *   - VALUE payload (region != NULL): the graph lives in the region —
+ *     bulk-free the region, never free(payload).
+ *   - RAW payload: plain free (shallow — same as process_destroy; never
+ *     _sw_free_global_val, which crashes on non-value structs).
+ *   - EXIT/DOWN reason_str: unreachable via the capped producers
+ *     (deliver_signal bypasses the cap) — handled anyway, defensively, in
+ *     case C callers hand-roll those tags through sw_send_tagged.
+ * Then bump the global drop counter, warn (first drop + every 65536th), and
+ * CRITICALLY wake the receiver anyway: a spurious wake is harmless (every
+ * receive loop re-checks), but a receiver parked while all inbound is being
+ * dropped would never drain — livelock. The wake call is load-bearing.
+ */
+static void mailbox_overflow_drop(sw_process_t *to, uint64_t tag,
+                                  void *payload, sw_value_arena_t *region) {
+    if (region) {
+        sw_varena_free_all(region);
+    } else if (payload) {
+        if (tag == SW_TAG_EXIT || tag == SW_TAG_DOWN) {
+            sw_signal_t *s = (sw_signal_t *)payload;
+            free(s->reason_str);
+        }
+        free(payload);
+    }
+    uint64_t dropped = atomic_fetch_add_explicit(&g_mb_dropped, 1,
+                                                 memory_order_relaxed);
+    if ((dropped & 0xFFFF) == 0) {
+        fprintf(stderr,
+            "swarmrt: mailbox overflow pid=%llu len=%lld cap=%lld from=%llu"
+            " — message dropped (%llu dropped total; SW_MAILBOX_MAX tunes,"
+            " 0 disables)\n",
+            (unsigned long long)to->pid,
+            (long long)atomic_load_explicit(&to->mb_len, memory_order_relaxed),
+            (long long)g_mailbox_max,
+            (unsigned long long)(tls_current ? tls_current->pid : 0),
+            (unsigned long long)(dropped + 1));
+    }
+    mailbox_wake(to);
+}
+
 void sw_send(sw_process_t *to, void *msg) {
     if (!to || !msg) return;
+
+    if (!mailbox_admit(to)) {
+        mailbox_overflow_drop(to, SW_TAG_NONE, msg, NULL);
+        return;
+    }
 
     sw_msg_t *m = msg_alloc();
     m->tag = SW_TAG_NONE;
@@ -2245,7 +2342,7 @@ void *sw_receive(uint64_t timeout_ms) {
         mailbox_drain(&proc->mailbox);
 
         /* Pop first message from private queue */
-        sw_msg_t *m = mailbox_pop_first(&proc->mailbox);
+        sw_msg_t *m = mailbox_pop_first(proc);
         if (m) {
             void *payload = msg_take_payload(m, 0);
             msg_free(m);
@@ -2265,7 +2362,7 @@ void *sw_receive(uint64_t timeout_ms) {
          * (seq_cst store: see the Dekker note in sw_receive_any — on x86 the
          * drain's locked xchg fenced this anyway; on arm64 it did not.) */
         mailbox_drain(&proc->mailbox);
-        m = mailbox_pop_first(&proc->mailbox);
+        m = mailbox_pop_first(proc);
         if (m) {
             /* Got a message — race-safe cancel via atomic_exchange.
              * Only self-resume if WE clear waiting (exchange returns 1).
@@ -2290,6 +2387,7 @@ void *sw_receive(uint64_t timeout_ms) {
             else proc->mailbox.priv_tail = m;
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
+            atomic_fetch_add_explicit(&proc->mb_len, 1, memory_order_relaxed);
             sw_context_swap(proc, &proc->scheduler->sched_proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
@@ -2366,6 +2464,7 @@ void sw_mailbox_remove_msg(sw_msg_t *m) {
     if (m->next) m->next->prev = m->prev;
     else mb->priv_tail = m->prev;
     mb->count--;
+    atomic_fetch_sub_explicit(&proc->mb_len, 1, memory_order_relaxed);
     proc->messages_recv++;
 }
 
@@ -2454,6 +2553,11 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
 static void deliver_signal(sw_process_t *target, uint64_t tag,
                            uint64_t from_pid, uint64_t ref, int reason,
                            const char *reason_str) {
+    /* EXIT/DOWN signals are EXEMPT from the SW_MAILBOX_MAX cap — dropping
+     * them would break supervision (a flooded supervisor missing a child's
+     * EXIT). Still increment mb_len so the accounting stays exact. */
+    atomic_fetch_add_explicit(&target->mb_len, 1, memory_order_relaxed);
+
     sw_signal_t *sig = (sw_signal_t *)malloc(sizeof(sw_signal_t));
     sig->pid = from_pid;
     sig->ref = ref;
@@ -3001,6 +3105,12 @@ int sw_cancel_timer(uint64_t ref) {
     return -1; /* Not found */
 }
 
+/* Defined below with sw_send_tagged; forward-declared so fire_timers can take
+ * the UNCAPPED path (capped=0) — timer fires must never be dropped, the
+ * receive-after wake-ups depend on them. */
+static void send_tagged_internal(sw_process_t *to, uint64_t tag, void *msg,
+                                 int capped);
+
 static void fire_timers(void) {
     if (!g_swarm) return;
 
@@ -3025,8 +3135,10 @@ static void fire_timers(void) {
             /* Wake-up timer (from receive timeout) — just wake process */
             mailbox_wake(t->dest);
         } else {
-            /* Regular timer — deliver the message */
-            sw_send_tagged(t->dest, t->tag, t->msg);
+            /* Regular timer — deliver the message. UNCAPPED (capped=0):
+             * a timer fire dropped by a full mailbox would silently break
+             * receive-after/send_after semantics on a flooded process. */
+            send_tagged_internal(t->dest, t->tag, t->msg, 0);
         }
         timer_free(t);
 
@@ -3039,8 +3151,21 @@ static void fire_timers(void) {
  * TAGGED MESSAGES & SELECTIVE RECEIVE
  * ============================================================================ */
 
-void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
+/* Shared body for sw_send_tagged (capped=1, user sends) and timer fires
+ * (capped=0 — exempt from SW_MAILBOX_MAX, but still counted in mb_len so the
+ * accounting stays exact; see fire_timers). */
+static void send_tagged_internal(sw_process_t *to, uint64_t tag, void *msg,
+                                 int capped) {
     if (!to) return;
+
+    if (capped) {
+        if (!mailbox_admit(to)) {
+            mailbox_overflow_drop(to, tag, msg, NULL);
+            return;
+        }
+    } else {
+        atomic_fetch_add_explicit(&to->mb_len, 1, memory_order_relaxed);
+    }
 
     sw_msg_t *m = msg_alloc();
     m->tag = tag;
@@ -3057,6 +3182,10 @@ void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
     if (tls_current) tls_current->messages_sent++;
 }
 
+void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
+    send_tagged_internal(to, tag, msg, 1);
+}
+
 /* Ownership v2: enqueue an sw_val_t VALUE payload OWNED by `region`. The region
  * holds the deep-copied graph while queued; the receiver adopts it on match
  * (codegen), and process_destroy bulk-frees it if undelivered. Distinct from the
@@ -3064,6 +3193,13 @@ void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
 void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
                         struct sw_value_arena *region) {
     if (!to) return;
+
+    if (!mailbox_admit(to)) {
+        /* VALUE drop: the payload graph lives entirely in `region` —
+         * mailbox_overflow_drop bulk-frees the region, never free(payload). */
+        mailbox_overflow_drop(to, tag, payload, region);
+        return;
+    }
 
     sw_msg_t *m = msg_alloc();
     m->tag = tag;
@@ -3098,7 +3234,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
     while (1) {
         /* Drain signal queue and scan private queue for matching tag */
         mailbox_drain(&proc->mailbox);
-        sw_msg_t *m = mailbox_pop_tagged(&proc->mailbox, tag);
+        sw_msg_t *m = mailbox_pop_tagged(proc, tag);
         if (m) {
             void *payload = msg_take_payload(m, 0);
             msg_free(m);
@@ -3116,7 +3252,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
          * (seq_cst store: see the Dekker note in sw_receive_any — on x86 the
          * drain's locked xchg fenced this anyway; on arm64 it did not.) */
         mailbox_drain(&proc->mailbox);
-        m = mailbox_pop_tagged(&proc->mailbox, tag);
+        m = mailbox_pop_tagged(proc, tag);
         if (m) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
@@ -3133,6 +3269,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             else proc->mailbox.priv_tail = m;
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
+            atomic_fetch_add_explicit(&proc->mb_len, 1, memory_order_relaxed);
             sw_context_swap(proc, &proc->scheduler->sched_proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
@@ -3189,7 +3326,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
         /* Drain signal queue into private queue */
         mailbox_drain(&proc->mailbox);
 
-        sw_msg_t *m = mailbox_pop_first(&proc->mailbox);
+        sw_msg_t *m = mailbox_pop_first(proc);
         if (m) {
             if (out_tag) *out_tag = m->tag;
             void *payload = msg_take_payload(m, adopt);
@@ -3208,7 +3345,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
          * (seq_cst store: see the Dekker note in sw_receive_any — on x86 the
          * drain's locked xchg fenced this anyway; on arm64 it did not.) */
         mailbox_drain(&proc->mailbox);
-        m = mailbox_pop_first(&proc->mailbox);
+        m = mailbox_pop_first(proc);
         if (m) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
@@ -3226,6 +3363,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             else proc->mailbox.priv_tail = m;
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
+            atomic_fetch_add_explicit(&proc->mb_len, 1, memory_order_relaxed);
             sw_context_swap(proc, &proc->scheduler->sched_proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;

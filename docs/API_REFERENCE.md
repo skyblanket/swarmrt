@@ -146,6 +146,17 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
 ```
 Receive any message, writing its tag to `out_tag`.
 
+```c
+uint64_t sw_mailbox_dropped(void);
+```
+Total messages dropped by the `SW_MAILBOX_MAX` mailbox depth cap since boot
+(process-global, monotonic). Sends to a process whose mailbox already holds
+`SW_MAILBOX_MAX` pending messages (default 1,000,000; env-tunable; `0`
+disables) are dropped with a rate-limited stderr warning. EXIT/DOWN signals
+and timer fires are exempt from the cap, so supervision and `receive … after`
+keep working on a flooded process; a dropped GenServer call reply surfaces as
+the caller's receive timeout.
+
 ### Selective Receive (Advanced)
 
 ```c

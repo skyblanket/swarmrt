@@ -1064,6 +1064,57 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
 #endif
 }
 
+/* Decide whether a byte just read from stdin is a GENUINE interrupt request
+ * (a bare Esc, or Ctrl-C) versus the FIRST byte of an escape sequence — arrow
+ * keys, F-keys, Home/End, alt-combos and bracketed-paste ALL begin with 0x1b.
+ * For an escape sequence we drain the rest and return 0, so a stray arrow key
+ * or a paste can never spuriously abort a stream or kill a running tool. This
+ * is the single source of truth for every stdin interrupt-watch site (LLM
+ * stream, shell_managed, read_key). `first` is the byte already read off `fd`
+ * (a raw-mode tty). A bare Esc is confirmed by a 50ms peek finding no follow-up. */
+static int _sw_stdin_is_interrupt(int fd, unsigned char first) {
+#ifdef _WIN32
+    (void)fd;
+    return (first == 0x03 || first == 0x1b) ? 1 : 0;
+#else
+    if (first == 0x03) return 1;          /* Ctrl-C */
+    if (first != 0x1b) return 0;          /* not Esc → not an interrupt */
+    fd_set pf;
+    FD_ZERO(&pf);
+    FD_SET(fd, &pf);
+    struct timeval ptv;
+    ptv.tv_sec = 0;
+    ptv.tv_usec = 50000;  /* 50ms — bare Esc has no follow-up byte */
+    int pr = select(fd + 1, &pf, NULL, NULL, &ptv);
+    if (pr == 0) return 1;   /* clean timeout: no follow-up byte → genuine bare Esc */
+    if (pr < 0)  return 0;   /* select error/EINTR: do NOT guess "interrupt" — a
+                              * spurious abort is worse than a missed Esc (user re-presses) */
+    /* pr > 0: a follow-up byte is pending → escape sequence; drain it below. */
+    unsigned char intro;
+    if (read(fd, &intro, 1) != 1) return 0;
+    if (intro == '[' || intro == 'O') {
+        /* CSI/SS3: drain params/intermediates up to a final byte (0x40-0x7e),
+         * peeking 0ms between bytes so we never block. */
+        int guard = 0;
+        unsigned char seq;
+        while (guard < 24) {
+            fd_set sf;
+            FD_ZERO(&sf);
+            FD_SET(fd, &sf);
+            struct timeval z;
+            z.tv_sec = 0;
+            z.tv_usec = 0;
+            if (select(fd + 1, &sf, NULL, NULL, &z) <= 0) break;
+            if (read(fd, &seq, 1) != 1) break;
+            guard++;
+            if (seq >= 0x40 && seq <= 0x7e) break;
+        }
+    }
+    /* else: Esc + one byte (Alt-combo) — `intro` already consumed. */
+    return 0;  /* escape sequence → NOT an interrupt */
+#endif
+}
+
 /* ============================================================
  * Bidirectional subprocess — for MCP stdio + any long-lived child
  * ============================================================
@@ -1378,7 +1429,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
             if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
                 unsigned char ib;
                 ssize_t nb = read(stdin_fd, &ib, 1);
-                if (nb == 1 && (ib == 0x1b || ib == 0x03)) {
+                if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) {
                     interrupted = 1;
                     fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
                     fflush(stdout);
@@ -1386,7 +1437,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
                     ch.fp = NULL; ch.pid = -1;
                     done = 1; break;
                 }
-                /* Other keystrokes during the wait: ignore. */
+                /* Other keystrokes (incl. arrow/F-keys, drained by the helper): ignore. */
             }
 
             if (FD_ISSET(pipe_fd, &rfds)) {
@@ -1738,11 +1789,22 @@ static void _sw_spinner_draw(const char *verb, uint64_t elapsed_ms, int tokens) 
     const char *c_dim   = "\x1b[38;5;240m";
     const char *c_reset = "\x1b[0m";
 
+    /* Live throughput readout, derived from the char-based token estimate
+     * already passed in. Computed only once the sample is stable so early
+     * ticks don't flash an absurd rate. Approximate (a heartbeat/feel
+     * signal), not server telemetry — same basis as the token counter. */
+    char rate_s[24];
+    rate_s[0] = '\0';
+    if (tokens >= 25 && elapsed_ms >= 300) {
+        int tps = (int)(((uint64_t)tokens * 1000ULL) / elapsed_ms);
+        if (tps > 0) snprintf(rate_s, sizeof(rate_s), " · %d tok/s", tps);
+    }
+
     /* Only show token counter once we've accumulated something worth showing. */
     if (tokens >= 25) {
-        printf("\r\x1b[K %s%s%s %s%s… (%s · ↑ %d tokens · esc to interrupt)%s",
+        printf("\r\x1b[K %s%s%s %s%s… (%s · ↑ %d tokens%s · esc to interrupt)%s",
                c_brand, frames[frame], c_reset,
-               c_dim, verb, elapsed_s, tokens, c_reset);
+               c_dim, verb, elapsed_s, tokens, rate_s, c_reset);
     } else {
         printf("\r\x1b[K %s%s%s %s%s… (%s · esc to interrupt)%s",
                c_brand, frames[frame], c_reset,
@@ -2242,14 +2304,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             break;
         }
 
-        /* Check stdin for an interrupt keystroke. ESC (0x1b) or
-         * Ctrl+C (0x03) aborts the stream, kills the child, and
-         * returns the partial buffer with an [Interrupted] marker
-         * the model will see on the next turn. */
+        /* Check stdin for an interrupt keystroke. A bare Esc or Ctrl+C
+         * aborts the stream, kills the child, and returns the partial
+         * buffer with an [Interrupted] marker the model sees next turn.
+         * Escape SEQUENCES (arrow/F-keys/paste — all 0x1b-prefixed) are
+         * drained by _sw_stdin_is_interrupt and ignored, not aborted. */
         if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
             unsigned char ib;
             ssize_t nb = read(stdin_fd, &ib, 1);
-            if (nb == 1 && (ib == 0x1b || ib == 0x03)) {
+            if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) {
                 interrupted = 1;
                 if (spinner_drawn) {
                     fputs("\r\x1b[K", stdout);
@@ -2729,9 +2792,16 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     if (fail_reason) {
         if (so.subagent) {
             _stream_out_send_tagged(so.target, "stream_chunk", so.name, fail_reason);
-        } else {
+        } else if (is_tty) {
+            /* Only paint the inline ⚠ on a real terminal. */
             fprintf(stdout, "\n  \x1b[38;5;208m⚠ %s\x1b[0m\n", fail_reason);
             fflush(stdout);
+        } else {
+            /* Piped/redirected (headless -p capture, JSON-RPC stream): the
+             * tagged {'error, ...} return value is the caller's channel, so
+             * keep stdout clean — but still surface the detail on stderr so
+             * it's debuggable via 2>. */
+            fprintf(stderr, "swarm-code: %s\n", fail_reason);
         }
     }
 
@@ -3468,8 +3538,25 @@ static sw_val_t *_builtin_process_info(sw_val_t **a, int n) {
      * never unmaps, so a stale parent at most mis-groups a child as a root. */
     if (proc->parent)
         { keys[c] = sw_val_atom("parent"); vals[c] = sw_val_int((int64_t)proc->parent->pid); c++; }
-    if (proc->reg_entry)
-        { keys[c] = sw_val_atom("name"); vals[c] = sw_val_string(proc->reg_entry->name); c++; }
+    /* reg_entry is malloc'd at registration and free()d ONLY under
+     * registry.lock (registry_remove_proc). A process exiting / crash-restarting
+     * on another scheduler frees it concurrently, so reading ->name unlocked is a
+     * use-after-free: ASan reports heap-use-after-free in strlen, and in
+     * production the freed+reallocated entry corrupts the heap -> SIGBUS in the
+     * sw_val_map_new() below. Read the name under the rdlock (as _builtin_registered
+     * does); sw_val_string copies it out, so it stays valid after we unlock. */
+    {
+        char _nm[SW_REG_NAME_MAX];
+        int _have = 0;
+        extern sw_swarm_t *g_swarm;
+        if (g_swarm) {
+            pthread_rwlock_rdlock(&g_swarm->registry.lock);
+            sw_reg_entry_t *re = atomic_load_explicit(&proc->reg_entry, memory_order_acquire);
+            if (re) { strncpy(_nm, re->name, SW_REG_NAME_MAX - 1); _nm[SW_REG_NAME_MAX - 1] = '\0'; _have = 1; }
+            pthread_rwlock_unlock(&g_swarm->registry.lock);
+        }
+        if (_have) { keys[c] = sw_val_atom("name"); vals[c] = sw_val_string(_nm); c++; }
+    }
 
     return sw_val_map_new(keys, vals, c);
 }
@@ -4556,7 +4643,11 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     int is_tty = isatty(fileno(stdout));
     int done = 0;
     int polls = 0;
-    const int max_poll_seconds = 600;  /* hard cap: 10 minutes */
+    const int max_poll_seconds = 120;  /* hard cap (was 600): bound the worst
+        case if a backgrounded child is killed before writing its exit file
+        (the orphan-wedge). swarm-code's own tools no longer rely on shell()'s
+        poll for long commands — they use shell_managed (own pgroup + C timeout
+        + killpg). 120s stays well above any legit fast/local shell() use. */
     off_t last_size = 0;
 
     while (!done && polls < max_poll_seconds) {
@@ -4712,6 +4803,217 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     free(buf);
     free(items);
     return r;
+}
+
+/* shell_managed(cmd, timeout_ms) → {exit_code, output, interrupted}
+ *
+ * Like shell() but built for arbitrary, possibly-runaway MODEL-supplied
+ * commands. Three guarantees shell() can't make:
+ *   1. The command runs in its OWN process group (via _sw_popen_pid's
+ *      setpgid), so on timeout/interrupt we killpg the whole subtree —
+ *      no leaked node/python/server grandchildren.
+ *   2. While it runs we select() on stdin (only when the line editor has
+ *      already put the tty in raw mode, i.e. _sw_rl.saved_ok). An ESC
+ *      (0x1b) or Ctrl-C (0x03) keystroke kills the process group and
+ *      returns immediately — this is what makes a hung tool interruptible
+ *      from the REPL, mirroring the LLM-stream interrupt path above.
+ *   3. The wall-clock timeout is enforced in C; when it fires we killpg.
+ *
+ * Returns a 3-tuple read by sw via elem(r,0/1/2):
+ *   elem 0: exit_code (int) — natural code, or 124 (timeout) / 130 (key).
+ *   elem 1: output (string) — sanitized stdout (caller folds stderr via 2>&1).
+ *   elem 2: interrupted (atom 'true'|'false') — true on timeout OR keystroke.
+ * timeout_ms <= 0 means "no wall-clock limit" ONLY when an interactive raw
+ * tty is present (an ESC keystroke can then stop it). With no such tty
+ * (headless, piped stdin, a worker whose stdin isn't the terminal) we impose
+ * a hard ceiling instead, so a child that never EOFs (tail -f, a daemon)
+ * can never wedge us unkillably.
+ *
+ * Every exit path — including errors — returns the SAME {code, output,
+ * interrupted} 3-tuple shape so sw callers can always elem(r,0/1/2) safely.
+ *
+ * We deliberately NEVER call _sw_rl_setup()/_sw_rl_restore() here: the tool
+ * worker is a different process from the reader that owns termios, so
+ * flipping the terminal mode would race the reader and could leave it cooked
+ * or steal the user's in-progress line. We only READ when it is already raw. */
+static sw_val_t *_sw_managed_tuple(int code, const char *msg) {
+    sw_val_t *it[3];
+    it[0] = sw_val_int(code);
+    it[1] = sw_val_string(msg);
+    it[2] = sw_val_atom("false");
+    return sw_val_tuple(it, 3);
+}
+
+static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return _sw_managed_tuple(-1, "error: shell_managed needs a string command");
+#ifdef _WIN32
+    return _sw_managed_tuple(-1, "error: shell_managed unsupported on this platform");
+#else
+    const char *cmd = a[0]->v.str;
+    int64_t timeout_ms =
+        (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) ? a[1]->v.i : 0;
+
+    int stdin_fd = -1;
+    if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) stdin_fd = STDIN_FILENO;
+
+    /* Never allow an uninterruptible, unbounded run: with no raw tty to catch
+     * an ESC, a non-positive timeout would otherwise loop forever on a child
+     * that holds stdout open. Impose a 10-minute ceiling so the C deadline
+     * still fires. (Both in-tree callers floor the timeout, so this only
+     * guards direct/future callers — but it keeps the "can't hang" invariant.) */
+    if (timeout_ms <= 0 && stdin_fd < 0) timeout_ms = 600000;
+
+    _sw_popen_pid_t ch = _sw_popen_pid(cmd);
+    if (!ch.fp) return _sw_managed_tuple(-1, "error: failed to launch command");
+
+    int pipe_fd = fileno(ch.fp);
+    int fl = fcntl(pipe_fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(pipe_fd, F_SETFL, fl | O_NONBLOCK);
+
+    size_t cap = 65536, raw_len = 0;
+    char *raw = (char *)malloc(cap);
+    if (!raw) { _sw_pkill_close(ch); return _sw_managed_tuple(-1, "error: out of memory"); }
+    raw[0] = 0;
+
+    uint64_t t_start = _sw_now_ms();
+    int interrupted = 0;   /* set on a keystroke OR a timeout */
+    int timed_out = 0;
+    int done = 0;
+    int oom = 0;
+
+    while (!done) {
+        /* Remaining wall-clock budget; tick at least once per second so a
+         * huge timeout still re-checks, and so a quiet child can't wedge us. */
+        int64_t remaining_ms = 1000;
+        if (timeout_ms > 0) {
+            int64_t elapsed = (int64_t)(_sw_now_ms() - t_start);
+            if (elapsed >= timeout_ms) { timed_out = 1; interrupted = 1; break; }
+            remaining_ms = timeout_ms - elapsed;
+            if (remaining_ms > 1000) remaining_ms = 1000;
+        }
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pipe_fd, &rfds);
+        if (stdin_fd >= 0) FD_SET(stdin_fd, &rfds);
+        int max_fd = pipe_fd;
+        if (stdin_fd > max_fd) max_fd = stdin_fd;
+
+        struct timeval tv;
+        tv.tv_sec  = remaining_ms / 1000;
+        tv.tv_usec = (remaining_ms % 1000) * 1000;
+
+        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ret == 0) continue;  /* tick — re-check the deadline at loop top */
+
+        /* Check stdin BEFORE the pipe so an interrupt keystroke wins a tie. */
+        if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
+            unsigned char ib;
+            ssize_t nb = read(stdin_fd, &ib, 1);
+            if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) { interrupted = 1; break; }
+            /* other keystrokes (arrow/F-keys drained by the helper): ignore */
+        }
+
+        if (FD_ISSET(pipe_fd, &rfds)) {
+            char chunk[8192];
+            ssize_t rn = read(pipe_fd, chunk, sizeof(chunk));
+            if (rn == 0) { done = 1; }              /* EOF — child closed stdout */
+            else if (rn < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                done = 1;
+            } else {
+                if (raw_len + (size_t)rn + 1 > cap) {
+                    while (raw_len + (size_t)rn + 1 > cap) cap *= 2;
+                    char *tmp = (char *)realloc(raw, cap);
+                    if (!tmp) { oom = 1; break; }   /* keep old `raw` to free below */
+                    raw = tmp;
+                }
+                memcpy(raw + raw_len, chunk, rn);
+                raw_len += (size_t)rn;
+            }
+        }
+    }
+
+    /* Terminate + reap. On interrupt/timeout/oom, killpg the whole group so no
+     * grandchild survives; on natural EOF just reap. Never touch ch twice. */
+    int status;
+    if (interrupted || oom) {
+        _sw_pkill_close(ch);
+        status = timed_out ? 124 : 130;
+    } else {
+        int wstatus = _sw_popen_pid_close(ch);
+        status = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+    }
+    if (oom) { free(raw); return _sw_managed_tuple(-1, "error: out of memory capturing output"); }
+    raw[raw_len] = 0;
+
+    /* Sanitize: keep printable ASCII + \t \n \r (binary poisons the model). */
+    size_t len = 0;
+    char *buf = (char *)malloc(raw_len + 64);
+    if (!buf) { free(raw); return _sw_managed_tuple(-1, "error: out of memory"); }
+    for (size_t i = 0; i < raw_len; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E))
+            buf[len++] = (char)c;
+    }
+    buf[len] = 0;
+    free(raw);
+    if (len == 0 && raw_len > 0) {
+        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
+        len = strlen(buf);
+    }
+
+    sw_val_t *items[3];
+    items[0] = sw_val_int(status);
+    items[1] = sw_val_string(buf);
+    items[2] = sw_val_atom(interrupted ? "true" : "false");
+    sw_val_t *r = sw_val_tuple(items, 3);
+    free(buf);
+    return r;
+#endif
+}
+
+/* read_key(timeout_ms) → int (the byte value) | nil
+ *
+ * A single, timeout-bounded raw key read for interrupt-watching while a
+ * (non-shell) tool runs in a worker. Returns the byte (e.g. 27=ESC, 3=Ctrl-C)
+ * if a key arrives within timeout_ms, else nil (timeout / no key / EOF).
+ * Reads ONLY when the tty is already in raw mode (_sw_rl.saved_ok) — exactly
+ * like shell_managed's stdin watch — so it never blocks on a cooked terminal
+ * and is a harmless no-op (nil) when headless or piped. It NEVER changes
+ * termios itself; the reader process owns that. Used by the reader's
+ * interrupt-watch loop, which is active only during non-shell tool execution
+ * (shell tools self-watch inside shell_managed), so stdin has a single
+ * reader at any moment. */
+static sw_val_t *_builtin_read_key(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_nil();
+#else
+    int64_t timeout_ms = (n >= 1 && a[0] && a[0]->type == SW_VAL_INT) ? a[0]->v.i : 0;
+    if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok)) return sw_val_nil();
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(STDIN_FILENO, &rfds);
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int ret = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+    if (ret <= 0) return sw_val_nil();   /* timeout or error → no key */
+    unsigned char b;
+    ssize_t nb = read(STDIN_FILENO, &b, 1);
+    if (nb != 1) return sw_val_nil();
+    /* Bare Esc → 27 (a real interrupt). Arrow/F-key/paste escape sequences also
+     * start with 0x1b but are drained by the shared helper and reported here as
+     * "no key" (nil), so the interrupt-watcher never mistakes them for ESC. */
+    if (b == 0x1b && !_sw_stdin_is_interrupt(STDIN_FILENO, b)) return sw_val_nil();
+    return sw_val_int((int64_t)b);
+#endif
 }
 
 /* exec_argv(cmd, args_list) → {exit_code, stdout}

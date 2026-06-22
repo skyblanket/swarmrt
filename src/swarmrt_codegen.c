@@ -260,7 +260,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "typeof") == 0 ||
            /* Phase 13: Agent stdlib */
            strcmp(name, "http_get") == 0 || strcmp(name, "shell") == 0 ||
-           strcmp(name, "shell_sandboxed") == 0 ||
+           strcmp(name, "shell_sandboxed") == 0 || strcmp(name, "shell_managed") == 0 ||
            strcmp(name, "json_encode") == 0 || strcmp(name, "json_decode") == 0 ||
            strcmp(name, "file_exists") == 0 || strcmp(name, "file_list") == 0 ||
            strcmp(name, "file_delete") == 0 || strcmp(name, "file_append") == 0 ||
@@ -361,6 +361,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "pdf_meta") == 0 ||
            /* Phase 16: Interactive CLI primitives */
            strcmp(name, "read_line") == 0 ||
+           strcmp(name, "read_key") == 0 ||
            strcmp(name, "print_inline") == 0 ||
            strcmp(name, "sys_exit") == 0 ||
            strcmp(name, "pid_alive") == 0 ||
@@ -1851,8 +1852,8 @@ static const char *_common_builtins[] = {
     "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_set_handler", "wsc_close",
     "audio_ulaw_to_pcm16", "audio_pcm16_to_ulaw", "audio_resample",
     "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
-    "read_line", "read_char", "read_choice",
-    "sleep", "timestamp", "getenv", "sys_exit", "shell", "pid_alive",
+    "read_line", "read_char", "read_key", "read_choice",
+    "sleep", "timestamp", "getenv", "sys_exit", "shell", "shell_managed", "pid_alive",
     "random_int", "supervise",
     "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
     "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
@@ -2201,7 +2202,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "typeof") == 0 ||
              /* Phase 13: Agent stdlib */
              strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||
-             strcmp(fname, "shell_sandboxed") == 0 ||
+             strcmp(fname, "shell_sandboxed") == 0 || strcmp(fname, "shell_managed") == 0 ||
              strcmp(fname, "json_encode") == 0 || strcmp(fname, "json_decode") == 0 ||
              strcmp(fname, "file_exists") == 0 || strcmp(fname, "file_list") == 0 ||
              strcmp(fname, "file_delete") == 0 || strcmp(fname, "file_append") == 0 ||
@@ -2302,6 +2303,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "pdf_meta") == 0 ||
              /* Phase 16: Interactive CLI primitives */
              strcmp(fname, "read_line") == 0 ||
+             strcmp(fname, "read_key") == 0 ||
              strcmp(fname, "print_inline") == 0 ||
              strcmp(fname, "sys_exit") == 0 ||
              strcmp(fname, "pid_alive") == 0 ||

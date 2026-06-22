@@ -245,6 +245,8 @@ needed.
 |---|---|---|
 | `SW_SCHEDULERS` | CPU count | Number of scheduler threads. `1` for deterministic CLI tools. |
 | `SW_MAX_PROCS` | `100000` | Arena ceiling. Drop to `1024`/`4096` for fast-start CLI binaries — measured ~6 ms total wall (vs ~40 ms at the default ceiling) on Linux x86_64. Floor of 16. |
+| `SW_MAILBOX_MAX` | `1000000` | Mailbox depth cap (pending messages per process). User sends over the cap are dropped — loudly: a global counter (`sw_mailbox_dropped()`) plus a rate-limited stderr warning. EXIT/DOWN signals and timer fires are exempt, so supervision and `receive … after` keep working on a flooded process. `0` disables. |
+| `SW_HTTP_MAX_REQUEST` | `33554432` (32MB) | Max bytes buffered for one HTTP request (headers + body) and max accepted `Content-Length`. Oversized declared bodies get a `413`; connections that outgrow the buffer cap are closed. Min `4096`. |
 | `SW_QUIET` | unset | Suppress the `[SwarmRT] Arena initialized…` banner on stderr. Set in scripts/CI. |
 
 ---
