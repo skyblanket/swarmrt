@@ -36,6 +36,9 @@
 #include "swarmrt_codegen.h"
 #include "swarmrt_repl.h"
 #include "swarmrt_test.h"
+#include "swarmrt_native.h"
+#include "swarmrt_io.h"
+#include <pthread.h>
 
 static void usage(void) {
     fprintf(stderr,
@@ -141,12 +144,40 @@ static void merge_module_funs(node_t *dst, node_t *src, int qualify) {
     }
 }
 
+/* Bootstrap context handed to the spawned root process. Mirrors the
+ * compiled entrypoint's _main_entry/_sw_done_* machinery (codegen
+ * emit_entry_and_main): the root process calls main() inside a live
+ * scheduler (so tls_current is set → self/send/receive/spawn/monitor/link
+ * behave exactly as compiled), records the exit code, then signals the
+ * waiting OS thread to tear the runtime down. */
+typedef struct {
+    sw_interp_t       *interp;
+    int                rc;
+    pthread_mutex_t    lock;
+    pthread_cond_t     cond;
+    volatile int       done;
+} run_boot_ctx_t;
+
+/* Root process entry. Runs main() under a real process context, then
+ * signals the OS thread (identical shape to codegen's _main_entry). */
+static void run_main_entry(void *arg) {
+    run_boot_ctx_t *ctx = (run_boot_ctx_t *)arg;
+    sw_lang_call(ctx->interp, "main", NULL, 0);
+    ctx->rc = ctx->interp->error ? 1 : 0;
+    if (ctx->interp->error)
+        fprintf(stderr, "swc: runtime error: %s\n", ctx->interp->error_msg);
+    pthread_mutex_lock(&ctx->lock);
+    ctx->done = 1;
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
 /* `swc run <file.sw>` — interpret a .sw program: parse the file, resolve
  * its `import` declarations from the local dir and the bundled lib/, merge
  * all functions into one module, build an interpreter, and call main().
  * The documented interpreter run path (SW_LANGUAGE.md). Returns the
  * process exit code. */
-static int run_file(const char *path, const char *argv0) {
+static int run_file(const char *path, const char *argv0, int argc, char **argv) {
     char *source = read_file(path);
     if (!source) return 1;
     void *main_ast = sw_lang_parse(source);
@@ -214,10 +245,63 @@ static int run_file(const char *path, const char *argv0) {
         sw_lang_free(interp);
         return 1;
     }
-    sw_lang_call(interp, "main", NULL, 0);
-    int rc = interp->error ? 1 : 0;
-    if (interp->error)
-        fprintf(stderr, "swc: runtime error: %s\n", interp->error_msg);
+    /* Run main() inside a real scheduler/root-process, replicating the
+     * compiled entrypoint (codegen emit_entry_and_main) verbatim so that
+     * self()/send/receive/spawn/monitor/link see a live process context
+     * (tls_current). Before this, main() ran on the bare OS main thread
+     * with tls_current==NULL, diverging from compiled on every
+     * concurrency primitive. */
+    sw_prog_argc = argc;
+    sw_prog_argv = argv;
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Interpreter run path: ALWAYS single-scheduler, regardless of
+     * SW_SCHEDULERS. Every sw process (root + every spawned child) is a
+     * cooperative fiber multiplexed onto ONE OS thread, so the shared
+     * sw_interp_t (interp->error/call_depth/panicking/try_depth) and the
+     * shared global_env hash buckets are never touched concurrently. The
+     * tree-walking interpreter has no per-process interp isolation, so a
+     * second scheduler thread would put a child's eval() on another OS
+     * thread and race those fields → UB. Hence spawning real child fibers
+     * (N_SPAWN) is only safe under nsched==1.
+     *
+     * KNOWN/ACCEPTED TRADEOFF: single-scheduler `swc run` can deadlock on
+     * in-process HTTP self-loopback (a Phase-3 limitation) — acceptable for
+     * the dev/test interpreter; data races are strictly worse. The COMPILED
+     * path keeps its own nproc scheduler count (codegen) — do NOT change it. */
+    int nsched = 1;
+
+    run_boot_ctx_t boot;
+    boot.interp = interp;
+    boot.rc = 0;
+    boot.done = 0;
+    pthread_mutex_init(&boot.lock, NULL);
+    pthread_cond_init(&boot.cond, NULL);
+
+    /* The interpreter tree-walks on the C stack (no TCO), so give the root
+     * process the deep stack it used to have running on the OS main thread.
+     * Lazy mmap → shallow programs touch only a few pages. Set before sw_init
+     * so the root process slot is allocated at this size. */
+    sw_proc_stack_size = 8 * 1024 * 1024;
+
+    sw_init(get_mod_name(main_ast), (uint32_t)nsched);
+    sw_io_init();
+    sw_spawn(run_main_entry, &boot);
+
+    /* Wait for the root process's main() to return (set by run_main_entry).
+     * An abnormal root exit (panic / non-zero reason) is handled inline by
+     * the scheduler's root_exit_check via exit(1) — matching compiled — so
+     * we never reach here in that case. */
+    pthread_mutex_lock(&boot.lock);
+    while (!boot.done) pthread_cond_wait(&boot.cond, &boot.lock);
+    pthread_mutex_unlock(&boot.lock);
+    int rc = boot.rc;
+
+    sw_io_shutdown();
+    sw_shutdown(0);
+    pthread_cond_destroy(&boot.cond);
+    pthread_mutex_destroy(&boot.lock);
+
     /* Don't node_free the merged module: its funs[] mixes shared imported
      * nodes with shallow qualified clones (sharing bodies), so a recursive
      * free would double-free. Same trade-off the test runner makes — let
@@ -264,7 +348,7 @@ int main(int argc, char **argv) {
      * SW_LANGUAGE.md; previously printed "unknown command 'run'". */
     if (strcmp(cmd, "run") == 0) {
         if (argc < 3) { fprintf(stderr, "swc: run needs a .sw file\n"); return 1; }
-        return run_file(argv[2], argv[0]);
+        return run_file(argv[2], argv[0], argc, argv);
     }
 
     if (argc < 3) { usage(); return 1; }

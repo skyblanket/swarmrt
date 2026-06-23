@@ -32,7 +32,9 @@
 #include "swarmrt_lang.h"
 #include "swarmrt_ets.h"
 #include "swarmrt_varena.h"  /* per-process value arena (GC v1) */
+#include "swarmrt_node.h"    /* sw_send_dispatch: structure-preserving send */
 #include "swarmrt_audio.h"   /* G.711 / PCM16 / resample for REPL+test parity */
+#include "swarmrt_otp.h"     /* sw_supervisor_start + child spec (interp supervise) */
 
 /* ed25519_verify lives in swarmrt_builtins_studio.h for the compiled path, but
  * the interpreter (this file) doesn't pull in that header. To keep REPL/codegen
@@ -127,6 +129,13 @@ __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
  * keeps swc linkable without the runtime and makes the interpreter use calloc. */
 __attribute__((weak)) sw_value_arena_t *sw_self_varena(void) { return NULL; }
 __attribute__((weak)) void sw_set_self_varena(sw_value_arena_t *a) { (void)a; }
+/* Reports the current process fiber's stack bounds (1 + fills low/high) when
+ * running on a fiber, else 0 (use OS-thread bounds). Strong impl in
+ * swarmrt_native.c. Weak stub keeps swc/runtime-less linkable and makes the
+ * interpreter fall back to pthread stack introspection. */
+__attribute__((weak)) int sw_self_stack_bounds(uintptr_t *low, uintptr_t *high) {
+    (void)low; (void)high; return 0;
+}
 
 /* =========================================================================
  * Lexer
@@ -2852,40 +2861,52 @@ static int pattern_match(node_t *pattern, sw_val_t *val, sw_env_t *env) {
     }
 }
 
-/* Convert sw_val_t to a serializable message for sw_send_tagged */
-typedef struct {
-    sw_val_type_t type;
-    int64_t ival;
-    double fval;
-    int count;         /* tuple/list item count */
-    char sval[128];
-} sw_msg_val_t;
+/* The interpreter routes send()/receive through the SAME value-send /
+ * value-receive plumbing the compiled path uses (sw_send_dispatch →
+ * sw_send_value, msg_take_payload). That deep-copies the FULL sw_val_t
+ * graph (tuples / lists / nested / maps / atoms / strings / ints / floats /
+ * pids) into a SW_PK_VALUE message region, so structured messages round-trip
+ * intact. The old flat sw_msg_val_t codec (serialize_val/deserialize_val)
+ * was lossy — it dropped tuple/list item pointers and nil'd every nested
+ * value — and has been removed in favour of the structure-preserving path. */
 
-static sw_msg_val_t *serialize_val(sw_val_t *v, int *out_len) {
-    /* Simple flat serialization: single value only (no nested tuples via wire) */
-    sw_msg_val_t *m = calloc(1, sizeof(sw_msg_val_t));
-    *out_len = sizeof(sw_msg_val_t);
-    m->type = v->type;
-    switch (v->type) {
-    case SW_VAL_INT: m->ival = v->v.i; break;
-    case SW_VAL_FLOAT: m->fval = v->v.f; break;
-    case SW_VAL_STRING: case SW_VAL_ATOM:
-        strncpy(m->sval, v->v.str, sizeof(m->sval)-1); break;
-    case SW_VAL_TUPLE: case SW_VAL_LIST:
-        m->count = v->v.tuple.count; break;
-    default: break;
-    }
-    return m;
+/* Monotonic milliseconds for the selective-receive timeout budget — local
+ * mirror of the compiled path's _sw_now_ms (which lives in the studio
+ * builtins header, not linkable here). */
+static uint64_t recv_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-static sw_val_t *deserialize_val(sw_msg_val_t *m) {
-    switch (m->type) {
-    case SW_VAL_INT: return sw_val_int(m->ival);
-    case SW_VAL_FLOAT: return sw_val_float(m->fval);
-    case SW_VAL_STRING: return sw_val_string(m->sval);
-    case SW_VAL_ATOM: return sw_val_atom(m->sval);
-    default: return sw_val_nil();
+/* Build a value from a queued mailbox message for pattern-matching, mirroring
+ * the compiled emit_receive synthesis: runtime-injected EXIT/DOWN signals
+ * carry an sw_signal_t* payload (not an sw_val_t*) and must be presented as
+ * the documented {'EXIT', from, reason} / {'DOWN', ref, 'process', from,
+ * reason} tuples so trap_exit / monitor patterns match. Plain send() messages
+ * (SW_PK_VALUE / RAW value payloads) pass through as the live sw_val_t*. */
+static sw_val_t *recv_msg_to_val(sw_msg_t *m) {
+    if (m->tag == SW_TAG_EXIT && m->payload) {
+        sw_signal_t *sig = (sw_signal_t *)m->payload;
+        sw_val_t *reason = sig->reason_str ? sw_val_string(sig->reason_str)
+                                           : sw_val_int((int64_t)sig->reason);
+        sw_val_t *items[3] = { sw_val_atom("EXIT"),
+                               sw_val_pid(sw_find_by_pid_any(sig->pid)),
+                               reason };
+        return sw_val_tuple(items, 3);
     }
+    if (m->tag == SW_TAG_DOWN && m->payload) {
+        sw_signal_t *sig = (sw_signal_t *)m->payload;
+        sw_val_t *reason = sig->reason_str ? sw_val_string(sig->reason_str)
+                                           : sw_val_int((int64_t)sig->reason);
+        sw_val_t *items[5] = { sw_val_atom("DOWN"),
+                               sw_val_int((int64_t)sig->ref),
+                               sw_val_atom("process"),
+                               sw_val_pid(sw_find_by_pid_any(sig->pid)),
+                               reason };
+        return sw_val_tuple(items, 5);
+    }
+    return m->payload ? (sw_val_t *)m->payload : sw_val_nil();
 }
 
 /* Built-in function: print.
@@ -2943,6 +2964,24 @@ static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, .
 static int interp_stack_near_limit(void) {
     char probe;                         /* address ~ current stack pointer */
     uintptr_t sp = (uintptr_t)&probe;
+
+    /* If we're running ON a process fiber (e.g. `swc run`'s root process or a
+     * studio tool fiber), the OS-thread stack bounds below belong to the
+     * scheduler thread, NOT the swapped-in fiber — measure the fiber instead.
+     * The fiber is small (128KB), so use a proportionally smaller margin; eval
+     * has comfortable headroom in 128KB (parsing is offloaded to a big helper
+     * thread), and the guard page below the fiber catches a true overflow. */
+    uintptr_t flo, fhi;
+    if (sw_self_stack_bounds(&flo, &fhi)) {
+        /* Margin must be < the fiber size. The default runtime fiber is small
+         * (128KB); `swc run` uses a large fiber (sw_proc_stack_size) so the
+         * interpreter has OS-main-thread-like headroom. Cap the margin at a
+         * quarter of the fiber so it's never larger than the stack itself. */
+        size_t fiber = (size_t)(fhi - flo);
+        size_t margin = SW_STACK_GUARD_MARGIN;
+        if (margin > fiber / 4) margin = fiber / 4;
+        return sp <= flo + margin;
+    }
 #if defined(__APPLE__)
     pthread_t self = pthread_self();
     uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);   /* highest addr */
@@ -3385,6 +3424,117 @@ static void _repl_warn_scheduler(const char *name) {
     _repl_scheduler_warned = 1;
 }
 
+/* ---- spawn(): re-enter the interpreter on a fresh fiber -------------------
+ *
+ * Heap boot-context handed to a spawned child. Carries everything the child
+ * fiber needs to re-enter the tree-walker on its OWN process context (with
+ * tls_current set to the child, so self()/receive/send resolve to it). Safe
+ * because `swc run` forces nsched=1: the child runs as a cooperative fiber on
+ * the SAME OS thread as its parent, never touching the shared interp/env
+ * concurrently. b->fn_node and b->params[] point into the immortal module AST
+ * (run_file never frees it); b->args hold parent-evaluated global-heap values.
+ * The trampoline owns and frees b (and b->args) on exit. */
+typedef struct {
+    sw_interp_t  *interp;        /* the single shared interp (safe: nsched=1) */
+    node_t       *fn_node;       /* the N_FUN node whose .v.fun.body we eval */
+    sw_env_t     *closure_env;   /* closure env (NULL → interp->global_env) */
+    sw_val_t    **args;          /* pre-evaluated arg values (heap), or NULL */
+    int           nargs;
+} spawn_boot_t;
+
+static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env);
+
+/* Child-fiber panic propagation, shared by every interpreter fiber that runs a
+ * user fn as a process (plain spawn AND supervised children). If `interp` was
+ * left in a crashed state by eval(), (1) clear the SHARED flags so the crash
+ * does not leak into other fibers, and (2) abort THIS process via the native
+ * sw_process_panic so the scheduler's process_exit walks our links/monitors and
+ * synthesises {'EXIT',from,reason}/{'DOWN',...} — exactly as _sw_runtime_panic
+ * does for a compiled process. sw_process_panic is NORETURN. The reason mirrors
+ * the compiled EXIT reason (bare message), so we strip interp_raise_panic's
+ * "panic: " prefix. No-op (returns) if the fiber exited cleanly. */
+static void interp_fiber_propagate_panic(sw_interp_t *interp) {
+    if (!(interp->error || interp->panicking)) return;
+    char reason[256];
+    const char *m = interp->error_msg;
+    if (strncmp(m, "panic: ", 7) == 0) m += 7;
+    snprintf(reason, sizeof(reason), "%s", m);
+    interp->error = 0;
+    interp->panicking = 0;
+    interp->error_msg[0] = '\0';
+    sw_process_t *me = sw_self();
+    if (me) sw_process_panic(me, -1, reason);  /* NORETURN */
+}
+
+/* C trampoline run on the child's fiber. Mirrors run_main_entry (swc.c) and
+ * the compiled _main_entry: bind args into a fresh env (child of the closure
+ * or global env), bracket call_depth, eval the fn body, tear down. */
+static void spawn_trampoline(void *arg) {
+    spawn_boot_t *b = (spawn_boot_t *)arg;
+    sw_env_t *fenv = env_new(b->closure_env ? b->closure_env
+                                            : b->interp->global_env);
+    node_t *fn = b->fn_node;
+    for (int i = 0; i < b->nargs && i < fn->v.fun.nparams && i < 16; i++)
+        env_set(fenv, fn->v.fun.params[i], b->args[i]);
+    sw_interp_t *interp = b->interp;   /* capture before free(b) below */
+    interp->call_depth++;
+    (void)eval(interp, fn->v.fun.body, fenv);
+    interp->call_depth--;
+    env_free(fenv);
+    if (b->args) free(b->args);
+    free(b);
+
+    interp_fiber_propagate_panic(interp);
+}
+
+/* === Interpreter-aware supervisor child entry ============================
+ *
+ * The native supervisor (sw_supervisor_start) is fully reused for restart
+ * strategy + circuit-breaker + registration; only the per-child START differs.
+ * The compiled backend's _sup_child_entry dispatches the child closure via
+ * sw_val_apply (cfunc-ONLY) — interpreter lambdas carry an AST body +
+ * closure_env with NO cfunc, so that path would silently no-op. So we supply an
+ * interpreter-native start_func that eval()s the lambda's body, plus the same
+ * MASTER/per-incarnation-copy closure contract the compiled path uses:
+ *   start_arg      = MASTER (freed at child removal / supervisor teardown)
+ *   copy_start_arg = fresh per-incarnation copy (freed by the child itself)
+ *   free_start_arg = frees a copy or the master
+ * Single-scheduler (`swc run` forces nsched=1): the child is a cooperative
+ * fiber on the parent's OS thread, never touching the shared interp/env
+ * concurrently. fn_node points into the immortal module AST; closure_env lives
+ * in (or under) the never-freed global_env — so the small struct is all that is
+ * copied/freed, the value graph it references is stable. */
+typedef struct {
+    sw_interp_t *interp;
+    node_t      *fn_node;       /* N_FUN whose .v.fun.body we eval (0 params) */
+    sw_env_t    *closure_env;   /* NULL -> global_env */
+} sup_interp_child_t;
+
+static void *_sup_interp_copy(void *raw) {
+    sup_interp_child_t *src = (sup_interp_child_t *)raw;
+    sup_interp_child_t *cp = (sup_interp_child_t *)malloc(sizeof(sup_interp_child_t));
+    *cp = *src;
+    return cp;
+}
+static void _sup_interp_free(void *raw) {
+    free(raw);
+}
+static void _sup_interp_entry(void *raw) {
+    sup_interp_child_t *c = (sup_interp_child_t *)raw;
+    sw_interp_t *interp = c->interp;
+    node_t *fn = c->fn_node;
+    if (fn && fn->v.fun.body) {
+        sw_env_t *fenv = env_new(c->closure_env ? c->closure_env : interp->global_env);
+        interp->call_depth++;
+        (void)eval(interp, fn->v.fun.body, fenv);
+        interp->call_depth--;
+        env_free(fenv);
+    }
+    /* `c` is THIS incarnation's private copy; freed in process_destroy via the
+     * dtor sup_start_child armed (free_start_arg) before this fiber ran. */
+    interp_fiber_propagate_panic(interp);
+}
+
 /* Invoke an interpreter SW_VAL_FUN value (an AST lambda) with `nargs`
  * args. The compiled-path sw_val_apply() only handles cfunc closures; this
  * is its interpreter twin, used by the functional primitives (map/reduce/
@@ -3473,7 +3623,23 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     /* === System ================================================ */
     if (strcmp(fname, "sleep") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
         int64_t ms = args[0]->v.i;
-        if (ms > 0) usleep((useconds_t)(ms * 1000));
+        if (ms > 0) {
+            /* Yield to the scheduler (sw_receive_any with a timeout) when
+             * running inside a live process, exactly like the compiled
+             * _builtin_sleep — under the single-scheduler `swc run` path all
+             * processes are cooperative fibers on ONE thread, so a raw usleep
+             * would block the whole thread and starve spawned children (e.g.
+             * `spawn(child) ; sleep(150)` would never let the child run).
+             * Fall back to usleep only outside a process (REPL/test contexts
+             * where tls_current is NULL). */
+            if (sw_self()) {
+                uint64_t tag = 0;
+                void *m = sw_receive_any((uint64_t)ms, &tag);
+                if (m) free(m);  /* discard any spurious message */
+            } else {
+                usleep((useconds_t)(ms * 1000));
+            }
+        }
         return sw_val_atom("ok");  /* matches codegen path */
     }
     if (strcmp(fname, "sys_exit") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
@@ -4442,12 +4608,225 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_bytes(out, outlen); free(out); return r;
     }
 
-    /* === Process-scheduler primitives — warn + degrade ========= */
+    /* === Process-scheduler primitives — WIRED to native scheduler =====
+     * These plain BUILTIN calls now run on real interpreter fibers with a
+     * live scheduler + real pids (spawn/self/send already work), so we wire
+     * them directly to the native sw_* primitives — exact arg/return
+     * marshalling replicated from the compiled-path _builtin_* wrappers in
+     * swarmrt_builtins_studio.h (which is NOT included here; bodies inlined).
+     * NB: PID args guard SW_VAL_PID only (these primitives are local-only;
+     * a SW_VAL_REMOTE_PID's union .pid would be garbage). */
+
+    /* link/unlink/trap_exit/exit_proc — {'EXIT',from,reason} delivery */
+    if (strcmp(fname, "link") == 0) {
+        if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
+        sw_link(args[0]->v.pid);
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "unlink") == 0) {
+        if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
+        return sw_val_atom(sw_unlink(args[0]->v.pid) == 0 ? "ok" : "error");
+    }
+    if (strcmp(fname, "trap_exit") == 0) {
+        if (nargs < 1 || !args[0]) return sw_val_atom("error");
+        int v = 0;
+        if (args[0]->type == SW_VAL_ATOM && args[0]->v.str && strcmp(args[0]->v.str, "true") == 0) v = 1;
+        else if (args[0]->type == SW_VAL_INT && args[0]->v.i != 0) v = 1;
+        sw_process_flag(SW_FLAG_TRAP_EXIT, v);
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "exit_proc") == 0) {
+        if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
+        int reason = 2;  /* default: 'killed' */
+        if (nargs >= 2 && args[1] && args[1]->type == SW_VAL_ATOM && args[1]->v.str) {
+            if (strcmp(args[1]->v.str, "normal") == 0) reason = 0;
+            else if (strcmp(args[1]->v.str, "killed") == 0) reason = 2;
+            else reason = 3;
+        }
+        sw_process_kill(args[0]->v.pid, reason);
+        return sw_val_atom("ok");
+    }
+
+    /* monitor/demonitor — same machinery spawn_monitor already uses */
+    if (strcmp(fname, "monitor") == 0) {
+        if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_nil();
+        return sw_val_int((int64_t)sw_monitor(args[0]->v.pid));
+    }
+    if (strcmp(fname, "demonitor") == 0) {
+        if (nargs < 1 || args[0]->type != SW_VAL_INT) return sw_val_atom("error");
+        return sw_val_atom(sw_demonitor((uint64_t)args[0]->v.i) == 0 ? "ok" : "error");
+    }
+
+    /* register/whereis — name arg accepts STRING or ATOM (both use .str) */
+    if (strcmp(fname, "register") == 0) {
+        if (nargs < 2 || !args[0]->v.str ||
+            (args[0]->type != SW_VAL_STRING && args[0]->type != SW_VAL_ATOM) ||
+            args[1]->type != SW_VAL_PID)
+            return sw_val_atom("error");
+        return sw_val_atom(sw_register(args[0]->v.str, args[1]->v.pid) == 0 ? "ok" : "error");
+    }
+    if (strcmp(fname, "whereis") == 0) {
+        if (nargs < 1 || !args[0]->v.str ||
+            (args[0]->type != SW_VAL_STRING && args[0]->type != SW_VAL_ATOM))
+            return sw_val_nil();
+        sw_process_t *p = sw_whereis(args[0]->v.str);
+        return p ? sw_val_pid(p) : sw_val_nil();
+    }
+
+    /* process_info / process_list / registered — pure reads */
+    if (strcmp(fname, "process_info") == 0) {
+        if (nargs < 1 || args[0]->type != SW_VAL_PID || !args[0]->v.pid)
+            return sw_val_nil();
+        sw_process_t *proc = args[0]->v.pid;
+        sw_val_t *keys[8], *vals[8];
+        int c = 0;
+        keys[c] = sw_val_atom("pid");     vals[c] = sw_val_int((int64_t)proc->pid); c++;
+        keys[c] = sw_val_atom("status");
+        switch (proc->state) {
+            case SW_PROC_RUNNING:  vals[c] = sw_val_atom("running"); break;
+            case SW_PROC_RUNNABLE: vals[c] = sw_val_atom("runnable"); break;
+            case SW_PROC_WAITING:  vals[c] = sw_val_atom("waiting"); break;
+            case SW_PROC_EXITING:  vals[c] = sw_val_atom("exiting"); break;
+            default:               vals[c] = sw_val_atom("unknown"); break;
+        }
+        c++;
+        keys[c] = sw_val_atom("reductions"); vals[c] = sw_val_int((int64_t)proc->reductions_done); c++;
+        keys[c] = sw_val_atom("messages");   vals[c] = sw_val_int((int64_t)proc->mailbox.count); c++;
+        keys[c] = sw_val_atom("heap_used");  vals[c] = sw_val_int((int64_t)(proc->heap.top - proc->heap.start)); c++;
+        keys[c] = sw_val_atom("heap_size");  vals[c] = sw_val_int((int64_t)proc->heap.size); c++;
+        if (proc->parent)
+            { keys[c] = sw_val_atom("parent"); vals[c] = sw_val_int((int64_t)proc->parent->pid); c++; }
+        {
+            char _nm[SW_REG_NAME_MAX];
+            int _have = 0;
+            extern sw_swarm_t *g_swarm;
+            if (g_swarm) {
+                pthread_rwlock_rdlock(&g_swarm->registry.lock);
+                sw_reg_entry_t *re = atomic_load_explicit(&proc->reg_entry, memory_order_acquire);
+                if (re) { strncpy(_nm, re->name, SW_REG_NAME_MAX - 1); _nm[SW_REG_NAME_MAX - 1] = '\0'; _have = 1; }
+                pthread_rwlock_unlock(&g_swarm->registry.lock);
+            }
+            if (_have) { keys[c] = sw_val_atom("name"); vals[c] = sw_val_string(_nm); c++; }
+        }
+        return sw_val_map_new(keys, vals, c);
+    }
+    if (strcmp(fname, "process_list") == 0) {
+        extern sw_swarm_t *g_swarm;
+        if (!g_swarm) return sw_val_list(NULL, 0);
+        int cap = 256, cnt = 0;
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+        for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
+            if (slab[i].state != SW_PROC_FREE && slab[i].state != SW_PROC_EXITING) {
+                if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+                items[cnt++] = sw_val_pid(&slab[i]);
+            }
+        }
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
+    }
+    if (strcmp(fname, "registered") == 0) {
+        extern sw_swarm_t *g_swarm;
+        if (!g_swarm || !g_swarm->registry.buckets) return sw_val_list(NULL, 0);
+        int cap = 64, cnt = 0;
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        pthread_rwlock_rdlock(&g_swarm->registry.lock);
+        for (uint32_t i = 0; i < g_swarm->registry.num_buckets; i++) {
+            sw_reg_entry_t *e = g_swarm->registry.buckets[i];
+            while (e) {
+                if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
+                sw_val_t **pair = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
+                pair[0] = sw_val_string(e->name);
+                pair[1] = sw_val_pid(e->proc);
+                items[cnt++] = sw_val_tuple(pair, 2);
+                free(pair);
+                e = e->next;
+            }
+        }
+        pthread_rwlock_unlock(&g_swarm->registry.lock);
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
+    }
+
+    /* supervise(strategy_atom, children_list) -> supervisor pid | nil
+     * children: [{name, fun() {...}, restart_atom}, ...]
+     * Reuses the native supervisor (restart strategy + circuit breaker +
+     * registration) with an interpreter-native child entry (above). Matches the
+     * compiled _builtin_supervise's surface: strategy one_for_one|one_for_all|
+     * rest_for_one, restart permanent|temporary|transient (default permanent),
+     * max_restarts=3 / max_seconds=5. Children register under their name, so
+     * whereis(name) resolves — exactly as supervisor.sw expects. */
+    if (strcmp(fname, "supervise") == 0) {
+        if (nargs < 2) return sw_val_nil();
+        sw_val_t *strat_val = args[0];
+        sw_val_t *children = args[1];
+        if (!children || children->type != SW_VAL_LIST) return sw_val_nil();
+
+        sw_restart_strategy_t strat = SW_ONE_FOR_ONE;
+        if (strat_val && strat_val->type == SW_VAL_ATOM && strat_val->v.str) {
+            if (strcmp(strat_val->v.str, "one_for_all") == 0) strat = SW_ONE_FOR_ALL;
+            else if (strcmp(strat_val->v.str, "rest_for_one") == 0) strat = SW_REST_FOR_ONE;
+        }
+
+        int nchildren = children->v.tuple.count;
+        if (nchildren <= 0 || nchildren > SW_MAX_CHILDREN) return sw_val_nil();
+        sw_child_spec_t *specs = (sw_child_spec_t *)calloc(nchildren, sizeof(sw_child_spec_t));
+        int valid = 0;
+        for (int i = 0; i < nchildren; i++) {
+            sw_val_t *child = children->v.tuple.items[i];
+            if (!child || child->type != SW_VAL_TUPLE || child->v.tuple.count < 3) continue;
+            sw_val_t *name_v    = child->v.tuple.items[0];
+            sw_val_t *fn_v      = child->v.tuple.items[1];
+            sw_val_t *restart_v = child->v.tuple.items[2];
+            if (!fn_v || fn_v->type != SW_VAL_FUN || !fn_v->v.fun.body) continue;
+
+            if (name_v && (name_v->type == SW_VAL_ATOM || name_v->type == SW_VAL_STRING) && name_v->v.str)
+                strncpy(specs[valid].name, name_v->v.str, SW_REG_NAME_MAX - 1);
+            else
+                snprintf(specs[valid].name, SW_REG_NAME_MAX - 1, "child_%d", i);
+
+            sup_interp_child_t *c = (sup_interp_child_t *)malloc(sizeof(sup_interp_child_t));
+            c->interp      = interp;
+            c->fn_node     = (node_t *)fn_v->v.fun.body;
+            c->closure_env = fn_v->v.fun.closure_env;
+            specs[valid].start_func     = _sup_interp_entry;
+            specs[valid].start_arg      = c;                  /* MASTER */
+            specs[valid].copy_start_arg = _sup_interp_copy;   /* per-child copy */
+            specs[valid].free_start_arg = _sup_interp_free;
+            specs[valid].restart        = SW_PERMANENT;
+            if (restart_v && restart_v->type == SW_VAL_ATOM && restart_v->v.str) {
+                if (strcmp(restart_v->v.str, "temporary") == 0) specs[valid].restart = SW_TEMPORARY;
+                else if (strcmp(restart_v->v.str, "transient") == 0) specs[valid].restart = SW_TRANSIENT;
+            }
+            valid++;
+        }
+        if (valid == 0) { free(specs); return sw_val_nil(); }
+
+        sw_sup_spec_t sup_spec;
+        memset(&sup_spec, 0, sizeof(sup_spec));
+        sup_spec.strategy     = strat;
+        sup_spec.max_restarts = 3;
+        sup_spec.max_seconds  = 5;
+        sup_spec.children     = specs;
+        sup_spec.num_children = valid;
+        sup_spec.owns_children = 1;   /* heap specs[]: supervisor frees post-copy */
+
+        sw_process_t *sup = sw_supervisor_start("sw_sup", &sup_spec);
+        if (!sup) free(specs);
+        return sup ? sw_val_pid(sup) : sw_val_nil();
+    }
+
+    /* === Process-scheduler primitives — warn + degrade =========
+     * dyn_supervisor/sup_* stay stubbed: the dynamic supervisor's start_child
+     * path also dispatches the child closure via sw_val_apply (cfunc-ONLY),
+     * but interpreter lambdas carry an AST .body + .closure_env with no cfunc,
+     * so a supervised worker would never run. Wiring needs an interpreter-aware
+     * child trampoline + closure_env rebind — out of scope for call-the-native. */
     static const char *scheduler_names[] = {
-        "send", "register", "whereis", "link", "unlink", "monitor",
-        "demonitor", "exit_proc", "trap_exit", "supervise",
+        "send",
         "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
-        "process_list", "process_info", "registered",
         "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
         "http_listen", "http_respond", "ws_send", "ws_close",
         "ws_set_handler", "ws_send_binary", "ws_request_headers", "ws_request_path",
@@ -5055,29 +5434,85 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     }
 
     case N_SPAWN: {
-        /* The tree-walking interpreter has no real scheduler, so spawn runs
-         * the work *synchronously* in the current process and returns a nil
-         * pid (the compiled path is the concurrent one). Two inner shapes:
-         *  - spawn(worker(args)) / spawn(fn(){...}) — evaluating the N_CALL /
-         *    inline-lambda-applied expression already runs the body.
-         *  - spawn(f) where `f` is a closure/fun VALUE — evaluating the ident
-         *    only yields the fun; we must apply it (0 args) so its body runs.
-         *    Without this, a closure-valued local spawn silently no-ops here
-         *    while the compiled twin runs it — a parity gap. */
+        /* Spawn a REAL child fiber that re-enters the interpreter, instead of
+         * running the body inline in the parent (which made monitor/link/
+         * ping-pong fail and spawn-based examples HANG: the parent received a
+         * message its inlined "child" never actually sent from a child
+         * context). Safe because swc run forces nsched=1 (single OS thread →
+         * cooperative fibers → no concurrent interp/env mutation).
+         *
+         * Two AST shapes (see parser par_expr):
+         *  (a) N_CALL — spawn(worker(a,b)): resolve the fn by name, evaluate
+         *      ONLY the args in the PARENT env now (matching the compiled
+         *      deep-copy-of-args-at-spawn semantics), and run the body on a
+         *      new fiber. We must NOT eval the N_CALL (that would run the body
+         *      inline).
+         *  (b) non-N_CALL — spawn(f) / spawn(fn(){...}): eval yields a
+         *      SW_VAL_FUN value; run its body with 0 args on a new fiber. */
         node_t *se = n->v.spawn.expr;
-        sw_val_t *inner = eval(interp, se, env);
-        /* interp_apply_fn (not sw_val_apply): interpreter closures carry an
-         * AST body + captured env, not a C cfunc. Only apply when the inner
-         * is a fun VALUE reached as a bare expression (ident / non-call) — a
-         * spawn(worker(args)) N_CALL already ran its body during eval. */
-        if (inner && inner->type == SW_VAL_FUN && inner->v.fun.body &&
-            se && se->type != N_CALL)
-            (void)interp_apply_fn(interp, inner, NULL, 0);
-        sw_val_t *pid = sw_val_pid(NULL);
+        spawn_boot_t *b = calloc(1, sizeof(*b));
+        b->interp = interp;
+
+        if (se && se->type == N_CALL && se->v.call.func &&
+            se->v.call.func->type == N_IDENT) {
+            const char *fname = se->v.call.func->v.sval;
+            node_t *fn = find_fun((node_t *)interp->module_ast, fname);
+            if (!fn) {
+                /* Fall back: a closure-valued local var? */
+                sw_val_t *fv = env_get(env, fname);
+                if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body) {
+                    fn = (node_t *)fv->v.fun.body;
+                    b->closure_env = fv->v.fun.closure_env;
+                }
+            }
+            if (!fn) {
+                free(b);
+                snprintf(interp->error_msg, sizeof(interp->error_msg),
+                         "spawn: undefined function: %s", fname);
+                interp->error = 1;
+                return sw_val_nil();
+            }
+            b->fn_node = fn;
+            int na = se->v.call.nargs;
+            if (na > 16) na = 16;
+            b->nargs = na;
+            if (na) {
+                b->args = malloc(sizeof(sw_val_t *) * na);
+                for (int i = 0; i < na; i++)
+                    b->args[i] = eval(interp, se->v.call.args[i], env);
+                if (interp->error) { free(b->args); free(b); return sw_val_nil(); }
+            }
+        } else {
+            /* fn-value / inline-lambda form — eval to a SW_VAL_FUN, 0 args. */
+            sw_val_t *inner = eval(interp, se, env);
+            if (interp->error) { free(b); return sw_val_nil(); }
+            if (!inner || inner->type != SW_VAL_FUN || !inner->v.fun.body) {
+                free(b);
+                snprintf(interp->error_msg, sizeof(interp->error_msg),
+                         "spawn: expression is not callable");
+                interp->error = 1;
+                return sw_val_nil();
+            }
+            b->fn_node = (node_t *)inner->v.fun.body;
+            b->closure_env = inner->v.fun.closure_env;
+            b->nargs = 0;
+        }
+
+        sw_process_t *child = sw_spawn(spawn_trampoline, b);
+        if (!child) {
+            if (b->args) free(b->args);
+            free(b);
+            snprintf(interp->error_msg, sizeof(interp->error_msg),
+                     "spawn failed: process table full");
+            interp->error = 1;
+            return sw_val_nil();
+        }
+        sw_val_t *pid = sw_val_pid(child);   /* REAL pid */
         if (n->v.spawn.monitor) {
-            /* spawn_monitor -> {pid, ref}: match the documented/compiled
-             * shape even though the interpreter has no real scheduler. */
-            sw_val_t *items[2] = { pid, sw_val_int(0) };
+            /* spawn_monitor -> {pid, ref}: install a real monitor so DOWN
+             * signals route back, matching the compiled spawn_monitor. */
+            uint64_t ref = sw_monitor(child);
+            sw_val_t *items[2] = { pid, sw_val_int((int64_t)ref) };
             return sw_val_tuple(items, 2);
         }
         return pid;
@@ -5086,11 +5521,14 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     case N_SEND: {
         sw_val_t *to = eval(interp, n->v.send.to, env);
         sw_val_t *msg = eval(interp, n->v.send.msg, env);
-        if (to->type == SW_VAL_PID && to->v.pid) {
-            int msg_len = 0;
-            sw_msg_val_t *m = serialize_val(msg, &msg_len);
-            sw_send_tagged(to->v.pid, SW_TAG_CAST, m);
-        }
+        /* Structure-preserving send: identical to the compiled path
+         * (emit_send → sw_send_dispatch → sw_send_value, SW_TAG_NONE).
+         * Deep-copies the full sw_val_t graph into the receiver's mailbox
+         * (SW_PK_VALUE region), and handles SW_VAL_REMOTE_PID for free.
+         * Tag is SW_TAG_NONE (was SW_TAG_CAST) to match compiled; receive
+         * pattern-matches the payload and ignores the tag, so this is safe. */
+        if (to && (to->type == SW_VAL_PID || to->type == SW_VAL_REMOTE_PID))
+            sw_send_dispatch(to, msg);
         return msg;
     }
 
@@ -5212,38 +5650,77 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     }
 
     case N_RECEIVE: {
-        /* Simplified receive: wait for a message, try to match clauses */
-        uint64_t timeout = n->v.recv.after_ms >= 0 ? (uint64_t)n->v.recv.after_ms : 5000;
-        uint64_t tag = 0;
-        void *raw = sw_receive_any(timeout, &tag);
-        if (!raw) {
-            /* Timeout */
-            if (n->v.recv.after_body) {
-                return eval(interp, n->v.recv.after_body, env);
-            }
-            return sw_val_nil();
-        }
-        sw_msg_val_t *m = (sw_msg_val_t *)raw;
-        sw_val_t *msg = deserialize_val(m);
-        free(raw);
+        /* True selective receive — mirrors the compiled emit_receive. Scan the
+         * WHOLE mailbox in arrival order; for each queued message try every
+         * clause (pattern + guard); consume ONLY the first message that matches
+         * some clause (leaving all others queued in order); run that clause body
+         * and return. If nothing matches, block for new messages within the
+         * remaining `after` budget; on timeout run after_body (or return nil).
+         *
+         * Safe under the single-scheduler contract (swc run forces nsched=1):
+         * no concurrent sender mutates this mailbox, so the peek/remove/wait
+         * dance needs none of the compiled lock-free care. */
+        uint64_t budget = n->v.recv.after_ms >= 0 ? (uint64_t)n->v.recv.after_ms
+                                                  : (uint64_t)-1;  /* forever (compiled parity) */
+        uint64_t start = recv_now_ms();
 
-        /* Try clauses */
-        for (int i = 0; i < n->v.recv.nclauses; i++) {
-            node_t *cl = n->v.recv.clauses[i];
-            sw_env_t *cl_env = env_new(env);
-            if (pattern_match(cl->v.clause.pattern, msg, cl_env)) {
-                /* Check guard if present */
-                if (cl->v.clause.guard) {
-                    sw_val_t *gv = eval(interp, cl->v.clause.guard, cl_env);
-                    if (!sw_val_is_truthy(gv)) { env_free(cl_env); continue; }
+        for (;;) {
+            /* (1) Scan the currently-queued messages. */
+            sw_mailbox_drain_signals();
+            sw_msg_t *cur = sw_mailbox_peek();
+            while (cur) {
+                sw_msg_t *next = cur->next;
+                sw_val_t *msg = recv_msg_to_val(cur);
+                for (int i = 0; i < n->v.recv.nclauses; i++) {
+                    node_t *cl = n->v.recv.clauses[i];
+                    sw_env_t *cl_env = env_new(env);
+                    if (pattern_match(cl->v.clause.pattern, msg, cl_env)) {
+                        if (cl->v.clause.guard) {
+                            sw_val_t *gv = eval(interp, cl->v.clause.guard, cl_env);
+                            if (!sw_val_is_truthy(gv)) { env_free(cl_env); continue; }
+                        }
+                        /* Matched: consume only this message. Adopt-splice its
+                         * value region into the receiver's arena so the bound
+                         * payload aliases live in the receiver's lifecycle
+                         * (mirrors compiled). RAW/signal payloads and the
+                         * GC-off path (no receiver arena) skip the adopt. */
+                        sw_mailbox_remove_msg(cur);
+                        {
+                            sw_value_arena_t *rv = sw_self_varena();
+                            if (cur->pkind == SW_PK_VALUE && cur->region && rv) {
+                                sw_varena_adopt(rv, cur->region);
+                                cur->region = NULL;
+                            }
+                        }
+                        sw_msg_release(cur);
+                        sw_val_t *r = eval(interp, cl->v.clause.body, cl_env);
+                        env_free(cl_env);
+                        return r;
+                    }
+                    env_free(cl_env);
                 }
-                sw_val_t *r = eval(interp, cl->v.clause.body, cl_env);
-                env_free(cl_env);
-                return r;
+                cur = next;
             }
-            env_free(cl_env);
+
+            /* (2) No queued message matched — wait for new ones, respecting the
+             * remaining budget. */
+            uint64_t elapsed = recv_now_ms() - start;
+            if (elapsed >= budget) break;          /* timed out */
+            uint64_t remaining = (budget == (uint64_t)-1) ? (uint64_t)-1
+                                                          : budget - elapsed;
+            /* No process identity (tool eval thread, sw_self()==NULL): no sender
+             * can ever deliver here, so a blocking receive must DEGRADE to its
+             * after-clause/nil instead of spinning forever. Mirrors the no-proc
+             * short-circuit in sw_receive_any / sw_mailbox_wait_new. */
+            if (!sw_self()) break;
+            sw_mailbox_wait_new(remaining);
+            /* Loop back and re-scan (a spurious wake just rescans harmlessly). */
         }
-        return msg;
+
+        /* Timeout: run the after clause if present, else nil. */
+        if (n->v.recv.after_body)
+            return eval(interp, n->v.recv.after_body, env);
+        return sw_val_nil();
     }
 
     default:

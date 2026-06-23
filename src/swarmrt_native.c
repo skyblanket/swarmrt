@@ -96,6 +96,11 @@ uint64_t sw_mailbox_dropped(void) {
  * entry too. */
 static __thread sw_gen_exec_t _sw_gen_fallback;
 __thread sw_gen_exec_t *_sw_gen;
+/* Per-process usable stack size in bytes. 0 = use the built-in
+ * SW_PROC_STACK_SIZE default (128KB; compiled path). Set BEFORE sw_init by
+ * `swc run` so the interpreter's deep C-stack tree-walk runs on a large fiber
+ * (it used to run on the 8MB OS main thread). Lazy mmap = no physical cost. */
+size_t sw_proc_stack_size = 0;
 /* GC v2: region handed to the next sw_spawn_opts to record on the child's
  * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
 static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
@@ -585,9 +590,18 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
      * tight. 128KB gives eval comfortable headroom while staying lightweight
      * (stacks are lazily mmap'd; physical = touched pages only). */
     if (!proc->stack_mem) {
+        /* Per-process usable stack. Defaults to SW_PROC_STACK_SIZE (128KB) so
+         * the compiled path is unchanged (millions of lightweight processes).
+         * `swc run` runs the WHOLE tree-walking interpreter on the root
+         * process fiber, which recurses deeply on the C stack (no TCO), so it
+         * sets sw_proc_stack_size large (like the 8MB OS main thread it used
+         * to run on) BEFORE sw_init. Lazy mmap means physical = touched pages,
+         * so a large reservation costs nothing for shallow programs. */
+        size_t usable = sw_proc_stack_size ? sw_proc_stack_size
+                                           : (size_t)SW_PROC_STACK_SIZE;
 #ifdef _WIN32
         long page_size = 4096;
-        size_t total = (size_t)page_size + SW_PROC_STACK_SIZE;
+        size_t total = (size_t)page_size + usable;
         total = (total + page_size - 1) & ~(page_size - 1);
         void *mem = VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!mem) { return -1; }
@@ -596,7 +610,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         VirtualProtect(mem, page_size, PAGE_NOACCESS, &old_prot);
 #else
         long page_size = sysconf(_SC_PAGESIZE);
-        size_t total = (size_t)page_size + SW_PROC_STACK_SIZE;
+        size_t total = (size_t)page_size + usable;
         /* Round up to page alignment */
         total = (total + page_size - 1) & ~(page_size - 1);
         void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE,
@@ -2080,6 +2094,22 @@ void sw_process_kill(sw_process_t *proc, int reason) {
 
 sw_process_t *sw_self(void) {
     return tls_current;
+}
+
+/* Report the running process's FIBER stack bounds so the interpreter's
+ * stack-near-limit guard measures the right stack. When the tree-walking
+ * interpreter runs ON a process fiber (e.g. `swc run`'s root process, or a
+ * studio tool fiber), the OS-thread stack bounds reported by
+ * pthread_get_stacksize_np() belong to the scheduler thread, not the
+ * swapped-in fiber — so the guard mis-fires. Returns 1 and fills *low
+ * (lowest usable addr) / *high (top of stack) when on a fiber; returns 0
+ * (use OS-thread bounds) otherwise. */
+int sw_self_stack_bounds(uintptr_t *low, uintptr_t *high) {
+    sw_process_t *p = tls_current;
+    if (!p || !p->stack_mem) return 0;
+    if (low)  *low  = (uintptr_t)p->stack_mem;
+    if (high) *high = (uintptr_t)p->stack_mem + p->stack_size;
+    return 1;
 }
 
 /* GC v1: the running process's value arena (NULL outside a fiber). The value

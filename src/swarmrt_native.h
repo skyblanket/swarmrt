@@ -546,6 +546,11 @@ extern uint64_t sw_rdtsc(void);
 int sw_init(const char *name, uint32_t num_schedulers);
 void sw_shutdown(int swarm_id);
 
+/* Per-process usable stack size (bytes). 0 = built-in 128KB default. Set
+ * BEFORE sw_init when running the tree-walking interpreter on a process fiber
+ * (`swc run`), which needs a deep C stack. Does NOT affect the compiled path. */
+extern size_t sw_proc_stack_size;
+
 /* Process table lookup by PID */
 sw_process_t *sw_find_by_pid(uint64_t pid);
 /* Like sw_find_by_pid but also returns slots for EXITING/dead processes

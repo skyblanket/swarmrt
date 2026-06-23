@@ -34,6 +34,29 @@ fun echo_server() {
     echo_loop()
 }
 
+# Robust connect: echo_server runs in a *spawned* process, so the listener's
+# bind (http_listen → sw_tcp_listen) and the bridge fiber that completes the
+# WS upgrade handshake only run once the scheduler gets to that process. Under
+# CPU contention that can lag past any fixed sleep, so a single wsc_connect
+# races the bind/handshake and returns nil (ECONNREFUSED, or the in-VM bridge
+# not scheduled in time to send the 101). Instead of guessing a sleep, retry
+# the dial with a small backoff until the server is up — wsc_connect returns
+# nil on refusal/handshake-timeout and an int handle on success, so 'nil' vs _
+# cleanly drives the loop. ~100 × 50 ms = ~5 s budget; a healthy run connects
+# on the first try. This is the same hardening test_voice_ws_loopback uses.
+fun connect_retry(url, attempts) {
+    h = wsc_connect(url)
+    case h {
+        'nil' ->
+            if (attempts <= 1) { 'nil' }
+            else {
+                sleep(50)
+                connect_retry(url, attempts - 1)
+            }
+        _ -> h
+    }
+}
+
 fun echo_loop() {
     receive {
         {'ws_message', conn, text} ->
@@ -69,9 +92,11 @@ fun recv_close(h) {
 
 fun main() {
     spawn(fun() { echo_server() })
-    sleep(200)   # let the listener bind
 
-    h = wsc_connect("ws://127.0.0.1:9097/")
+    # Retry the dial until the spawned listener is bound and its bridge fiber
+    # is scheduled to complete the handshake — deterministic under load,
+    # unlike a fixed sleep (which raced and returned nil / hung in connect).
+    h = connect_retry("ws://127.0.0.1:9097/", 100)
     fails = 0
     case h {
         'nil' ->
