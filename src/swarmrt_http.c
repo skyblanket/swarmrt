@@ -1116,4 +1116,33 @@ void sw_http_fuzz_parse(const char *buf, uint32_t len) {
      * (GC reclaims it — we run ASAN with detect_leaks=0). */
     (void)sw_val_map_get(map, sw_val_string("authorization"));
 }
+
+/* Fuzz entry: drive the WebSocket frame decoder (ws_try_parse) over
+ * arbitrary bytes — header decode (7/16/64-bit lengths), masking, the
+ * 16MB caps, control frames, and the fragmentation/reassembly buffer —
+ * exactly as conn_on_data would after a WS upgrade, but scheduler-free.
+ * handler=NULL (sw_send_value no-ops on a NULL target) and port=NULL
+ * (sw_tcp_send rejects a NULL port), so delivery and pong/close writes
+ * degrade safely; what's under test is the parser's memory safety.
+ * Uses conn slot 0 exclusively; resets it fully per input so one input's
+ * frag state can't leak into the next (each input IS one connection). */
+void sw_ws_fuzz_frames(const uint8_t *data, uint32_t len) {
+    sw_http_conn_t *c = &g_http_conns[0];
+    memset(c, 0, sizeof(*c));
+    c->active = 1;
+    c->mode = SW_HTTP_MODE_WS;
+    /* conn_on_data guarantees a NUL one past buf_len; mirror it. */
+    c->buf = (uint8_t *)malloc((size_t)len + 1);
+    if (!c->buf) { memset(c, 0, sizeof(*c)); return; }
+    if (len) memcpy(c->buf, data, len);
+    c->buf[len] = '\0';
+    c->buf_len = len;
+    c->buf_cap = len + 1;
+
+    ws_try_parse(0);
+
+    free(c->buf);
+    free(c->frag_buf);
+    memset(c, 0, sizeof(*c));
+}
 #endif /* SW_FUZZ_HTTP */

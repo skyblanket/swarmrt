@@ -268,7 +268,7 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 
-.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json
+.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json fuzz-ws fuzz-db isolation-gate
 fuzz-parse: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
@@ -296,7 +296,49 @@ fuzz-http: dirs
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
 	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
 
-fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http
+# WebSocket frame decoder (the post-upgrade inbound boundary): header decode
+# (7/16/64-bit lengths), masking, the 16MB caps, control frames, and the
+# fragmentation/reassembly realloc path. Reuses -DSW_FUZZ_HTTP (both hooks
+# live in swarmrt_http.c).
+fuzz-ws: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
+	    tests/fuzz/fuzz_ws.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_ws $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_ws tests/fuzz/corpus/ws
+
+# db_*/SQLite builtin arg path: the 3-arg bind overload, _sw_db_bind's
+# memstream fallback, and _sw_db_row_to_map's TEXT/BLOB readback. The target
+# includes swarmrt_builtins_studio.h exactly like generated code, so it
+# drives the real static implementations.
+fuzz-db: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
+	    tests/fuzz/fuzz_db.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_db $(LDFLAGS)
+	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
+
+fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db
+
+# Cross-process isolation under malformed input (Phase 3 exit criterion:
+# "malformed input cannot crash another process"). The decoder fuzz targets
+# above prove the parsers are memory-safe in isolation; this proves the
+# RUNTIME PROPERTY around them — a process that ingests hostile input and
+# panics does NOT corrupt/stall/kill its siblings or the node. 25 rounds, 8
+# adversarial-input crashers + 1 real-work survivor + a shared ETS table per
+# round; asserts every crasher delivered a DOWN, the survivor's answer is
+# exact, and the ETS value is intact. Run twice: once native (behavioral),
+# once through the ASAN+arena-poison runner (proves no cross-process heap
+# corruption from the crash churn). The crasher panic banners on stderr are
+# expected. tests/stress/isolation_fuzz.sw.
+.PHONY: isolation-gate
+isolation-gate: swc libswarmrt
+	@./bin/swc build tests/stress/isolation_fuzz.sw -o $(BIN_DIR)/isolation_fuzz >/dev/null
+	@$(BIN_DIR)/isolation_fuzz >$(BIN_DIR)/_iso.out 2>/dev/null; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_iso.out; then \
+	   echo "isolation-gate: FAIL (native rc=$$rc — a crash was not isolated)"; \
+	   cat $(BIN_DIR)/_iso.out; rm -f $(BIN_DIR)/_iso.out; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_iso.out
+	@v=$$(bash scripts/gc_asan_run.sh tests/stress/isolation_fuzz.sw isolationgate 2>&1 | grep VERDICT); \
+	 if ! echo "$$v" | grep -q "VERDICT: PASS"; then \
+	   echo "isolation-gate: FAIL under ASAN ($$v)"; exit 1; fi
+	@echo "isolation-gate: PASS (crashers isolated, survivor+ETS intact, ASAN-clean)"
 
 # GC v1 correctness gate: the copy-on-escape stress harness compiled with ASAN +
 # SW_ARENA_POISON. Workers build compound values in their per-process arenas,

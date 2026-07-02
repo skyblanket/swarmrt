@@ -239,7 +239,6 @@ static sw_val_t *_builtin_ets_get(sw_val_t **a, int n) {
     /* ETS debug removed */
     pthread_rwlock_rdlock(&t->lock);
     _vets_entry_t *e = t->buckets[bucket];
-    int count = 0;
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
             /* Copy OUT into the caller's arena (BEAM ETS semantics) so the table
@@ -251,7 +250,6 @@ static sw_val_t *_builtin_ets_get(sw_val_t **a, int n) {
             return v;
         }
         e = e->next;
-        count++;
     }
     /* ETS debug removed */
     pthread_rwlock_unlock(&t->lock);
@@ -4165,7 +4163,8 @@ static sw_val_t *_sw_db_row_to_map(sqlite3_stmt *stmt) {
                 int sz = sqlite3_column_bytes(stmt, i);
                 const unsigned char *bytes = (const unsigned char *)sqlite3_column_blob(stmt, i);
                 char *hex = (char *)malloc(sz * 2 + 1);
-                for (int j = 0; j < sz; j++) sprintf(hex + j * 2, "%02x", bytes[j]);
+                for (int j = 0; j < sz; j++)
+                    snprintf(hex + j * 2, 3, "%02x", bytes[j]);
                 hex[sz * 2] = '\0';
                 vals[i] = sw_val_string(hex);
                 free(hex);

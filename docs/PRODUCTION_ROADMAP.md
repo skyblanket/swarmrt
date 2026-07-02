@@ -26,7 +26,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
 | 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
-| 3 | Security & fault isolation (fuzzing, limits) | ⏳ fuzz boundaries ✅; limits/quotas ✅ (proc-mem quota, HTTP idle timeout, msg-size cap, backpressure decision); WS/SQLite fuzz + cross-proc-isolation-under-fuzz remain |
+| 3 | Security & fault isolation (fuzzing, limits) | ✅ **DONE** — fuzz boundaries (parser/JSON/dist/HTTP/WS/SQLite, depth-guarded); limits/quotas (proc-mem quota, HTTP idle timeout, msg-size cap, backpressure decision); cross-process isolation under malformed input |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
 
@@ -215,7 +215,7 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   full day. This is a sign-off that requires a sustained host run; the harness is ready.
 ---
 
-## Phase 3 — SECURITY & FAULT ISOLATION  ⏳ (fuzz + depth limits DONE; quotas/backpressure remain)
+## Phase 3 — SECURITY & FAULT ISOLATION  ✅ DONE (fuzz boundaries + depth limits + quotas + cross-process isolation)
 
 **Done (Round-7 continuation):**
 - Fuzz every external-input boundary under ASAN/UBSAN, 20k mutations each, wired into CI
@@ -277,9 +277,26 @@ per-process quota × process count bounds value memory operationally, and node-l
 are the OS/deployment layer's job (cgroup/ulimit/container limits, documented in Phase 4's
 deploy docs) rather than a second in-runtime accounting pass.
 
-**Remaining (feature work):**
-- Extend fuzz to the WebSocket frame parser + the `db_*`/SQLite arg path.
-- Prove malformed input cannot crash another process (cross-process isolation under fuzz).
+**Done (fuzz-extension batch, 2026-07-03, branch `phase3-fuzz`):**
+- **WebSocket frame decoder fuzzed** (`make fuzz-ws`): `sw_ws_fuzz_frames` drives `ws_try_parse`
+  over arbitrary bytes — 7/16/64-bit length decode, masking, the 16MB payload/reassembly caps,
+  control frames, and the fragmentation realloc path — scheduler-free (NULL handler/port).
+  8 seeds + 20k mutations, ASAN/UBSAN clean.
+- **db builtins' SQLite arg path fuzzed** (`make fuzz-db`): the target includes
+  `swarmrt_builtins_studio.h` like generated code, so it drives the real `_builtin_db_exec`/
+  `_builtin_db_query`/`_sw_db_bind`/`_sw_db_row_to_map` — the 3-arg bind overload, the
+  open_memstream fallback for non-scalar binds, and the TEXT/BLOB-hex column readback — against
+  an in-memory `SQLITE_DBCONFIG_DEFENSIVE` db. 8 seeds + 20k mutations, ASAN/UBSAN clean.
+  (Also fixed two pre-existing warnings this surfaced in studio.h: a dead ETS `count` variable
+  and a `sprintf`→`snprintf` in the BLOB-hex render.)
+- **Cross-process isolation under malformed input** (`make isolation-gate`): 25 rounds ×
+  (8 adversarial-input crashers that panic + 1 real-work survivor + a shared ETS table). Asserts
+  every crasher delivers a DOWN, the survivor's computed answer is exact, and the ETS value is
+  intact across the crash churn — proving a poisoned input kills one process, not its siblings or
+  the node. Run native (behavioral) AND through the ASAN+arena-poison runner (no cross-process
+  heap corruption). This closes the Phase-3 exit criterion.
+
+Phase 3 is complete.
 
 ## Phase 4 — OPERATIONAL READINESS
 - Observability: per-process memory / mailbox depth / reductions, spawn/crash/restart counters,
