@@ -3673,7 +3673,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     }
     if (strcmp(fname, "expect") == 0 && nargs >= 1) {
         int falsy = (args[0]->type == SW_VAL_NIL) ||
-                    (args[0]->type == SW_VAL_ATOM && strcmp(args[0]->v.str, "false") == 0);
+                    (args[0]->type == SW_VAL_ATOM &&
+                     (strcmp(args[0]->v.str, "false") == 0 ||
+                      strcmp(args[0]->v.str, "nil") == 0));
         if (falsy) {
             const char *msg = (nargs >= 2 && args[1]->type == SW_VAL_STRING)
                                 ? args[1]->v.str : "expect failed";
@@ -4996,6 +4998,17 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             if (strcmp(op, ">=") == 0) return sw_val_atom(a >= b ? "true" : "false");
         }
 
+        /* String lexicographic comparison — parity with compiled _op_cmp.
+         * (Full BEAM total-order across mixed/atom/list types is deferred;
+         * this closes the common string<string case that returned nil.) */
+        if (left->type == SW_VAL_STRING && right->type == SW_VAL_STRING) {
+            int c = strcmp(left->v.str, right->v.str);
+            if (strcmp(op, "<") == 0)  return sw_val_atom(c <  0 ? "true" : "false");
+            if (strcmp(op, ">") == 0)  return sw_val_atom(c >  0 ? "true" : "false");
+            if (strcmp(op, "<=") == 0) return sw_val_atom(c <= 0 ? "true" : "false");
+            if (strcmp(op, ">=") == 0) return sw_val_atom(c >= 0 ? "true" : "false");
+        }
+
         /* Arithmetic on floats */
         if ((left->type == SW_VAL_FLOAT || left->type == SW_VAL_INT) &&
             (right->type == SW_VAL_FLOAT || right->type == SW_VAL_INT)) {
@@ -5233,19 +5246,17 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             const char *s = args[0]->v.str;
             const char *sep = args[1]->v.str;
             int seplen = (int)strlen(sep);
-            sw_val_t *items[256];
-            int count = 0;
+            int cap = 16, count = 0;
+            sw_val_t **items = malloc(sizeof(sw_val_t*) * cap);
             const char *cur = s;
             if (seplen == 0) {
-                /* Empty separator: split into chars (best-effort, ASCII). */
-                for (; *cur && count < 256; cur++) {
-                    char ch[2] = { *cur, 0 };
-                    items[count++] = sw_val_string(ch);
-                }
+                /* Empty separator: whole string as one element (compiled parity). */
+                items[count++] = sw_val_string(s);
             } else {
-                while (count < 256) {
+                while (1) {
                     const char *hit = strstr(cur, sep);
                     if (!hit) break;
+                    if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
                     int len = (int)(hit - cur);
                     char *piece = malloc(len + 1);
                     memcpy(piece, cur, len); piece[len] = '\0';
@@ -5253,9 +5264,12 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                     free(piece);
                     cur = hit + seplen;
                 }
-                if (count < 256) items[count++] = sw_val_string(cur);
+                if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
+                items[count++] = sw_val_string(cur);
             }
-            return sw_val_list(items, count);
+            sw_val_t *r = sw_val_list(items, count);
+            free(items);
+            return r;
         }
         if (strcmp(fname, "string_contains") == 0 && nargs >= 2 &&
             args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
