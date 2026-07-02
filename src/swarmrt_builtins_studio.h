@@ -920,6 +920,16 @@ typedef struct {
     char **cur_buf;
     size_t *cur_len;
     size_t *cur_cursor;
+    /* Multi-line redraw bookkeeping (F10): the physical terminal-line
+     * geometry the MOST RECENT redraw produced, so the NEXT redraw (from
+     * any of the concurrent writers — keystroke, print_above, shell
+     * progress, http-stream stall) can wipe ALL prior physical lines
+     * instead of only the single \r\x1b[K line. `last_rows` is the total
+     * physical rows the render occupied (>=1 once anything was drawn);
+     * `caret_row` is the caret's 0-based physical row from the top of the
+     * render. Both are 0 until the first redraw. */
+    int last_rows;
+    int caret_row;
 } _sw_rl_state_t;
 
 static _sw_rl_state_t _sw_rl = {0};
@@ -932,6 +942,11 @@ static pthread_mutex_t _sw_term_lock = PTHREAD_MUTEX_INITIALIZER;
  * file. Needed up here so shell()'s progress wipe can redraw the
  * input box back below its output without eating what the user typed. */
 static void _sw_rl_redraw_unlocked(const char *prompt, const char *buf, size_t len, size_t cursor);
+/* Erase ALL physical rows of the active input render (F10). External writers
+ * (shell progress, print_above, http-stream stall) call this before printing
+ * their own "above" output, then re-call _sw_rl_redraw_unlocked. Defined near
+ * read_line; forward-declared here for the shell()-progress wipe above it. */
+static void _sw_rl_wipe_unlocked(void);
 
 /* ============================================================
  * popen with pid tracking — so we can kill on interrupt
@@ -1996,26 +2011,37 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
     }
 }
 
-/* Build the tagged return for http_post_stream. The result is a 2-tuple
- * the sw caller can `case`-branch on:
- *   {'ok,    json}    — success; `json` is the OpenAI-shaped response
- *                       string (choices[0].message.{content,reasoning_content,
- *                       tool_calls}, plus usage). Same string the function
- *                       used to return bare, so existing extract paths work
- *                       once the caller unwraps the tuple.
- *   {'error, reason}  — failure; `reason` is a human-readable string
- *                       (curl exit / non-2xx status + body / parse failure).
- * Tagging lets an agent distinguish "model said nothing" (ok + empty
- * content) from "curl died" / "non-2xx" / "stream parse failed" (error),
- * which were all indistinguishable before. */
-static sw_val_t *_sw_hps_tagged(const char *tag, const char *payload) {
+/* Build the tagged return for http_post_stream (cross-slice CONTRACT). The
+ * sw caller `case`-branches on the leading atom:
+ *   {'ok,    body}            — success; `body` is the OpenAI-shaped response
+ *                               string (choices[0].message.{content,
+ *                               reasoning_content,tool_calls}, plus usage), so
+ *                               existing extract paths work after unwrapping.
+ *   {'error, status, body}    — failure; `status` is the HTTP status int (0
+ *                               for connection-refused / timeout / no-response
+ *                               / parse-empty — anything where no HTTP code
+ *                               was seen), `body` is the server's error body
+ *                               or a human-readable transport reason.
+ * Slice B's failure classifier keys on `status`: 0 or 5xx/408/429 → transient
+ * (backoff-retry), 4xx (esp 400) / JSON-parse-error body → FATAL (stop, don't
+ * resend the identical body). The 3-tuple error shape lets it tell those apart
+ * — bare 2-tuples collapsed every failure together. */
+static sw_val_t *_sw_hps_ok(const char *json) {
     sw_val_t *items[2];
-    items[0] = sw_val_atom(tag);
-    items[1] = sw_val_string(payload ? payload : "");
+    items[0] = sw_val_atom("ok");
+    items[1] = sw_val_string(json ? json : "");
     return sw_val_tuple(items, 2);
 }
-static sw_val_t *_sw_hps_ok(const char *json)    { return _sw_hps_tagged("ok", json); }
-static sw_val_t *_sw_hps_err(const char *reason) { return _sw_hps_tagged("error", reason); }
+static sw_val_t *_sw_hps_err3(int status, const char *body) {
+    sw_val_t *items[3];
+    items[0] = sw_val_atom("error");
+    items[1] = sw_val_int((int64_t)status);
+    items[2] = sw_val_string(body ? body : "");
+    return sw_val_tuple(items, 3);
+}
+/* Back-compat shim for the early-return setup failures (bad args, temp-file
+ * write, curl spawn): no HTTP exchange happened, so status is 0. */
+static sw_val_t *_sw_hps_err(const char *reason) { return _sw_hps_err3(0, reason); }
 
 /*
  * http_post_stream(url, headers_list, body, [target_pid, name]) → tagged tuple
@@ -2023,9 +2049,12 @@ static sw_val_t *_sw_hps_err(const char *reason) { return _sw_hps_tagged("error"
  * POSTs a JSON body with "stream": true to an OpenAI-compatible endpoint,
  * parses the Server-Sent-Events stream token-by-token, prints each
  * delta.content to stdout as it arrives (for visual streaming), and
- * returns a TAGGED 2-tuple the caller branches on:
- *    {'ok,    "<openai-json>"}   on success
- *    {'error, "<reason>"}        on curl-failure / non-2xx / parse-failure
+ * returns a TAGGED tuple the caller branches on (cross-slice CONTRACT):
+ *    {'ok,    "<openai-json>"}        on success
+ *    {'error, status_int, "<body>"}   on curl-failure / non-2xx / parse-failure
+ *                                     (status_int = HTTP code, or 0 when no
+ *                                      HTTP code was seen — conn refused,
+ *                                      timeout, stall, empty/parse failure)
  * The `ok` json keeps the minimal OpenAI response shape so the existing
  * extract_content path works after unwrapping:
  *    {"choices":[{"message":{"role":"assistant","content":"..."}}]}
@@ -2082,26 +2111,39 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     snprintf(err_file, sizeof(err_file), "%s/sw_stream_err_%d_%u.txt",
              sw_tmpdir(), sw_getpid_os(), sw_random_u32());
 
-    /* Stream-stall guard: if SWARM_CODE_STREAM_STALL_MS is set, convert it
-     * to seconds (minimum 10s, default 120s) and pass --speed-limit 1
-     * --speed-time <N> to curl.  This aborts with exit 28 if fewer than
-     * 1 byte/s arrives for N consecutive seconds of the live stream,
-     * without affecting normal bursty generation.  The existing exit-28
-     * trunc_marker + sw-level retry path in chat_native_retry handles the
-     * recovery automatically. */
-    int stall_secs = 120;
+    /* Prefill-aware stall guard (F3c). A long reasoning/prefill phase is
+     * SILENT — the server emits zero bytes for many seconds while it builds
+     * the KV cache — but a stream that goes dead MID-generation is a real
+     * failure. curl's --speed-time can't tell the two apart (it counts from
+     * the start of the transfer, so a slow first byte trips it), so we drop
+     * curl's speed guard entirely and enforce TWO distinct deadlines in the
+     * select loop below:
+     *   - SWARM_CODE_PREFILL_TIMEOUT_MS : generous FIRST-BYTE / TTFT budget,
+     *     measured from request send until the first stream byte arrives.
+     *     Default 300_000 ms (5 min) — covers long prefills on slow/local
+     *     models without killing a healthy-but-thinking request.
+     *   - SWARM_CODE_STREAM_STALL_MS    : inter-byte stall guard, ARMED ONLY
+     *     AFTER the first byte. Aborts if no byte arrives for this long once
+     *     generation has started. Default 120_000 ms (2 min).
+     * Either firing kills the child and is surfaced as a transport timeout
+     * (curl exit 28 semantics) so the existing trunc_marker + sw retry path
+     * handles recovery unchanged. */
+    long prefill_timeout_ms = 300000;   /* 5 min TTFT budget */
+    {
+        const char *e = getenv("SWARM_CODE_PREFILL_TIMEOUT_MS");
+        if (e) {
+            long ms = atol(e);
+            if (ms > 0) prefill_timeout_ms = (ms < 10000) ? 10000 : ms;
+        }
+    }
+    long stall_ms = 120000;             /* 2 min inter-byte stall guard */
     {
         const char *stall_env = getenv("SWARM_CODE_STREAM_STALL_MS");
         if (stall_env) {
             long ms = atol(stall_env);
-            if (ms > 0) {
-                int s = (int)(ms / 1000);
-                stall_secs = (s < 10) ? 10 : s;
-            }
+            if (ms > 0) stall_ms = (ms < 10000) ? 10000 : ms;
         }
     }
-    char stall_secs_str[16];
-    snprintf(stall_secs_str, sizeof(stall_secs_str), "%d", stall_secs);
 
     /* Build a curl ARGV (no shell — url/headers can't inject) with -N for
      * unbuffered streaming.
@@ -2114,18 +2156,19 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      *   streaming). Catches transient SSL/connect timeouts (curl 28/35).
      * --max-time 1800: hard ceiling at 30 min — long reasoning is fine
      *   but eventually we want to surface a failure rather than hang.
-     * --speed-limit 1 --speed-time N: stream-stall guard — abort with
-     *   exit 28 if throughput drops below 1 byte/s for N seconds.
+     * NOTE (F3c): we deliberately DO NOT pass curl --speed-limit/--speed-time
+     *   anymore — its stall window starts at transfer start, so a long silent
+     *   prefill (zero bytes during reasoning) tripped it. The prefill-aware
+     *   TTFT + inter-byte stall guards are enforced in the select loop below.
      * curl stderr is redirected to err_file by _sw_popen_argv. */
     char body_arg[300];
     snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
     int nhdr = (headers && headers->type == SW_VAL_LIST) ? headers->v.tuple.count : 0;
-    /* 23 fixed + 2 per header + (--data-binary, body_arg, url) + NULL.
-     * +4 over the prior 19: --speed-limit, "1", --speed-time, stall_secs_str.
+    /* 19 fixed flags + 2 per header + (--data-binary, body_arg, url) + NULL.
      * The --write-out flag + format routes the final HTTP status code to
      * stderr (err_file) so we can detect non-2xx responses without
      * polluting the SSE stdout. */
-    char **argv = (char **)malloc(sizeof(char *) * (23 + 2 * nhdr + 3 + 1));
+    char **argv = (char **)malloc(sizeof(char *) * (19 + 2 * nhdr + 3 + 1));
     char **hdr_strs = (char **)malloc(sizeof(char *) * (nhdr > 0 ? nhdr : 1));
     int argc = 0, nhdr_alloc = 0;
     argv[argc++] = "curl";
@@ -2145,13 +2188,9 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     argv[argc++] = "1";
     argv[argc++] = "--retry-connrefused";
     argv[argc++] = "--retry-all-errors";
-    /* Stream-stall guard: abort if throughput < 1 byte/s for stall_secs.
-     * Triggers curl exit 28, same as --max-time, which the sw retry path
-     * already handles via the trunc_marker / chat_native_retry loop. */
-    argv[argc++] = "--speed-limit";
-    argv[argc++] = "1";
-    argv[argc++] = "--speed-time";
-    argv[argc++] = stall_secs_str;
+    /* (F3c) No --speed-limit/--speed-time: the prefill-aware first-byte and
+     * inter-byte stall guards are enforced in the select loop below so a
+     * silent prefill is never mistaken for a dead stream. */
     /* %{stderr} routes the write-out to stderr (curl >= 7.63), which we
      * already redirect to err_file. We parse "SW_HTTP_CODE:NNN" back out
      * after the stream closes to branch ok/error on non-2xx statuses. */
@@ -2208,6 +2247,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     int spinner_drawn = 0;
     uint64_t t_start = _sw_now_ms();
     uint64_t t_next_tick = t_start;
+    /* Prefill-aware stall guard state (F3c). `first_byte_ms` stays 0 until the
+     * first stream byte arrives; before then we enforce the generous TTFT
+     * budget (prefill_timeout_ms). `last_byte_ms` is the wall-clock of the
+     * most recent byte; once first_byte_ms is set we enforce the inter-byte
+     * stall guard (stall_ms) against it. `stall_fired` records that one of
+     * the two deadlines killed the child so we surface it like curl exit 28. */
+    uint64_t first_byte_ms = 0;
+    uint64_t last_byte_ms = t_start;
+    int stall_fired = 0;
 
     /* Column-aware stream emitter: 2-col left indent + wrap at term_w-2. */
     _sw_stream_state_t stream;
@@ -2331,6 +2379,39 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             /* Any other keystroke while streaming: ignore and loop. */
         }
         if (ret == 0) {
+            /* Prefill-aware stall guard (F3c). On every spinner tick check
+             * the two deadlines:
+             *   - Before the first byte: generous TTFT budget. A long silent
+             *     prefill is healthy, so this window is wide (default 5 min).
+             *   - After the first byte: inter-byte stall guard. A mid-stream
+             *     stall (server hung, route dropped) is a real failure, so a
+             *     tighter window (default 2 min since the last byte) aborts.
+             * On a hit we kill the child and break; the EOF/classify path
+             * treats a non-zero curl exit as a transport timeout (exit 28
+             * semantics) and appends the cut-off marker. */
+            uint64_t now_ms = _sw_now_ms();
+            if (first_byte_ms == 0) {
+                if ((uint64_t)(now_ms - t_start) >= (uint64_t)prefill_timeout_ms) {
+                    stall_fired = 1;
+                }
+            } else {
+                if ((uint64_t)(now_ms - last_byte_ms) >= (uint64_t)stall_ms) {
+                    stall_fired = 1;
+                }
+            }
+            if (stall_fired) {
+                if (spinner_drawn) {
+                    fputs("\r\x1b[K", stdout);
+                    spinner_drawn = 0;
+                    _sw_stream_reset_line(&stream);
+                }
+                _sw_pkill_close(ch);
+                pp = NULL;
+                ch.fp = NULL;
+                ch.pid = -1;
+                done = 1;
+                break;
+            }
             /* Timeout — tick the spinner whenever it's supposed to be
              * showing. Three cases need it:
              *   1. Dead air before the first content byte (TTFT wait)
@@ -2344,7 +2425,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
              * should be visible on screen right now, so we just refresh
              * it. */
             if (is_tty && spinner_drawn) {
-                uint64_t elapsed = _sw_now_ms() - t_start;
+                uint64_t elapsed = now_ms - t_start;
                 int est_tokens = (int)(buf_len / 4);
                 _sw_spinner_draw(verb, elapsed, est_tokens);
             }
@@ -2358,6 +2439,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             break;
         }
         if (rn == 0) { done = 1; break; }
+
+        /* Bytes arrived — feed the prefill-aware stall guard (F3c). The first
+         * byte switches the guard from the wide TTFT budget to the tighter
+         * inter-byte window; every byte resets the inter-byte clock. */
+        {
+            uint64_t now_b = _sw_now_ms();
+            if (first_byte_ms == 0) first_byte_ms = now_b;
+            last_byte_ms = now_b;
+        }
 
         for (ssize_t ri = 0; ri < rn && !done; ri++) {
             char ch = readbuf[ri];
@@ -2719,6 +2809,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         curl_exit = WIFEXITED(curl_status) ? WEXITSTATUS(curl_status) : -1;
 #endif
     }
+    /* The prefill-aware stall guard (F3c) already killed the child above, so
+     * pp is NULL and we never read a real exit code. Synthesise curl's
+     * timeout exit (28) so the failure classifier + trunc_marker treat a
+     * TTFT/inter-byte stall identically to curl's own --max-time abort. */
+    if (stall_fired) curl_exit = 28;
     swbs_unlink(body_file);
 
     /* Read curl's stderr once. It carries two things now:
@@ -2775,15 +2870,21 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     int is_curl_fail = (curl_exit != 0 && !interrupted);
     int is_http_fail = (http_code >= 400);
     const char *fail_reason = NULL;
+    /* The HTTP status threaded out per the CONTRACT: the real code on a
+     * non-2xx, else 0 (transport/timeout/stall/parse — no HTTP code seen).
+     * Slice B keys retry-vs-fatal on this. */
+    int fail_status = 0;
     char fail_buf[1280];
     if (is_curl_fail) {
         snprintf(fail_buf, sizeof(fail_buf), "curl exit %d: %s", curl_exit,
                  erlen > 0 ? errbuf : "(no stderr captured — check the URL/endpoint)");
         fail_reason = fail_buf;
+        fail_status = 0;   /* conn refused / DNS / TLS / timeout(28) / stall */
     } else if (is_http_fail) {
         snprintf(fail_buf, sizeof(fail_buf), "HTTP %d: %s", http_code,
                  errbody_len > 0 ? errbody : (erlen > 0 ? errbuf : "(no response body)"));
         fail_reason = fail_buf;
+        fail_status = http_code;
     }
 
     /* Surface curl/HTTP failures on screen as before (visual parity with the
@@ -2820,6 +2921,13 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     const char *trunc_marker = NULL;
     if (interrupted) {
         trunc_marker = "\n\n[Request interrupted by user]";
+    } else if (stall_fired && first_byte_ms == 0) {
+        trunc_marker = "\n\n[No response from the model before the first-byte (prefill) "
+                       "timeout — the request never started streaming. Check the endpoint "
+                       "is up, or raise SWARM_CODE_PREFILL_TIMEOUT_MS for a very slow model.]";
+    } else if (stall_fired) {
+        trunc_marker = "\n\n[Stream stalled mid-generation — no bytes arrived within the "
+                       "inter-byte timeout. Retry, or raise SWARM_CODE_STREAM_STALL_MS.]";
     } else if (curl_exit == 28) {
         trunc_marker = "\n\n[Response cut off by transport timeout after 30 minutes — "
                        "the generation was still in progress. Retry with a more targeted "
@@ -2954,19 +3062,21 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             enc, renc, tc_field);
     }
 
-    /* Decide the tagged return. Precedence:
-     *   1. curl/transport failure   → {'error, "curl exit N: ..."}
-     *   2. non-2xx HTTP status      → {'error, "HTTP NNN: <body>"}
-     *   3. stream parsed but empty  → {'error, "stream produced no content..."}
+    /* Decide the tagged return per the CONTRACT. Precedence:
+     *   1. curl/transport failure   → {'error, 0,      "curl exit N: ..."}
+     *   2. non-2xx HTTP status      → {'error, status, "HTTP NNN: <body>"}
+     *   3. stream parsed but empty  → {'error, 0,      "stream produced no..."}
      *      (no content AND no tool calls AND not a deliberate interrupt)
      *   4. otherwise                → {'ok, "<openai-json>"}
      * An interrupt with no content is still {'ok,...} carrying the
-     * interrupt marker — the caller asked to stop, that's not a failure. */
+     * interrupt marker — the caller asked to stop, that's not a failure.
+     * Status 0 = "no HTTP code seen" (transport/timeout/stall/parse-empty),
+     * which Slice B treats as transient-but-bounded. */
     sw_val_t *result;
     if (fail_reason) {
-        result = _sw_hps_err(fail_reason);
+        result = _sw_hps_err3(fail_status, fail_reason);
     } else if (!produced_output && !interrupted) {
-        result = _sw_hps_err(
+        result = _sw_hps_err3(0,
             "stream produced no content and no tool calls "
             "(SSE parse yielded nothing — check the endpoint emits "
             "OpenAI-shaped 'data: {\"choices\":[{\"delta\":{\"content\":...}}]}' chunks)");
@@ -4700,7 +4810,7 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
                     pthread_mutex_lock(&_sw_term_lock);
                     int _act = _sw_rl.active;
                     if (_act) {
-                        fputs("\r\033[K", stdout);
+                        _sw_rl_wipe_unlocked();   /* erase ALL input rows */
                         fprintf(stdout, "    \033[38;5;240m⎿ %s\033[0m\n",
                                 line_buf);
                         if (_sw_rl.cur_buf && *_sw_rl.cur_buf) {
@@ -4723,13 +4833,13 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
      * line editor is mid-read, otherwise the wipe eats the user's typing. */
     if (is_tty) {
         pthread_mutex_lock(&_sw_term_lock);
-        fputs("\r\033[K", stdout);
         if (_sw_rl.active && _sw_rl.cur_buf && *_sw_rl.cur_buf) {
+            _sw_rl_wipe_unlocked();   /* erase ALL input rows */
             _sw_rl_redraw_unlocked(_sw_rl.cur_prompt,
                 *_sw_rl.cur_buf,
                 _sw_rl.cur_len ? *_sw_rl.cur_len : 0,
                 _sw_rl.cur_cursor ? *_sw_rl.cur_cursor : 0);
-        } else { fflush(stdout); }
+        } else { fputs("\r\033[K", stdout); fflush(stdout); }
         pthread_mutex_unlock(&_sw_term_lock);
     }
 
@@ -6939,17 +7049,93 @@ static void _sw_rl_history_push(const char *line) {
     _sw_rl.entries[_sw_rl.count++] = strdup(line);
 }
 
-/* Redraw the current buffer: clear line, reprint prompt + buf, position cursor.
+/* Advance a physical (row,col) cursor by the display width of one byte
+ * stream, honouring ANSI CSI escape sequences (zero width), hard newlines,
+ * UTF-8 continuation bytes (zero width — only lead bytes advance a column),
+ * tabs (next multiple of 8), and soft-wrap at `term_w`. `*row`/`*col` are
+ * updated in place. Used by the multi-line redraw to compute geometry
+ * identically on the wipe pass and the reprint pass. */
+static void _sw_rl_advance(const char *s, size_t n, int term_w,
+                           int *row, int *col) {
+    int in_ansi = 0;
+    if (term_w < 1) term_w = 1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (in_ansi) {
+            /* CSI sequence: terminates on a final byte 0x40..0x7e. */
+            if (c >= 0x40 && c <= 0x7e) in_ansi = 0;
+            continue;
+        }
+        if (c == 0x1b) { in_ansi = 1; continue; }   /* ESC — start of escape */
+        if (c == '\n') { (*row)++; *col = 0; continue; }
+        if (c == '\r') { *col = 0; continue; }
+        if (c == '\t') {
+            int next = ((*col / 8) + 1) * 8;
+            if (next >= term_w) { (*row)++; *col = 0; }
+            else *col = next;
+            continue;
+        }
+        if (c >= 0x80 && c < 0xc0) continue;         /* UTF-8 continuation */
+        /* A visible column. Soft-wrap when it would overflow the line. */
+        if (*col >= term_w) { (*row)++; *col = 0; }
+        (*col)++;
+    }
+}
+
+/* Redraw the current buffer multi-line-correctly (F10).
+ *
+ * The old single-line `\r\x1b[K` only wiped ONE physical row, so when the
+ * prompt+buffer wrapped (long input) or contained hard newlines (multi-line
+ * paste) and any of the five concurrent writers fired a redraw, the stale
+ * lower rows survived and the reprint stacked another copy underneath —
+ * producing the ~14x input-doubling. We instead remember the physical-line
+ * geometry of the previous render in `_sw_rl` and, on every redraw:
+ *   1. move the caret to the top-left of the previous render
+ *      (\r + cursor-up by the stored caret_row), then
+ *   2. \x1b[J to erase from there to the end of the screen (ALL prior rows),
+ *      then
+ *   3. reprint prompt + buffer and reposition the caret to `cursor`,
+ *      recording the new geometry for the NEXT writer.
+ * The whole wipe+reprint runs under _sw_term_lock (held by the caller),
+ * so concurrent writers serialise on one atomic redraw and never interleave.
  * `cursor` is the byte offset within buf where the caret should end up.
  * The _unlocked variant assumes the caller already holds _sw_term_lock. */
 static void _sw_rl_redraw_unlocked(const char *prompt, const char *buf, size_t len, size_t cursor) {
-    fputs("\r\x1b[K", stdout);
+    int term_w = _sw_term_cols();
+    if (term_w < 1) term_w = 1;
+
+    /* (1)+(2) Wipe the entire previous render. Return the caret to col 0
+     * of the top physical row of the last render, then clear downward. */
+    fputs("\r", stdout);
+    if (_sw_rl.caret_row > 0) printf("\x1b[%dA", _sw_rl.caret_row);
+    fputs("\x1b[J", stdout);
+
+    /* (3) Reprint prompt + buffer. */
     if (prompt) fputs(prompt, stdout);
     fwrite(buf, 1, len, stdout);
-    if (cursor < len) {
-        size_t back = len - cursor;
-        printf("\x1b[%zuD", (size_t)back);
-    }
+
+    /* Compute the geometry of what we just drew so we can (a) park the
+     * caret at `cursor` and (b) hand the NEXT redraw an accurate wipe size.
+     * The prompt advances the cursor but contributes no caret offset within
+     * `buf`; we track its rows so the buffer rows are measured from the right
+     * starting column. */
+    int end_row = 0, end_col = 0;
+    if (prompt) _sw_rl_advance(prompt, strlen(prompt), term_w, &end_row, &end_col);
+    int caret_row = end_row, caret_col = end_col;
+    /* caret position = geometry after prompt + buf[0..cursor) */
+    _sw_rl_advance(buf, cursor < len ? cursor : len, term_w, &caret_row, &caret_col);
+    /* end-of-text position = geometry after prompt + the full buffer */
+    _sw_rl_advance(buf, len, term_w, &end_row, &end_col);
+
+    /* Move the physical caret from end-of-text back to the caret position. */
+    if (end_row > caret_row) printf("\x1b[%dA", end_row - caret_row);
+    printf("\r");
+    if (caret_col > 0) printf("\x1b[%dC", caret_col);
+
+    /* Record geometry for the next writer's wipe pass. */
+    _sw_rl.last_rows = end_row + 1;
+    _sw_rl.caret_row = caret_row;
+
     fflush(stdout);
 }
 
@@ -6957,6 +7143,22 @@ static void _sw_rl_redraw(const char *prompt, const char *buf, size_t len, size_
     pthread_mutex_lock(&_sw_term_lock);
     _sw_rl_redraw_unlocked(prompt, buf, len, cursor);
     pthread_mutex_unlock(&_sw_term_lock);
+}
+
+/* Erase the entire active input render (all physical rows of the previous
+ * redraw) and leave the caret at col 0 of the top row, then reset the
+ * geometry so the subsequent reprint starts from a clean slate. This is the
+ * one entry point every EXTERNAL writer (print_above, shell progress, the
+ * http-stream stall path) must use BEFORE printing its own "above" text and
+ * then re-calling _sw_rl_redraw_unlocked — it replaces the old single-line
+ * `\r\x1b[K`, which wiped only one row and let wrapped/multi-line input
+ * stack duplicate copies (the ~14x doubling). Caller must hold _sw_term_lock. */
+static void _sw_rl_wipe_unlocked(void) {
+    fputs("\r", stdout);
+    if (_sw_rl.caret_row > 0) printf("\x1b[%dA", _sw_rl.caret_row);
+    fputs("\x1b[J", stdout);
+    _sw_rl.last_rows = 0;
+    _sw_rl.caret_row = 0;
 }
 
 /* Clear the published editor state — under the lock so a concurrent
@@ -6967,6 +7169,8 @@ static void _sw_rl_done(void) {
     _sw_rl.cur_buf = NULL;
     _sw_rl.cur_len = NULL;
     _sw_rl.cur_cursor = NULL;
+    _sw_rl.last_rows = 0;
+    _sw_rl.caret_row = 0;
     pthread_mutex_unlock(&_sw_term_lock);
 }
 
@@ -7009,6 +7213,11 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
     _sw_rl.cur_buf = &buf;
     _sw_rl.cur_len = &len;
     _sw_rl.cur_cursor = &cursor;
+    /* Fresh render: the prompt was already printed once by the block above,
+     * so seed the geometry to that single physical row (caret on row 0). The
+     * first redraw will recompute exact rows; this just stops a stale wipe. */
+    _sw_rl.last_rows = 1;
+    _sw_rl.caret_row = 0;
     _sw_rl.active = 1;
     pthread_mutex_unlock(&_sw_term_lock);
 
@@ -7031,20 +7240,33 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
         }
         /* Enter (LF or CR) = submit. */
         if (c == '\n' || c == '\r') {
+            /* F10: the caret may be parked on a NON-bottom physical row of a
+             * wrapped multi-row input (after a cursor-up / Left / Ctrl-A). A bare
+             * '\n' from there moves down only one row, leaving the lower input
+             * rows on screen for the reply to overwrite. Step DOWN to the bottom
+             * row first, then emit a clean CR+LF so output starts at col 0 on a
+             * fresh line below every input row. Held under the term lock so a
+             * concurrent print_above can't interleave with the submit. */
+            pthread_mutex_lock(&_sw_term_lock);
+            int _rl_down = _sw_rl.last_rows - 1 - _sw_rl.caret_row;
+            if (_rl_down > 0) printf("\x1b[%dB", _rl_down);
+            fputc('\r', stdout);
             fputc('\n', stdout);
             fflush(stdout);
+            pthread_mutex_unlock(&_sw_term_lock);
             break;
         }
         /* Backspace (DEL or BS). */
         if (c == 127 || c == 8) {
             if (len > 0 && cursor > 0) {
                 if (has_newline || cursor == len) {
-                    /* Simple append-mode backspace: just pop the last char. */
+                    /* Append-mode backspace. A bare "\b \b" can't undo a line
+                     * wrap and won't update the multi-line geometry (F10), so
+                     * redraw through the geometry-tracking path instead. */
                     len--;
                     cursor = len;
                     buf[len] = '\0';
-                    fputs("\b \b", stdout);
-                    fflush(stdout);
+                    _sw_rl_redraw(prompt, buf, len, cursor);
                 } else {
                     /* Delete char before cursor, shift tail left. */
                     memmove(buf + cursor - 1, buf + cursor, len - cursor);
@@ -7171,21 +7393,22 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
                 }
                 continue;
             }
-            /* Right arrow */
+            /* Right arrow. Redraw rather than emit a bare \x1b[C so the caret
+             * crosses a wrap boundary correctly and caret_row stays exact for
+             * a concurrent writer's wipe (F10). */
             if (c2 == 'C') {
                 if (!has_newline && cursor < len) {
                     cursor++;
-                    fputs("\x1b[C", stdout);
-                    fflush(stdout);
+                    _sw_rl_redraw(prompt, buf, len, cursor);
                 }
                 continue;
             }
-            /* Left arrow */
+            /* Left arrow. Redraw rather than emit a bare \x1b[D (which can't
+             * move up across a wrap) so caret_row stays exact (F10). */
             if (c2 == 'D') {
                 if (!has_newline && cursor > 0) {
                     cursor--;
-                    fputs("\x1b[D", stdout);
-                    fflush(stdout);
+                    _sw_rl_redraw(prompt, buf, len, cursor);
                 }
                 continue;
             }
@@ -7295,12 +7518,16 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
         if (c >= 0x20 && c != 0x7f) {
             if (len + 2 >= cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
             if (has_newline || cursor == len) {
-                /* Append at end — cheap path, no redraw. */
+                /* Append at end. We could echo the single byte directly, but
+                 * a bare fputc doesn't update the multi-line geometry (F10),
+                 * so once prompt+buf wraps the stored caret_row goes stale and
+                 * a concurrent writer's wipe would clear the wrong rows. Go
+                 * through the geometry-tracking redraw so last_rows/caret_row
+                 * stay exact even as input wraps onto new physical lines. */
                 buf[len++] = (char)c;
                 cursor = len;
                 buf[len] = '\0';
-                fputc(c, stdout);
-                fflush(stdout);
+                _sw_rl_redraw(prompt, buf, len, cursor);
             } else {
                 /* Insert at cursor position, shift tail right. */
                 memmove(buf + cursor + 1, buf + cursor, len - cursor);
@@ -7445,7 +7672,7 @@ static sw_val_t *_builtin_print_inline(sw_val_t **a, int n) {
 static sw_val_t *_builtin_print_above(sw_val_t **a, int n) {
     pthread_mutex_lock(&_sw_term_lock);
     int act = _sw_rl.active;
-    if (act) fputs("\r\x1b[K", stdout);   /* wipe the current input line */
+    if (act) _sw_rl_wipe_unlocked();      /* wipe ALL rows of the input render */
     for (int i = 0; i < n; i++) {
         if (i) fputc(' ', stdout);
         sw_val_print(a[i]);

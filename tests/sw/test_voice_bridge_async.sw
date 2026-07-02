@@ -51,13 +51,29 @@ fun collect(ha, hb, got_a, got_b) {
     }
 }
 
+# Retry the connect with backoff: under parallel-suite CPU contention the
+# spawned echo server's bind+handshake can race past a fixed sleep. Matches
+# the hardening in test_voice_wsc_async (was a brittle sleep+single-connect).
+fun connect_retry(url, attempts) {
+    h = wsc_connect(url)
+    case h {
+        'nil' ->
+            if (attempts <= 1) { 'nil' }
+            else {
+                sleep(50)
+                connect_retry(url, attempts - 1)
+            }
+        _ -> h
+    }
+}
+
 fun main() {
     spawn(fun() { echo_server(9095) })
     sleep(200)
 
     fails = 0
-    ha = wsc_connect("ws://127.0.0.1:9095/")
-    hb = wsc_connect("ws://127.0.0.1:9095/")
+    ha = connect_retry("ws://127.0.0.1:9095/", 100)
+    hb = connect_retry("ws://127.0.0.1:9095/", 100)
     case ha {
         'nil' -> print("FAIL bridge_async_connect_a") ; fails = 1
         _ ->
