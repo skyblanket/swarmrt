@@ -431,6 +431,34 @@ quota-gate: swc libswarmrt
 	 rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; \
 	 echo "quota-gate: PASS (bidirectional — hog killed under cap, completes uncapped)"
 
+# Local message-size cap gate (SW_MSG_MAX_BYTES) — bidirectional. Capped run:
+# a ~128 KB message under a 64 KB cap is dropped at sw_send_tagged_msg — the
+# stderr banner names SW_MSG_MAX_BYTES, the small message + end-marker still
+# arrive, and the drop wakes the receiver (a marker delivered promptly, not a
+# receive timeout). Uncapped run: the SAME binary delivers the big message
+# intact (full 131073-byte length verified) with NO banner (no false drops).
+# Neuter the size check in sw_send_tagged_msg and the capped run fails — the
+# gate has been proven bidirectionally.
+.PHONY: msgsize-gate
+msgsize-gate: swc libswarmrt
+	@./bin/swc build tests/gc/msg_size_cap.sw -o $(BIN_DIR)/msg_size_cap >/dev/null
+	@SW_MSG_MAX_BYTES=65536 $(BIN_DIR)/msg_size_cap >$(BIN_DIR)/_mc.out 2>$(BIN_DIR)/_mc.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_mc.out; then \
+	   echo "msgsize-gate: FAIL (capped run rc=$$rc — big message not dropped or receiver wedged)"; \
+	   cat $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; exit 1; fi; \
+	 if ! grep -q "SW_MSG_MAX_BYTES" $(BIN_DIR)/_mc.err; then \
+	   echo "msgsize-gate: FAIL (no SW_MSG_MAX_BYTES drop banner on stderr)"; \
+	   cat $(BIN_DIR)/_mc.err; rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; exit 1; fi
+	@$(BIN_DIR)/msg_size_cap >$(BIN_DIR)/_mc.out 2>$(BIN_DIR)/_mc.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_mc.out; then \
+	   echo "msgsize-gate: FAIL (uncapped run rc=$$rc — big message should deliver intact)"; \
+	   cat $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; exit 1; fi; \
+	 if grep -q "SW_MSG_MAX_BYTES" $(BIN_DIR)/_mc.err; then \
+	   echo "msgsize-gate: FAIL (false drop with SW_MSG_MAX_BYTES unset)"; \
+	   cat $(BIN_DIR)/_mc.err; rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; \
+	 echo "msgsize-gate: PASS (bidirectional — big dropped under cap, intact uncapped)"
+
 # HTTP idle-timeout gate (SW_HTTP_IDLE_TIMEOUT_MS, slow-loris) — bidirectional.
 # Phase 1 (timeout 500ms): a full table of idle sockets is swept (slots
 # freed), an established-but-quiet WS conn survives (exempt by default), and

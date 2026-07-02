@@ -81,8 +81,25 @@ static _Atomic uint64_t g_mb_dropped;
  * interpreter values outside a fiber) is not metered. */
 static size_t g_proc_mem_max = 0;
 
+/* Max LOCAL message size (SW_MSG_MAX_BYTES, bytes; 0 = unlimited — the
+ * deliberate product default: dist frames are already bounded by
+ * SW_NODE_MAX_FRAME, this cap exists for operators hardening a node against
+ * hostile/buggy senders). Same publication contract as g_mailbox_max.
+ * Enforced in sw_send_tagged_msg on the message REGION's total_bytes — the
+ * exact bytes the deep-copied value graph occupies. The global-heap fallback
+ * (SW_GC_OFF / no sender arena) is not metered, same scope caveat as
+ * SW_PROC_MEM_MAX. EXIT/DOWN ride deliver_signal and are exempt — a size cap
+ * must never blind supervision. */
+static size_t g_msg_max_bytes = 0;
+/* Total messages dropped by the size cap (LOUD: rate-limited stderr below). */
+static _Atomic uint64_t g_msgsize_dropped;
+
 uint64_t sw_mailbox_dropped(void) {
     return atomic_load_explicit(&g_mb_dropped, memory_order_relaxed);
+}
+
+uint64_t sw_msgsize_dropped(void) {
+    return atomic_load_explicit(&g_msgsize_dropped, memory_order_relaxed);
 }
 
 /* Generated-code execution state (line/file/call-trace), PER PROCESS. `_sw_gen`
@@ -1617,6 +1634,14 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     if (pm_max_env && *pm_max_env) {
         long long n = strtoll(pm_max_env, NULL, 10);
         if (n > 0) g_proc_mem_max = (size_t)n;
+    }
+
+    /* Max local message size — SW_MSG_MAX_BYTES (bytes; 0/unset = unlimited).
+     * Same pre-scheduler publication; negative/garbage input is ignored. */
+    const char *msg_max_env = getenv("SW_MSG_MAX_BYTES");
+    if (msg_max_env && *msg_max_env) {
+        long long n = strtoll(msg_max_env, NULL, 10);
+        if (n > 0) g_msg_max_bytes = (size_t)n;
     }
     if (sw_arena_init(&g_swarm->arena, max_procs) != 0) {
         free(g_swarm);
@@ -3268,6 +3293,32 @@ void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
 void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
                         struct sw_value_arena *region) {
     if (!to) return;
+
+    /* Message-size cap (SW_MSG_MAX_BYTES): the region's total_bytes IS the
+     * deep-copied payload's size. Drop mirrors mailbox_overflow_drop: bulk-
+     * free the region (the whole graph lives in it — never free(payload)),
+     * count + warn rate-limited, and CRITICALLY wake the receiver anyway —
+     * a parked receiver whose inbound is all oversized would otherwise never
+     * re-check its queue (livelock); a spurious wake is harmless. EXIT/DOWN
+     * are exempt by construction (they ride deliver_signal, not this path). */
+    if (g_msg_max_bytes && region && region->total_bytes > g_msg_max_bytes) {
+        size_t sz = region->total_bytes;
+        sw_varena_free_all(region);
+        uint64_t dropped = atomic_fetch_add_explicit(&g_msgsize_dropped, 1,
+                                                     memory_order_relaxed);
+        if ((dropped & 0x3F) == 0) {
+            fprintf(stderr,
+                "swarmrt: message of %zu bytes exceeds SW_MSG_MAX_BYTES=%zu"
+                " pid=%llu from=%llu — message dropped (%llu dropped total;"
+                " 0 disables)\n",
+                sz, g_msg_max_bytes,
+                (unsigned long long)to->pid,
+                (unsigned long long)(tls_current ? tls_current->pid : 0),
+                (unsigned long long)(dropped + 1));
+        }
+        mailbox_wake(to);
+        return;
+    }
 
     if (!mailbox_admit(to)) {
         /* VALUE drop: the payload graph lives entirely in `region` —

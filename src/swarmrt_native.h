@@ -650,6 +650,15 @@ struct sw_value_arena *sw_self_take_spawn_region(void);
  * Observability hook for tests/ops — see SW_MAILBOX_MAX_DEFAULT above. */
 uint64_t sw_mailbox_dropped(void);
 
+/* Total messages dropped by the SW_MSG_MAX_BYTES size cap since boot
+ * (monotonic, process-global; 0 = cap disabled or never hit). The cap bounds
+ * a single LOCAL value message's deep-copied size (the message region's
+ * total_bytes); default 0 = unlimited. Oversized sends are dropped loudly
+ * (rate-limited stderr), leak-free, with the receiver still woken. EXIT/DOWN
+ * signals are exempt. Scope: region sends only — the SW_GC_OFF global-heap
+ * fallback is not metered (same caveat as SW_PROC_MEM_MAX). */
+uint64_t sw_msgsize_dropped(void);
+
 /* Selective receive: scan mailbox without consuming, remove matched msg */
 void sw_mailbox_drain_signals(void);         /* Drain signal stack → private queue */
 sw_msg_t *sw_mailbox_peek(void);             /* First message in private queue (no pop) */
