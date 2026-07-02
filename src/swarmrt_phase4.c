@@ -333,6 +333,7 @@ static void dynsup_record_restart(sw_dynsup_state_t *st) {
     st->restart_times[st->restart_idx] = dynsup_now_seconds();
     st->restart_idx = (st->restart_idx + 1) % 64;
     if (st->restart_count < 64) st->restart_count++;
+    sw_note_restart();   /* node-wide restart counter (swarm_stats) */
 }
 
 static void dynsup_kill_child(sw_dynsup_child_t *child) {

@@ -4680,7 +4680,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (nargs < 1 || args[0]->type != SW_VAL_PID || !args[0]->v.pid)
             return sw_val_nil();
         sw_process_t *proc = args[0]->v.pid;
-        sw_val_t *keys[8], *vals[8];
+        sw_val_t *keys[12], *vals[12];
         int c = 0;
         keys[c] = sw_val_atom("pid");     vals[c] = sw_val_int((int64_t)proc->pid); c++;
         keys[c] = sw_val_atom("status");
@@ -4696,6 +4696,26 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         keys[c] = sw_val_atom("messages");   vals[c] = sw_val_int((int64_t)proc->mailbox.count); c++;
         keys[c] = sw_val_atom("heap_used");  vals[c] = sw_val_int((int64_t)(proc->heap.top - proc->heap.start)); c++;
         keys[c] = sw_val_atom("heap_size");  vals[c] = sw_val_int((int64_t)proc->heap.size); c++;
+        /* memory / mailbox_len / messages_sent / messages_recv — same
+         * fields and same read discipline as the compiled builtin
+         * (_builtin_process_info in swarmrt_builtins_studio.h): varena
+         * bytes under link_lock (process_destroy detaches it under that
+         * lock), the rest best-effort. */
+        {
+            int64_t mem = 0;
+            extern sw_swarm_t *g_swarm;
+            if (g_swarm) {
+                pthread_mutex_lock(&g_swarm->link_lock);
+                struct sw_value_arena *va = proc->varena;
+                if (va) mem = (int64_t)va->total_bytes;
+                pthread_mutex_unlock(&g_swarm->link_lock);
+            }
+            keys[c] = sw_val_atom("memory"); vals[c] = sw_val_int(mem); c++;
+        }
+        keys[c] = sw_val_atom("mailbox_len");
+        vals[c] = sw_val_int((int64_t)atomic_load_explicit(&proc->mb_len, memory_order_relaxed)); c++;
+        keys[c] = sw_val_atom("messages_sent"); vals[c] = sw_val_int((int64_t)proc->messages_sent); c++;
+        keys[c] = sw_val_atom("messages_recv"); vals[c] = sw_val_int((int64_t)proc->messages_recv); c++;
         if (proc->parent)
             { keys[c] = sw_val_atom("parent"); vals[c] = sw_val_int((int64_t)proc->parent->pid); c++; }
         {
@@ -4750,6 +4770,54 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_list(items, cnt);
         free(items);
         return r;
+    }
+
+    /* swarm_stats() — node-level runtime metrics map; pure read, same
+     * fields as the compiled _builtin_swarm_stats (see the field-by-field
+     * doc in swarmrt_builtins_studio.h). nil when no runtime is booted. */
+    if (strcmp(fname, "swarm_stats") == 0) {
+        extern sw_swarm_t *g_swarm;
+        if (!g_swarm) return sw_val_nil();
+
+        int64_t live = 0;
+        sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+        for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
+            sw_proc_state_t st = slab[i].state;
+            if (st != SW_PROC_FREE && st != SW_PROC_EXITING) live++;
+        }
+
+        int64_t overflow;
+        pthread_mutex_lock(&g_swarm->overflow_rq.lock);
+        overflow = (int64_t)g_swarm->overflow_rq.count;
+        pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
+
+        uint32_t nsched = g_swarm->num_schedulers;
+        sw_val_t **scheds = (sw_val_t **)malloc(sizeof(sw_val_t *) * (nsched ? nsched : 1));
+        for (uint32_t i = 0; i < nsched; i++) {
+            sw_scheduler_t *sc = g_swarm->schedulers[i];
+            sw_val_t *sk[5], *sv[5];
+            sk[0] = sw_val_atom("id");         sv[0] = sw_val_int((int64_t)sc->id);
+            sk[1] = sw_val_atom("procs_run");  sv[1] = sw_val_int((int64_t)sc->procs_run);
+            sk[2] = sw_val_atom("loop_iters"); sv[2] = sw_val_int((int64_t)sc->loop_iters);
+            sk[3] = sw_val_atom("idle_waits"); sv[3] = sw_val_int((int64_t)sc->idle_waits);
+            sk[4] = sw_val_atom("steals");     sv[4] = sw_val_int((int64_t)sc->steal_attempts);
+            scheds[i] = sw_val_map_new(sk, sv, 5);
+        }
+        sw_val_t *sched_list = sw_val_list(scheds, (int)nsched);
+        free(scheds);
+
+        sw_val_t *keys[10], *vals[10];
+        int c = 0;
+        keys[c] = sw_val_atom("processes");       vals[c] = sw_val_int(live); c++;
+        keys[c] = sw_val_atom("schedulers");      vals[c] = sw_val_int((int64_t)nsched); c++;
+        keys[c] = sw_val_atom("spawns");          vals[c] = sw_val_int((int64_t)atomic_load_explicit(&g_swarm->total_spawns, memory_order_relaxed)); c++;
+        keys[c] = sw_val_atom("crashes");         vals[c] = sw_val_int((int64_t)sw_proc_crashes()); c++;
+        keys[c] = sw_val_atom("restarts");        vals[c] = sw_val_int((int64_t)sw_restarts_total()); c++;
+        keys[c] = sw_val_atom("mailbox_dropped"); vals[c] = sw_val_int((int64_t)sw_mailbox_dropped()); c++;
+        keys[c] = sw_val_atom("msgsize_dropped"); vals[c] = sw_val_int((int64_t)sw_msgsize_dropped()); c++;
+        keys[c] = sw_val_atom("overflow_queue");  vals[c] = sw_val_int(overflow); c++;
+        keys[c] = sw_val_atom("scheduler_stats"); vals[c] = sched_list; c++;
+        return sw_val_map_new(keys, vals, c);
     }
 
     /* supervise(strategy_atom, children_list) -> supervisor pid | nil

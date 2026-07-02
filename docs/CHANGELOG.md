@@ -4,6 +4,39 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-07-03 — Phase 4: per-process + node metrics surface (swarm_stats, extended process_info)
+
+**feat(observability): operators can now read the numbers the runtime already keeps.**
+`process_info(pid)` grows four fields: `memory` (the process's value-arena `total_bytes` —
+the same number `SW_PROC_MEM_MAX` meters), `mailbox_len` (the PENDING depth counter the
+`SW_MAILBOX_MAX` cap checks; `messages` only counted the drained private queue),
+`messages_sent`, `messages_recv`. New node-level builtin `swarm_stats()` → map of
+`processes` (live), `schedulers`, `spawns` (`_Atomic total_spawns`), `crashes` (NEW `_Atomic`
+counter bumped in `process_exit`'s abnormal path), `restarts` (NEW `_Atomic` counter bumped
+via `sw_note_restart()` from both restart-record choke points — static `sup_record_restart`
++ dynamic `dynsup_record_restart`), `mailbox_dropped` / `msgsize_dropped` (the Phase-3 cap
+counters), `overflow_queue`, and `scheduler_stats` (per-scheduler `%{id, procs_run,
+loop_iters, idle_waits, steals}` — best-effort lock-free reads, the watchdog contract).
+
+Memory-safety note: `process_info` reads `proc->varena->total_bytes` cross-process, so
+`process_destroy` now DETACHES varena/spawn_region under `link_lock` (snapshot-then-NULL,
+free after unlock — the same discipline `panic_msg` already used) and the reader holds the
+same lock: it sees a live arena header or NULL, never freed-but-non-NULL. Deliberately NOT
+exposed (dead/untracked in this runtime — never fabricate a metric): node-total `sends` and
+`reductions` (`g_swarm->total_sends`/`total_reductions` are only bumped by the unlinked
+legacy `swarmrt_proc.c`; wiring sends would put a shared-cacheline atomic on the send hot
+path), per-scheduler run-queue depth (Vyukov MPSC has no length counter), utilization %.
+
+`swarm_stats` is registered at all three dispatch sites (codegen `is_builtin` + emit list,
+studio.h impl, interpreter impl — a pure read, NOT scheduler-degraded, so `swc run` gets
+real numbers from its booted scheduler). Gates: `tests/sw/test_observability.sw` (compiled,
+23 assertions: counters, pending-depth determinism, crash + restart deltas) +
+`tests/sw/run/test_observability_interp.sw` (interpreter twin). test-sw 58 files/507
+assertions, gc-stress (default + `SW_SCHEDULERS=1`), gc-slope, phases 2–10 all green; zero
+warnings.
+
+---
+
 ## 2026-06-10 — close the pre-trampoline kill window (timer + supervisor child) via sw_spawn_dtor
 
 **fix(gc): a timer/child killed before its entry fn ever runs now reclaims its arg.** A

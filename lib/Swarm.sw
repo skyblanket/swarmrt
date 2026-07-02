@@ -12,7 +12,9 @@ export [top, tree, print_top, print_tree]
 
 # top() — flat snapshot: a list of per-process maps. Each map has:
 #   pid (int), status, reductions, messages (drained mailbox depth),
-#   heap_used, heap_size, and — when set — name and parent (parent's pid).
+#   mailbox_len (pending depth), memory (value-arena bytes),
+#   messages_sent, messages_recv, heap_used, heap_size, and — when
+#   set — name and parent (parent's pid).
 fun top() {
     map(fun(p) { process_info(p) }, process_list())
 }

@@ -659,6 +659,17 @@ uint64_t sw_mailbox_dropped(void);
  * fallback is not metered (same caveat as SW_PROC_MEM_MAX). */
 uint64_t sw_msgsize_dropped(void);
 
+/* Phase-4 observability counters (monotonic, process-global, _Atomic).
+ * sw_proc_crashes: abnormal process exits (panic / uncaught error / kill —
+ * any process_exit with a non-zero reason) since boot. sw_restarts_total:
+ * supervisor child restarts (static supervise() + dynamic dyn_supervisor())
+ * since boot; bumped by sw_note_restart() from the two restart-record choke
+ * points (sup_record_restart / dynsup_record_restart). Surfaced to sw via
+ * the swarm_stats() builtin. */
+uint64_t sw_proc_crashes(void);
+uint64_t sw_restarts_total(void);
+void sw_note_restart(void);
+
 /* Selective receive: scan mailbox without consuming, remove matched msg */
 void sw_mailbox_drain_signals(void);         /* Drain signal stack → private queue */
 sw_msg_t *sw_mailbox_peek(void);             /* First message in private queue (no pop) */

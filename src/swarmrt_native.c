@@ -102,6 +102,26 @@ uint64_t sw_msgsize_dropped(void) {
     return atomic_load_explicit(&g_msgsize_dropped, memory_order_relaxed);
 }
 
+/* Phase-4 observability counters (see the header). Crashes are bumped in
+ * process_exit's abnormal path (the single teardown choke point — both
+ * scheduler exit sites route through it); restarts by sw_note_restart()
+ * from the supervisor restart-record functions. Relaxed ordering: these
+ * are monotonic stats, never used for synchronization. */
+static _Atomic uint64_t g_proc_crashes;
+static _Atomic uint64_t g_sup_restarts;
+
+uint64_t sw_proc_crashes(void) {
+    return atomic_load_explicit(&g_proc_crashes, memory_order_relaxed);
+}
+
+uint64_t sw_restarts_total(void) {
+    return atomic_load_explicit(&g_sup_restarts, memory_order_relaxed);
+}
+
+void sw_note_restart(void) {
+    atomic_fetch_add_explicit(&g_sup_restarts, 1, memory_order_relaxed);
+}
+
 /* Generated-code execution state (line/file/call-trace), PER PROCESS. `_sw_gen`
  * is pointed at the running process's gen_exec block on every context switch in
  * (below), so the generated _sw_current_line/_sw_current_file/_sw_trace* macros
@@ -783,9 +803,20 @@ static void process_destroy(sw_process_t *proc) {
      * the free must serialise with it or the monitor reads freed memory.
      * NULL-under-lock means the monitor sees either a valid pointer or
      * NULL, never freed-but-non-NULL. */
+    /* The varena/spawn_region DETACH also happens inside this same critical
+     * section (snapshot-then-NULL under link_lock, free after unlock): the
+     * process_info builtin reads proc->varena->total_bytes cross-thread for
+     * its 'memory' stat, under link_lock. Detaching under the lock gives it
+     * the same guarantee panic_msg has — a reader holding link_lock sees
+     * either a live arena header or NULL, never freed-but-non-NULL. The
+     * frees stay outside the lock (O(chunks), no need to hold it). */
     pthread_mutex_lock(&g_swarm->link_lock);
     char *_pm = proc->panic_msg;
     proc->panic_msg = NULL;
+    struct sw_value_arena *_va = proc->varena;
+    proc->varena = NULL;
+    struct sw_value_arena *_sr = proc->spawn_region;
+    proc->spawn_region = NULL;
     pthread_mutex_unlock(&g_swarm->link_lock);
     free(_pm);
 
@@ -793,17 +824,13 @@ static void process_destroy(sw_process_t *proc) {
      * the fiber has returned, so there are no live sw_val_t* C-stack roots.
      * Every value that escaped this process was deep-copied to the global heap
      * at the send/spawn/ETS boundary, so nothing else aliases these chunks. */
-    if (proc->varena) {
-        sw_varena_free_all(proc->varena);
-        proc->varena = NULL;
-    }
+    if (_va)
+        sw_varena_free_all(_va);
 
     /* GC v2: a spawn region still attached means the child was killed BEFORE its
      * trampoline adopted it (pre-start kill) — reclaim it here so it isn't leaked. */
-    if (proc->spawn_region) {
-        sw_varena_free_all(proc->spawn_region);
-        proc->spawn_region = NULL;
-    }
+    if (_sr)
+        sw_varena_free_all(_sr);
 
     /* Return block and slot to the current scheduler's partition
      * immediately. The slot-reuse race (R2-#4) is now closed by the
@@ -2677,6 +2704,11 @@ static void deliver_signal(sw_process_t *target, uint64_t tag,
 }
 
 static void process_exit(sw_process_t *proc, int reason) {
+    /* Observability: count every abnormal exit (panic / uncaught error /
+     * kill). Cold path, relaxed atomic — see sw_proc_crashes(). */
+    if (reason != 0)
+        atomic_fetch_add_explicit(&g_proc_crashes, 1, memory_order_relaxed);
+
     pthread_mutex_lock(&g_swarm->link_lock);
     /* Set the terminal reason UNDER link_lock so sw_monitor's
      * already-dead fast path (which now reads it under the same lock)

@@ -16,6 +16,7 @@
 #include "swarmrt_otp.h"
 #include "swarmrt_phase4.h"   /* sw_dynsup_* — DynamicSupervisor (runtime start_child) */
 #include "swarmrt_http.h"
+#include "swarmrt_varena.h"   /* varena->total_bytes — process_info 'memory' stat */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3624,7 +3625,7 @@ static sw_val_t *_builtin_process_info(sw_val_t **a, int n) {
         return sw_val_nil();
     sw_process_t *proc = a[0]->v.pid;
 
-    sw_val_t *keys[8], *vals[8];
+    sw_val_t *keys[12], *vals[12];
     int c = 0;
     keys[c] = sw_val_atom("pid");     vals[c] = sw_val_int((int64_t)proc->pid); c++;
     keys[c] = sw_val_atom("status");
@@ -3640,6 +3641,32 @@ static sw_val_t *_builtin_process_info(sw_val_t **a, int n) {
     keys[c] = sw_val_atom("messages");    vals[c] = sw_val_int((int64_t)proc->mailbox.count); c++;
     keys[c] = sw_val_atom("heap_used");   vals[c] = sw_val_int((int64_t)(proc->heap.top - proc->heap.start)); c++;
     keys[c] = sw_val_atom("heap_size");   vals[c] = sw_val_int((int64_t)proc->heap.size); c++;
+    /* memory: bytes handed out by this process's VALUE ARENA
+     * (varena->total_bytes — the same number SW_PROC_MEM_MAX meters; 0 when
+     * the process has no arena, e.g. SW_GC_OFF). Read UNDER link_lock:
+     * process_destroy detaches proc->varena under the same lock before
+     * freeing it, so a reader here sees either a live arena header or NULL —
+     * never freed-but-non-NULL (the reg_entry lesson below, same shape).
+     * total_bytes itself is owner-written without a lock; this is a
+     * best-effort stat snapshot like the counters above. */
+    {
+        int64_t mem = 0;
+        extern sw_swarm_t *g_swarm;
+        if (g_swarm) {
+            pthread_mutex_lock(&g_swarm->link_lock);
+            struct sw_value_arena *va = proc->varena;
+            if (va) mem = (int64_t)va->total_bytes;
+            pthread_mutex_unlock(&g_swarm->link_lock);
+        }
+        keys[c] = sw_val_atom("memory"); vals[c] = sw_val_int(mem); c++;
+    }
+    /* mailbox_len: PENDING (undrained) mailbox depth — the counter the
+     * SW_MAILBOX_MAX admission cap checks. 'messages' above only counts the
+     * drained private queue; this one covers the signal stack too. */
+    keys[c] = sw_val_atom("mailbox_len");
+    vals[c] = sw_val_int((int64_t)atomic_load_explicit(&proc->mb_len, memory_order_relaxed)); c++;
+    keys[c] = sw_val_atom("messages_sent"); vals[c] = sw_val_int((int64_t)proc->messages_sent); c++;
+    keys[c] = sw_val_atom("messages_recv"); vals[c] = sw_val_int((int64_t)proc->messages_recv); c++;
     /* parent pid (numeric, matching the int 'pid' field above) so Swarm.tree()
      * can reconstruct the supervision hierarchy from the child->parent link.
      * Best-effort read of the arena slab, like process_list — the slot memory
@@ -3716,6 +3743,74 @@ static sw_val_t *_builtin_registered(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);
     return r;
+}
+
+/* swarm_stats() → node-level runtime metrics map. Every field is a REAL
+ * counter the runtime already maintains — nothing is fabricated:
+ *   processes        live process count (best-effort slab scan, as process_list)
+ *   schedulers       scheduler thread count
+ *   spawns           processes spawned since boot        (_Atomic total_spawns)
+ *   crashes          abnormal process exits since boot   (sw_proc_crashes)
+ *   restarts         supervisor child restarts, static + dynamic (sw_restarts_total)
+ *   mailbox_dropped  messages dropped by the SW_MAILBOX_MAX depth cap
+ *   msgsize_dropped  messages dropped by the SW_MSG_MAX_BYTES size cap
+ *   overflow_queue   global overflow run-queue length (work no scheduler
+ *                    has claimed; read under its own cold mutex)
+ *   scheduler_stats  per-scheduler list of %{id, procs_run, loop_iters,
+ *                    idle_waits, steals} — best-effort lock-free reads of the
+ *                    scheduler debug counters (the watchdog contract; a stale
+ *                    value is fine, a lock on the hot path is not)
+ * NOT exposed because the runtime does not track them: per-scheduler
+ * run-queue depth (the Vyukov MPSC has no length counter), scheduler
+ * utilization %, node-total reductions, and node-total sends
+ * (g_swarm->total_reductions / total_sends are DEAD counters in this
+ * runtime — only the unlinked legacy swarmrt_proc.c bumps them; wiring
+ * total_sends would put a shared-cacheline atomic on the send hot path.
+ * Per-process reductions / messages_sent in process_info cover both). */
+static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    extern sw_swarm_t *g_swarm;
+    if (!g_swarm) return sw_val_nil();
+
+    int64_t live = 0;
+    sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
+    for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
+        sw_proc_state_t st = slab[i].state;
+        if (st != SW_PROC_FREE && st != SW_PROC_EXITING) live++;
+    }
+
+    int64_t overflow;
+    pthread_mutex_lock(&g_swarm->overflow_rq.lock);
+    overflow = (int64_t)g_swarm->overflow_rq.count;
+    pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
+
+    uint32_t nsched = g_swarm->num_schedulers;
+    sw_val_t **scheds = (sw_val_t **)malloc(sizeof(sw_val_t *) * (nsched ? nsched : 1));
+    for (uint32_t i = 0; i < nsched; i++) {
+        sw_scheduler_t *sc = g_swarm->schedulers[i];
+        sw_val_t *sk[5], *sv[5];
+        sk[0] = sw_val_atom("id");         sv[0] = sw_val_int((int64_t)sc->id);
+        sk[1] = sw_val_atom("procs_run");  sv[1] = sw_val_int((int64_t)sc->procs_run);
+        sk[2] = sw_val_atom("loop_iters"); sv[2] = sw_val_int((int64_t)sc->loop_iters);
+        sk[3] = sw_val_atom("idle_waits"); sv[3] = sw_val_int((int64_t)sc->idle_waits);
+        sk[4] = sw_val_atom("steals");     sv[4] = sw_val_int((int64_t)sc->steal_attempts);
+        scheds[i] = sw_val_map_new(sk, sv, 5);
+    }
+    sw_val_t *sched_list = sw_val_list(scheds, (int)nsched);
+    free(scheds);
+
+    sw_val_t *keys[10], *vals[10];
+    int c = 0;
+    keys[c] = sw_val_atom("processes");       vals[c] = sw_val_int(live); c++;
+    keys[c] = sw_val_atom("schedulers");      vals[c] = sw_val_int((int64_t)nsched); c++;
+    keys[c] = sw_val_atom("spawns");          vals[c] = sw_val_int((int64_t)atomic_load_explicit(&g_swarm->total_spawns, memory_order_relaxed)); c++;
+    keys[c] = sw_val_atom("crashes");         vals[c] = sw_val_int((int64_t)sw_proc_crashes()); c++;
+    keys[c] = sw_val_atom("restarts");        vals[c] = sw_val_int((int64_t)sw_restarts_total()); c++;
+    keys[c] = sw_val_atom("mailbox_dropped"); vals[c] = sw_val_int((int64_t)sw_mailbox_dropped()); c++;
+    keys[c] = sw_val_atom("msgsize_dropped"); vals[c] = sw_val_int((int64_t)sw_msgsize_dropped()); c++;
+    keys[c] = sw_val_atom("overflow_queue");  vals[c] = sw_val_int(overflow); c++;
+    keys[c] = sw_val_atom("scheduler_stats"); vals[c] = sched_list; c++;
+    return sw_val_map_new(keys, vals, c);
 }
 
 /* map_new() → empty map */

@@ -658,9 +658,10 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `self()` | own pid |
 | `send(pid, msg)` | non-blocking |
 | `register(name, pid)` / `whereis(name)` | atom registry |
-| `process_info(pid)` | inspection map: `pid, status, reductions, messages, heap_used, heap_size`, plus `name` / `parent` (parent's pid) when set |
+| `process_info(pid)` | inspection map: `pid, status, reductions, messages` (drained mailbox), `mailbox_len` (pending depth — what `SW_MAILBOX_MAX` meters), `memory` (value-arena bytes — what `SW_PROC_MEM_MAX` meters), `messages_sent`, `messages_recv`, `heap_used`, `heap_size`, plus `name` / `parent` (parent's pid) when set |
 | `process_list()` | all live pids |
 | `registered()` | all registered `{name, pid}` pairs |
+| `swarm_stats()` | node-level metrics map: `processes` (live), `schedulers`, `spawns` / `crashes` / `restarts` (monotonic since boot), `mailbox_dropped` / `msgsize_dropped` (cap-drop counters), `overflow_queue`, and `scheduler_stats` — a per-scheduler list of `%{id, procs_run, loop_iters, idle_waits, steals}` |
 | `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Compiled-only (see note below). |
 | `pid_alive(os_pid)` | `'true'` if the OS process (integer pid from `subprocess_spawn`) is still running, `'false'` if it has exited. Uses `kill(pid, 0)` — no signal sent. Does **not** take sw actor pids returned by `spawn()`. |
 | `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |

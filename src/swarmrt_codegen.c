@@ -283,6 +283,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "process_info") == 0 ||
            strcmp(name, "process_list") == 0 ||
            strcmp(name, "registered") == 0 ||
+           strcmp(name, "swarm_stats") == 0 ||
            /* LiveView HTTP/WS */
            strcmp(name, "http_listen") == 0 ||
            strcmp(name, "http_respond") == 0 ||
@@ -1854,7 +1855,7 @@ static const char *_common_builtins[] = {
     "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
     "read_line", "read_char", "read_key", "read_choice",
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "shell_managed", "pid_alive",
-    "random_int", "supervise",
+    "random_int", "supervise", "swarm_stats",
     "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
     "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
     NULL
@@ -2225,6 +2226,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "process_info") == 0 ||
              strcmp(fname, "process_list") == 0 ||
              strcmp(fname, "registered") == 0 ||
+             strcmp(fname, "swarm_stats") == 0 ||
              /* LiveView HTTP/WS */
              strcmp(fname, "http_listen") == 0 ||
              strcmp(fname, "http_respond") == 0 ||

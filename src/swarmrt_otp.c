@@ -229,6 +229,7 @@ static void sup_record_restart(sw_sup_state_t *st) {
     st->restart_times[st->restart_idx] = now_seconds();
     st->restart_idx = (st->restart_idx + 1) % 64;
     if (st->restart_count < 64) st->restart_count++;
+    sw_note_restart();   /* node-wide restart counter (swarm_stats) */
 }
 
 static int sup_start_child(sw_sup_child_rt_t *child) {
