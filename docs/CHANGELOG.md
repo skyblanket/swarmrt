@@ -4,6 +4,25 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-07-03 — Phase 4: health/readiness endpoint (lib/Health.sw, make health-gate)
+
+**feat(observability): a curl-able liveness/readiness surface — pure sw, zero new C.** The
+HTTP primitives (`http_listen` + `{'http_request', …}` delivery + `http_respond` with status)
+already made this trivially expressible in the language, so the deliverable is a lib + a
+documented example rather than a C endpoint: `lib/Health.sw` exposes `Health.start(port)`
+(spawns the server, returns its pid) and `Health.serve(port)` (runs in the calling process).
+`/healthz` → 200 `"ok"` (liveness: the scheduler can run the handler), `/readyz` → 200 with
+the live `swarm_stats()` map as JSON (readiness with real runtime state: processes, spawns/
+crashes/restarts, drop counters, per-scheduler stats), anything else → 404.
+`examples/health_endpoint.sw` is the three-line operator recipe (PORT env override).
+
+Gate: `make health-gate` (tests/obs/health_gate.sh) — boots the example on loopback and
+asserts the contract with a real HTTP client: /healthz 200 + body `ok`, /readyz 200 + the
+actual metric keys in the JSON (not just any 200), unknown path 404. check-docs (all 29
+documented/example programs compile), test-sw, zero warnings.
+
+---
+
 ## 2026-07-03 — Phase 4: structured crash logs (SW_LOG_JSON=1, make crashlog-gate)
 
 **feat(observability): opt-in machine-readable crash records for log shippers.** With

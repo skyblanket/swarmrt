@@ -543,6 +543,17 @@ crashlog-gate: swc libswarmrt
 	 rm -f $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; \
 	 echo "crashlog-gate: PASS (bidirectional — JSON record when opted in, silent by default)"
 
+# Health/readiness endpoint gate (Phase 4 observability): boots
+# examples/health_endpoint.sw (lib/Health.sw over http_listen +
+# swarm_stats) on loopback and asserts with a real HTTP client that
+# /healthz answers 200 "ok", /readyz answers 200 with the LIVE
+# swarm_stats() JSON (the metric keys, not just any 200), and unknown
+# paths answer 404. See tests/obs/health_gate.sh.
+.PHONY: health-gate
+health-gate: swc libswarmrt
+	@./bin/swc build examples/health_endpoint.sw -o $(BIN_DIR)/health_demo >/dev/null
+	@bash tests/obs/health_gate.sh
+
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
