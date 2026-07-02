@@ -26,7 +26,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 |------:|-------|--------|
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
 | 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
-| 3 | Security & fault isolation (fuzzing, limits) | ⏳ fuzz boundaries ✅ (parser/JSON/dist/HTTP, depth-guarded); quotas/backpressure remain |
+| 3 | Security & fault isolation (fuzzing, limits) | ⏳ fuzz boundaries ✅; limits/quotas ✅ (proc-mem quota, HTTP idle timeout, msg-size cap, backpressure decision); WS/SQLite fuzz + cross-proc-isolation-under-fuzz remain |
 | 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
 
@@ -245,12 +245,39 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
   force ~4GB RSS) and rejects oversized declared `Content-Length` with a 413. WS frames were
   already capped at 16MB.
 
-**Remaining (feature work, mostly product decisions):**
-- Limits/quotas: max LOCAL message size (dist frames already capped at `SW_NODE_MAX_FRAME`),
-  sender-side backpressure (current mailbox cap drops instead of throttling), per-process
-  memory quota (hook exists: `varena->total_bytes` is tracked but unchecked), per-node memory
-  quotas, HTTP connection/request **idle timeouts** (slow-loris can still pin all
-  `SW_HTTP_MAX_CONNS=256` slots — needs timer integration in the bridge loop).
+**Done (Phase-3 limits & quotas batch, 2026-07-03, branch `phase3-quotas`):**
+- **Per-process memory quota** (`SW_PROC_MEM_MAX`, bytes; 0/unset = unlimited): enforced at the
+  varena grow/adopt cold paths on `varena->total_bytes`. An over-quota PROCESS dies with a loud
+  panic naming the quota + pid; the node and siblings survive (a supervisor can restart it).
+  Scope: the per-process value arena — the `SW_GC_OFF`/global-heap fallback is not metered.
+  Gate: `make quota-gate` (bidirectional).
+- **HTTP idle timeout** (`SW_HTTP_IDLE_TIMEOUT_MS`, default 30000; 0 disables): connections with
+  no inbound bytes are closed and their slot freed — slow-loris can no longer pin the
+  `SW_HTTP_MAX_CONNS` table. Swept from the existing bridge fiber (periodic receive timeout, no
+  new thread); each bridge sweeps only connections it owns. Established WS conns are exempt by
+  default (`SW_HTTP_WS_IDLE_TIMEOUT_MS`, default 0 = never — quiet LiveView/agent sessions are
+  legitimate). Gate: `make slowloris-gate` (bidirectional; phase 2 reproduces the DoS).
+- **Max local message size** (`SW_MSG_MAX_BYTES`, bytes; 0/unset = unlimited — deliberate
+  default, dist frames are already bounded by `SW_NODE_MAX_FRAME`): enforced in
+  `sw_send_tagged_msg` on the message region's `total_bytes`. Over-cap sends are dropped
+  loudly (rate-limited stderr + `sw_msgsize_dropped()` counter), leak-free (region bulk-freed),
+  and the receiver is still woken (livelock guard). EXIT/DOWN exempt by construction
+  (`deliver_signal`). Gate: `make msgsize-gate` (bidirectional).
+
+**Decision record — sender-side backpressure: NOT building (2026-07-03).** The mailbox cap
+keeps drop-with-counter semantics rather than throttling senders. Rationale: (a) bounded memory
+against *untrusted/hostile* inbound is the security property Phase 3 needs — a sender-throttling
+scheme gives a flooder a lever to slow the node instead; (b) cooperating processes that need
+lossless flow already have it: gen_server CALL (request/reply) self-throttles, and
+`Std.task_stream` bounds fan-out; (c) BEAM's sender-penalty model exists to protect a shared
+global heap — swarmrt messages are copied into per-message regions, so the pressure point the
+BEAM design protects does not exist here. Revisit only on a real user report, as an opt-in
+(`SW_MAILBOX_BLOCK=1`-style) never a default. **Per-node memory quota: deferred** — the
+per-process quota × process count bounds value memory operationally, and node-level ceilings
+are the OS/deployment layer's job (cgroup/ulimit/container limits, documented in Phase 4's
+deploy docs) rather than a second in-runtime accounting pass.
+
+**Remaining (feature work):**
 - Extend fuzz to the WebSocket frame parser + the `db_*`/SQLite arg path.
 - Prove malformed input cannot crash another process (cross-process isolation under fuzz).
 
