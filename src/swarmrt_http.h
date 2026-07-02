@@ -26,9 +26,24 @@
  * Chosen above the 16MB WebSocket frame/reassembly cap so WS traffic is
  * never the binding constraint. Oversized declared bodies get a 413;
  * a buffer that outgrows the cap without a parseable request gets the
- * connection closed. NOTE: idle/slow-loris TIMEOUTS are a separate,
- * still-open TODO (needs timer integration in the bridge loop). */
+ * connection closed. */
 #define SW_HTTP_MAX_REQUEST_DEFAULT (32u * 1024u * 1024u)
+
+/* === Idle timeout (slow-loris defense) ===
+ * A client that connects and sends nothing (or stops sending) used to pin
+ * its SW_HTTP_MAX_CONNS slot FOREVER — 256 idle sockets = full table = DoS.
+ * A connection with no INBOUND bytes for SW_HTTP_IDLE_TIMEOUT_MS (env,
+ * default 30000; 0 disables) is closed and its slot freed. Swept from the
+ * existing bridge fiber: the bridge's forever-receive becomes a periodic
+ * timeout (min(timeout)/4, clamped 50..1000 ms) — no new thread, no timer
+ * wheel entry per connection.
+ *
+ * ESTABLISHED WebSocket connections are EXEMPT by default (a LiveView/agent
+ * session may be legitimately quiet for hours, and the server does not
+ * originate pings — only answers them). Operators can opt in with
+ * SW_HTTP_WS_IDLE_TIMEOUT_MS (env, default 0 = never; inbound client pings
+ * count as activity since conn_on_data timestamps every inbound byte). */
+#define SW_HTTP_IDLE_TIMEOUT_MS_DEFAULT 30000u
 
 /* Connection modes */
 typedef enum {
@@ -80,6 +95,15 @@ typedef struct {
     uint32_t            frag_len;
     uint32_t            frag_cap;
     int                 frag_opcode; /* 0 = not reassembling */
+
+    /* Idle-timeout state (slow-loris defense, see SW_HTTP_IDLE_TIMEOUT_MS
+     * above). last_activity_ms = CLOCK_MONOTONIC ms of the last INBOUND
+     * bytes (set at accept, refreshed in conn_on_data). owner = the bridge
+     * process whose port events service this connection; each bridge sweeps
+     * ONLY its own connections, so all mutation of a conn stays on its
+     * single bridge fiber (same threading model as the data path). */
+    uint64_t            last_activity_ms;
+    sw_process_t       *owner;
 } sw_http_conn_t;
 
 /* Bridge state (passed to bridge process) */

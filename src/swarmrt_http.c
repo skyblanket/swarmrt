@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <strings.h>
 #include <pthread.h>
+#include <time.h>
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
 #else
@@ -61,6 +62,45 @@ static uint32_t http_max_request(void) {
     return (uint32_t)n;
 }
 
+/* === Idle timeouts (SW_HTTP_IDLE_TIMEOUT_MS / SW_HTTP_WS_IDLE_TIMEOUT_MS) ===
+ * Lazy-parsed like the request cap. 0 is a VALID configured value (disable),
+ * so "parsed" is encoded as stored = 1 + timeout_ms (0 = not yet parsed);
+ * racing bridge fibers compute identical values, atomics keep it TSan-clean. */
+static _Atomic uint64_t g_http_idle_conf;     /* HTTP conns (pre-upgrade too) */
+static _Atomic uint64_t g_http_ws_idle_conf;  /* established WS conns */
+
+static uint64_t http_idle_conf(_Atomic uint64_t *slot, const char *env,
+                               uint64_t dflt) {
+    uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
+    if (v) return v - 1;
+    uint64_t n = dflt;
+    const char *e = getenv(env);
+    if (e && *e) {
+        char *end = NULL;
+        unsigned long long p = strtoull(e, &end, 10);
+        if (end != e) n = (uint64_t)p;   /* 0 = disabled is accepted */
+    }
+    atomic_store_explicit(slot, n + 1, memory_order_relaxed);
+    return n;
+}
+
+static uint64_t http_idle_timeout_ms(void) {
+    return http_idle_conf(&g_http_idle_conf, "SW_HTTP_IDLE_TIMEOUT_MS",
+                          SW_HTTP_IDLE_TIMEOUT_MS_DEFAULT);
+}
+
+/* Established WS default 0 = EXEMPT (see the header note: quiet LiveView/
+ * agent sessions are legitimate; the server answers pings, never sends them). */
+static uint64_t http_ws_idle_timeout_ms(void) {
+    return http_idle_conf(&g_http_ws_idle_conf, "SW_HTTP_WS_IDLE_TIMEOUT_MS", 0);
+}
+
+static uint64_t http_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
 /* === Connection Management === */
 
 static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
@@ -82,6 +122,11 @@ static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
             c->keep_alive = 1; /* HTTP/1.1 default */
             c->req_headers = NULL;
             c->req_path = NULL;
+            /* Idle-timeout bookkeeping: stamp the accept, and record the
+             * OWNING bridge (conn_alloc runs on the bridge fiber that got
+             * the accept event) so only that bridge ever sweeps this conn. */
+            c->last_activity_ms = http_now_ms();
+            c->owner = sw_self();
             pthread_mutex_unlock(&g_http_lock);
             return i;
         }
@@ -109,6 +154,7 @@ static void conn_free(int cid) {
     c->active = 0;
     c->port = NULL;
     c->handler = NULL;
+    c->owner = NULL;
     pthread_mutex_unlock(&g_http_lock);
 }
 
@@ -651,6 +697,10 @@ deliver_body:
 static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
+    /* Idle timeout: any inbound bytes count as activity (incl. WS pings —
+     * they arrive here as frame bytes before ws_try_parse answers them). */
+    c->last_activity_ms = http_now_ms();
+
     /* Request-size cap: one client must not be able to grow this buffer
      * without bound (headers that never terminate, a body the client keeps
      * streaming, WS bytes piling up behind a stalled parse). 64-bit sum so
@@ -712,14 +762,95 @@ static void conn_on_close(int cid) {
     conn_free(cid);
 }
 
+/* === Idle sweep (slow-loris defense) ===
+ *
+ * Close every connection THIS bridge owns that has had no inbound bytes for
+ * its timeout (HTTP vs established-WS timeouts differ — see the header).
+ * Two-pass: collect victims under g_http_lock (conn_free re-locks it, so
+ * closing inline would self-deadlock), then close outside the lock. The
+ * close+free shape mirrors the oversize-drop path in conn_on_data; a
+ * concurrent handler-side ws_close is tolerated the same way it is there
+ * (conn_free NULLs what it frees; sweeping is per-owner so the data path
+ * for a conn never races its own sweep — both run on the bridge fiber). */
+static void http_sweep_idle(void) {
+    uint64_t http_to = http_idle_timeout_ms();
+    uint64_t ws_to   = http_ws_idle_timeout_ms();
+    if (!http_to && !ws_to) return;
+
+    sw_process_t *self = sw_self();
+    uint64_t now = http_now_ms();
+    int        victim_cid[SW_HTTP_MAX_CONNS];
+    sw_port_t *victim_port[SW_HTTP_MAX_CONNS];
+    uint64_t   victim_idle[SW_HTTP_MAX_CONNS];
+    int nv = 0;
+
+    pthread_mutex_lock(&g_http_lock);
+    for (int i = 0; i < SW_HTTP_MAX_CONNS; i++) {
+        sw_http_conn_t *c = &g_http_conns[i];
+        if (!c->active || c->owner != self) continue;
+        uint64_t to = (c->mode == SW_HTTP_MODE_WS) ? ws_to : http_to;
+        if (!to) continue;                       /* exempt (e.g. WS default) */
+        uint64_t idle = now - c->last_activity_ms;
+        if (idle >= to) {
+            victim_cid[nv]  = i;
+            victim_port[nv] = c->port;
+            victim_idle[nv] = idle;
+            nv++;
+        }
+    }
+    pthread_mutex_unlock(&g_http_lock);
+
+    for (int k = 0; k < nv; k++) {
+        /* LOUD but rate-limited (a slow-loris flood would otherwise spam):
+         * first close + every 64th. */
+        static _Atomic uint32_t g_http_idle_closes;
+        uint32_t d = atomic_fetch_add_explicit(&g_http_idle_closes, 1,
+                                               memory_order_relaxed);
+        if ((d & 0x3F) == 0) {
+            fprintf(stderr,
+                "swarmrt_http: closing idle conn %d — no inbound bytes for "
+                "%llu ms (SW_HTTP_IDLE_TIMEOUT_MS=%llu, "
+                "SW_HTTP_WS_IDLE_TIMEOUT_MS=%llu; %u idle closes total)\n",
+                victim_cid[k], (unsigned long long)victim_idle[k],
+                (unsigned long long)http_to, (unsigned long long)ws_to, d + 1);
+        }
+        if (victim_port[k]) sw_port_close(victim_port[k]);
+        conn_free(victim_cid[k]);
+    }
+}
+
 /* === Bridge Process === */
 
 static void http_bridge_entry(void *arg) {
     sw_http_bridge_t *bridge = (sw_http_bridge_t *)arg;
 
+    /* Idle-timeout sweep cadence: the bridge's forever-receive becomes a
+     * periodic timeout so the EXISTING loop ticks — no extra thread, no
+     * per-connection timer. Tick = min(enabled timeout)/4 clamped to
+     * [50, 1000] ms; with both timeouts disabled the receive stays
+     * infinite and this loop is byte-for-byte the old behavior. */
+    uint64_t http_to = http_idle_timeout_ms();
+    uint64_t ws_to   = http_ws_idle_timeout_ms();
+    uint64_t tick = 0;
+    if (http_to || ws_to) {
+        uint64_t min_to = http_to && ws_to ? (http_to < ws_to ? http_to : ws_to)
+                                           : (http_to ? http_to : ws_to);
+        tick = min_to / 4;
+        if (tick < 50)   tick = 50;
+        if (tick > 1000) tick = 1000;
+    }
+    uint64_t last_sweep = http_now_ms();
+
     while (1) {
         uint64_t tag;
-        void *raw = sw_receive_any((uint64_t)-1, &tag);
+        void *raw = sw_receive_any(tick ? tick : (uint64_t)-1, &tag);
+        if (tick) {
+            uint64_t now = http_now_ms();
+            if (now - last_sweep >= tick) {       /* also under event load */
+                http_sweep_idle();
+                last_sweep = now;
+            }
+        }
         if (!raw) continue;
 
         if (tag == SW_TAG_PORT_ACCEPT) {

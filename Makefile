@@ -431,6 +431,18 @@ quota-gate: swc libswarmrt
 	 rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; \
 	 echo "quota-gate: PASS (bidirectional — hog killed under cap, completes uncapped)"
 
+# HTTP idle-timeout gate (SW_HTTP_IDLE_TIMEOUT_MS, slow-loris) — bidirectional.
+# Phase 1 (timeout 500ms): a full table of idle sockets is swept (slots
+# freed), an established-but-quiet WS conn survives (exempt by default), and
+# a real request then succeeds. Phase 2 (timeout 0 = pre-fix behavior): the
+# same attack pins all SW_HTTP_MAX_CONNS slots and a real request is starved.
+# See tests/stress/slowloris_gate.sh.
+.PHONY: slowloris-gate
+slowloris-gate: swc libswarmrt
+	@./bin/swc build tests/stress/slowloris_server.sw -o $(BIN_DIR)/slowloris_server >/dev/null
+	$(CC) $(CFLAGS) tests/stress/slowloris_client.c -o $(BIN_DIR)/slowloris_client
+	@bash tests/stress/slowloris_gate.sh
+
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
