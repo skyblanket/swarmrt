@@ -513,6 +513,36 @@ slowloris-gate: swc libswarmrt
 	$(CC) $(CFLAGS) tests/stress/slowloris_client.c -o $(BIN_DIR)/slowloris_client
 	@bash tests/stress/slowloris_gate.sh
 
+# Structured crash-log gate (SW_LOG_JSON, Phase 4 observability) —
+# bidirectional. With SW_LOG_JSON=1, a registered monitored child that
+# panics emits one {"ev":"proc_crash",...} JSON line on stderr carrying the
+# panic msg + registered name, while the probe itself survives the crash and
+# exits 0 (PROBE_OK). Without the env, the SAME binary emits no proc_crash
+# record (the default surface stays the human panic trace). Neuter the
+# emit_crash_json call in process_exit and the first run fails — proven
+# bidirectionally.
+.PHONY: crashlog-gate
+crashlog-gate: swc libswarmrt
+	@./bin/swc build tests/obs/crash_json.sw -o $(BIN_DIR)/crash_json >/dev/null
+	@SW_LOG_JSON=1 $(BIN_DIR)/crash_json >$(BIN_DIR)/_cj.out 2>$(BIN_DIR)/_cj.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_cj.out; then \
+	   echo "crashlog-gate: FAIL (probe rc=$$rc — crash not isolated)"; \
+	   cat $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; rm -f $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; exit 1; fi; \
+	 if ! grep -q '"ev":"proc_crash"' $(BIN_DIR)/_cj.err || \
+	    ! grep -q '"msg":"json_gate_boom"' $(BIN_DIR)/_cj.err || \
+	    ! grep -q '"name":"json_gate_victim"' $(BIN_DIR)/_cj.err; then \
+	   echo "crashlog-gate: FAIL (proc_crash JSON record missing/incomplete on stderr)"; \
+	   cat $(BIN_DIR)/_cj.err; rm -f $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; exit 1; fi
+	@$(BIN_DIR)/crash_json >$(BIN_DIR)/_cj.out 2>$(BIN_DIR)/_cj.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_cj.out; then \
+	   echo "crashlog-gate: FAIL (unset run rc=$$rc)"; \
+	   cat $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; rm -f $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; exit 1; fi; \
+	 if grep -q '"ev":"proc_crash"' $(BIN_DIR)/_cj.err; then \
+	   echo "crashlog-gate: FAIL (proc_crash emitted with SW_LOG_JSON unset)"; \
+	   cat $(BIN_DIR)/_cj.err; rm -f $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_cj.out $(BIN_DIR)/_cj.err; \
+	 echo "crashlog-gate: PASS (bidirectional — JSON record when opted in, silent by default)"
+
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK

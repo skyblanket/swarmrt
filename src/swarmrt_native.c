@@ -122,6 +122,81 @@ void sw_note_restart(void) {
     atomic_fetch_add_explicit(&g_sup_restarts, 1, memory_order_relaxed);
 }
 
+/* ── Structured crash log (SW_LOG_JSON=1, default OFF) ───────────────────
+ * One JSON object per line on stderr for every ABNORMAL process exit:
+ *   {"ev":"proc_crash","pid":N,"reason":R[,"msg":"…"][,"name":"…"],"ts":MS}
+ * reason is the numeric exit reason; msg is the panic message when the exit
+ * was a panic (JSON-escaped, truncated); name appears only while the process
+ * is registered (the emit runs BEFORE process_exit unregisters it). Opt-in
+ * for log shippers — the human-readable panic trace stays the default
+ * surface. Emitted from process_exit (the single teardown choke point), so
+ * it is allocation-free by design: stack buffers + one fprintf (a single
+ * write keeps concurrent schedulers' records from interleaving mid-line). */
+static _Atomic int g_log_json = -1;   /* -1 unresolved, 0 off, 1 on */
+
+static int log_json_enabled(void) {
+    int v = atomic_load_explicit(&g_log_json, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("SW_LOG_JSON");
+        v = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        atomic_store_explicit(&g_log_json, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+/* Minimal JSON string escape into a fixed stack buffer (truncates).
+ * Backslash + quote are escaped; control bytes become spaces — enough for
+ * a diagnostic line without \uXXXX expansion or allocation. */
+static void json_escape_buf(const char *src, char *dst, size_t cap) {
+    size_t o = 0;
+    if (!src || cap == 0) { if (cap) dst[0] = '\0'; return; }
+    for (size_t i = 0; src[i] && o + 2 < cap; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if (ch == '"' || ch == '\\') { dst[o++] = '\\'; dst[o++] = (char)ch; }
+        else if (ch < 0x20)          { dst[o++] = ' '; }
+        else                         { dst[o++] = (char)ch; }
+    }
+    dst[o] = '\0';
+}
+
+static void emit_crash_json(sw_process_t *proc, int reason) {
+    /* panic_msg is safe to read directly here: it is freed later in
+     * process_destroy (same thread, after process_exit returns) and its
+     * only writer is the process itself via sw_process_panic. */
+    char msg_esc[192];
+    json_escape_buf(proc->panic_msg, msg_esc, sizeof(msg_esc));
+
+    /* Registered name: read under the registry rdlock — reg_entry is freed
+     * only under that lock (the process_info discipline); copy out before
+     * unlocking. */
+    char name_esc[SW_REG_NAME_MAX * 2];
+    name_esc[0] = '\0';
+    int have_name = 0;
+    if (g_swarm) {
+        pthread_rwlock_rdlock(&g_swarm->registry.lock);
+        sw_reg_entry_t *re = atomic_load_explicit(&proc->reg_entry, memory_order_acquire);
+        if (re) { json_escape_buf(re->name, name_esc, sizeof(name_esc)); have_name = 1; }
+        pthread_rwlock_unlock(&g_swarm->registry.lock);
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+
+    char msg_field[224];
+    msg_field[0] = '\0';
+    if (proc->panic_msg)
+        snprintf(msg_field, sizeof(msg_field), ",\"msg\":\"%s\"", msg_esc);
+    char name_field[SW_REG_NAME_MAX * 2 + 16];
+    name_field[0] = '\0';
+    if (have_name)
+        snprintf(name_field, sizeof(name_field), ",\"name\":\"%s\"", name_esc);
+
+    fprintf(stderr, "{\"ev\":\"proc_crash\",\"pid\":%llu,\"reason\":%d%s%s,\"ts\":%llu}\n",
+            (unsigned long long)proc->pid, reason, msg_field, name_field,
+            (unsigned long long)ms);
+}
+
 /* Generated-code execution state (line/file/call-trace), PER PROCESS. `_sw_gen`
  * is pointed at the running process's gen_exec block on every context switch in
  * (below), so the generated _sw_current_line/_sw_current_file/_sw_trace* macros
@@ -2800,6 +2875,14 @@ static void process_exit(sw_process_t *proc, int reason) {
     proc->my_monitors = NULL;
 
     pthread_mutex_unlock(&g_swarm->link_lock);
+
+    /* 3b. Observability: structured crash record (opt-in, SW_LOG_JSON=1).
+     * Emitted AFTER the lock is released (fprintf under link_lock would
+     * serialize teardown on stderr) and BEFORE step 6 unregisters, so the
+     * record still carries the registered name. Reuses THIS exit path —
+     * no second exit hook. */
+    if (reason != 0 && log_json_enabled())
+        emit_crash_json(proc, reason);
 
     /* 4. Clean up owned ETS tables */
     if (proc->ets_tables) {

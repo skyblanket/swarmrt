@@ -4,6 +4,32 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-07-03 — Phase 4: structured crash logs (SW_LOG_JSON=1, make crashlog-gate)
+
+**feat(observability): opt-in machine-readable crash records for log shippers.** With
+`SW_LOG_JSON=1`, every ABNORMAL process exit (panic / uncaught error / kill) emits exactly one
+JSON object per line on stderr:
+`{"ev":"proc_crash","pid":N,"reason":R[,"msg":"…"][,"name":"…"],"ts":MS}` — `reason` is the
+numeric exit reason, `msg` the panic message when present (JSON-escaped, truncated), `name`
+the registered name when the process had one, `ts` epoch millis. Default OFF: the
+human-readable panic trace stays the default surface.
+
+Implementation reuses the EXISTING abnormal-exit path — the emit sits in `process_exit` (the
+single teardown choke point both scheduler exit sites route through), after `link_lock` is
+released (no fprintf under the lock) and before step 6 unregisters (so the record still
+carries the name, read under the registry rdlock — the reg_entry discipline). Allocation-free
+by design: env flag cached in an `_Atomic` once, stack buffers, minimal escaper (quote/
+backslash escaped, control bytes → spaces), one fprintf so concurrent schedulers' records
+can't interleave mid-line. No second exit hook was added.
+
+Gate: `make crashlog-gate` (tests/obs/crash_json.sw) — bidirectional: with `SW_LOG_JSON=1` a
+registered monitored panicking child must produce a record containing the msg + name while
+the probe survives (PROBE_OK); with the env unset the same binary must emit none. Proven by
+neutering the emit (gate FAILs) and restoring (PASSes). test-sw 58/507, gc-stress, gc-slope
+all green; zero warnings.
+
+---
+
 ## 2026-07-03 — Phase 4: per-process + node metrics surface (swarm_stats, extended process_info)
 
 **feat(observability): operators can now read the numbers the runtime already keeps.**
