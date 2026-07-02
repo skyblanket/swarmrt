@@ -15,6 +15,13 @@
 int sw_alloc_fault_tick(void);
 #endif
 
+/* Per-process memory quota hook (SW_PROC_MEM_MAX) — see the header contract.
+ * Weak no-op so varena.c keeps linking without the runtime (parser/codegen
+ * tools); the strong impl in swarmrt_native.c panics the over-quota process. */
+__attribute__((weak)) void sw_varena_quota_check(sw_value_arena_t *a, size_t need) {
+    (void)a; (void)need;
+}
+
 static sw_varena_chunk_t *chunk_new(size_t cap) {
 #ifdef SW_ALLOC_FAULT
     if (sw_alloc_fault_tick()) return NULL;
@@ -103,6 +110,12 @@ void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src) {
         dst->chunk_count += src->chunk_count;
     }
     free(src);                       /* header only; chunks transferred to dst */
+    /* SW_PROC_MEM_MAX: adopt-splice can bring in an arbitrarily large
+     * message/spawn region — re-check AFTER the merge so ownership is
+     * consistent when the panic tears the process down (all chunks now
+     * belong to dst = the process arena, bulk-freed in process_destroy;
+     * nothing is half-owned, no leak, no double-free). May not return. */
+    sw_varena_quota_check(dst, 0);
 }
 
 void *sw_varena_alloc(sw_value_arena_t *a, size_t n) {
@@ -110,6 +123,10 @@ void *sw_varena_alloc(sw_value_arena_t *a, size_t n) {
     n = (n + (SW_VARENA_ALIGN - 1)) & ~(size_t)(SW_VARENA_ALIGN - 1);
     sw_varena_chunk_t *c = a->head;
     if (c->used + n > c->cap) {
+        /* SW_PROC_MEM_MAX: quota-check on the GROW path only (cold — bump
+         * allocs inside the current chunk stay check-free). May not return
+         * (panics the over-quota process; node survives). */
+        sw_varena_quota_check(a, n);
         /* Grow: new head chunk sized max(n, 2*current cap). The new chunk
          * becomes head; the old one stays linked behind it (still live). */
         size_t ncap = c->cap * 2;

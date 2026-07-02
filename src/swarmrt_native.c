@@ -73,6 +73,14 @@ static int64_t g_mailbox_max = SW_MAILBOX_MAX_DEFAULT;
 /* Total messages dropped by the cap (LOUD: also rate-limited stderr below). */
 static _Atomic uint64_t g_mb_dropped;
 
+/* Per-process memory quota (SW_PROC_MEM_MAX, bytes; 0 = unlimited — the
+ * deliberate product default). Same publication contract as g_mailbox_max:
+ * written once in sw_init before any scheduler thread exists. Enforced by
+ * sw_varena_quota_check below (called from the varena grow/adopt cold paths);
+ * scope is the per-process VALUE ARENA — the global-heap fallback (SW_GC_OFF,
+ * interpreter values outside a fiber) is not metered. */
+static size_t g_proc_mem_max = 0;
+
 uint64_t sw_mailbox_dropped(void) {
     return atomic_load_explicit(&g_mb_dropped, memory_order_relaxed);
 }
@@ -1601,6 +1609,15 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         long long n = strtoll(mb_max_env, NULL, 10);
         if (n >= 0) g_mailbox_max = (int64_t)n;
     }
+
+    /* Per-process memory quota — SW_PROC_MEM_MAX (bytes; 0/unset = unlimited).
+     * Same pre-scheduler publication as the mailbox cap. Negative/garbage
+     * input is ignored (strtoll so "-1" doesn't wrap into a huge quota). */
+    const char *pm_max_env = getenv("SW_PROC_MEM_MAX");
+    if (pm_max_env && *pm_max_env) {
+        long long n = strtoll(pm_max_env, NULL, 10);
+        if (n > 0) g_proc_mem_max = (size_t)n;
+    }
     if (sw_arena_init(&g_swarm->arena, max_procs) != 0) {
         free(g_swarm);
         g_swarm = NULL;
@@ -2068,6 +2085,34 @@ void sw_process_panic(sw_process_t *proc, int reason, const char *msg) {
     atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
     sw_context_swap(proc, &proc->scheduler->sched_proc);
     /* Should never reach here — scheduler tears down the process. */
+}
+
+/* SW_PROC_MEM_MAX enforcement (strong impl; weak no-op lives in
+ * swarmrt_varena.c for runtime-less links). Called from the varena GROW and
+ * ADOPT cold paths. Fires ONLY when `a` is the CURRENT process's installed
+ * arena — see the contract in swarmrt_varena.h for why (mid-copy temp regions
+ * grow under g_alloc_target and are metered at adopt instead). Over quota →
+ * loud stderr banner naming the quota + pid, then sw_process_panic: the
+ * PROCESS dies (links/monitors/supervisors observe it; a supervisor can
+ * restart it), the node and every other process survive. NORETURN on the
+ * kill path (context-swaps to the scheduler); plain return otherwise. */
+void sw_varena_quota_check(sw_value_arena_t *a, size_t need) {
+    size_t cap = g_proc_mem_max;
+    if (cap == 0 || !a) return;
+    sw_process_t *proc = tls_current;
+    if (!proc || proc->varena != a) return;
+    if (a->total_bytes + need <= cap) return;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "SW_PROC_MEM_MAX exceeded in process #%llu: arena %zu bytes"
+             " + %zu requested > quota %zu bytes",
+             (unsigned long long)proc->pid, a->total_bytes, need, cap);
+    fprintf(stderr,
+            "\n\033[1;31mpanic\033[0m: %s — killing process"
+            " (node continues; a supervisor can restart it)\n", msg);
+    fflush(stderr);
+    sw_process_panic(proc, -1, msg);
+    /* Not reached: sw_process_panic swaps to the scheduler for teardown. */
 }
 
 void sw_yield(void) {

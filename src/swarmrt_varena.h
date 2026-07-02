@@ -80,6 +80,24 @@ void sw_varena_free_all(sw_value_arena_t *a);
  * tls_current->varena; a weak stub in swarmrt_lang.c covers runtime-less links. */
 sw_value_arena_t *sw_self_varena(void);
 
+/* Per-process memory quota (SW_PROC_MEM_MAX env, bytes; 0/unset = unlimited).
+ * Called from the arena GROW path (before chunk_new) and from adopt-splice —
+ * NOT per-value, so the cost is one call on the cold path only. Enforcement
+ * fires only when `a` is the CURRENT process's INSTALLED arena
+ * (tls_current->varena == a): that covers every byte the process retains —
+ * its own allocations plus adopted message/spawn/turn regions (adopt merges
+ * total_bytes into the installed arena, where the next grow/adopt re-checks) —
+ * while excluding the mid-copy hazard (a turn-checkpoint temp region grows
+ * under g_alloc_target; panicking there would leak the alloc-target
+ * thread-local into the next fiber on this scheduler thread). Over quota →
+ * the strong impl (swarmrt_native.c) panics THE PROCESS (loud stderr banner
+ * naming the quota + pid; sw_process_panic — links/monitors/supervisors see
+ * a normal abnormal exit; the node and other processes survive). May not
+ * return. Weak no-op stub below covers runtime-less links; the quota is
+ * ARENA-SCOPED by design — the global-heap fallback (SW_GC_OFF, interpreter
+ * values outside a fiber) is not metered. */
+void sw_varena_quota_check(sw_value_arena_t *a, size_t need);
+
 /* Ownership v2 turn-checkpoint: swap the current process's value arena (after
  * copying carry-forward state into the new one). No-op outside a process. */
 void sw_set_self_varena(sw_value_arena_t *a);

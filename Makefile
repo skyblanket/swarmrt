@@ -403,6 +403,34 @@ mailbox-flood: dirs
 	@SW_MAILBOX_MAX=1000 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood capped
 	@SW_MAILBOX_MAX=0 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood uncapped
 
+# Per-process memory quota gate (SW_PROC_MEM_MAX) — bidirectional. Capped run:
+# a hog child accumulating ~6.5 MB of LIVE strings under a 2 MB quota is killed
+# by the arena grow/adopt quota check — the stderr panic names SW_PROC_MEM_MAX
+# + the pid, the parent sees the monitor DOWN, and a sibling process + the
+# parent complete normally (PROBE_OK — the node survives, fault isolation
+# holds). Uncapped run: the SAME binary with the quota unset completes the
+# full hog with NO quota banner (no false kills). Neuter sw_varena_quota_check
+# and the capped run fails — the gate has been proven bidirectionally.
+.PHONY: quota-gate
+quota-gate: swc libswarmrt
+	@./bin/swc build tests/gc/quota_kill.sw -o $(BIN_DIR)/quota_kill >/dev/null
+	@SW_PROC_MEM_MAX=2000000 $(BIN_DIR)/quota_kill >$(BIN_DIR)/_qk.out 2>$(BIN_DIR)/_qk.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_qk.out; then \
+	   echo "quota-gate: FAIL (capped run rc=$$rc — hog not killed cleanly or node died)"; \
+	   cat $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; exit 1; fi; \
+	 if ! grep -q "SW_PROC_MEM_MAX exceeded" $(BIN_DIR)/_qk.err; then \
+	   echo "quota-gate: FAIL (no SW_PROC_MEM_MAX panic banner on stderr)"; \
+	   cat $(BIN_DIR)/_qk.err; rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; exit 1; fi
+	@$(BIN_DIR)/quota_kill >$(BIN_DIR)/_qk.out 2>$(BIN_DIR)/_qk.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_qk.out; then \
+	   echo "quota-gate: FAIL (uncapped run rc=$$rc — hog should complete with no quota)"; \
+	   cat $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; exit 1; fi; \
+	 if grep -q "SW_PROC_MEM_MAX exceeded" $(BIN_DIR)/_qk.err; then \
+	   echo "quota-gate: FAIL (false quota kill with SW_PROC_MEM_MAX unset)"; \
+	   cat $(BIN_DIR)/_qk.err; rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_qk.out $(BIN_DIR)/_qk.err; \
+	 echo "quota-gate: PASS (bidirectional — hog killed under cap, completes uncapped)"
+
 # GC memory-slope gate (Ownership v2): run the escaped-value slope probes at a low
 # and high count (fixed concurrency / mailbox depth / turns) and fail if peak-RSS
 # growth exceeds budget. Each probe only counts if it exits 0 AND prints PROBE_OK
