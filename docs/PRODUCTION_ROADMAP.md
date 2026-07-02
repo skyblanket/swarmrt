@@ -27,7 +27,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
 | 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
 | 3 | Security & fault isolation (fuzzing, limits) | ✅ **DONE** — fuzz boundaries (parser/JSON/dist/HTTP/WS/SQLite, depth-guarded); limits/quotas (proc-mem quota, HTTP idle timeout, msg-size cap, backpressure decision); cross-process isolation under malformed input |
-| 4 | Operational readiness (observability, graceful shutdown, docs) | ⬜ pending |
+| 4 | Operational readiness (observability, graceful shutdown, docs) | 🟡 **observability DONE** (metrics + crash logs + health endpoint); graceful shutdown + deploy docs pending |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
 
 ---
@@ -299,11 +299,39 @@ deploy docs) rather than a second in-runtime accounting pass.
 Phase 3 is complete.
 
 ## Phase 4 — OPERATIONAL READINESS
-- Observability: per-process memory / mailbox depth / reductions, spawn/crash/restart counters,
-  scheduler utilization, structured logs + crash reports, health/readiness endpoints.
+
+**Done (observability batch, 2026-07-03, branch `phase4-observability`):**
+- **Metrics surface**: `process_info(pid)` grew `memory` (value-arena bytes — the number
+  `SW_PROC_MEM_MAX` meters), `mailbox_len` (PENDING depth — what `SW_MAILBOX_MAX` checks),
+  `messages_sent`, `messages_recv` (reductions were already exposed). New `swarm_stats()`
+  builtin → node map: processes, schedulers, spawns, **crashes** (new `_Atomic`, bumped in
+  `process_exit`'s abnormal path), **restarts** (new `_Atomic` via `sw_note_restart()` from
+  both restart-record choke points), mailbox_dropped/msgsize_dropped, overflow_queue, and
+  per-scheduler `scheduler_stats` (procs_run/loop_iters/idle_waits/steals, best-effort
+  lock-free). Registered at all three dispatch sites (codegen ×2 + studio.h + interpreter —
+  a pure read, NOT degraded under `swc run`). Memory-safety: `process_destroy` now detaches
+  varena/spawn_region under `link_lock` (panic_msg discipline) so the cross-process `memory`
+  read can't chase a freed arena header. Gates: `tests/sw/test_observability.sw` (23
+  assertions) + `tests/sw/run/test_observability_interp.sw`.
+  **Deliberately not exposed (runtime doesn't track them — do not fabricate):** node-total
+  sends/reductions (`total_sends`/`total_reductions` are dead counters here; wiring sends
+  would put a shared-cacheline atomic on the send hot path), per-scheduler run-queue depth
+  (Vyukov MPSC has no length counter), scheduler utilization %.
+- **Structured crash logs** (`SW_LOG_JSON=1`, default OFF): every abnormal exit emits one
+  `{"ev":"proc_crash","pid":N,"reason":R[,"msg"][,"name"],"ts":MS}` line on stderr, from the
+  EXISTING `process_exit` choke point (no second exit hook), allocation-free (stack buffers,
+  single fprintf), name read under the registry rdlock before unregistration. Gate:
+  `make crashlog-gate` (bidirectional — seen to FAIL with the emit neutered).
+- **Health/readiness endpoint**: pure sw, no new C — `lib/Health.sw` (`Health.start(port)` /
+  `Health.serve(port)`): `/healthz` → 200 `ok`, `/readyz` → 200 `swarm_stats()` as JSON,
+  404 elsewhere; `examples/health_endpoint.sw` is the operator recipe. Gate:
+  `make health-gate` (real curl against a booted example: status + body + metric keys + 404).
+
+**Remaining in Phase 4:**
 - Graceful shutdown: stop accepting work → drain or reject outstanding messages → cancel timers
   → flush storage → terminate within a configurable deadline.
-- Deploy/recovery docs: supported platforms + deps, config reference, upgrade/rollback, backup/DR.
+- Deploy/recovery docs: supported platforms + deps, config reference (document `SW_LOG_JSON`
+  alongside the Phase-3 caps), upgrade/rollback, backup/DR.
 
 ## Phase 5 — RELEASE DISCIPLINE
 - Continuously test Linux x86_64, Linux ARM64, macOS ARM64 (dev).
