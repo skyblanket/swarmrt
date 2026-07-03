@@ -4806,7 +4806,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *sched_list = sw_val_list(scheds, (int)nsched);
         free(scheds);
 
-        sw_val_t *keys[10], *vals[10];
+        sw_val_t *keys[11], *vals[11];
         int c = 0;
         keys[c] = sw_val_atom("processes");       vals[c] = sw_val_int(live); c++;
         keys[c] = sw_val_atom("schedulers");      vals[c] = sw_val_int((int64_t)nsched); c++;
@@ -4816,6 +4816,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         keys[c] = sw_val_atom("mailbox_dropped"); vals[c] = sw_val_int((int64_t)sw_mailbox_dropped()); c++;
         keys[c] = sw_val_atom("msgsize_dropped"); vals[c] = sw_val_int((int64_t)sw_msgsize_dropped()); c++;
         keys[c] = sw_val_atom("overflow_queue");  vals[c] = sw_val_int(overflow); c++;
+        keys[c] = sw_val_atom("draining");        vals[c] = sw_val_atom(sw_is_draining() ? "true" : "false"); c++;
         keys[c] = sw_val_atom("scheduler_stats"); vals[c] = sched_list; c++;
         return sw_val_map_new(keys, vals, c);
     }

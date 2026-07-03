@@ -513,6 +513,18 @@ slowloris-gate: swc libswarmrt
 	$(CC) $(CFLAGS) tests/stress/slowloris_client.c -o $(BIN_DIR)/slowloris_client
 	@bash tests/stress/slowloris_gate.sh
 
+# Graceful-shutdown gate (SW_SHUTDOWN_GRACE_MS, SIGTERM/SIGINT) — bidirectional.
+# Drives the real path: long-lived sw server → SIGTERM → async-signal-safe
+# handler → sw_wait_for_exit (main thread) → sw_shutdown_graceful. Phase A
+# (idle/quiescent) drains near-instantly. Phase B (busy infinite-loop worker)
+# never quiesces, so the deadline must FORCE a BOUNDED teardown — neuter the
+# deadline break and phase B hangs past the ceiling (the gate FAILs).
+# See tests/stress/shutdown_gate.sh.
+.PHONY: shutdown-gate
+shutdown-gate: swc libswarmrt
+	@./bin/swc build tests/stress/shutdown_server.sw -o $(BIN_DIR)/shutdown_server >/dev/null
+	@bash tests/stress/shutdown_gate.sh
+
 # Structured crash-log gate (SW_LOG_JSON, Phase 4 observability) —
 # bidirectional. With SW_LOG_JSON=1, a registered monitored child that
 # panics emits one {"ev":"proc_crash",...} JSON line on stderr carrying the

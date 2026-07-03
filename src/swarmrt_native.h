@@ -546,6 +546,66 @@ extern uint64_t sw_rdtsc(void);
 int sw_init(const char *name, uint32_t num_schedulers);
 void sw_shutdown(int swarm_id);
 
+/* === Graceful shutdown (Phase 4) ===========================================
+ * Orderly drain-with-deadline, then the EXISTING hard teardown (sw_shutdown).
+ * Sequence: flip a global draining flag (observable via sw_is_draining() and
+ * the swarm_stats() `draining` field, so /readyz can report NOT-ready and a
+ * load balancer drains first) → poll until the run-queues + every mailbox
+ * quiesce, up to the deadline → cancel pending timers → sw_shutdown (joins the
+ * schedulers, fires on_destroy per process, frees the arena).
+ *
+ * MUST run on the main/embedder thread — it (via sw_shutdown) JOINS the
+ * scheduler threads, so calling it from a scheduler fiber would self-join.
+ * `deadline_ms` >= 0 is an explicit budget in milliseconds (0 = no drain
+ * window); < 0 uses SW_SHUTDOWN_GRACE_MS (default 5000). Returns 0 if the node
+ * quiesced within the deadline, 1 if the deadline forced teardown with work
+ * still outstanding. The call ALWAYS returns by roughly the deadline — a hung
+ * (never-quiescing) workload cannot make it block forever, because the hard
+ * teardown's join is bounded by reduction preemption honouring should_exit.
+ *
+ * DRAIN GUARANTEE: messages already queued in mailboxes are drained (the
+ * fibers get to run and consume them) until quiescent or the deadline; pending
+ * TIMERS are cancelled (a heartbeat/interval timer is discarded on shutdown,
+ * not waited on). In-flight internal sends are NOT rejected (rejecting them
+ * would break a gen_server call/reply mid-drain and prevent quiescence). */
+int sw_shutdown_graceful(int swarm_id, int deadline_ms);
+
+/* Resolve the configured grace deadline: SW_SHUTDOWN_GRACE_MS (ms, clamped to
+ * [0, 3600000]) or the 5000 ms default. */
+int sw_shutdown_grace_ms(void);
+
+/* 1 once sw_shutdown_graceful has begun draining. Surfaced in swarm_stats()
+ * (`draining`) so a readiness probe can fail during the drain window. */
+int sw_is_draining(void);
+
+/* Install async-signal-safe SIGTERM + SIGINT handlers that request graceful
+ * shutdown. The handler ONLY sets an atomic flag (a second signal hard-exits
+ * via _exit, an operator escape hatch); the actual drain runs from the
+ * main-thread wait loop (sw_wait_for_exit), never a scheduler thread. Call
+ * ONLY from a program's own entry (swc run / a `swc build` binary) so a library
+ * embedder keeps its own signal disposition. No-op when SW_NO_SIGNAL_SHUTDOWN
+ * is set. Does NOT touch the crash (SIGSEGV/SIGBUS/SIGABRT) or preemption
+ * (SIGALRM) handlers installed by sw_init. */
+void sw_install_shutdown_signals(void);
+
+/* 1 if a SIGTERM/SIGINT (or sw_request_shutdown) has requested graceful
+ * shutdown. Polled by the main-thread wait loop. */
+int sw_shutdown_requested(void);
+
+/* Request graceful shutdown programmatically (sets the same flag the signal
+ * handler does). Safe to call from any thread/fiber — it only stores an atomic;
+ * the main-thread wait loop performs the actual off-scheduler drain. */
+void sw_request_shutdown(void);
+
+/* Block the calling (main/embedder) thread until *done_flag becomes nonzero OR
+ * a shutdown has been requested, whichever first. `lock`/`cond` are the caller's
+ * done-flag mutex/condvar (a normal completion signals `cond`, so this returns
+ * immediately with zero added latency; a shutdown request is noticed within
+ * ~50 ms). Returns 1 if it woke on the done flag (normal main() return), 0 on a
+ * shutdown request — the caller then chooses sw_shutdown vs sw_shutdown_graceful. */
+int sw_wait_for_exit(volatile int *done_flag, pthread_mutex_t *lock,
+                     pthread_cond_t *cond);
+
 /* Per-process usable stack size (bytes). 0 = built-in 128KB default. Set
  * BEFORE sw_init when running the tree-walking interpreter on a process fiber
  * (`swc run`), which needs a deep C stack. Does NOT affect the compiled path. */

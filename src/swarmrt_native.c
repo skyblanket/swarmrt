@@ -102,6 +102,82 @@ uint64_t sw_msgsize_dropped(void) {
     return atomic_load_explicit(&g_msgsize_dropped, memory_order_relaxed);
 }
 
+/* ── Graceful shutdown (Phase 4) ─────────────────────────────────────────
+ * g_sw_draining        set the instant sw_shutdown_graceful begins; read by
+ *                      sw_is_draining() → swarm_stats() so /readyz can report
+ *                      NOT-ready during the drain window.
+ * g_sw_shutdown_requested  set ONLY by the async-signal-safe SIGTERM/SIGINT
+ *                      handler (or sw_request_shutdown); polled by the
+ *                      main-thread wait loop (sw_wait_for_exit), which then runs
+ *                      the drain OFF a scheduler thread. Both relaxed — they are
+ *                      one-way flags, never used for synchronization; the actual
+ *                      teardown handshake is sw_shutdown's join. */
+static _Atomic int g_sw_draining = 0;
+static _Atomic int g_sw_shutdown_requested = 0;
+
+int sw_is_draining(void) {
+    return atomic_load_explicit(&g_sw_draining, memory_order_relaxed);
+}
+
+int sw_shutdown_requested(void) {
+    return atomic_load_explicit(&g_sw_shutdown_requested, memory_order_relaxed);
+}
+
+void sw_request_shutdown(void) {
+    atomic_store_explicit(&g_sw_shutdown_requested, 1, memory_order_relaxed);
+}
+
+int sw_shutdown_grace_ms(void) {
+    const char *e = getenv("SW_SHUTDOWN_GRACE_MS");
+    if (e && *e) {
+        long v = strtol(e, NULL, 10);
+        if (v >= 0 && v <= 3600000) return (int)v;   /* clamp to [0, 1h] */
+    }
+    return 5000;
+}
+
+/* Async-signal-safe: touches ONLY a lock-free atomic. The FIRST signal requests
+ * a graceful drain; a SECOND (impatient operator, or systemd escalating before
+ * TimeoutStopSec) hard-exits immediately via _exit — also async-signal-safe.
+ * Standard shell exit codes: 130 for SIGINT, 143 (128+SIGTERM) otherwise. */
+static void _sw_term_handler(int sig) {
+    if (atomic_exchange_explicit(&g_sw_shutdown_requested, 1,
+                                 memory_order_relaxed)) {
+        _exit(sig == SIGINT ? 130 : 143);
+    }
+}
+
+void sw_install_shutdown_signals(void) {
+    if (getenv("SW_NO_SIGNAL_SHUTDOWN")) return;
+#ifndef _WIN32
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = _sw_term_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   /* no SA_RESTART: the polling wait re-checks promptly */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+#else
+    signal(SIGTERM, _sw_term_handler);
+    signal(SIGINT,  _sw_term_handler);
+#endif
+}
+
+int sw_wait_for_exit(volatile int *done_flag, pthread_mutex_t *lock,
+                     pthread_cond_t *cond) {
+    pthread_mutex_lock(lock);
+    while (!*done_flag && !sw_shutdown_requested()) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 50000000L;   /* 50 ms poll — signal noticed promptly */
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(cond, lock, &ts);
+    }
+    int normal = *done_flag ? 1 : 0;
+    pthread_mutex_unlock(lock);
+    return normal;
+}
+
 /* Phase-4 observability counters (see the header). Crashes are bumped in
  * process_exit's abnormal path (the single teardown choke point — both
  * scheduler exit sites route through it); restarts by sw_note_restart()
@@ -1745,6 +1821,14 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         long long n = strtoll(msg_max_env, NULL, 10);
         if (n > 0) g_msg_max_bytes = (size_t)n;
     }
+
+    /* Reset the graceful-shutdown flags so an embedder that re-inits after a
+     * prior sw_shutdown starts clean. No signal can have arrived yet — the
+     * SIGTERM/SIGINT handler is installed only from the entry path AFTER
+     * sw_init returns (sw_install_shutdown_signals). */
+    atomic_store_explicit(&g_sw_draining, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_sw_shutdown_requested, 0, memory_order_relaxed);
+
     if (sw_arena_init(&g_swarm->arena, max_procs) != 0) {
         free(g_swarm);
         g_swarm = NULL;
@@ -3360,6 +3444,136 @@ static void fire_timers(void) {
         pthread_mutex_lock(&tl->lock);
     }
     pthread_mutex_unlock(&tl->lock);
+}
+
+/* ============================================================================
+ * GRACEFUL SHUTDOWN — drain-with-deadline (Phase 4)
+ * ============================================================================ */
+
+/* Is the node quiescent — no outstanding work to drain? True when every live,
+ * non-scheduler process is parked (WAITING/SUSPENDED/EXITING) with an EMPTY
+ * mailbox and the global overflow run-queue is empty. Mirrors the watchdog
+ * scan: best-effort, lock-free reads of per-process state/mailbox (a message in
+ * flight at the scan instant just costs one more poll). A RUNNABLE/RUNNING
+ * process, a non-empty mailbox (sig_head/priv_head/mb_len), or queued overflow
+ * work all mean "not yet drained". Pending TIMERS are deliberately NOT counted
+ * as outstanding work — a heartbeat/interval timer would otherwise keep the
+ * node "busy" forever; they are cancelled explicitly (cancel_pending_timers). */
+static int runtime_is_quiescent(void) {
+    sw_swarm_t *sw = g_swarm;
+    if (!sw) return 1;
+    sw_process_t *slab = (sw_process_t *)sw->arena.proc_slab;
+    if (!slab) return 1;
+    uint32_t cap = sw->arena.proc_capacity;
+
+    uint64_t sched_pids[SWARM_MAX_SCHEDULERS];
+    uint32_t nsched = sw->num_schedulers;
+    if (nsched > SWARM_MAX_SCHEDULERS) nsched = SWARM_MAX_SCHEDULERS;
+    for (uint32_t s = 0; s < nsched; s++) {
+        sw_scheduler_t *sc = sw->schedulers[s];
+        sched_pids[s] = sc ? sc->sched_proc.pid : (uint64_t)-1;
+    }
+
+    for (uint32_t i = 0; i < cap; i++) {
+        sw_process_t *p = &slab[i];
+        sw_proc_state_t st = atomic_load_explicit(&p->state, memory_order_acquire);
+        if (st == SW_PROC_FREE) continue;
+
+        uint64_t pid = p->pid;
+        int is_sched = 0;
+        for (uint32_t s = 0; s < nsched; s++)
+            if (pid == sched_pids[s]) { is_sched = 1; break; }
+        if (is_sched) continue;
+
+        /* Still on/heading-to a run queue = work in progress. */
+        if (st == SW_PROC_RUNNABLE || st == SW_PROC_RUNNING) return 0;
+
+        /* Pending mailbox = a parked receiver about to be woken with work. */
+        sw_msg_t *sig = (sw_msg_t *)atomic_load_explicit(
+            &p->mailbox.sig_head, memory_order_acquire);
+        if (sig || p->mailbox.priv_head) return 0;
+        if (atomic_load_explicit(&p->mb_len, memory_order_relaxed) > 0) return 0;
+    }
+
+    pthread_mutex_lock(&sw->overflow_rq.lock);
+    uint32_t oc = sw->overflow_rq.count;
+    pthread_mutex_unlock(&sw->overflow_rq.lock);
+    if (oc > 0) return 0;
+
+    return 1;
+}
+
+/* Cancel every pending timer (the "cancel timers" step): unlink the whole list
+ * under its lock, then free each node + its RAW payload (matching sw_shutdown's
+ * own timer teardown — plain free, not the tls freelist, so nothing accumulates
+ * on the shutting-down thread). Schedulers may still be running: fire_timers
+ * re-locks and finds an empty list. A timer a still-draining fiber arms after
+ * this is reclaimed by sw_shutdown's own timer sweep, so nothing leaks. */
+static void cancel_pending_timers(void) {
+    if (!g_swarm) return;
+    sw_timer_list_t *tl = &g_swarm->timers;
+    pthread_mutex_lock(&tl->lock);
+    sw_timer_t *t = tl->head;
+    tl->head = NULL;
+    pthread_mutex_unlock(&tl->lock);
+    while (t) {
+        sw_timer_t *next = t->next;
+        free(t->msg);
+        free(t);
+        t = next;
+    }
+}
+
+int sw_shutdown_graceful(int swarm_id, int deadline_ms) {
+    if (!g_swarm) return 0;
+    if (deadline_ms < 0) deadline_ms = sw_shutdown_grace_ms();
+
+    int quiet = !getenv("SW_QUIET") && !getenv("SW_RUNTIME_QUIET");
+
+    /* 1. Stop accepting new work: flip the draining flag. Observable via
+     *    sw_is_draining()/swarm_stats() → a readiness probe (/readyz) can fail
+     *    so a load balancer stops routing new external requests. */
+    atomic_store_explicit(&g_sw_draining, 1, memory_order_release);
+    if (quiet) {
+        fprintf(stderr, "[SwarmRT] graceful shutdown: draining (deadline %dms)\n",
+                deadline_ms);
+        fflush(stderr);
+    }
+
+    /* 2. Drain outstanding messages: let runnable fibers finish and mailboxes
+     *    empty, polling for quiescence up to the deadline. */
+    uint64_t start = now_ns();
+    uint64_t deadline_ns = start + (uint64_t)deadline_ms * 1000000ULL;
+    int drained = 0;
+    while (1) {
+        if (runtime_is_quiescent()) { drained = 1; break; }
+        if (now_ns() >= deadline_ns) break;
+        usleep(2000);   /* 2 ms poll — negligible vs the drain window */
+    }
+
+    /* 3. Cancel timers: discard any pending fire so nothing re-injects work. */
+    cancel_pending_timers();
+
+    if (quiet) {
+        uint64_t took_ms = (now_ns() - start) / 1000000ULL;
+        if (drained)
+            fprintf(stderr, "[SwarmRT] graceful shutdown: drained in %llums\n",
+                    (unsigned long long)took_ms);
+        else
+            fprintf(stderr, "[SwarmRT] graceful shutdown: deadline reached after"
+                    " %llums with work outstanding — forcing teardown\n",
+                    (unsigned long long)took_ms);
+        fflush(stderr);
+    }
+
+    /* 4. Flush storage / terminate. The hard teardown joins the scheduler
+     *    threads — BOUNDED even for a hung (never-quiescing) fiber, because
+     *    reduction preemption returns each fiber to its scheduler, which then
+     *    honours should_exit. process_destroy fires on_destroy per process.
+     *    SQLite durability is per-statement autocommit; the drain above let
+     *    in-flight writers finish (see docs/DEPLOYMENT.md). */
+    sw_shutdown(swarm_id);
+    return drained ? 0 : 1;
 }
 
 /* ============================================================================

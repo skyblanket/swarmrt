@@ -3478,12 +3478,18 @@ static void emit_entry_and_main(cg_ctx_t *ctx,
     fprintf(f, "        sw_init(\"%s\", _sw_nsched);\n", ctx->mod_name);
     fprintf(f, "    }\n");
     fprintf(f, "    sw_io_init();\n");
+    /* Trap SIGTERM/SIGINT for graceful drain-with-deadline shutdown (Phase 4).
+     * Only from a program's own main() — a library embedder never reaches this
+     * codegen path — and it's a no-op under SW_NO_SIGNAL_SHUTDOWN. */
+    fprintf(f, "    sw_install_shutdown_signals();\n");
     fprintf(f, "    sw_spawn(_main_entry, NULL);\n");
-    fprintf(f, "    /* Wait for the user's main() to return (set by _main_entry). */\n");
-    fprintf(f, "    pthread_mutex_lock(&_sw_done_lock);\n");
-    fprintf(f, "    while (!_sw_done_flag) pthread_cond_wait(&_sw_done_cond, &_sw_done_lock);\n");
-    fprintf(f, "    pthread_mutex_unlock(&_sw_done_lock);\n");
-    fprintf(f, "    sw_shutdown(0);\n");
+    fprintf(f, "    /* Wait for the user's main() to return OR a SIGTERM/SIGINT to\n");
+    fprintf(f, "     * request shutdown, whichever first (off-scheduler, main thread). */\n");
+    fprintf(f, "    if (sw_wait_for_exit(&_sw_done_flag, &_sw_done_lock, &_sw_done_cond)) {\n");
+    fprintf(f, "        sw_shutdown(0);              /* normal main() return */\n");
+    fprintf(f, "    } else {\n");
+    fprintf(f, "        sw_shutdown_graceful(0, -1); /* signal → drain then teardown */\n");
+    fprintf(f, "    }\n");
     fprintf(f, "    return 0;\n");
     fprintf(f, "}\n");
 }

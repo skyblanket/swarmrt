@@ -286,19 +286,20 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
 
     sw_init(get_mod_name(main_ast), (uint32_t)nsched);
     sw_io_init();
+    sw_install_shutdown_signals();   /* SIGTERM/SIGINT → graceful drain (Phase 4) */
     sw_spawn(run_main_entry, &boot);
 
-    /* Wait for the root process's main() to return (set by run_main_entry).
-     * An abnormal root exit (panic / non-zero reason) is handled inline by
-     * the scheduler's root_exit_check via exit(1) — matching compiled — so
-     * we never reach here in that case. */
-    pthread_mutex_lock(&boot.lock);
-    while (!boot.done) pthread_cond_wait(&boot.cond, &boot.lock);
-    pthread_mutex_unlock(&boot.lock);
+    /* Wait for the root process's main() to return (set by run_main_entry) OR
+     * a SIGTERM/SIGINT to request shutdown, whichever first. An abnormal root
+     * exit (panic / non-zero reason) is handled inline by the scheduler's
+     * root_exit_check via exit(1) — matching compiled — so we never reach here
+     * in that case. */
+    int normal = sw_wait_for_exit(&boot.done, &boot.lock, &boot.cond);
     int rc = boot.rc;
 
     sw_io_shutdown();
-    sw_shutdown(0);
+    if (normal) { sw_shutdown(0); }
+    else { sw_shutdown_graceful(0, -1); }   /* signal → drain then teardown */
     pthread_cond_destroy(&boot.cond);
     pthread_mutex_destroy(&boot.lock);
 
