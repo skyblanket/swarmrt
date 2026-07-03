@@ -51,6 +51,15 @@ jobs:
       - name: Build swc + libswarmrt
         run: make swc libswarmrt
 
+      - name: Version string is wired (swc --version)
+        # `swc --version` must print the VERSION file's semver (release
+        # discipline: a binary that can't report its version can't be
+        # released). Asserts the Makefile -DSWARMRT_VERSION injection works.
+        run: |
+          set -e
+          ./bin/swc --version
+          ./bin/swc --version | grep -qF "$(cat VERSION)"
+
       - name: Compile-check every documented sw snippet + example
         # Tripwire against doc/example drift: every complete ```sw block
         # in the docs (those with a `module` + `fun main`) and every
@@ -217,6 +226,30 @@ jobs:
         # native Linux x86_64 May 29, so any miss here is a regression.
         run: make stress
 
+      - name: Phase 3 limits & isolation gates (each bidirectional)
+        # Every operational limit added in Phase 3 ships with a gate that has
+        # been SEEN to fail without the fix (the roadmap gate philosophy):
+        #   quota-gate     — SW_PROC_MEM_MAX kills the hog, node survives
+        #   msgsize-gate   — SW_MSG_MAX_BYTES drops the oversized message
+        #   slowloris-gate — SW_HTTP_IDLE_TIMEOUT_MS reclaims idle conn slots
+        #   isolation-gate — a crashing process can't take down siblings/node
+        run: |
+          set -e
+          make quota-gate
+          make msgsize-gate
+          make slowloris-gate
+          make isolation-gate
+
+      - name: Phase 4 observability & shutdown gates (each bidirectional)
+        #   crashlog-gate  — SW_LOG_JSON emits a proc_crash record, silent by default
+        #   health-gate    — lib/Health.sw /healthz + /readyz + 404
+        #   shutdown-gate  — graceful drain, and the deadline bounds a hung workload
+        run: |
+          set -e
+          make crashlog-gate
+          make health-gate
+          make shutdown-gate
+
   fuzz:
     # Fuzz gets a fresh 16 GB runner entirely to itself. Run 27312711773
     # proved that a single RSS-hungry gate sharing a runner with everything
@@ -253,8 +286,54 @@ jobs:
 
       - name: Fuzz (Phase 3 — untrusted-input boundaries under ASAN/UBSAN)
         # 20k mutations per target over parser, JSON decoder (agent-facing
-        # boundary), distribution unmarshal, and HTTP header parser. Every
-        # external-input surface must be memory-safe on arbitrary bytes.
-        # fuzz-json found two real heap-overflows (number force-advance past
-        # NUL, backslash-at-EOF) on the first run — so this gate earns its keep.
+        # boundary), distribution unmarshal, HTTP header parser, the WebSocket
+        # frame decoder, and the db_*/SQLite arg path. Every external-input
+        # surface must be memory-safe on arbitrary bytes. fuzz-json found two
+        # real heap-overflows (number force-advance past NUL, backslash-at-EOF)
+        # on the first run — so this gate earns its keep.
         run: make fuzz
+
+  macos:
+    # Multi-platform coverage (Phase 5): macOS ARM64 is the dev + a supported
+    # release target, so the build, the sw suite, and the operational gates
+    # must stay green on Apple clang too — the whole runtime is developed here
+    # and the codegen/asm has an arm64-darwin path distinct from Linux.
+    # NOTE: macOS Apple-clang ASAN has NO LeakSanitizer, so the leak gates are
+    # Linux-only (see hardening-gates); this leg covers build + behavior + the
+    # UAF/poison ASAN checks + the operational gates.
+    runs-on: macos-14   # Apple silicon (arm64)
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Homebrew sqlite3)
+        run: brew install sqlite3 || true
+
+      - name: Build swc + libswarmrt (zero warnings is the gate)
+        run: make swc libswarmrt
+
+      - name: Version string is wired (swc --version)
+        run: |
+          set -e
+          ./bin/swc --version
+          ./bin/swc --version | grep -qF "$(cat VERSION)"
+
+      - name: sw test suite + interp/compiled conformance
+        run: make test-sw
+
+      - name: Docs + examples still compile
+        run: bash scripts/check_sw_docs.sh
+
+      - name: GC copy-on-escape gate (ASAN + arena poison)
+        run: make gc-stress
+
+      - name: Phase 3/4 operational gates (bidirectional)
+        run: |
+          set -e
+          make quota-gate
+          make msgsize-gate
+          make slowloris-gate
+          make isolation-gate
+          make crashlog-gate
+          make health-gate
+          make shutdown-gate

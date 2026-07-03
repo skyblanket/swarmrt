@@ -55,6 +55,17 @@ BUILD_DIR = build
 BIN_DIR = bin
 EXAMPLES_DIR = examples
 
+# Single source of truth for the version string is the top-level VERSION file.
+# Injected as -DSWARMRT_VERSION so `swc --version` and the release workflow agree.
+# `git describe` appends the commit when built from a checkout (e.g.
+# 1.0.0-rc.1-3-gabc1234) so a dev build is never mistaken for a tagged release.
+SWARMRT_VERSION := $(shell cat VERSION 2>/dev/null || echo unknown)
+SWARMRT_GITDESC := $(shell git describe --tags --always --dirty 2>/dev/null)
+CFLAGS += -DSWARMRT_VERSION='"$(SWARMRT_VERSION)"'
+ifneq ($(SWARMRT_GITDESC),)
+CFLAGS += -DSWARMRT_GITDESC='"$(SWARMRT_GITDESC)"'
+endif
+
 # Core object files (needed by all native targets since process_exit hooks into all modules)
 CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
             swarmrt_phase4 swarmrt_phase5 swarmrt_hotload swarmrt_io swarmrt_gc swarmrt_node \

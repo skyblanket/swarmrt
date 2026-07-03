@@ -48,7 +48,8 @@ static void usage(void) {
         "  run      Interpret a .sw file (calls main())\n"
         "  emit     Output generated C to stdout\n"
         "  repl     Start interactive REPL\n"
-        "  test     Run test_* functions in .sw files\n\n"
+        "  test     Run test_* functions in .sw files\n"
+        "  version  Print the swc/runtime version (also --version, -v)\n\n"
         "Options:\n"
         "  -o <name>          Output binary name (default: module name)\n"
         "  -O                 Optimize (-O2)\n"
@@ -312,10 +313,28 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
     return rc;
 }
 
+#ifndef SWARMRT_VERSION
+#define SWARMRT_VERSION "0.0.0-dev"   /* Makefile injects the real value from ./VERSION */
+#endif
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
 
     const char *cmd = argv[1];
+
+    /* Version — before anything else so it never needs a swarm/init. Prints the
+     * semver from ./VERSION; when built from a git checkout also the git
+     * describe (e.g. "1.0.0-rc.1 (1.0.0-rc.1-3-gabc1234)") so a dev build is
+     * distinguishable from a tagged release. */
+    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0 ||
+        strcmp(cmd, "-v") == 0) {
+#ifdef SWARMRT_GITDESC
+        printf("swc %s (%s)\n", SWARMRT_VERSION, SWARMRT_GITDESC);
+#else
+        printf("swc %s\n", SWARMRT_VERSION);
+#endif
+        return 0;
+    }
 
     /* REPL — no input files needed */
     if (strcmp(cmd, "repl") == 0)
