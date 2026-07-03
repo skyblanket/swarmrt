@@ -235,7 +235,9 @@ static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint
         /* text */
         char *text = (char *)malloc((size_t)len + 1);
         if (!text) { c->active = 0; return; }
-        memcpy(text, payload, (size_t)len);
+        /* len==0 (empty reassembled/text frame) → payload may be NULL, and
+         * memcpy with a NULL src is UB even for 0 bytes. Skip the no-op copy. */
+        if (len > 0) memcpy(text, payload, (size_t)len);
         text[len] = '\0';
         sw_val_t *items[3];
         items[0] = sw_val_atom("ws_message");
@@ -317,7 +319,13 @@ static void ws_try_parse(int cid) {
                     if (!nb) { c->active = 0; return; }
                     c->frag_buf = nb; c->frag_cap = ncap;
                 }
-                memcpy(c->frag_buf + c->frag_len, payload, (size_t)payload_len);
+                /* Guard the zero-length case: an empty fragment (FIN=0,
+                 * payload_len=0) leaves frag_buf NULL (no realloc above), and
+                 * `c->frag_buf + c->frag_len` is then `NULL + 0` — undefined
+                 * behavior (caught by the fuzz-ws UBSan target). The copy is a
+                 * no-op anyway, so skip it. */
+                if (payload_len > 0)
+                    memcpy(c->frag_buf + c->frag_len, payload, (size_t)payload_len);
                 c->frag_len += (uint32_t)payload_len;
 
                 if (fin) {
