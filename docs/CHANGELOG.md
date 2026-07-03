@@ -4,6 +4,60 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-07-03 — Phase 5: release discipline (swc --version, gate-suite CI, macOS leg, release workflow)
+
+**feat(release): the runtime can now identify itself and cut a reproducible cross-platform
+release.** The top-level `VERSION` file (`1.0.0-rc.1`) is the single source of truth; the
+Makefile injects `-DSWARMRT_VERSION` + `-DSWARMRT_GITDESC` (git describe) so `swc --version`
+(also `version` / `-v`) prints e.g. `swc 1.0.0-rc.1 (1.0.0-rc.1-3-gabc1234)` — a dev build is
+never mistaken for a tagged release. CI: every Phase-3/4 bidirectional gate (quota / msgsize /
+slowloris / isolation / crashlog / health / shutdown) is now wired into the Linux hardening
+job, a `swc --version` assertion into quickstart, and a new **macOS-arm64 job** (the dev + a
+supported release target — the arm64-darwin codegen/asm path is distinct from Linux) runs
+build + suite + gc-stress + the operational gates. New `release.yml` (on `v*` tags) builds
+`swc` + `libswarmrt.a` on macOS-arm64 / Linux-x86_64 / Linux-arm64, verifies the tag matches
+`VERSION` and `swc --version`, packages each with the public headers, checksums, and publishes
+a GitHub Release (auto-prerelease for rc/alpha/beta). New `docs/RELEASING.md` documents the
+SemVer policy (over the `sw` language + the embedder C ABI), the release process, and the
+gates a final `1.0.0` requires. Unblocks: a tagged, downloadable, checksummed release.
+
+Verified: clean build zero warnings; test-sw 58 files/507; swc --version prints the VERSION
+semver; both CI workflows validate. Remaining before the `1.0.0` tag (roadmap Phase 5): the
+24h soak on a dedicated Linux host + an independent adversarial review (incl. the deferred
+ETS re-audit).
+
+---
+
+## 2026-07-03 — Phase 4: graceful drain-with-deadline shutdown + SIGTERM (make shutdown-gate)
+
+**feat(shutdown): orderly shutdown for production — stop accepting work, drain, cancel timers,
+teardown, all bounded by a deadline.** `sw_shutdown_graceful(swarm_id, deadline_ms)` flips a
+global `_Atomic` draining flag (surfaced as `swarm_stats().draining` → `/readyz` reports
+NOT-ready so a load balancer drains this instance first), polls run-queues + every mailbox for
+quiescence up to the deadline, cancels pending timers, then runs the existing hard teardown
+(`sw_shutdown`, joins schedulers, fires `on_destroy`). Deadline from `SW_SHUTDOWN_GRACE_MS`
+(default 5000, clamped `[0, 3600000]`); returns 0 if quiesced, 1 if the deadline forced
+teardown. **Bounded even for a hung workload** — a never-quiescing fiber is returned to its
+scheduler by reduction preemption which honors `should_exit`, so shutdown always completes at
+~the deadline, never hangs. Signal path: an async-signal-safe SIGTERM/SIGINT handler sets an
+atomic flag ONLY (a second signal hard-exits 130/143); the main-thread wait loop
+(`sw_wait_for_exit`) notices it and runs the drain OFF a scheduler thread. Wired into BOTH the
+codegen-emitted compiled `main()` and the `swc run` interpreter path; installed only from a
+program's own entry (embedders keep their signals), no-op under `SW_NO_SIGNAL_SHUTDOWN`.
+No new `sw_process` fields (global `_Atomic` flags only). Drain guarantee: queued messages are
+drained, timers cancelled, in-flight internal sends NOT rejected (rejecting a gen_server reply
+would prevent quiescence).
+
+Gate: `make shutdown-gate` (bidirectional, real SIGTERM end-to-end) — phase A (idle/quiescent)
+drains + exits in ~25ms, far under the 2000ms deadline; phase B (busy infinite-loop worker)
+never quiesces so the 800ms deadline FORCES a bounded ~820ms teardown; neuter the deadline
+break and phase B hangs past the ceiling and the gate FAILs. Also shipped `docs/DEPLOYMENT.md`
+(platforms/deps, full env-var config reference, shutdown/signal behavior, OTA
+restart-rehydrate-from-SQLite, Health usage, backup/DR). test-sw 58/507, gc-stress ASAN clean,
+check-docs 29, zero warnings.
+
+---
+
 ## 2026-07-03 — Phase 4: health/readiness endpoint (lib/Health.sw, make health-gate)
 
 **feat(observability): a curl-able liveness/readiness surface — pure sw, zero new C.** The

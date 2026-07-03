@@ -353,13 +353,29 @@ Phase 3 is complete.
 
 **Phase 4 is complete.**
 
-## Phase 5 — RELEASE DISCIPLINE
-- Continuously test Linux x86_64, Linux ARM64, macOS ARM64 (dev).
-- Release gates: no sanitizer failures, no known P0/P1, all memory slopes bounded, 24h soak passes,
-  native-Linux stress passes repeatedly, no unexplained compiler warnings.
-- Semver + API/language compatibility rules + migration notes.
-- **Commission an independent runtime/security review before calling it 1.0** — and fold in the
-  deferred clean ETS re-audit (see Phase-1 verification gap).
+## Phase 5 — RELEASE DISCIPLINE  ⏳ (CI + semver + release workflow DONE; soak + independent review remain)
+
+**Done (release-discipline batch, 2026-07-03, branch `phase5-release`):**
+- **Version identity**: `VERSION` file (single source of truth) → Makefile `-DSWARMRT_VERSION`
+  + `-DSWARMRT_GITDESC` → `swc --version` / `version` / `-v` prints `1.0.0-rc.1 (<git describe>)`.
+- **Multi-platform CI**: the Linux workflow's hardening job now runs every Phase-3/4 bidirectional
+  gate (quota/msgsize/slowloris/isolation/crashlog/health/shutdown); `make fuzz` covers WS + SQLite;
+  a `swc --version` assertion is in quickstart; a new **macos-14 (arm64)** job runs build + test-sw +
+  conformance + doc-compile + gc-stress + the operational gates. (Linux ARM64 build+release is covered
+  by the release matrix; a continuous ARM64-Linux test leg can be added if a runner is provisioned.)
+- **Semver + release process**: `docs/RELEASING.md` (SemVer over the `sw` language + the embedder C
+  ABI, compatibility notes, the cut-a-release steps, the 1.0.0 gate list). `.github/workflows/release.yml`
+  (on `v*` tags) builds `swc` + `libswarmrt.a` on macOS-arm64 / Linux-x86_64 / Linux-arm64, asserts the
+  tag matches `VERSION` and `swc --version`, packages with public headers, checksums, and publishes a
+  GitHub Release (auto-prerelease for rc/alpha/beta).
+
+**Remaining before the `1.0.0` tag:**
+- **24h soak** on a dedicated Linux host: `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512
+  ./tests/soak/run_soak.sh` (harness ready; needs a host — the intended box `sushi` was unreachable
+  at 2026-07-03). Assert bounded RSS + zero sanitizer hits + no leaked process slots over the day.
+- **Independent runtime/security review** before calling it 1.0 — fold in the deferred clean ETS
+  re-audit (the Phase-1 verification gap: the fresh-eyes auditor failed to report on ETS in both runs).
+- Then bump `VERSION` 1.0.0-rc.1 → 1.0.0, tag `v1.0.0`, push (the release workflow does the rest).
 
 ---
 

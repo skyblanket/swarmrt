@@ -1,0 +1,148 @@
+name: Release
+
+# Cuts a SwarmRT release when a v* tag is pushed (e.g. v1.0.0, v1.0.0-rc.1).
+# Builds the swc compiler + libswarmrt.a on each supported platform, packages
+# each with the public headers, checksums everything, and publishes a GitHub
+# Release. A tag matching a pre-release identifier (rc/alpha/beta) is marked
+# prerelease automatically.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Install dependencies (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install sqlite3 || true
+
+      - name: Tag must match the VERSION file
+        # Release discipline: a v1.2.3 tag must be cut from a commit whose
+        # VERSION file says 1.2.3. Prevents shipping a binary that reports a
+        # different version than the release it's attached to.
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME#v}"
+          FILE="$(cat VERSION)"
+          echo "tag=$TAG version-file=$FILE"
+          test "$TAG" = "$FILE"
+
+      - name: Build swc + libswarmrt (zero warnings is the gate)
+        run: make swc libswarmrt
+
+      - name: Smoke — version + a hello build
+        run: |
+          set -e
+          ./bin/swc --version
+          ./bin/swc --version | grep -qF "$(cat VERSION)"
+          ./bin/swc build examples/hello.sw -o /tmp/hello
+          /tmp/hello | grep -q "Hello"
+
+      - name: Package
+        run: |
+          set -e
+          PKG="swarmrt-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$PKG/include"
+          cp bin/swc "dist/$PKG/"
+          cp bin/libswarmrt.a "dist/$PKG/"
+          # Public headers an embedder links against.
+          cp src/swarmrt_native.h src/swarmrt_lang.h src/swarmrt_varena.h "dist/$PKG/include/" 2>/dev/null || true
+          cp VERSION README.md LICENSE "dist/$PKG/" 2>/dev/null || true
+          if [[ "${{ matrix.target }}" == linux-* ]]; then strip "dist/$PKG/swc" || true; fi
+          tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+          ls -lh "dist/$PKG.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarmrt-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Mark prerelease for rc/alpha/beta tags
+        id: pre
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ (rc|alpha|beta) ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "SwarmRT ${{ github.ref_name }}"
+          body: |
+            ## SwarmRT ${{ github.ref_name }}
+
+            BEAM-shaped C runtime + the `sw` language for AI agents. Each release
+            ships the `swc` compiler and `libswarmrt.a` as a single self-contained
+            native archive per platform — no VM, no runtime install.
+
+            ### Install
+            Download the archive for your platform, extract, and put `swc` on PATH:
+            ```bash
+            tar xzf swarmrt-*-<platform>.tar.gz
+            ./swarmrt-*/swc --version
+            ./swarmrt-*/swc build yourprogram.sw -o yourprogram
+            ```
+
+            ### Platforms
+            | Archive | Platform |
+            |---------|----------|
+            | `swarmrt-*-darwin-arm64.tar.gz` | macOS Apple Silicon |
+            | `swarmrt-*-linux-x86_64.tar.gz` | Linux x86_64 |
+            | `swarmrt-*-linux-arm64.tar.gz` | Linux ARM64 |
+
+            Each archive contains `swc`, `libswarmrt.a`, the public headers,
+            `README.md`, and `LICENSE`. See `docs/DEPLOYMENT.md` for operating a
+            compiled binary in production and `docs/CHANGELOG.md` for changes.
+
+            Verify downloads against `checksums.txt`.
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          draft: false
+          prerelease: ${{ steps.pre.outputs.prerelease }}
