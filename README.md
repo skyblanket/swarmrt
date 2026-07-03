@@ -140,7 +140,9 @@ Full reference: **[docs/SW_LANGUAGE.md](docs/SW_LANGUAGE.md)**.
 | **[docs/AGENT_SYSTEM.md](docs/AGENT_SYSTEM.md)** | Cheatsheet for an LLM that's *writing* sw on demand — load this into a system prompt, not into a human's head. |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Internals — schedulers, mailboxes, GC, distribution. |
 | **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** | The C runtime API — for embedding swarmrt or writing new builtins. |
+| **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** | Running a compiled binary in production — platforms, the full env-var config reference, graceful shutdown, restart/recovery, health endpoints, backup/DR. |
 | **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** | Spawn / send / context-switch numbers. |
+| **[docs/RELEASING.md](docs/RELEASING.md)** | Versioning (SemVer) + how a release is cut. |
 | **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | What changed and when, with motivation. |
 
 ---
@@ -247,7 +249,15 @@ needed.
 | `SW_MAX_PROCS` | `100000` | Arena ceiling. Drop to `1024`/`4096` for fast-start CLI binaries — measured ~6 ms total wall (vs ~40 ms at the default ceiling) on Linux x86_64. Floor of 16. |
 | `SW_MAILBOX_MAX` | `1000000` | Mailbox depth cap (pending messages per process). User sends over the cap are dropped — loudly: a global counter (`sw_mailbox_dropped()`) plus a rate-limited stderr warning. EXIT/DOWN signals and timer fires are exempt, so supervision and `receive … after` keep working on a flooded process. `0` disables. |
 | `SW_HTTP_MAX_REQUEST` | `33554432` (32MB) | Max bytes buffered for one HTTP request (headers + body) and max accepted `Content-Length`. Oversized declared bodies get a `413`; connections that outgrow the buffer cap are closed. Min `4096`. |
+| `SW_HTTP_IDLE_TIMEOUT_MS` | `30000` | Close an HTTP connection idle (no inbound bytes) this long and free its slot (slow-loris defense). `0` disables; established WebSockets are exempt unless `SW_HTTP_WS_IDLE_TIMEOUT_MS` is set. |
+| `SW_PROC_MEM_MAX` | `0` (off) | Per-process memory cap (bytes). A process over the cap dies loudly; the node + siblings survive. |
+| `SW_MSG_MAX_BYTES` | `0` (off) | Max size of a single local message (bytes). Over-cap sends are dropped loudly, leak-free. |
+| `SW_SHUTDOWN_GRACE_MS` | `5000` | Graceful-shutdown drain deadline. On SIGTERM/SIGINT the node stops accepting work, drains, cancels timers, then tears down within this budget. |
+| `SW_LOG_JSON` | unset | `1` → one JSON `proc_crash` record per abnormal exit on stderr (for log shippers). Human-readable trace stays the default. |
 | `SW_QUIET` | unset | Suppress the `[SwarmRT] Arena initialized…` banner on stderr. Set in scripts/CI. |
+
+The full operational config reference (every var, defaults, meanings) and the
+graceful-shutdown / recovery model live in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
 ---
 
@@ -259,6 +269,7 @@ swc emit  <file.sw>               Print generated C to stdout
 swc repl                          Interactive REPL (no file needed)
 swc test [<file.sw>|<dir>]        Run test_* functions in .sw files
 swc lsp                           Language Server (LSP 3.17 over stdio)
+swc version                       Print the version (also --version, -v)
 
 Options for build/emit
   -o <name>          Output binary name
@@ -425,17 +436,19 @@ docs/                      Long-form documentation
 
 ## Status
 
-Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; Linux x86_64 builds and runs in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
+Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; both macOS ARM64 and Linux x86_64 build, test, and run the gate suite in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)); Linux ARM64 is built and released via the release workflow. Windows is best-effort.
 
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
-- `make test-sw` — **56 files, 493 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
+- `make test-sw` — **59 files, 514 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
 - `make test-phase$p` for `p` in **2 through 10** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC scaffolding (phase 8), distribution (phase 9), language frontend (phase 10); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 - `make gc-stress` — GC v1 copy-on-escape correctness: the value-arena stress harness compiled with ASAN + `-DSW_ARENA_POISON`; a missed deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free or a `0xDE`-garbage content assert
 
 - `make gc-slope` — **Ownership v2 memory-slope gate (CI, default + `SW_SCHEDULERS=1`)**: peak-RSS growth must stay under budget across a 10× scale-up of fixed-concurrency spawns (32 KB args), fixed-depth large messages, a 100k-turn tail loop, and pmap. Each probe only counts if it exits 0 and prints `PROBE_OK` (a crashing/`sys_exit(1)` probe fails the gate).
+- `make fuzz` — untrusted-input boundaries under ASAN/UBSAN (parser, JSON, distribution unmarshal, HTTP headers, WebSocket frames, the SQLite arg path)
+- **Operational-limit + isolation gates**, each **bidirectional** (proven to fail without its fix): `quota-gate` (per-process memory), `msgsize-gate` (message size), `slowloris-gate` (HTTP idle timeout), `isolation-gate` (a crashing process can't take down siblings/node), `crashlog-gate` (`SW_LOG_JSON`), `health-gate` (`/healthz` + `/readyz`), `shutdown-gate` (graceful drain, deadline-bounded even for a hung workload)
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
 - **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
