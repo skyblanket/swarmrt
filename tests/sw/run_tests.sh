@@ -24,6 +24,15 @@ if [ ! -x "$SWC" ]; then
     exit 2
 fi
 
+# Portable per-test timeout: GNU `timeout` (Linux) or `gtimeout` (macOS
+# coreutils) if present, else run with no bound. A fresh macOS runner has
+# NEITHER by default, and hard-coding `timeout` made every compiled test's run
+# fail with "timeout: command not found" — so detect it.
+if command -v timeout >/dev/null 2>&1; then   RUN_TO() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then RUN_TO() { gtimeout "$@"; }
+else                                           RUN_TO() { shift; "$@"; }
+fi
+
 mkdir -p "$BUILD_DIR"
 
 # Color helpers (skip if not a TTY).
@@ -59,7 +68,7 @@ for sw in "$TESTS_DIR"/test_*.sw; do
     # deadlocking under SW_SCHEDULERS=1 (blocking curl client starves the
     # in-process server fiber on the only scheduler) and the suite sat on
     # it indefinitely. 180s is ~20x the slowest healthy test.
-    if timeout 180 "$bin" >"$log" 2>&1; then
+    if RUN_TO 180 "$bin" >"$log" 2>&1; then
         # Pull the summary line + count any PASS lines for the rollup.
         passes=$(grep -c '^PASS ' "$log" || true)
         total_assertions=$((total_assertions + passes))

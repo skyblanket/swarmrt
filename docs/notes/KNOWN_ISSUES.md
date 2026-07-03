@@ -8,6 +8,23 @@ a repro, impact, and current hypothesis.
 These are genuine limitations, not crashes. Each is reproducible with the
 shipped `bin/swc`.
 
+### Interpreter (`swc run`) first-spawn scheduling flake on constrained hosts
+
+On the tree-walking `swc run` path (single cooperative scheduler), the FIRST
+`spawn(closure_value)` in a fresh runtime occasionally does not schedule its
+child, so the child's effect never appears even after ~1s of polling.
+Subsequent spawns in the same run are unaffected — it looks like a
+cold-scheduler race on the very first fiber.
+
+**Impact:** interpreter/dev path only — the COMPILED path (the shipping
+product) is unaffected and runs the child every time. **Repro:** only observed
+on the 2-core GitHub-hosted Linux CI runner; NOT reproducible locally
+(`test_spawn_value` interp passes 100/100 on multi-core macOS, even under load).
+**Hypothesis:** a first-spawn/runqueue initialization race that only surfaces
+under heavy core contention. **Workaround (in `tests/sw/run/test_spawn_value.sw`):**
+re-spawn the idempotent closure if its effect hasn't appeared. A real fix needs
+a Linux repro host to bisect the interp scheduler's first-fiber enqueue.
+
 ### Compiled `receive` has no default timeout (interpreter/compiled divergence)
 
 A bare `receive` with no `after` clause blocks forever in a compiled binary
