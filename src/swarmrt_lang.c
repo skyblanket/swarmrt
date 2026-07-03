@@ -4684,7 +4684,11 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         int c = 0;
         keys[c] = sw_val_atom("pid");     vals[c] = sw_val_int((int64_t)proc->pid); c++;
         keys[c] = sw_val_atom("status");
-        switch (proc->state) {
+        /* Load the _Atomic state into a plain enum before the switch — some
+         * clang versions reject switching directly on an _Atomic-qualified type
+         * ("statement requires expression of integer type"). */
+        sw_proc_state_t pi_state = proc->state;
+        switch (pi_state) {
             case SW_PROC_RUNNING:  vals[c] = sw_val_atom("running"); break;
             case SW_PROC_RUNNABLE: vals[c] = sw_val_atom("runnable"); break;
             case SW_PROC_WAITING:  vals[c] = sw_val_atom("waiting"); break;
