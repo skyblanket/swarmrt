@@ -396,6 +396,16 @@ gc-stress: swc libswarmrt
 	    tests/gc/ets_alias_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_ets_alias $(LDFLAGS)
 	@rm -f tests/gc/ets_alias_repro.gen.c $(BIN_DIR)/_etsa_emit
 	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_ets_alias
+	@# ets_list must ALSO copy out (independent review found ets_get copied out but
+	@# ets_list aliased the table's stored key/value pointers -> a reader's returned
+	@# list dangled once a writer replaced/deleted the key: a reproduced heap-UAF).
+	@# Capture the {k,v} pairs, churn+delete the key (frees the stored graph), then
+	@# deep-read the captured list -> UAF if aliased.
+	@./bin/swc build --emit-c tests/gc/ets_list_alias_repro.sw -o $(BIN_DIR)/_etsl_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
+	    tests/gc/ets_list_alias_repro.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_ets_list_alias $(LDFLAGS)
+	@rm -f tests/gc/ets_list_alias_repro.gen.c $(BIN_DIR)/_etsl_emit
+	@SW_SCHEDULERS=1 $(ASAN_FUZZ_ENV) $(BIN_DIR)/gc_ets_list_alias
 	@# Supervisor child closures: each child gets a private COPY (freed in its own
 	@# process_destroy, crash-safe); the supervisor frees the MASTER at permanent
 	@# removal/teardown. Freeing the master must NOT race a live child (kill is

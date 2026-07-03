@@ -559,15 +559,27 @@ void sw_shutdown(int swarm_id);
  * `deadline_ms` >= 0 is an explicit budget in milliseconds (0 = no drain
  * window); < 0 uses SW_SHUTDOWN_GRACE_MS (default 5000). Returns 0 if the node
  * quiesced within the deadline, 1 if the deadline forced teardown with work
- * still outstanding. The call ALWAYS returns by roughly the deadline — a hung
- * (never-quiescing) workload cannot make it block forever, because the hard
- * teardown's join is bounded by reduction preemption honouring should_exit.
+ * still outstanding.
+ *
+ * DEADLINE SCOPE (precise): the step-2 drain POLL always returns by the
+ * deadline. The step-4 hard-teardown JOIN is bounded only for cooperatively-
+ * scheduled fibers — a fiber running compiled sw hits a reduction checkpoint
+ * (sw_check_reds) and returns to its scheduler, which honours should_exit, so a
+ * busy *sw* loop is bounded (the shutdown gate proves this). BUT a fiber
+ * BLOCKED IN A C BUILTIN / SYSCALL (e.g. http_get / db_query against a slow or
+ * hung peer) owns its scheduler OS thread, reaches no checkpoint, and the join
+ * — and thus this call — can exceed the deadline until that syscall returns.
+ * The operational bounds for that case are a SECOND SIGTERM/SIGINT (hard _exit,
+ * see _sw_term_handler) and the external supervisor's own stop-timeout →
+ * SIGKILL. See docs/DEPLOYMENT.md.
  *
  * DRAIN GUARANTEE: messages already queued in mailboxes are drained (the
- * fibers get to run and consume them) until quiescent or the deadline; pending
- * TIMERS are cancelled (a heartbeat/interval timer is discarded on shutdown,
- * not waited on). In-flight internal sends are NOT rejected (rejecting them
- * would break a gen_server call/reply mid-drain and prevent quiescence). */
+ * fibers get to run and consume them) until quiescent or the deadline;
+ * quiescence requires TWO consecutive clean scans so a message planted during a
+ * single lock-free scan is not missed. Pending TIMERS are cancelled (a
+ * heartbeat/interval timer is discarded on shutdown, not waited on). In-flight
+ * internal sends are NOT rejected (rejecting them would break a gen_server
+ * call/reply mid-drain and prevent quiescence). */
 int sw_shutdown_graceful(int swarm_id, int deadline_ms);
 
 /* Resolve the configured grace deadline: SW_SHUTDOWN_GRACE_MS (ms, clamped to

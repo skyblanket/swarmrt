@@ -369,12 +369,31 @@ Phase 3 is complete.
   tag matches `VERSION` and `swc --version`, packages with public headers, checksums, and publishes a
   GitHub Release (auto-prerelease for rc/alpha/beta).
 
-**Remaining before the `1.0.0` tag:**
+**Independent adversarial review — DONE (2026-07-03), findings fixed:**
+The review targeted the just-landed graceful-shutdown code + the deferred ETS re-audit, and it
+paid off — it found a **reproduced P0 use-after-free** the shipping suite missed:
+- **B1 (P0, FIXED):** `_builtin_ets_list` aliased the table's stored key/value pointers instead of
+  copying out like `ets_get`, so a returned `{k,v}` list dangled once a writer replaced/deleted the
+  key — a heap-UAF reproduced under ASAN+poison. Fixed (deep-copy both key and value out under the
+  rdlock) + new permanent gate `tests/gc/ets_list_alias_repro.sw` in `make gc-stress` (bidirectional:
+  neutered → GC_BUG, fixed → PASS).
+- **A2 (P1, FIXED):** `runtime_is_quiescent` was a single lock-free scan → a message planted mid-scan
+  by a fire-and-park sender could be declared drained and dropped. Now requires TWO consecutive
+  quiescent scans.
+- **A1 (P1, doc fix):** the "bounded even for a hung workload / never hangs" claim was true only for
+  cooperatively-scheduled sw loops; a fiber blocked in a C builtin/syscall (curl/db) can delay the
+  teardown join past the deadline (the 2nd-signal hard-exit + supervisor SIGKILL are the real bounds).
+  Corrected in the header, the code comment, and `docs/DEPLOYMENT.md` — no overstated guarantee ships.
+- **B2 (P2, FIXED):** ETS PID keys hashed by pointer but compared by id (invariant break → duplicate
+  entries). Now hashed by pid id; key-type contract documented (scalars/tuples). Regression test
+  `tests/sw/test_ets_pidkey.sw`.
+- Verdict on the rest: the shutdown signal machinery, timer teardown, and wait-loop, and the ETS
+  get/take/update/cas copy-out + free-on-replace paths, were independently confirmed solid.
+
+**Remaining before the `1.0.0` tag (ONE item):**
 - **24h soak** on a dedicated Linux host: `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512
   ./tests/soak/run_soak.sh` (harness ready; needs a host — the intended box `sushi` was unreachable
   at 2026-07-03). Assert bounded RSS + zero sanitizer hits + no leaked process slots over the day.
-- **Independent runtime/security review** before calling it 1.0 — fold in the deferred clean ETS
-  re-audit (the Phase-1 verification gap: the fresh-eyes auditor failed to report on ETS in both runs).
 - Then bump `VERSION` 1.0.0-rc.1 → 1.0.0, tag `v1.0.0`, push (the release workflow does the rest).
 
 ---

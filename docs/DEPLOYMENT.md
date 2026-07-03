@@ -93,10 +93,16 @@ The drain sequence:
 3. **Cancel timers** — pending one-shot/interval timers are discarded (a
    heartbeat timer must not keep the node "busy" forever).
 4. **Terminate** — the schedulers are joined and each process's `on_destroy`
-   hook fires. This is **bounded even for a hung workload**: a never-quiescing
-   fiber is returned to its scheduler by reduction preemption, which then honors
-   the exit flag — so shutdown always completes at roughly the deadline, never
-   hangs forever.
+   hook fires. A busy **`sw`** loop is bounded here: reduction preemption returns
+   the fiber to its scheduler, which honors the exit flag, so it completes at
+   roughly the deadline (the shutdown gate proves this with an infinite-loop
+   worker). **Caveat — a fiber blocked in a C builtin/syscall is NOT bounded by
+   the deadline:** a process stuck in `http_get`/`db_query` against a slow or
+   hung peer owns its scheduler OS thread and reaches no preemption checkpoint,
+   so the join waits for that syscall to return. The bounds for that case are a
+   **second SIGTERM/SIGINT** (immediate hard exit) and your supervisor's own
+   stop-timeout escalating to SIGKILL — so set `TimeoutStopSec` /
+   `stop_grace_period` above `SW_SHUTDOWN_GRACE_MS` but finite.
 
 **Drain guarantee:** messages already queued in mailboxes are drained (fibers
 run to consume them) until quiescent or the deadline; pending timers are

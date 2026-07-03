@@ -4,6 +4,34 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-07-03 — Phase 5: independent-review fixes — P0 ets_list UAF + shutdown drain hardening
+
+**fix: the Phase-5 independent adversarial review found a reproduced P0 use-after-free the shipping
+suite missed; fixed it and two P1s.** `_builtin_ets_list` aliased the table's stored key/value
+pointers (while `ets_get`/`take`/`update` all deep-copy out under the lock), so the `{k,v}` list it
+returned dangled the moment any writer replaced or deleted a key — a heap-UAF reproduced under
+ASAN + `-DSW_ARENA_POISON`. Fixed: deep-copy BOTH key and value out under the rdlock, matching
+`ets_get`. New permanent gate `tests/gc/ets_list_alias_repro.sw` wired into `make gc-stress`,
+bidirectional (neuter the copy-out → `GC_BUG` heap-UAF at swarmrt_lang.c:2644; restore → PASS).
+
+Also from the review: (1) `runtime_is_quiescent` was a single lock-free scan, so a message planted
+mid-scan by a fire-and-park sender could be declared "drained" and dropped by teardown — now
+graceful shutdown requires TWO consecutive quiescent scans. (2) The graceful-shutdown "bounded even
+for a hung workload / never hangs" claim was true only for cooperatively-scheduled sw loops; a fiber
+blocked in a C builtin/syscall (curl/db) can delay the teardown join past the deadline (the second
+SIGTERM hard-exit + the supervisor's SIGKILL timeout are the real bounds) — corrected in the header,
+the code comment, and `docs/DEPLOYMENT.md`, so no overstated guarantee ships. (3) ETS PID keys were
+hashed by pointer but compared by id (invariant break → duplicate entries + mislookup) — now hashed
+by pid id; regression test `tests/sw/test_ets_pidkey.sw` (7 assertions), key-type contract documented.
+
+The review independently confirmed the rest solid: the shutdown signal machinery (async-safe handler,
+no clobber of the crash/preempt handlers), timer teardown (no race with `fire_timers`), the
+`sw_wait_for_exit` wait-loop (no lost wakeup), and the ETS get/take/update/cas copy-out +
+free-on-replace paths. Unblocks: the independent-review Phase-5 gate is cleared. test-sw 59 files/514,
+gc-stress ASAN clean (both ETS alias gates), zero warnings.
+
+---
+
 ## 2026-07-03 — Phase 5: release discipline (swc --version, gate-suite CI, macOS leg, release workflow)
 
 **feat(release): the runtime can now identify itself and cut a reproducible cross-platform

@@ -133,7 +133,25 @@ static uint32_t _vets_hash_val(sw_val_t *v) {
             for (int i = 0; i < v->v.tuple.count; i++) h ^= _vets_hash_val(v->v.tuple.items[i]) * (i + 1);
             break;
         }
+        case SW_VAL_PID: {
+            /* Hash by the NUMERIC pid id — must match _vets_key_eq, which
+             * compares pids by id. Hashing the pointer here (the old default)
+             * broke the eq⇒same-bucket invariant: two equal pids that are
+             * different arena-copied sw_val_t landed in different buckets yet
+             * compared equal, so a pid-keyed put never found the prior entry
+             * and the table accumulated duplicates + mislooked-up. */
+            uint64_t k = v->v.pid ? v->v.pid->pid : 0;
+            for (int i = 0; i < 8; i++) { h ^= (k & 0xff); h *= 1099511628211ULL; k >>= 8; }
+            break;
+        }
         default: {
+            /* FLOAT / BOOL / NIL / LIST / MAP: no value-hash + eq is pointer
+             * identity (below), but the compiled path deep-copies the key on
+             * insert, so a later lookup key never shares the stored pointer —
+             * these key types do NOT reliably match. ETS keys must be scalars
+             * (int/atom/string/bytes/pid) or tuples of those (documented in
+             * SW_LANGUAGE.md). Kept pointer-based rather than made a hard error
+             * to avoid a behavior break; the contract is the guard. */
             uint64_t k = (uint64_t)(uintptr_t)v;
             h ^= k; h *= 1099511628211ULL;
             break;
@@ -6947,7 +6965,18 @@ static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
         _vets_entry_t *e = t->buckets[b];
         while (e) {
             if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
-            sw_val_t *pair[2] = { e->key, e->value };
+            /* Copy BOTH key and value OUT into the caller's arena (BEAM ETS
+             * semantics), exactly as ets_get does — the table owns + frees its
+             * stored copies, so a later writer (put-replace/delete/take) must
+             * not be able to dangle a leaf of the list we return. Aliasing the
+             * stored e->key/e->value here was a heap-use-after-free (the reader
+             * holds a list whose leaves point into the table; a subsequent
+             * ets_delete/replace frees them). Done under the rdlock — a writer
+             * needs the wrlock, so the graph can't be freed mid-copy. */
+            sw_val_t *pair[2] = {
+                sw_val_deep_copy_local(e->key),
+                sw_val_deep_copy_local(e->value)
+            };
             items[cnt++] = sw_val_tuple(pair, 2);
             e = e->next;
         }

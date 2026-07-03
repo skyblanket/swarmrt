@@ -3541,12 +3541,28 @@ int sw_shutdown_graceful(int swarm_id, int deadline_ms) {
     }
 
     /* 2. Drain outstanding messages: let runnable fibers finish and mailboxes
-     *    empty, polling for quiescence up to the deadline. */
+     *    empty, polling for quiescence up to the deadline.
+     *
+     *    runtime_is_quiescent() is a lock-free per-process scan while the
+     *    schedulers still run, so a single "quiescent" verdict has a TOCTOU
+     *    hole: a fire-and-park sender at a higher slab index than its target
+     *    can plant a message into an already-scanned mailbox and then be
+     *    scanned itself as parked/empty — the scan returns quiescent with a
+     *    message pending, and breaking here would let the teardown drop it.
+     *    Require TWO CONSECUTIVE quiescent scans (separated by the poll gap):
+     *    a message planted during scan N leaves its target RUNNABLE / mb_len>0
+     *    for scan N+1, which then fails and resets the counter. Only genuine
+     *    quiescence survives two back-to-back scans. */
     uint64_t start = now_ns();
     uint64_t deadline_ns = start + (uint64_t)deadline_ms * 1000000ULL;
     int drained = 0;
+    int quiet_streak = 0;
     while (1) {
-        if (runtime_is_quiescent()) { drained = 1; break; }
+        if (runtime_is_quiescent()) {
+            if (++quiet_streak >= 2) { drained = 1; break; }
+        } else {
+            quiet_streak = 0;
+        }
         if (now_ns() >= deadline_ns) break;
         usleep(2000);   /* 2 ms poll — negligible vs the drain window */
     }
@@ -3567,11 +3583,14 @@ int sw_shutdown_graceful(int swarm_id, int deadline_ms) {
     }
 
     /* 4. Flush storage / terminate. The hard teardown joins the scheduler
-     *    threads — BOUNDED even for a hung (never-quiescing) fiber, because
-     *    reduction preemption returns each fiber to its scheduler, which then
-     *    honours should_exit. process_destroy fires on_destroy per process.
-     *    SQLite durability is per-statement autocommit; the drain above let
-     *    in-flight writers finish (see docs/DEPLOYMENT.md). */
+     *    threads. Bounded for a busy *sw* loop — reduction preemption returns
+     *    the fiber to its scheduler, which honours should_exit. NOT bounded by
+     *    this deadline for a fiber blocked in a C builtin/syscall (curl/db): it
+     *    owns its scheduler thread and the join waits for the syscall (a second
+     *    signal hard-exits, and the supervisor's SIGKILL timeout is the outer
+     *    bound — see the header + docs/DEPLOYMENT.md). process_destroy fires
+     *    on_destroy per process. SQLite durability is per-statement autocommit;
+     *    the drain above let in-flight sw-level writers finish. */
     sw_shutdown(swarm_id);
     return drained ? 0 : 1;
 }
