@@ -27,21 +27,31 @@ fun assert_eq(name, actual, expected) {
     }
 }
 
+# Poll an ETS key until the spawned process has written it, up to `tries`
+# 20ms ticks (~1s budget). Returns as soon as the value appears — typically
+# on the first tick — so it's fast when the scheduler is idle but tolerant of
+# a slow/loaded CI runner. A fixed sleep(150) here was a brittle timing flake
+# (it went red on a contended GitHub runner where 150ms wasn't enough for the
+# cooperative interp scheduler to run the child).
+fun wait_for(t, key, tries) {
+    v = ets_get(t, key)
+    if (v != nil) { v }
+    else { if (tries <= 0) { nil } else { sleep(20) ; wait_for(t, key, tries - 1) } }
+}
+
 # 1. spawn a closure-valued LOCAL (the headline gap).
 fun test_spawn_local_closure() {
     t = ets_new()
     f = fn() { ets_put(t, 'k', 'local_ran') }
     spawn(f)
-    sleep(150)
-    assert_eq("spawn_local_closure", ets_get(t, 'k'), 'local_ran')
+    assert_eq("spawn_local_closure", wait_for(t, 'k', 50), 'local_ran')
 }
 
 # 2. spawn an INLINE lambda (must keep working — prior phase).
 fun test_spawn_inline() {
     t = ets_new()
     spawn(fn() { ets_put(t, 'k', 'inline_ran') })
-    sleep(150)
-    assert_eq("spawn_inline", ets_get(t, 'k'), 'inline_ran')
+    assert_eq("spawn_inline", wait_for(t, 'k', 50), 'inline_ran')
 }
 
 # 3. a closure that CAPTURES a local must run with its capture intact.
@@ -50,8 +60,7 @@ fun test_spawn_capture() {
     tag = 'captured_ok'
     f = fn() { ets_put(t, 'k', tag) }
     spawn(f)
-    sleep(150)
-    assert_eq("spawn_capture", ets_get(t, 'k'), 'captured_ok')
+    assert_eq("spawn_capture", wait_for(t, 'k', 50), 'captured_ok')
 }
 
 # 4. spawn_monitor of a closure-valued local: returns {pid, ref} AND runs it.
@@ -63,7 +72,7 @@ fun test_spawn_monitor_local() {
     t = ets_new()
     f = fn() { ets_put(t, 'k', 'monitored_ran') }
     pm = spawn_monitor(f)
-    sleep(150)
+    _side = wait_for(t, 'k', 50)
     ref = elem(pm, 1)
     if (ets_get(t, 'k') == 'monitored_ran' && ref >= 0) {
         print("PASS spawn_monitor_local") ; 0
