@@ -291,7 +291,13 @@ jobs:
         # surface must be memory-safe on arbitrary bytes. fuzz-json found two
         # real heap-overflows (number force-advance past NUL, backslash-at-EOF)
         # on the first run — so this gate earns its keep.
-        run: make fuzz
+        # SW_FUZZ_ITERS=5000 (vs the 20000 local default): the 2-core hosted
+        # runner is slow + memory-constrained (no swap), and 20000 mutations ×
+        # 6 ASAN targets starved it mid-fuzz_json (job cancelled). 5000/target
+        # still exercises every boundary (the seed corpus is always replayed in
+        # full first, and each target is memory-bounded via FUZZ_ASAN_ENV +
+        # the 128 KB input cap). Bump locally for a deeper sweep.
+        run: SW_FUZZ_ITERS=5000 make fuzz
 
   macos:
     # Multi-platform coverage (Phase 5): macOS ARM64 is the dev + a supported

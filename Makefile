@@ -278,12 +278,22 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_gc.c $(SRC_DIR)/swarmrt_node.c $(SRC_DIR)/swarmrt_lang.c \
            $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+# Memory-bounded ASAN env for the fuzz-* targets ONLY. The fuzz harness replays
+# thousands of mutations; on the no-swap 16 GB GitHub runner, ASAN's default
+# unbounded quarantine + 2 KB redzones let fuzz_json's transient peak balloon
+# past RAM and the OOM killer terminated the job (the historically-flaky fuzz
+# step). Capping the quarantine (freed blocks released sooner) + the redzone
+# bounds peak RSS without weakening per-input crash detection — a fuzz crash is
+# an immediate same-iteration abort, so a small quarantine is fine here. NOT
+# used for gc-stress, where a large quarantine widens the cross-process
+# use-after-free detection window.
+FUZZ_ASAN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:quarantine_size_mb=64:max_redzone=256:malloc_context_size=10
 
 .PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json fuzz-ws fuzz-db isolation-gate
 fuzz-parse: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
-	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
 
 # JSON decoder — the agent-facing input boundary (every LLM tool-call
 # response / parsed HTTP body). Proves no crash/over-read/stack-overflow
@@ -292,12 +302,12 @@ fuzz-parse: dirs
 fuzz-json: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_json.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_json $(LDFLAGS)
-	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
 
 fuzz-marshal: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_marshal.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_marshal $(LDFLAGS)
-	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
 
 # HTTP request-header parser (the headers-to-handler delivery surface).
 # -DSW_FUZZ_HTTP exposes sw_http_fuzz_parse() in swarmrt_http.c (built once,
@@ -305,7 +315,7 @@ fuzz-marshal: dirs
 fuzz-http: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
-	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
 
 # WebSocket frame decoder (the post-upgrade inbound boundary): header decode
 # (7/16/64-bit lengths), masking, the 16MB caps, control frames, and the
@@ -314,7 +324,7 @@ fuzz-http: dirs
 fuzz-ws: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_ws.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_ws $(LDFLAGS)
-	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_ws tests/fuzz/corpus/ws
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_ws tests/fuzz/corpus/ws
 
 # db_*/SQLite builtin arg path: the 3-arg bind overload, _sw_db_bind's
 # memstream fallback, and _sw_db_row_to_map's TEXT/BLOB readback. The target
@@ -323,7 +333,7 @@ fuzz-ws: dirs
 fuzz-db: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_db.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_db $(LDFLAGS)
-	@$(ASAN_FUZZ_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
 
 fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db
 

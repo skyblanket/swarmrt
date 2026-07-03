@@ -38,7 +38,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 #include <sys/stat.h>
 
 #define _FZ_MAX_SEEDS 4096
-#define _FZ_MAX_LEN   (1u << 20)   /* 1 MB per input */
+/* 128 KB per input. Was 1 MB, but a 1 MB mutated JSON builds a proportionally
+ * huge sw_val tree under ASAN (each alloc gets a redzone), and fuzz_json's
+ * transient peak (~1 GB locally) OOM-thrashed the no-swap 16 GB GitHub runner
+ * and got the job cancelled. Memory-safety bugs in these parsers reproduce on
+ * small inputs (the decoders are depth-capped at 256 anyway), so 128 KB keeps
+ * full crash-finding coverage at ~8x lower peak. All corpus seeds are < 1 KB. */
+#define _FZ_MAX_LEN   (1u << 17)   /* 128 KB per input */
 
 static uint8_t *_fz_seeds[_FZ_MAX_SEEDS];
 static size_t   _fz_seed_lens[_FZ_MAX_SEEDS];

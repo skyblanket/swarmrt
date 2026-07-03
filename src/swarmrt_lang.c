@@ -2647,7 +2647,7 @@ void sw_val_format(FILE *f, sw_val_t *v) {
     case SW_VAL_FLOAT: fprintf(f, "%.17g", v->v.f); break;
     case SW_VAL_STRING: fprintf(f, "%s", v->v.str); break;
     case SW_VAL_ATOM: fprintf(f, ":%s", v->v.str); break;
-    case SW_VAL_PID: fprintf(f, "<pid:%llu>", v->v.pid ? v->v.pid->pid : 0); break;
+    case SW_VAL_PID: fprintf(f, "<pid:%llu>", (unsigned long long)(v->v.pid ? v->v.pid->pid : 0)); break;
     case SW_VAL_REMOTE_PID:
         fprintf(f, "<rpid:%s:%llu>",
                 v->v.rpid.node ? v->v.rpid.node : "?",
