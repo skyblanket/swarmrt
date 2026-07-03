@@ -27,7 +27,7 @@ captures what shipped, what's pending, the gate philosophy, and the landmines.
 | 1 | Close correctness blockers (ownership + isolation) | ✅ **DONE** (audit-confirmed) |
 | 2 | Runtime hardening (race detection, atomics, alloc-failure, soak) | ✅ **DONE** (2.1–2.6); full 24h run pending a host |
 | 3 | Security & fault isolation (fuzzing, limits) | ✅ **DONE** — fuzz boundaries (parser/JSON/dist/HTTP/WS/SQLite, depth-guarded); limits/quotas (proc-mem quota, HTTP idle timeout, msg-size cap, backpressure decision); cross-process isolation under malformed input |
-| 4 | Operational readiness (observability, graceful shutdown, docs) | 🟡 **observability DONE** (metrics + crash logs + health endpoint); graceful shutdown + deploy docs pending |
+| 4 | Operational readiness (observability, graceful shutdown, docs) | ✅ **DONE** — metrics (`swarm_stats`) + crash logs (`SW_LOG_JSON`) + health endpoint (`lib/Health.sw`); graceful drain-with-deadline shutdown (`SW_SHUTDOWN_GRACE_MS`, SIGTERM) + `docs/DEPLOYMENT.md` |
 | 5 | Release discipline (multi-platform CI, gates, semver, independent review) | ⬜ pending |
 
 ---
@@ -327,11 +327,31 @@ Phase 3 is complete.
   404 elsewhere; `examples/health_endpoint.sw` is the operator recipe. Gate:
   `make health-gate` (real curl against a booted example: status + body + metric keys + 404).
 
-**Remaining in Phase 4:**
-- Graceful shutdown: stop accepting work → drain or reject outstanding messages → cancel timers
-  → flush storage → terminate within a configurable deadline.
-- Deploy/recovery docs: supported platforms + deps, config reference (document `SW_LOG_JSON`
-  alongside the Phase-3 caps), upgrade/rollback, backup/DR.
+**Done (graceful shutdown + docs, 2026-07-03, branch `phase4-shutdown`):**
+- **Graceful shutdown** (`sw_shutdown_graceful(swarm_id, deadline_ms)`): flip a `draining` flag
+  (observable via `swarm_stats().draining` → `/readyz` reports not-ready so a load balancer
+  drains first) → poll for run-queue + mailbox quiescence up to the deadline → cancel pending
+  timers → existing hard teardown (`sw_shutdown`, joins schedulers, fires `on_destroy`). Deadline
+  from `SW_SHUTDOWN_GRACE_MS` (default 5000, clamped `[0, 3600000]`); returns 0 if quiesced, 1 if
+  the deadline forced teardown. **Bounded even for a hung workload** — a never-quiescing fiber is
+  returned to its scheduler by reduction preemption, which honors the exit flag, so shutdown
+  always completes at ~the deadline, never hangs. **Signal path:** async-signal-safe SIGTERM/SIGINT
+  handler sets an atomic flag ONLY (a second signal hard-exits 130/143); the main-thread wait loop
+  (`sw_wait_for_exit`) notices it and runs the drain OFF a scheduler thread. Wired into BOTH the
+  codegen-emitted compiled `main()` and the `swc run` interpreter path; installed only from a
+  program's own entry (a library embedder keeps its signals), no-op under `SW_NO_SIGNAL_SHUTDOWN`.
+  **Drain guarantee:** queued mailbox messages are drained; timers cancelled; in-flight internal
+  sends NOT rejected (rejecting a gen_server reply would prevent quiescence). No new `sw_process`
+  fields (global `_Atomic` flags only). Gate: `make shutdown-gate` (bidirectional — quiescent node
+  drains near-instant; a busy infinite-loop worker proves the deadline BOUNDS a hung workload;
+  neuter the deadline break and phase B hangs past the ceiling → FAIL).
+- **Deploy/recovery docs**: `docs/DEPLOYMENT.md` — supported platforms + link deps, a full
+  env-var config reference (all real `getenv` vars, defaults + meanings), graceful-shutdown/signal
+  behavior, the operational-OTA restart-and-rehydrate-from-SQLite recovery pattern, `lib/Health.sw`
+  usage, and backup/DR (SQLite durable; ETS does NOT survive restart). Its `sw` example compiles
+  under `check-docs`.
+
+**Phase 4 is complete.**
 
 ## Phase 5 — RELEASE DISCIPLINE
 - Continuously test Linux x86_64, Linux ARM64, macOS ARM64 (dev).
