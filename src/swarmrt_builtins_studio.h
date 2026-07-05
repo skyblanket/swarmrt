@@ -63,6 +63,8 @@
   #include <unistd.h>
   #include <sys/time.h>
   #include <sys/wait.h>
+  #include <signal.h>
+  #include <fcntl.h>
   #define sw_mkdir(p, m) mkdir(p, m)
   #define swbs_unlink(p) unlink(p)
   #define sw_sleep(s) sleep(s)
@@ -1147,6 +1149,33 @@ static int _sw_stdin_is_interrupt(int fd, unsigned char first) {
 #endif
 }
 
+/* After an explicit user interrupt, discard any queued key bytes before the
+ * caller returns to the agent loop. Without this, a double-press/held Esc can
+ * remain in the tty input queue and the next http_post_stream immediately
+ * aborts with "[Request interrupted by user]" even though the user already
+ * released the key. */
+static void _sw_stdin_flush_pending_interrupts(int fd) {
+#ifndef _WIN32
+    if (fd < 0) return;
+    if (isatty(fd)) {
+        tcflush(fd, TCIFLUSH);
+        return;
+    }
+    unsigned char junk[64];
+    for (int guard = 0; guard < 16; guard++) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = {0, 0};
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) break;
+        if (read(fd, junk, sizeof(junk)) <= 0) break;
+    }
+#else
+    (void)fd;
+#endif
+}
+
 /* ============================================================
  * Bidirectional subprocess — for MCP stdio + any long-lived child
  * ============================================================
@@ -1463,6 +1492,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
                 ssize_t nb = read(stdin_fd, &ib, 1);
                 if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) {
                     interrupted = 1;
+                    _sw_stdin_flush_pending_interrupts(stdin_fd);
                     fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
                     fflush(stdout);
                     _sw_pkill_close(ch);
@@ -2379,6 +2409,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             ssize_t nb = read(stdin_fd, &ib, 1);
             if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) {
                 interrupted = 1;
+                _sw_stdin_flush_pending_interrupts(stdin_fd);
                 if (spinner_drawn) {
                     fputs("\r\x1b[K", stdout);
                     spinner_drawn = 0;
@@ -5144,7 +5175,11 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
         if (stdin_fd >= 0 && FD_ISSET(stdin_fd, &rfds)) {
             unsigned char ib;
             ssize_t nb = read(stdin_fd, &ib, 1);
-            if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) { interrupted = 1; break; }
+            if (nb == 1 && _sw_stdin_is_interrupt(stdin_fd, ib)) {
+                interrupted = 1;
+                _sw_stdin_flush_pending_interrupts(stdin_fd);
+                break;
+            }
             /* other keystrokes (arrow/F-keys drained by the helper): ignore */
         }
 
