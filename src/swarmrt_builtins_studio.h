@@ -3724,8 +3724,15 @@ static sw_val_t *_builtin_process_info(sw_val_t **a, int n) {
      * can reconstruct the supervision hierarchy from the child->parent link.
      * Best-effort read of the arena slab, like process_list — the slot memory
      * never unmaps, so a stale parent at most mis-groups a child as a root. */
-    if (proc->parent)
-        { keys[c] = sw_val_atom("parent"); vals[c] = sw_val_int((int64_t)proc->parent->pid); c++; }
+    /* Snapshot the pointer ONCE: `if (proc->parent) ... proc->parent->pid`
+     * compiles to two loads, and a concurrent exit can null the field between
+     * them (UBSan: member access within null pointer — caught by the
+     * process_info_uaf repro under the stack-guard's perturbed timing). The
+     * slot behind a stale non-NULL snapshot never unmaps, per the note above. */
+    {
+        sw_process_t *par = proc->parent;
+        if (par) { keys[c] = sw_val_atom("parent"); vals[c] = sw_val_int((int64_t)par->pid); c++; }
+    }
     /* reg_entry is malloc'd at registration and free()d ONLY under
      * registry.lock (registry_remove_proc). A process exiting / crash-restarting
      * on another scheduler frees it concurrently, so reading ->name unlocked is a

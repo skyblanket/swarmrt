@@ -76,17 +76,30 @@ self-loopback workloads (the WebSocket client is yield-aware and not
 affected). **Fix direction (Phase 3):** run blocking transports on a
 dedicated I/O thread pool with fiber park/wake, like `wsc_*` does.
 
-### Mutual tail recursion is not TCO'd; deep chains overflow silently
+### Mutual tail recursion is not TCO'd — but overflow is now a recoverable panic
 
-Only **self** tail calls are optimised. Two functions tail-calling each other
-(the natural state-machine shape) consume a C stack frame per hop and overflow
-the 128KB fiber stack at depth ~10^4–10^5 — currently as a raw SIGSEGV without
-even the crash banner (the handler runs on the overflowed fiber stack; needs
-`sigaltstack`). See [REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O2.
+Only **self** tail calls are optimised (including, since 2026-07-05, self
+tail calls inside a `receive ... after` body — previously those stacked a
+real C frame per tick and killed long-lived heartbeat loops; swarm-code died
+this way after 154s of a slow tool call). Two functions tail-calling each
+other (the natural state-machine shape) still consume a C stack frame per
+hop. See [REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O2.
 
-**Impact:** mutually recursive FSMs die at depth in compiled binaries.
-**Workaround:** keep the loop in one function and dispatch on an argument
-(`fun fsm(state, n) { case state { ... } }`).
+Since 2026-07-05 the failure mode is contained: every generated function
+entry runs a red-zone stack guard (`sw_stack_low()`, 32KB margin), so a
+would-be overflow raises a NORMAL per-process panic — EXIT propagates to
+links/monitors, supervisors restart the actor, and the OS process survives.
+A fiber that blows past the red zone inside pure C (no sw frame in between)
+still hits the guard page, but the crash handler now recognises that on
+both SIGSEGV (Linux) and SIGBUS (macOS maps guard-page hits to
+KERN_PROTECTION_FAILURE → SIGBUS) and prints the stack-overflow banner
+instead of a generic crash. Gate: `tests/sw/test_stack_overflow.sw`.
+
+**Impact:** mutually recursive FSMs panic (recoverably) at depth instead of
+killing the binary. **Workaround for the depth itself:** keep the loop in
+one function and dispatch on an argument (`fun fsm(state, n) { case state
+{ ... } }`), or raise the per-process stack with `SW_PROC_STACK` (bytes,
+`k`/`m` suffixes; e.g. `SW_PROC_STACK=1m`).
 
 ### No static type or shape checking
 

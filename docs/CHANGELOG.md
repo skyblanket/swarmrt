@@ -4,6 +4,41 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-07-05 — after-body TCO + recoverable stack overflow (the swarm-code 154s SIGBUS)
+
+**fix(codegen): self-tail-calls in a `receive ... after` body are now TCO'd; stack overflow is
+now a per-process panic, not OS-process death.** Root cause chain (from the swarm-code crash
+report, UUID-matched binary + fault-time registers): swarm-code's `collect_tool_result` heartbeat
+recursed through its `after` arm once per 2s tick; `emit_receive` passed `tail=0` into the after
+body (receive arms got the real flag), so each tick stacked a real ~1.5KB C frame. At ~76 ticks
+(≈152s — the screen showed "154s") the 128KB fiber stack was exhausted and `snprintf` inside the
+progress-line draw pushed SP into the 16KB guard page. macOS delivers that as SIGBUS
+(`KERN_PROTECTION_FAILURE`), and the crash handler's overflow detector checked only SIGSEGV with
+an 8KB window (half a 16KB arm64 page) — so it printed a generic CRASH banner and the whole
+binary died, bypassing links/monitors/supervisors entirely.
+
+Fixed, four layers: (1) `emit_receive` propagates `tail` into the after body + `has_tail_calls`
+scans `after_body` (label/goto stay consistent) — all five of collect_tool_result's recursive
+sites now compile to the reduction-checked `goto _tail` loop (verified by disassembly: zero
+recursive `bl` sites remain). (2) Every generated function AND lambda entry runs a red-zone
+guard (`sw_stack_low()`, static inline, 32KB margin): a would-be overflow raises a NORMAL
+`_sw_runtime_panic` → EXIT to links/monitors → supervisor restart, OS process survives; panic
+names the function and the fix options. (3) The crash-handler overflow detector now fires on
+SIGBUS too, uses the real page size (cached at install; 16KB on macOS arm64), and reports the
+actual stack size. (4) `SW_PROC_STACK` env (bytes, k/m suffix, clamped 64KB–64MB) bumps compiled
+binaries' fiber stacks without recompiling; fills the default only (`sw_proc_stack_size` still
+wins for `swc run`). Drive-by: `_builtin_process_info` snapshotted `proc->parent` once (UBSan
+caught the check/deref double-load racing a concurrent exit under the new guard's timing).
+
+New permanent gate `tests/sw/test_stack_overflow.sw` (bidirectional: 100k after-arm ticks flat —
+pre-fix SIGBUS at ~80; mutual-recursion child dies as an EXIT the trapping parent receives —
+pre-fix whole-binary death). Unblocks: swarm-code (and any sw agent harness) can wait on
+arbitrarily long tools; heartbeat/receive-after loops are safe shapes. test-sw 60 files/516,
+gc-stress ASAN clean, gc-slope all PASS (turn-checkpoint now also fires per after-arm tick),
+conformance 12/12, swarm-code suite 98/98.
+
+---
+
 ## 2026-07-03 — Phase 5: independent-review fixes — P0 ets_list UAF + shutdown drain hardening
 
 **fix: the Phase-5 independent adversarial review found a reproduced P0 use-after-free the shipping

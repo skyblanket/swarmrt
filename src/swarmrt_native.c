@@ -297,6 +297,9 @@ __thread sw_gen_exec_t *_sw_gen;
  * `swc run` so the interpreter's deep C-stack tree-walk runs on a large fiber
  * (it used to run on the 8MB OS main thread). Lazy mmap = no physical cost. */
 size_t sw_proc_stack_size = 0;
+/* SW_PROC_STACK env override, parsed once in sw_init (pre-scheduler
+ * publication). Fills the default only — sw_proc_stack_size wins. */
+static size_t g_env_proc_stack = 0;
 /* GC v2: region handed to the next sw_spawn_opts to record on the child's
  * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
 static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
@@ -794,7 +797,8 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
          * to run on) BEFORE sw_init. Lazy mmap means physical = touched pages,
          * so a large reservation costs nothing for shallow programs. */
         size_t usable = sw_proc_stack_size ? sw_proc_stack_size
-                                           : (size_t)SW_PROC_STACK_SIZE;
+                      : g_env_proc_stack   ? g_env_proc_stack
+                      : (size_t)SW_PROC_STACK_SIZE;
 #ifdef _WIN32
         long page_size = 4096;
         size_t total = (size_t)page_size + usable;
@@ -1700,6 +1704,10 @@ static void _sw_install_altstack(void) {
 #endif
 }
 
+/* Page size cached at install time — sysconf() is not on the official
+ * async-signal-safe list, so the handler must not be the first caller. */
+static long g_crash_page_size = 4096;
+
 static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     const char *signame = (sig == SIGSEGV) ? "SIGSEGV" :
@@ -1711,22 +1719,30 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
     int len;
 
     /* Stack overflow detection: a fault inside (or within a page below) the
-     * RUNNING process's guard page means its 128KB fiber stack overflowed —
+     * RUNNING process's guard page means its fiber stack overflowed —
      * almost always deep non-self recursion (mutual tail calls are not
      * TCO'd; self-tail-calls compile to a flat loop). Say so, instead of
-     * leaving a bare SIGSEGV to be mistaken for a runtime bug. */
+     * leaving a bare crash banner to be mistaken for a runtime bug.
+     *
+     * BOTH signals matter: Linux delivers a guard-page hit as SIGSEGV, but
+     * macOS maps KERN_PROTECTION_FAILURE (store to a mapped PROT_NONE page)
+     * to SIGBUS — the 2026-07-05 swarm-code overflow surfaced as a generic
+     * "CRASH: SIGBUS" precisely because only SIGSEGV was checked here. The
+     * window is the real guard page (16KB on macOS arm64, not 4KB) plus one
+     * page of slack for frames that reach below the fault point. */
     sw_process_t *cur = tls_current;
-    if (sig == SIGSEGV && cur && cur->stack_mem && info->si_addr) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && cur && cur->stack_mem && info->si_addr) {
         uintptr_t fault = (uintptr_t)info->si_addr;
+        uintptr_t ps = (uintptr_t)g_crash_page_size;
         uintptr_t guard_top = (uintptr_t)cur->stack_mem;       /* guard page is just below */
-        uintptr_t guard_bot = guard_top - 8192;                /* guard page + one page slack */
+        uintptr_t guard_bot = guard_top - ps - ps;             /* guard page + one page slack */
         if (fault < guard_top && fault >= guard_bot) {
             len = snprintf(msg, sizeof(msg),
-                "\n\033[1;31mpanic\033[0m: stack overflow in process #%llu (128KB fiber stack)\n"
+                "\n\033[1;31mpanic\033[0m: stack overflow in process #%llu (%zuKB fiber stack)\n"
                 "  likely cause: deep NON-SELF recursion — mutual tail calls are not\n"
-                "  TCO'd (self-tail-calls are). Keep the loop in one function, or see\n"
-                "  docs/notes/KNOWN_ISSUES.md.\n",
-                (unsigned long long)cur->pid);
+                "  TCO'd (self-tail-calls are). Keep the loop in one function, raise\n"
+                "  SW_PROC_STACK, or see docs/notes/KNOWN_ISSUES.md.\n",
+                (unsigned long long)cur->pid, (size_t)(cur->stack_size / 1024));
             write(STDERR_FILENO, msg, len);
             signal(sig, SIG_DFL);
             raise(sig);
@@ -1820,6 +1836,23 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     if (msg_max_env && *msg_max_env) {
         long long n = strtoll(msg_max_env, NULL, 10);
         if (n > 0) g_msg_max_bytes = (size_t)n;
+    }
+
+    /* Fiber stack size — SW_PROC_STACK (bytes, or with k/K/m/M suffix).
+     * Operational escape hatch: bump a compiled binary's per-process stacks
+     * without recompiling (e.g. an agent harness with legitimately deep
+     * call chains). Fills the DEFAULT only — an embedder's programmatic
+     * sw_proc_stack_size (swc run's big interpreter stack) still wins.
+     * Clamped to [64KB, 64MB]: below 64KB the 32KB red zone + panic path
+     * leave no usable stack; same pre-scheduler publication as above. */
+    const char *stack_env = getenv("SW_PROC_STACK");
+    if (stack_env && *stack_env) {
+        char *end = NULL;
+        unsigned long long v = strtoull(stack_env, &end, 10);
+        if (end && (*end == 'k' || *end == 'K')) v *= 1024ULL;
+        else if (end && (*end == 'm' || *end == 'M')) v *= 1024ULL * 1024ULL;
+        if (v >= 64ULL * 1024 && v <= 64ULL * 1024 * 1024)
+            g_env_proc_stack = (size_t)v;
     }
 
     /* Reset the graceful-shutdown flags so an embedder that re-inits after a
@@ -1934,6 +1967,7 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     {
         struct sigaction crash_sa;
         memset(&crash_sa, 0, sizeof(crash_sa));
+        g_crash_page_size = sysconf(_SC_PAGESIZE);
         crash_sa.sa_sigaction = _sw_crash_handler;
         /* SA_ONSTACK: run on the per-thread sigaltstack. On a fiber-stack
          * overflow the faulting stack has no headroom — without this the

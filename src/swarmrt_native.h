@@ -653,6 +653,33 @@ sw_process_t *sw_self(void);
 uint64_t sw_getpid(void);
 sw_proc_state_t sw_get_state(sw_process_t *proc);
 
+/* Red-zone stack guard — recoverable stack overflow.
+ *
+ * Generated function prologues call this; when the running fiber's stack
+ * pointer is within SW_STACK_RED_ZONE of the guard page, the codegen raises
+ * a NORMAL sw panic (per-process death, EXIT propagation to links/monitors,
+ * supervisor restart) instead of letting the next deep call hit the guard
+ * page — which is a native SIGSEGV/SIGBUS that kills the whole OS process
+ * and bypasses every fault-tolerance layer the runtime has.
+ *
+ * The red zone must leave room for the panic path itself (vsnprintf +
+ * fprintf + trace print ≈ 4KB) plus the deepest C-side excursion a builtin
+ * makes below an sw frame (to_string/format recursion is bounded by the
+ * 253 value-depth cap ≈ 25KB worst case). 32KB covers both.
+ *
+ * Returns 0 when not on a fiber (interpreter/REPL/C threads — the
+ * tree-walking interpreter has its own stack-near-limit guard), or when
+ * the probe address is not inside this fiber's stack (delta > stack_size:
+ * scheduler-thread code running with tls_current still set). */
+#define SW_STACK_RED_ZONE (32 * 1024)
+static inline int sw_stack_low(void) {
+    sw_process_t *p = sw_self();
+    if (!p || !p->stack_mem) return 0;
+    char probe;
+    uintptr_t delta = (uintptr_t)&probe - (uintptr_t)p->stack_mem;
+    return delta <= p->stack_size && delta < SW_STACK_RED_ZONE;
+}
+
 /* Statistics */
 void sw_stats(int swarm_id);
 uint64_t sw_process_count(int swarm_id);

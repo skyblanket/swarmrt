@@ -914,7 +914,10 @@ static int has_tail_calls(cg_ctx_t *ctx, node_t *n) {
     case N_RECEIVE:
         for (int i = 0; i < n->v.recv.nclauses; i++)
             if (has_tail_calls(ctx, n->v.recv.clauses[i])) return 1;
-        return 0;
+        /* The `after` body is a tail position too (emit_receive propagates
+         * the tail flag into it) — miss it here and the goto _tail emitted
+         * for an after-arm self-call has no label to land on. */
+        return has_tail_calls(ctx, n->v.recv.after_body);
     case N_CLAUSE:
         return has_tail_calls(ctx, n->v.clause.body);
     case N_IF:
@@ -1472,6 +1475,12 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
          * since anonymous functions have no source name. */
         fprintf(f, "    _sw_trace_push(\"%s\", \"%s\", %d);\n",
                 ctx->mod_name, li->gen_name, fn->line);
+
+        /* Red-zone stack guard — same as emit_function: recursion through
+         * lambdas (apply chains, Y-combinator shapes) must die as a process
+         * panic, not a native guard-page fault. */
+        fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s (lambda) — deep recursion? raise SW_PROC_STACK or restructure the loop\");\n",
+                ctx->mod_name, li->gen_name);
 
         /* Body */
         char result[32];
@@ -2664,11 +2673,16 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     fprintf(f, "        }\n");
     fprintf(f, "      }\n");  /* end outer while (!matched) */
 
-    /* After clause (timeout handler) */
+    /* After clause (timeout handler). TAIL POSITION like the receive arms:
+     * a self-tail-call here must compile to `goto _tail`, not a real C call.
+     * This was emitted with tail=0 until 2026-07-05 — every heartbeat-style
+     * `receive {...} after N { loop(...) }` stacked ~1.5KB of C frame per
+     * tick and overflowed the 128KB fiber stack after a few minutes
+     * (swarm-code died with SIGBUS at 154s of a long tool wait). */
     if (n->v.recv.after_body) {
         fprintf(f, "      if (!_matched) {\n");
         char after_res[32];
-        emit_expr(ctx, n->v.recv.after_body, 0, after_res, sizeof(after_res));
+        emit_expr(ctx, n->v.recv.after_body, tail, after_res, sizeof(after_res));
         if (after_res[0])
             fprintf(f, "        %s = %s;\n", res, after_res);
         fprintf(f, "      }\n");
@@ -3397,6 +3411,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * frame — tail-recursion doesn't grow the call stack visually. */
     fprintf(f, "    _sw_trace_push(\"%s\", \"%s\", %d);\n",
             ctx->mod_name, fn->v.fun.name, fn->line);
+
+    /* Red-zone stack guard: turn a would-be fiber-stack overflow (native
+     * SIGBUS/SIGSEGV on the guard page = whole-OS-process death, no
+     * supervision) into a normal per-process panic while there is still
+     * headroom for the panic path. Fires on deep NON-self recursion —
+     * self-tail-calls take the goto below and never re-enter here. */
+    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep recursion? mutual tail calls are not TCO'd (self-tail-calls are); keep the loop in one function or raise SW_PROC_STACK\");\n",
+            ctx->mod_name, fn->v.fun.name);
 
     /* Tail call label. Ownership v2: record the arena "floor" at entry — the
      * scoped turn-checkpoint (emit_call) reclaims only what THIS function
