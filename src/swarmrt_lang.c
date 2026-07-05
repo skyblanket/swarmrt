@@ -27,6 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <pthread.h>
 #include "swarmrt_lang.h"
@@ -4038,6 +4039,69 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_tuple(items, 2);
 #endif
     }
+    /* shell_detached(cmd, log_path, exit_path) → pid_int | nil.
+     * Double-fork + setsid so the worker is reparented and leads its own
+     * process group; stdin=/dev/null, stdout/stderr→log_path, exit code→
+     * exit_path. Mirrors _builtin_shell_detached for `swc run`/REPL parity. */
+    if (strcmp(fname, "shell_detached") == 0 && nargs >= 3
+        && args[0]->type == SW_VAL_STRING
+        && args[1]->type == SW_VAL_STRING
+        && args[2]->type == SW_VAL_STRING) {
+#ifdef _WIN32
+        return sw_val_nil();
+#else
+        const char *cmd       = args[0]->v.str;
+        const char *log_path  = args[1]->v.str;
+        const char *exit_path = args[2]->v.str;
+        int pfd[2];
+        if (pipe(pfd) != 0) return sw_val_nil();
+        pid_t inter = fork();
+        if (inter < 0) { close(pfd[0]); close(pfd[1]); return sw_val_nil(); }
+        if (inter == 0) {
+            close(pfd[0]);
+            pid_t worker = fork();
+            if (worker < 0) { int neg = -1; (void)write(pfd[1], &neg, sizeof(neg)); close(pfd[1]); _exit(0); }
+            if (worker > 0) { int wp = (int)worker; (void)write(pfd[1], &wp, sizeof(wp)); close(pfd[1]); _exit(0); }
+            setsid();
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) dup2(devnull, STDIN_FILENO);
+            int logfd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (logfd >= 0) { dup2(logfd, STDOUT_FILENO); dup2(logfd, STDERR_FILENO); }
+            close(pfd[1]);
+            if (devnull > STDERR_FILENO) close(devnull);
+            if (logfd   > STDERR_FILENO) close(logfd);
+            size_t wlen = strlen(cmd) + strlen(exit_path) + 32;
+            char *wrapper = (char *)malloc(wlen);
+            if (!wrapper) _exit(127);
+            snprintf(wrapper, wlen, "( %s ); echo $? > %s", cmd, exit_path);
+            execl("/bin/sh", "sh", "-c", wrapper, (char *)NULL);
+            _exit(127);
+        }
+        close(pfd[1]);
+        int worker_pid = 0;
+        ssize_t drd = read(pfd[0], &worker_pid, sizeof(worker_pid));
+        close(pfd[0]);
+        waitpid(inter, NULL, 0);
+        if (drd != (ssize_t)sizeof(worker_pid) || worker_pid <= 0) return sw_val_nil();
+        return sw_val_int(worker_pid);
+#endif
+    }
+    /* pid_kill_group(pid) → 'true' | 'false'. kill(-pid, SIGTERM) with an
+     * ESRCH fallback to kill(pid,...); refuses pid <= 1. */
+    if (strcmp(fname, "pid_kill_group") == 0 && nargs >= 1 && args[0]) {
+#ifdef _WIN32
+        return sw_val_atom("false");
+#else
+        long kpid = 0;
+        if (args[0]->type == SW_VAL_INT) kpid = (long)args[0]->v.i;
+        else if (args[0]->type == SW_VAL_STRING) kpid = atol(args[0]->v.str);
+        else return sw_val_atom("false");
+        if (kpid <= 1) return sw_val_atom("false");
+        if (kill((pid_t)(-kpid), SIGTERM) == 0) return sw_val_atom("true");
+        if (errno == ESRCH && kill((pid_t)kpid, SIGTERM) == 0) return sw_val_atom("true");
+        return sw_val_atom("false");
+#endif
+    }
 
     /* === SQLite ================================================ */
     if (strcmp(fname, "db_open") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
@@ -5888,7 +5952,7 @@ static const char *k_interp_builtins[] = {
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
-    "random_int","read_key","reduce","shell","shell_managed","shell_sandboxed","sleep","string_replace",
+    "pid_kill_group","random_int","read_key","reduce","shell","shell_detached","shell_managed","shell_sandboxed","sleep","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
     NULL
@@ -5906,6 +5970,8 @@ static const char *lint_required_cap(const char *name) {
     if (strncmp(name, "db_", 3) == 0)   return "db";
     if (strcmp(name, "shell") == 0 || strcmp(name, "shell_sandboxed") == 0 ||
         strcmp(name, "shell_managed") == 0 ||
+        strcmp(name, "shell_detached") == 0 ||
+        strcmp(name, "pid_kill_group") == 0 ||
         strcmp(name, "exec_argv") == 0) return "shell";
     return NULL;
 }

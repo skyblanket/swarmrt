@@ -5350,6 +5350,114 @@ static sw_val_t *_builtin_exec_argv(sw_val_t **a, int n) {
 #endif
 }
 
+/* shell_detached(cmd, log_path, exit_path) → pid_int | nil
+ *
+ * Launch `cmd` FULLY detached from swarm-code: double-fork so the worker is
+ * reparented to init/launchd (no zombies, survives our own exit), and
+ * setsid() in the worker so it becomes a session + process-group leader
+ * (pgid == worker pid). That pgid is what lets pid_kill_group(pid) tear down
+ * the whole subtree via kill(-pid, ...). The worker's stdin is /dev/null (so a
+ * command that reads stdin gets immediate EOF instead of hanging); stdout+stderr
+ * are redirected to log_path (truncated); when the command finishes the wrapper
+ * writes its exit code to exit_path.
+ *
+ * Returns the worker pid (int) so the caller can poll pid_alive / kill it, or
+ * nil on any validation / pipe / fork failure. */
+static sw_val_t *_builtin_shell_detached(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_nil();
+#else
+    if (n < 3 || !a[0] || a[0]->type != SW_VAL_STRING
+              || !a[1] || a[1]->type != SW_VAL_STRING
+              || !a[2] || a[2]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    const char *cmd       = a[0]->v.str;
+    const char *log_path  = a[1]->v.str;
+    const char *exit_path = a[2]->v.str;
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return sw_val_nil();
+
+    pid_t inter = fork();
+    if (inter < 0) { close(pfd[0]); close(pfd[1]); return sw_val_nil(); }
+
+    if (inter == 0) {
+        /* Intermediate child: close the read end, fork the worker, report the
+         * worker pid up the pipe, then _exit(0). Its exit reparents the worker
+         * to init/launchd so no zombie is left for swarm-code to reap. */
+        close(pfd[0]);
+        pid_t worker = fork();
+        if (worker < 0) {                     /* worker fork failed */
+            int neg = -1;
+            (void)write(pfd[1], &neg, sizeof(neg));
+            close(pfd[1]);
+            _exit(0);
+        }
+        if (worker > 0) {                     /* still the intermediate */
+            int wp = (int)worker;
+            (void)write(pfd[1], &wp, sizeof(wp));
+            close(pfd[1]);
+            _exit(0);
+        }
+
+        /* Worker (grandchild). setsid() FIRST → new session, becomes its own
+         * process-group leader (pgid == pid) so kill(-pid,...) hits the tree. */
+        setsid();
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) dup2(devnull, STDIN_FILENO);
+        int logfd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (logfd >= 0) { dup2(logfd, STDOUT_FILENO); dup2(logfd, STDERR_FILENO); }
+        close(pfd[1]);                         /* don't leak the pipe into cmd */
+        if (devnull > STDERR_FILENO) close(devnull);
+        if (logfd   > STDERR_FILENO) close(logfd);
+
+        /* Wrapper: run cmd in a subshell, then record its exit code. */
+        size_t wlen = strlen(cmd) + strlen(exit_path) + 32;
+        char *wrapper = (char *)malloc(wlen);
+        if (!wrapper) _exit(127);
+        snprintf(wrapper, wlen, "( %s ); echo $? > %s", cmd, exit_path);
+        execl("/bin/sh", "sh", "-c", wrapper, (char *)NULL);
+        _exit(127);                            /* exec failed */
+    }
+
+    /* Parent: read the worker pid the intermediate wrote, reap the intermediate. */
+    close(pfd[1]);
+    int worker_pid = 0;
+    ssize_t rd = read(pfd[0], &worker_pid, sizeof(worker_pid));
+    close(pfd[0]);
+    waitpid(inter, NULL, 0);                    /* reap the short-lived middle */
+    if (rd != (ssize_t)sizeof(worker_pid) || worker_pid <= 0) return sw_val_nil();
+    return sw_val_int(worker_pid);
+#endif
+}
+
+/* pid_kill_group(pid) → 'true' | 'false'
+ *
+ * Tear down the entire process group led by `pid` (as established by
+ * shell_detached's setsid): kill(-pid, SIGTERM) signals every process in the
+ * group. REFUSES pid <= 1 (never kill(-1,...) — that would blast every process
+ * we can signal — and never init). If the group send fails with ESRCH (no such
+ * group / pid was never a leader), fall back to kill(pid, SIGTERM) for the lone
+ * process. Returns 'true' if either signal was delivered, else 'false'. */
+static sw_val_t *_builtin_pid_kill_group(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_atom("false");
+#else
+    if (n < 1 || !a[0]) return sw_val_atom("false");
+    long pid = 0;
+    if (a[0]->type == SW_VAL_INT) pid = (long)a[0]->v.i;
+    else if (a[0]->type == SW_VAL_STRING) pid = atol(a[0]->v.str);
+    else return sw_val_atom("false");
+    if (pid <= 1) return sw_val_atom("false");   /* never kill(-1,...) or init */
+
+    if (kill((pid_t)(-pid), SIGTERM) == 0) return sw_val_atom("true");
+    if (errno == ESRCH && kill((pid_t)pid, SIGTERM) == 0) return sw_val_atom("true");
+    return sw_val_atom("false");
+#endif
+}
+
 /* === JSON encode: sw_val_t → JSON string === */
 
 static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos);
