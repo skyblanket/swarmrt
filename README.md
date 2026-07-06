@@ -1,4 +1,4 @@
-<img src="docs/assets/banner.png" alt="swarmrt — erlang's soul, compiled. A BEAM-shaped runtime in C. Up to 100,000 processes. MIT." width="100%"/>
+<img src="docs/assets/banner.gif" alt="swarmrt — erlang's soul, compiled. A BEAM-shaped runtime in C. Up to 100,000 processes. MIT." width="100%"/>
 
 # SwarmRT
 
