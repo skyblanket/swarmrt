@@ -3556,6 +3556,50 @@ static sw_val_t *interp_apply_fn(sw_interp_t *interp, sw_val_t *fn,
     return r;
 }
 
+/* Pending-input ring for the interpreter path (`swc run`/REPL). The compiled
+ * path keeps its own copy in swarmrt_builtins_studio.h, which is NOT included
+ * here — so this is an independent 8 KB, byte-oriented, drop-oldest, mutex-
+ * guarded buffer giving stdin_pending_push / stdin_take_pending full parity. */
+#define _SW_INTERP_PENDING_CAP 8192
+static unsigned char _sw_interp_pending_buf[_SW_INTERP_PENDING_CAP];
+static size_t _sw_interp_pending_len = 0;
+static pthread_mutex_t _sw_interp_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void _sw_interp_pending_push(const unsigned char *data, size_t nb) {
+    if (!data || nb == 0) return;
+    pthread_mutex_lock(&_sw_interp_pending_lock);
+    if (nb >= _SW_INTERP_PENDING_CAP) {
+        memcpy(_sw_interp_pending_buf, data + (nb - _SW_INTERP_PENDING_CAP), _SW_INTERP_PENDING_CAP);
+        _sw_interp_pending_len = _SW_INTERP_PENDING_CAP;
+        pthread_mutex_unlock(&_sw_interp_pending_lock);
+        return;
+    }
+    if (_sw_interp_pending_len + nb > _SW_INTERP_PENDING_CAP) {
+        size_t drop = (_sw_interp_pending_len + nb) - _SW_INTERP_PENDING_CAP;
+        memmove(_sw_interp_pending_buf, _sw_interp_pending_buf + drop, _sw_interp_pending_len - drop);
+        _sw_interp_pending_len -= drop;
+    }
+    memcpy(_sw_interp_pending_buf + _sw_interp_pending_len, data, nb);
+    _sw_interp_pending_len += nb;
+    pthread_mutex_unlock(&_sw_interp_pending_lock);
+}
+
+/* Create every missing parent component of `path` (mkdir -p of dirname). */
+static void _sw_interp_mkparent(const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path) return;
+    size_t plen = (size_t)(slash - path);
+    char *tmp = (char *)malloc(plen + 1);
+    if (!tmp) return;
+    memcpy(tmp, path, plen);
+    tmp[plen] = '\0';
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    }
+    mkdir(tmp, 0755);
+    free(tmp);
+}
+
 /* Returns NULL if `fname` isn't a recognized extra builtin — caller
  * continues to user-fn lookup. */
 static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
@@ -3926,6 +3970,66 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     /* read_key: the interpreter has no raw-mode stdin watch — report "no key".
      * Compiled binaries use the real _builtin_read_key. */
     if (strcmp(fname, "read_key") == 0) { return sw_val_nil(); }
+
+    /* stdin_pending_push(str) → 'true'|'false': append the string's bytes to
+     * the pending-input ring (drop-oldest on overflow). */
+    if (strcmp(fname, "stdin_pending_push") == 0) {
+        if (nargs < 1 || !args[0] || args[0]->type != SW_VAL_STRING) return sw_val_atom("false");
+        size_t slen = strlen(args[0]->v.str);
+        if (slen == 0) return sw_val_atom("false");
+        _sw_interp_pending_push((const unsigned char *)args[0]->v.str, slen);
+        return sw_val_atom("true");
+    }
+
+    /* stdin_take_pending() → string|nil: atomically drain the whole ring. */
+    if (strcmp(fname, "stdin_take_pending") == 0) {
+        pthread_mutex_lock(&_sw_interp_pending_lock);
+        if (_sw_interp_pending_len == 0) { pthread_mutex_unlock(&_sw_interp_pending_lock); return sw_val_nil(); }
+        size_t plen = _sw_interp_pending_len;
+        char *out = (char *)malloc(plen + 1);
+        if (!out) { pthread_mutex_unlock(&_sw_interp_pending_lock); return sw_val_nil(); }
+        memcpy(out, _sw_interp_pending_buf, plen);
+        out[plen] = '\0';
+        _sw_interp_pending_len = 0;
+        pthread_mutex_unlock(&_sw_interp_pending_lock);
+        sw_val_t *r = sw_val_string(out);
+        free(out);
+        return r;
+    }
+
+    /* rl_history_load(path) → count|nil: read the history file, keeping the
+     * newest 1000 lines. The interpreter has no in-session line editor, so we
+     * only count (the compiled path also seeds _sw_rl); returns lines loaded. */
+    if (strcmp(fname, "rl_history_load") == 0) {
+        if (nargs < 1 || !args[0] || args[0]->type != SW_VAL_STRING) return sw_val_nil();
+        FILE *fp = fopen(args[0]->v.str, "r");
+        if (!fp) return sw_val_nil();
+        int total = 0;
+        char *lb = NULL;
+        size_t lcap = 0;
+        while (getline(&lb, &lcap, fp) != -1) total++;
+        free(lb);
+        fclose(fp);
+        if (total > 1000) total = 1000;   /* 1000-line cap (keep newest) */
+        return sw_val_int(total);
+    }
+
+    /* rl_history_append(path, line) → 'true'|'false': append one line, creating
+     * the parent directory if missing. Blank/newline-containing lines rejected. */
+    if (strcmp(fname, "rl_history_append") == 0) {
+        if (nargs < 2 || !args[0] || args[0]->type != SW_VAL_STRING
+                       || !args[1] || args[1]->type != SW_VAL_STRING) return sw_val_atom("false");
+        const char *path = args[0]->v.str;
+        const char *hline = args[1]->v.str;
+        if (!*hline || strchr(hline, '\n')) return sw_val_atom("false");
+        _sw_interp_mkparent(path);
+        FILE *fp = fopen(path, "a");
+        if (!fp) return sw_val_atom("false");
+        fputs(hline, fp);
+        fputc('\n', fp);
+        fclose(fp);
+        return sw_val_atom("true");
+    }
 
     /* shell_managed: the interpreter has no select loop, so behave like a
      * blocking shell and report interrupted='false'. The COMPILED binary
@@ -5952,7 +6056,9 @@ static const char *k_interp_builtins[] = {
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
-    "pid_kill_group","random_int","read_key","reduce","shell","shell_detached","shell_managed","shell_sandboxed","sleep","string_replace",
+    "pid_kill_group","random_int","read_key","reduce","rl_history_append","rl_history_load",
+    "shell","shell_detached","shell_managed","shell_sandboxed","sleep",
+    "stdin_pending_push","stdin_take_pending","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
     NULL

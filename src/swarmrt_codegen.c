@@ -378,7 +378,12 @@ static int is_builtin(const char *name) {
            strcmp(name, "exec_argv") == 0 ||
            /* detached background process + process-group kill */
            strcmp(name, "shell_detached") == 0 ||
-           strcmp(name, "pid_kill_group") == 0;
+           strcmp(name, "pid_kill_group") == 0 ||
+           /* pending-input ring + persistent line-history */
+           strcmp(name, "stdin_pending_push") == 0 ||
+           strcmp(name, "stdin_take_pending") == 0 ||
+           strcmp(name, "rl_history_load") == 0 ||
+           strcmp(name, "rl_history_append") == 0;
 }
 
 static int is_self_call(cg_ctx_t *ctx, node_t *n) {
@@ -1868,6 +1873,7 @@ static const char *_common_builtins[] = {
     "read_line", "read_char", "read_key", "read_choice",
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "shell_managed", "pid_alive",
     "shell_detached", "pid_kill_group",
+    "stdin_pending_push", "stdin_take_pending", "rl_history_load", "rl_history_append",
     "random_int", "supervise", "swarm_stats",
     "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
     "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
@@ -2339,6 +2345,11 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              /* detached background process + process-group kill */
              strcmp(fname, "shell_detached") == 0 ||
              strcmp(fname, "pid_kill_group") == 0 ||
+             /* pending-input ring + persistent line-history */
+             strcmp(fname, "stdin_pending_push") == 0 ||
+             strcmp(fname, "stdin_take_pending") == 0 ||
+             strcmp(fname, "rl_history_load") == 0 ||
+             strcmp(fname, "rl_history_append") == 0 ||
              /* DynamicSupervisor (runtime start_child) */
              strcmp(fname, "dyn_supervisor") == 0 ||
              strcmp(fname, "sup_start_child") == 0 ||

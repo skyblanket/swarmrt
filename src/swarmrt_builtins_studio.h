@@ -1098,6 +1098,101 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
 #endif
 }
 
+/* ============================================================
+ * Pending-input ring buffer — type-ahead captured mid-turn
+ * ============================================================
+ *
+ * Keys the user presses while an LLM stream or a tool is running used to be
+ * silently discarded at the stdin watch sites. Instead we deposit the raw
+ * bytes here (a fixed 8 KB, byte-oriented, drop-oldest ring, mutex-guarded so
+ * a worker/scheduler thread and the main reader never race) and the next
+ * read_line() drains it as a seed for the edit buffer (CC-style queued input).
+ *
+ * Builtins:
+ *   stdin_pending_push(str)  → 'true' | 'false'  (append bytes; false on bad arg)
+ *   stdin_take_pending()     → string | nil      (atomic drain of the whole ring)
+ */
+#define _SW_PENDING_CAP 8192
+static unsigned char _sw_pending_buf[_SW_PENDING_CAP];
+static size_t _sw_pending_len = 0;
+static pthread_mutex_t _sw_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Append n bytes, dropping the OLDEST bytes if the ring would overflow. */
+static void _sw_pending_push_bytes(const unsigned char *data, size_t n) {
+    if (!data || n == 0) return;
+    pthread_mutex_lock(&_sw_pending_lock);
+    if (n >= _SW_PENDING_CAP) {
+        /* The new data alone exceeds the ring: keep only its newest tail. */
+        memcpy(_sw_pending_buf, data + (n - _SW_PENDING_CAP), _SW_PENDING_CAP);
+        _sw_pending_len = _SW_PENDING_CAP;
+        pthread_mutex_unlock(&_sw_pending_lock);
+        return;
+    }
+    if (_sw_pending_len + n > _SW_PENDING_CAP) {
+        size_t drop = (_sw_pending_len + n) - _SW_PENDING_CAP;
+        memmove(_sw_pending_buf, _sw_pending_buf + drop, _sw_pending_len - drop);
+        _sw_pending_len -= drop;
+    }
+    memcpy(_sw_pending_buf + _sw_pending_len, data, n);
+    _sw_pending_len += n;
+    pthread_mutex_unlock(&_sw_pending_lock);
+}
+
+/* Atomically drain the ring into a freshly malloc'd NUL-terminated buffer.
+ * Returns NULL (and *out_len = 0) when the ring is empty. Caller frees. */
+static char *_sw_pending_take(size_t *out_len) {
+    if (out_len) *out_len = 0;
+    pthread_mutex_lock(&_sw_pending_lock);
+    if (_sw_pending_len == 0) { pthread_mutex_unlock(&_sw_pending_lock); return NULL; }
+    size_t n = _sw_pending_len;
+    char *r = (char *)malloc(n + 1);
+    if (!r) { pthread_mutex_unlock(&_sw_pending_lock); return NULL; }
+    memcpy(r, _sw_pending_buf, n);
+    r[n] = '\0';
+    _sw_pending_len = 0;
+    pthread_mutex_unlock(&_sw_pending_lock);
+    if (out_len) *out_len = n;
+    return r;
+}
+
+/* A bracketed-paste OPEN (ESC[200~) has just been consumed off `fd` mid-stream.
+ * Drain the paste BODY up to and including the ESC[201~ close, pushing only the
+ * body (never the framing) into the pending-input ring. A rolling match of the
+ * 6-byte close sequence lets us keep body bytes that merely resemble the close
+ * prefix; a short idle timeout bounds the loop so a truncated/never-closed
+ * paste can never hang the interrupt watcher. */
+#ifndef _WIN32
+static void _sw_stdin_drain_paste_body(int fd) {
+    static const unsigned char CLOSE[6] = {0x1b, '[', '2', '0', '1', '~'};
+    unsigned char body[4096];
+    size_t blen = 0;
+    int mp = 0;                 /* bytes of CLOSE currently matched (held back) */
+    for (int guard = 0; guard < 5000000; guard++) {
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(fd, &rf);
+        struct timeval tv = {0, 500000};   /* 500 ms idle → assume paste ended */
+        if (select(fd + 1, &rf, NULL, NULL, &tv) <= 0) break;
+        unsigned char b;
+        if (read(fd, &b, 1) != 1) break;
+        if (b == CLOSE[mp]) {
+            if (++mp == 6) break;          /* full ESC[201~ → done (framing dropped) */
+            continue;                      /* hold: might complete the close */
+        }
+        /* Mismatch: the mp held bytes were genuine body after all. */
+        for (int k = 0; k < mp; k++) {
+            body[blen++] = CLOSE[k];
+            if (blen == sizeof(body)) { _sw_pending_push_bytes(body, blen); blen = 0; }
+        }
+        mp = 0;
+        if (b == CLOSE[0]) { mp = 1; continue; }  /* b may start a fresh close */
+        body[blen++] = b;
+        if (blen == sizeof(body)) { _sw_pending_push_bytes(body, blen); blen = 0; }
+    }
+    if (blen > 0) _sw_pending_push_bytes(body, blen);
+}
+#endif
+
 /* Decide whether a byte just read from stdin is a GENUINE interrupt request
  * (a bare Esc, or Ctrl-C) versus the FIRST byte of an escape sequence — arrow
  * keys, F-keys, Home/End, alt-combos and bracketed-paste ALL begin with 0x1b.
@@ -1128,9 +1223,14 @@ static int _sw_stdin_is_interrupt(int fd, unsigned char first) {
     if (read(fd, &intro, 1) != 1) return 0;
     if (intro == '[' || intro == 'O') {
         /* CSI/SS3: drain params/intermediates up to a final byte (0x40-0x7e),
-         * peeking 0ms between bytes so we never block. */
+         * peeking 0ms between bytes so we never block. Capture the params so a
+         * bracketed-paste OPEN (ESC[200~) is recognised and its BODY diverted
+         * into the pending-input ring instead of being discarded byte-by-byte. */
         int guard = 0;
-        unsigned char seq;
+        unsigned char seq = 0;
+        char params[8];
+        int plen = 0;
+        int got_final = 0;
         while (guard < 24) {
             fd_set sf;
             FD_ZERO(&sf);
@@ -1141,39 +1241,79 @@ static int _sw_stdin_is_interrupt(int fd, unsigned char first) {
             if (select(fd + 1, &sf, NULL, NULL, &z) <= 0) break;
             if (read(fd, &seq, 1) != 1) break;
             guard++;
-            if (seq >= 0x40 && seq <= 0x7e) break;
+            if (seq >= 0x40 && seq <= 0x7e) { got_final = 1; break; }
+            if (plen < (int)sizeof(params) - 1) params[plen++] = (char)seq;
         }
+        params[plen] = '\0';
+        if (intro == '[' && got_final && seq == '~' && strcmp(params, "200") == 0)
+            _sw_stdin_drain_paste_body(fd);   /* ESC[200~ … ESC[201~ → ring */
     }
     /* else: Esc + one byte (Alt-combo) — `intro` already consumed. */
     return 0;  /* escape sequence → NOT an interrupt */
 #endif
 }
 
-/* After an explicit user interrupt, discard any queued key bytes before the
+/* After an explicit user interrupt, clear queued interrupt keys before the
  * caller returns to the agent loop. Without this, a double-press/held Esc can
  * remain in the tty input queue and the next http_post_stream immediately
  * aborts with "[Request interrupted by user]" even though the user already
- * released the key. */
+ * released the key. Bare Esc bytes are discarded; any OTHER queued bytes are
+ * legitimate type-ahead and are diverted into the pending-input ring so the
+ * next read_line can seed them rather than losing them to the flush. */
 static void _sw_stdin_flush_pending_interrupts(int fd) {
 #ifndef _WIN32
     if (fd < 0) return;
-    if (isatty(fd)) {
-        tcflush(fd, TCIFLUSH);
-        return;
-    }
-    unsigned char junk[64];
-    for (int guard = 0; guard < 16; guard++) {
+    /* Drain queued input after an explicit interrupt. Bare Esc bytes are the
+     * held/repeated interrupt key and stay discarded (the original bug: a
+     * lingering Esc made the next stream abort instantly); every OTHER byte is
+     * legitimate type-ahead the user entered and is preserved in the
+     * pending-input ring so the next read_line seeds it. We read (rather than
+     * tcflush) so we can inspect and selectively keep bytes. read() only fires
+     * after select() reports the fd readable, so it never blocks. */
+    unsigned char chunk[256];
+    for (int guard = 0; guard < 64; guard++) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
         struct timeval tv = {0, 0};
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ret <= 0) break;
-        if (read(fd, junk, sizeof(junk)) <= 0) break;
+        ssize_t rn = read(fd, chunk, sizeof(chunk));
+        if (rn <= 0) break;
+        unsigned char keep[256];
+        int kn = 0;
+        for (ssize_t i = 0; i < rn; i++) {
+            if (chunk[i] == 0x1b) continue;   /* held Esc → discard */
+            keep[kn++] = chunk[i];
+        }
+        if (kn > 0) _sw_pending_push_bytes(keep, (size_t)kn);
     }
 #else
     (void)fd;
 #endif
+}
+
+/* stdin_pending_push(str) → 'true' | 'false'. Append the string's bytes to the
+ * pending-input ring (drop-oldest on overflow). 'false' on a missing/non-string
+ * or empty argument. */
+static sw_val_t *_builtin_stdin_pending_push(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_atom("false");
+    const char *s = a[0]->v.str;
+    size_t len = strlen(s);
+    if (len == 0) return sw_val_atom("false");
+    _sw_pending_push_bytes((const unsigned char *)s, len);
+    return sw_val_atom("true");
+}
+
+/* stdin_take_pending() → string | nil. Atomically drain the whole ring. */
+static sw_val_t *_builtin_stdin_take_pending(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    size_t len = 0;
+    char *drained = _sw_pending_take(&len);
+    if (!drained) return sw_val_nil();
+    sw_val_t *r = sw_val_string(drained);
+    free(drained);
+    return r;
 }
 
 /* ============================================================
@@ -1499,7 +1639,15 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
                     ch.fp = NULL; ch.pid = -1;
                     done = 1; break;
                 }
-                /* Other keystrokes (incl. arrow/F-keys, drained by the helper): ignore. */
+                /* Non-interrupt keystrokes are legitimate type-ahead the user
+                 * entered mid-stream: preserve them in the pending-input ring
+                 * so the next read_line seeds them. Arrow/F-key framing and any
+                 * bracketed-paste body were already drained (the paste body
+                 * pushed to the ring) by _sw_stdin_is_interrupt; a lone ESC or
+                 * other control byte lands here but is dropped at seed time. */
+                else if (nb == 1) {
+                    _sw_pending_push_bytes(&ib, 1);
+                }
             }
 
             if (FD_ISSET(pipe_fd, &rfds)) {
@@ -7329,6 +7477,98 @@ static void _sw_rl_history_push(const char *line) {
     _sw_rl.entries[_sw_rl.count++] = strdup(line);
 }
 
+/* Return the length of `s` (raw bytes) with any INCOMPLETE trailing UTF-8
+ * multibyte sequence trimmed off, so callers never insert a broken codepoint.
+ * A complete codepoint (or plain ASCII) is kept; a lead byte still missing one
+ * or more of its continuation bytes is dropped. */
+static size_t _sw_utf8_trim_incomplete(const unsigned char *s, size_t n) {
+    if (n == 0) return 0;
+    size_t cont = 0;
+    size_t i = n;
+    while (i > 0 && (s[i - 1] & 0xC0) == 0x80) { i--; cont++; }  /* skip continuations */
+    if (i == 0) return n;   /* nothing but continuation bytes — leave for the caller */
+    unsigned char lead = s[i - 1];
+    size_t need;
+    if (lead < 0x80)               need = 1;   /* ASCII */
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    else                            need = 1;   /* invalid lead — treat as single */
+    size_t have = 1 + cont;                     /* lead + continuations present */
+    if (have >= need) return n;                 /* complete → keep everything */
+    return i - 1;                               /* incomplete tail → drop from the lead */
+}
+
+/* Extract the parent directory of `path` into `out` (NUL-terminated). Returns 1
+ * if a parent component exists (out set), 0 if `path` has no '/' (cwd-relative). */
+static int _sw_parent_dir(const char *path, char *out, size_t outsz) {
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path) return 0;
+    size_t n = (size_t)(slash - path);
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, path, n);
+    out[n] = '\0';
+    return 1;
+}
+
+/* rl_history_load(path) → count | nil. Read the history file, keep the newest
+ * 1000 lines, and push them (oldest-first) into the in-session history array so
+ * up-arrow recall survives a restart. Returns the number of lines loaded (post
+ * 1000-line cap), or nil if the file cannot be opened. */
+static sw_val_t *_builtin_rl_history_load(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    FILE *fp = fopen(a[0]->v.str, "r");
+    if (!fp) return sw_val_nil();
+    /* Ring of the newest 1000 line pointers. */
+    #define _SW_HIST_LOAD_CAP 1000
+    char *lines[_SW_HIST_LOAD_CAP];
+    int head = 0, cnt = 0;
+    char *lb = NULL;
+    size_t lcap = 0;
+    ssize_t rd;
+    while ((rd = getline(&lb, &lcap, fp)) != -1) {
+        while (rd > 0 && (lb[rd - 1] == '\n' || lb[rd - 1] == '\r')) lb[--rd] = '\0';
+        char *dup = strdup(lb);
+        if (!dup) continue;
+        if (cnt < _SW_HIST_LOAD_CAP) {
+            lines[(head + cnt) % _SW_HIST_LOAD_CAP] = dup;
+            cnt++;
+        } else {
+            free(lines[head]);              /* drop oldest, keep newest 1000 */
+            lines[head] = dup;
+            head = (head + 1) % _SW_HIST_LOAD_CAP;
+        }
+    }
+    free(lb);
+    fclose(fp);
+    for (int i = 0; i < cnt; i++) {
+        char *ln = lines[(head + i) % _SW_HIST_LOAD_CAP];
+        _sw_rl_history_push(ln);
+        free(ln);
+    }
+    #undef _SW_HIST_LOAD_CAP
+    return sw_val_int(cnt);
+}
+
+/* rl_history_append(path, line) → 'true' | 'false'. Append one line (creating
+ * the parent directory if missing). Blank lines and embedded newlines are
+ * rejected. */
+static sw_val_t *_builtin_rl_history_append(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING
+              || !a[1] || a[1]->type != SW_VAL_STRING) return sw_val_atom("false");
+    const char *path = a[0]->v.str;
+    const char *line = a[1]->v.str;
+    if (!*line || strchr(line, '\n')) return sw_val_atom("false");
+    char parent[1024];
+    if (_sw_parent_dir(path, parent, sizeof(parent))) _mkdirp(parent);
+    FILE *fp = fopen(path, "a");
+    if (!fp) return sw_val_atom("false");
+    fputs(line, fp);
+    fputc('\n', fp);
+    fclose(fp);
+    return sw_val_atom("true");
+}
+
 /* Advance a physical (row,col) cursor by the display width of one byte
  * stream, honouring ANSI CSI escape sequences (zero width), hard newlines,
  * UTF-8 continuation bytes (zero width — only lead bytes advance a column),
@@ -7500,6 +7740,33 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
     _sw_rl.caret_row = 0;
     _sw_rl.active = 1;
     pthread_mutex_unlock(&_sw_term_lock);
+
+    /* Seed the edit buffer with any pending type-ahead the user entered while
+     * the previous stream/tool was running (captured into the pending-input
+     * ring). Printable bytes — including multi-byte UTF-8 — are inserted at the
+     * caret and echoed; control bytes (Esc, arrow/paste framing residue, CR/LF)
+     * are dropped so we never seed a multi-line buffer. The ring holds RAW
+     * bytes, so an incomplete trailing UTF-8 sequence is trimmed first to avoid
+     * inserting a broken codepoint. */
+    {
+        size_t plen = 0;
+        char *pend = _sw_pending_take(&plen);
+        if (pend) {
+            size_t vlen = _sw_utf8_trim_incomplete((const unsigned char *)pend, plen);
+            int seeded = 0;
+            for (size_t i = 0; i < vlen; i++) {
+                unsigned char ch = (unsigned char)pend[i];
+                if (ch < 0x20 || ch == 0x7f) continue;   /* drop control bytes */
+                if (len + 2 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+                buf[len++] = (char)ch;
+                seeded = 1;
+            }
+            buf[len] = '\0';
+            cursor = len;
+            free(pend);
+            if (seeded) _sw_rl_redraw(prompt, buf, len, cursor);
+        }
+    }
 
     for (;;) {
         int c = fgetc(stdin);
