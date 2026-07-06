@@ -5180,34 +5180,42 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             }
             /* String concat with scalar auto-coercion. Atoms render as
              * their bare text (no leading ':'), bool/nil as true/false/nil,
-             * floats via %g — identical to _op_concat. */
-            char buf[4096];
-            size_t pos = 0;
-            buf[0] = '\0';
+             * floats via %g — identical to _op_concat.
+             *
+             * Sized exactly (heap) — the old fixed char[4096] SILENTLY
+             * TRUNCATED any concat past 4 KB, so a long ++ chain (or the
+             * f-string desugaring, which compiles to one) diverged from
+             * the compiled runtime's uncapped _op_concat. Found by
+             * tests/sw/conform/t14_input_builtins.sw (a 9 KB history file
+             * came out 4095 bytes on the interp path only). */
+            char numl[64], numr[64];
+            const char *ps[2]; size_t ns[2];
             sw_val_t *operands[2] = { left, right };
+            char *nums[2] = { numl, numr };
             for (int k = 0; k < 2; k++) {
                 sw_val_t *o = operands[k];
-                size_t avail = sizeof(buf) - pos - 1;
+                ps[k] = ""; ns[k] = 0;
                 if (!o) continue;
-                if (o->type == SW_VAL_STRING && o->v.str) {
-                    size_t n = strlen(o->v.str);
-                    if (n > avail) n = avail;
-                    memcpy(buf + pos, o->v.str, n); pos += n;
-                } else if (o->type == SW_VAL_ATOM && o->v.str) {
-                    size_t n = strlen(o->v.str);
-                    if (n > avail) n = avail;
-                    memcpy(buf + pos, o->v.str, n); pos += n;
+                if ((o->type == SW_VAL_STRING || o->type == SW_VAL_ATOM) && o->v.str) {
+                    ps[k] = o->v.str; ns[k] = strlen(o->v.str);
                 } else if (o->type == SW_VAL_INT) {
-                    pos += (size_t)snprintf(buf + pos, avail + 1, "%lld", (long long)o->v.i);
+                    snprintf(nums[k], sizeof(numl), "%lld", (long long)o->v.i);
+                    ps[k] = nums[k]; ns[k] = strlen(nums[k]);
                 } else if (o->type == SW_VAL_FLOAT) {
-                    pos += (size_t)snprintf(buf + pos, avail + 1, "%g", o->v.f);
+                    snprintf(nums[k], sizeof(numl), "%g", o->v.f);
+                    ps[k] = nums[k]; ns[k] = strlen(nums[k]);
                 } else if (o->type == SW_VAL_NIL) {
-                    pos += (size_t)snprintf(buf + pos, avail + 1, "nil");
+                    ps[k] = "nil"; ns[k] = 3;
                 }
-                if (pos > sizeof(buf) - 1) pos = sizeof(buf) - 1;
             }
-            buf[pos] = '\0';
-            return sw_val_string(buf);
+            char *out = (char *)malloc(ns[0] + ns[1] + 1);
+            if (!out) return sw_val_string("");
+            memcpy(out, ps[0], ns[0]);
+            memcpy(out + ns[0], ps[1], ns[1]);
+            out[ns[0] + ns[1]] = '\0';
+            sw_val_t *r = sw_val_string(out);
+            free(out);
+            return r;
         }
 
         /* Gleam-style loud error for the Python/JS reflex `"a" + "b"`.

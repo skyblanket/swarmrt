@@ -371,6 +371,7 @@ static int is_builtin(const char *name) {
            /* Phase 18: terminal introspection */
            strcmp(name, "term_cols") == 0 ||
            strcmp(name, "term_rows") == 0 ||
+           strcmp(name, "stdout_is_tty") == 0 ||
            strcmp(name, "stream_content_rows") == 0 ||
            /* Phase 19: interactive picker */
            strcmp(name, "read_choice") == 0 ||
@@ -1869,7 +1870,7 @@ static const char *_common_builtins[] = {
     "ws_request_headers", "ws_request_path",
     "wsc_connect", "wsc_connect_tls", "wsc_send", "wsc_recv", "wsc_set_handler", "wsc_close",
     "audio_ulaw_to_pcm16", "audio_pcm16_to_ulaw", "audio_resample",
-    "chrome_launch", "term_cols", "term_rows", "stream_content_rows",
+    "chrome_launch", "term_cols", "term_rows", "stdout_is_tty", "stream_content_rows",
     "read_line", "read_char", "read_key", "read_choice",
     "sleep", "timestamp", "getenv", "sys_exit", "shell", "shell_managed", "pid_alive",
     "shell_detached", "pid_kill_group",
@@ -2333,6 +2334,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              /* Phase 18: terminal introspection */
              strcmp(fname, "term_cols") == 0 ||
              strcmp(fname, "term_rows") == 0 ||
+             strcmp(fname, "stdout_is_tty") == 0 ||
              strcmp(fname, "stream_content_rows") == 0 ||
              /* Phase 19: interactive picker */
              strcmp(fname, "read_choice") == 0 ||

@@ -1283,7 +1283,21 @@ static void _sw_stdin_flush_pending_interrupts(int fd) {
         unsigned char keep[256];
         int kn = 0;
         for (ssize_t i = 0; i < rn; i++) {
-            if (chunk[i] == 0x1b) continue;   /* held Esc → discard */
+            if (chunk[i] == 0x1b) {
+                /* Held Esc → discard. If the Esc INTRODUCES a CSI/SS3 escape
+                 * sequence (arrow/F-key queued behind the held key), swallow
+                 * the whole sequence — its remainder ("[A") is key framing,
+                 * not type-ahead, and would otherwise be seeded into the next
+                 * read_line prompt as literal text. */
+                if (i + 1 < rn && (chunk[i + 1] == '[' || chunk[i + 1] == 'O')) {
+                    i++;                                 /* consume the intro */
+                    while (i + 1 < rn) {
+                        unsigned char fin = chunk[++i];  /* params → final    */
+                        if (fin >= 0x40 && fin <= 0x7e) break;
+                    }
+                }
+                continue;
+            }
             keep[kn++] = chunk[i];
         }
         if (kn > 0) _sw_pending_push_bytes(keep, (size_t)kn);
@@ -1785,6 +1799,15 @@ static int _sw_term_rows(void) { return 24; }
 static sw_val_t *_builtin_term_rows(sw_val_t **a, int n) {
     (void)a; (void)n;
     return sw_val_int((int64_t)_sw_term_rows());
+}
+
+/* sw builtin: stdout_is_tty() → 'true' | 'false'. Distinguishes a real
+ * terminal from a pipe/redirect so \r-rewrite UI (stream ticker, inline
+ * clears) can fall back to plain sequential output when captured —
+ * term_cols() can't be used for this: it falls back to /dev/tty. */
+static sw_val_t *_builtin_stdout_is_tty(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    return sw_val_atom(isatty(fileno(stdout)) ? "true" : "false");
 }
 
 /* Physical terminal rows the most recent (non-subagent) http_post_stream
@@ -2529,6 +2552,25 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     int tc_count = 0;
 
     while (!done) {
+        /* Routed-mode kill honor: when the sw side ESCs/timeouts a worker
+         * that is blocked in THIS builtin, exit_proc only sets the async
+         * kill_flag — without this check the curl child kept generating for
+         * up to --max-time (30 min), flooding stale chunks and, on a
+         * single-slot local server, queueing the retry BEHIND the zombie.
+         * Poll the flag each loop pass (≤ one spinner tick of latency),
+         * kill the child, and bail exactly like a user interrupt. */
+        {
+            sw_process_t *hps_self = sw_self();
+            if (hps_self && hps_self->kill_flag) {
+                interrupted = 1;
+                _sw_pkill_close(ch);
+                pp = NULL;
+                ch.fp = NULL;
+                ch.pid = -1;
+                done = 1;
+                break;
+            }
+        }
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(pipe_fd, &rfds);
@@ -3088,7 +3130,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * branches on, but the human still sees the warning inline. */
     if (fail_reason) {
         if (so.subagent) {
-            _stream_out_send_tagged(so.target, "stream_chunk", so.name, fail_reason);
+            /* Routed/subagent mode: a transport/HTTP failure is NOT content —
+             * tag it 'stream_err' so the sw renderer paints a gated ⚠ line
+             * instead of feeding it to the markdown/prose pipeline (which
+             * rendered errors as assistant text and bumped the token count). */
+            _stream_out_send_tagged(so.target, "stream_err", so.name, fail_reason);
         } else if (is_tty) {
             /* Only paint the inline ⚠ on a real terminal. */
             fprintf(stdout, "\n  \x1b[38;5;208m⚠ %s\x1b[0m\n", fail_reason);
@@ -3143,9 +3189,11 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
         buf_len += ml;
         buffer[buf_len] = '\0';
         /* Also show it on screen so the user can see it happened.
-         * In subagent mode, surface as a chunk so the parent can render. */
+         * In subagent/routed mode surface it as 'stream_err' — a status
+         * marker, not content — so the parent paints a ⚠ line instead of
+         * rendering it as assistant prose. */
         if (so.subagent) {
-            _stream_out_send_tagged(so.target, "stream_chunk", so.name, trunc_marker);
+            _stream_out_send_tagged(so.target, "stream_err", so.name, trunc_marker);
         } else if (is_tty && !interrupted) {
             fprintf(stdout, "\n  \x1b[38;5;208m⚠%s\x1b[0m\n", trunc_marker + 2);
             fflush(stdout);
@@ -7451,6 +7499,16 @@ static int _sw_rl_setup(void) {
     if (_sw_rl.saved_ok) return 1;
     if (!isatty(STDIN_FILENO)) return 0;
     if (tcgetattr(STDIN_FILENO, &_sw_rl.saved) != 0) return 0;
+    /* Unbuffer stdio stdin for the raw-mode session. The editor's
+     * ESC-disambiguation below and every stream-interrupt watcher select(2)
+     * on the FD — which cannot see bytes fgetc() already slurped into the
+     * stdio buffer. Buffered, a paste whose ESC[200~ open marker arrived in
+     * the same read burst as its body was misread as bare-Esc + literal
+     * "[200~" text (only pastes big enough to overflow the stdio buffer got
+     * recognised). Unbuffered, fgetc() reads one byte per call, so the
+     * kernel queue and select() always agree. Only the TTY path is
+     * affected — piped/test stdin never reaches this setup. */
+    setvbuf(stdin, NULL, _IONBF, 0);
     struct termios raw = _sw_rl.saved;
     /* Non-canonical, no echo. Keep ISIG so Ctrl+C stays. */
     raw.c_lflag &= ~(ICANON | ECHO);
@@ -7486,7 +7544,10 @@ static size_t _sw_utf8_trim_incomplete(const unsigned char *s, size_t n) {
     size_t cont = 0;
     size_t i = n;
     while (i > 0 && (s[i - 1] & 0xC0) == 0x80) { i--; cont++; }  /* skip continuations */
-    if (i == 0) return n;   /* nothing but continuation bytes — leave for the caller */
+    if (i == 0) return 0;   /* nothing but continuation bytes — a codepoint whose
+                             * lead byte was already lost (ring drop-oldest split
+                             * it). Unusable garbage: drop it all rather than
+                             * seeding mojibake into the caller's buffer. */
     unsigned char lead = s[i - 1];
     size_t need;
     if (lead < 0x80)               need = 1;   /* ASCII */
@@ -7590,9 +7651,11 @@ static void _sw_rl_advance(const char *s, size_t n, int term_w,
         if (c == '\n') { (*row)++; *col = 0; continue; }
         if (c == '\r') { *col = 0; continue; }
         if (c == '\t') {
+            /* Real terminals clamp TAB at the right margin — they never
+             * soft-wrap on it — so mirror that or the row math drifts. */
             int next = ((*col / 8) + 1) * 8;
-            if (next >= term_w) { (*row)++; *col = 0; }
-            else *col = next;
+            if (next > term_w - 1) next = term_w - 1;
+            if (next > *col) *col = next;
             continue;
         }
         if (c >= 0x80 && c < 0xc0) continue;         /* UTF-8 continuation */
@@ -7600,6 +7663,85 @@ static void _sw_rl_advance(const char *s, size_t n, int term_w,
         if (*col >= term_w) { (*row)++; *col = 0; }
         (*col)++;
     }
+}
+
+/* Render prompt + buffer AND/OR measure their physical geometry in ONE walk
+ * (F10b). `emit` nonzero → bytes are written to stdout exactly as measured;
+ * emit zero → pure measurement. Because printing and row/col math are the
+ * same loop, a wipe pass can never disagree with what a previous paint
+ * actually drew. (That disagreement was the root cause of the paste-then-type
+ * garbage: the old bracketed-paste echo printed continuation lines with its
+ * own hardcoded 2-space indent and never updated the recorded geometry, so
+ * the first keystroke after a multi-line paste wiped from the wrong origin
+ * row and stacked the reprint over stale rows.)
+ *
+ * Geometry rules (via _sw_rl_advance): rows/cols are 0-based; origin is
+ * col 0 of the prompt's first physical row; soft-wrap at term_w with
+ * deferred (xenl-style) wrap; ANSI CSI sequences and UTF-8 continuation
+ * bytes are zero-width. Hard line breaks in the buffer ('\n', lone '\r',
+ * or a "\r\n" pair = ONE break) start a continuation line indented with
+ * spaces to the prompt's end column — and that SAME indent is included in
+ * the math. Non-printing C0/DEL bytes in the buffer (possible via paste)
+ * are neither emitted nor counted. Outputs: caret (row,col) for byte
+ * offset `cursor`, end (row,col) after the full buffer. */
+static void _sw_rl_paint(const char *prompt, const char *buf, size_t len,
+                         size_t cursor, int term_w, int emit,
+                         int *caret_row, int *caret_col,
+                         int *end_row, int *end_col) {
+    if (term_w < 1) term_w = 1;
+    int row = 0, col = 0;
+    if (prompt) {
+        if (emit) fputs(prompt, stdout);
+        _sw_rl_advance(prompt, strlen(prompt), term_w, &row, &col);
+    }
+    /* Continuation lines align under the column where input starts (the
+     * prompt's end column). Degenerate prompts wider than the terminal
+     * fall back to col 0. */
+    int indent = (col < term_w) ? col : 0;
+    if (cursor > len) cursor = len;
+    int crow = row, ccol = col;
+    for (size_t i = 0; i < len; i++) {
+        if (i == cursor) { crow = row; ccol = col; }
+        char cb = buf[i];
+        if (cb == '\r' && i + 1 < len && buf[i + 1] == '\n') continue; /* CRLF: one break, at the '\n' */
+        if (cb == '\n' || cb == '\r') {
+            if (emit) {
+                fputc('\n', stdout);                   /* ONLCR is on → CR+LF */
+                for (int k = 0; k < indent; k++) fputc(' ', stdout);
+            }
+            row++;
+            col = indent;
+            continue;
+        }
+        if (((unsigned char)cb < 0x20 && cb != '\t') || cb == 0x7f)
+            continue;                                  /* invisible controls */
+        if (emit) fputc(cb, stdout);
+        _sw_rl_advance(&cb, 1, term_w, &row, &col);
+    }
+    if (cursor == len) { crow = row; ccol = col; }
+    *caret_row = crow; *caret_col = ccol;
+    *end_row = row;    *end_col = col;
+}
+
+/* Paint prompt + buffer starting at the CURRENT physical caret position
+ * (which must be the render origin: col 0 of the render's top row), then
+ * park the caret at its logical spot and record the geometry for the next
+ * wipe. Shared tail of the FIRST paint at read_line entry (no wipe — the
+ * caller's scrollback above the prompt must survive) and of every redraw.
+ * Caller must hold _sw_term_lock. */
+static void _sw_rl_paint_park_unlocked(const char *prompt, const char *buf,
+                                       size_t len, size_t cursor) {
+    int term_w = _sw_term_cols();   /* re-query TIOCGWINSZ every paint */
+    int crow = 0, ccol = 0, erow = 0, ecol = 0;
+    _sw_rl_paint(prompt, buf, len, cursor, term_w, 1, &crow, &ccol, &erow, &ecol);
+    /* Move the physical caret from end-of-text back to the caret position. */
+    if (erow > crow) printf("\x1b[%dA", erow - crow);
+    fputc('\r', stdout);
+    if (ccol > 0) printf("\x1b[%dC", ccol);
+    /* Record geometry for the next writer's wipe pass. */
+    _sw_rl.last_rows = erow + 1;
+    _sw_rl.caret_row = crow;
+    fflush(stdout);
 }
 
 /* Redraw the current buffer multi-line-correctly (F10).
@@ -7612,51 +7754,23 @@ static void _sw_rl_advance(const char *s, size_t n, int term_w,
  * geometry of the previous render in `_sw_rl` and, on every redraw:
  *   1. move the caret to the top-left of the previous render
  *      (\r + cursor-up by the stored caret_row), then
- *   2. \x1b[J to erase from there to the end of the screen (ALL prior rows),
- *      then
- *   3. reprint prompt + buffer and reposition the caret to `cursor`,
- *      recording the new geometry for the NEXT writer.
+ *   2. \x1b[J to erase from there to the end of the screen (ALL prior
+ *      rows — so a SHRINKING buffer leaves no stale rows), then
+ *   3. reprint prompt + buffer THROUGH THE SAME WALK that measures them
+ *      (_sw_rl_paint) and reposition the caret to `cursor`, recording the
+ *      new geometry for the NEXT writer.
  * The whole wipe+reprint runs under _sw_term_lock (held by the caller),
  * so concurrent writers serialise on one atomic redraw and never interleave.
  * `cursor` is the byte offset within buf where the caret should end up.
  * The _unlocked variant assumes the caller already holds _sw_term_lock. */
 static void _sw_rl_redraw_unlocked(const char *prompt, const char *buf, size_t len, size_t cursor) {
-    int term_w = _sw_term_cols();
-    if (term_w < 1) term_w = 1;
-
     /* (1)+(2) Wipe the entire previous render. Return the caret to col 0
      * of the top physical row of the last render, then clear downward. */
     fputs("\r", stdout);
     if (_sw_rl.caret_row > 0) printf("\x1b[%dA", _sw_rl.caret_row);
     fputs("\x1b[J", stdout);
-
-    /* (3) Reprint prompt + buffer. */
-    if (prompt) fputs(prompt, stdout);
-    fwrite(buf, 1, len, stdout);
-
-    /* Compute the geometry of what we just drew so we can (a) park the
-     * caret at `cursor` and (b) hand the NEXT redraw an accurate wipe size.
-     * The prompt advances the cursor but contributes no caret offset within
-     * `buf`; we track its rows so the buffer rows are measured from the right
-     * starting column. */
-    int end_row = 0, end_col = 0;
-    if (prompt) _sw_rl_advance(prompt, strlen(prompt), term_w, &end_row, &end_col);
-    int caret_row = end_row, caret_col = end_col;
-    /* caret position = geometry after prompt + buf[0..cursor) */
-    _sw_rl_advance(buf, cursor < len ? cursor : len, term_w, &caret_row, &caret_col);
-    /* end-of-text position = geometry after prompt + the full buffer */
-    _sw_rl_advance(buf, len, term_w, &end_row, &end_col);
-
-    /* Move the physical caret from end-of-text back to the caret position. */
-    if (end_row > caret_row) printf("\x1b[%dA", end_row - caret_row);
-    printf("\r");
-    if (caret_col > 0) printf("\x1b[%dC", caret_col);
-
-    /* Record geometry for the next writer's wipe pass. */
-    _sw_rl.last_rows = end_row + 1;
-    _sw_rl.caret_row = caret_row;
-
-    fflush(stdout);
+    /* (3) Reprint + re-park through the shared render walk. */
+    _sw_rl_paint_park_unlocked(prompt, buf, len, cursor);
 }
 
 static void _sw_rl_redraw(const char *prompt, const char *buf, size_t len, size_t cursor) {
@@ -7696,13 +7810,13 @@ static void _sw_rl_done(void) {
 
 static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
     const char *prompt = (n >= 1 && a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : NULL;
-    if (prompt) {
-        fputs(prompt, stdout);
-        fflush(stdout);
-    }
 
     /* Fall back to canonical line read if not a TTY (piped input, tests). */
     if (!_sw_rl_setup()) {
+        if (prompt) {
+            fputs(prompt, stdout);
+            fflush(stdout);
+        }
         size_t cap = 256, len = 0;
         char *buf = (char *)malloc(cap);
         int c;
@@ -7733,12 +7847,17 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
     _sw_rl.cur_buf = &buf;
     _sw_rl.cur_len = &len;
     _sw_rl.cur_cursor = &cursor;
-    /* Fresh render: the prompt was already printed once by the block above,
-     * so seed the geometry to that single physical row (caret on row 0). The
-     * first redraw will recompute exact rows; this just stops a stale wipe. */
-    _sw_rl.last_rows = 1;
+    _sw_rl.last_rows = 0;
     _sw_rl.caret_row = 0;
     _sw_rl.active = 1;
+    /* First paint: emit the prompt through the SAME render walk every
+     * subsequent redraw uses, so the recorded geometry (last_rows /
+     * caret_row) is exact from the first byte — even for prompts that wrap
+     * or contain newlines. No wipe here: the caller's own output above the
+     * prompt must survive. Same critical section as the publish so a
+     * concurrent print_above can never slip in between `active` flipping
+     * on and the first geometry record (it would double-paint the prompt). */
+    _sw_rl_paint_park_unlocked(prompt, buf, len, cursor);
     pthread_mutex_unlock(&_sw_term_lock);
 
     /* Seed the edit buffer with any pending type-ahead the user entered while
@@ -8014,7 +8133,15 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
                 int c4 = fgetc(stdin);
                 int c5 = fgetc(stdin);
                 if (c3 == '0' && c4 == '0' && c5 == '~') {
-                    /* Collect paste content verbatim until ESC [ 2 0 1 ~ */
+                    /* Collect paste content verbatim until ESC [ 2 0 1 ~.
+                     * Collection is SILENT — no per-byte echo. The old echo
+                     * printed continuation lines with a hardcoded 2-space
+                     * indent the redraw geometry never knew about, so the
+                     * first keystroke after a multi-line paste wiped from
+                     * the wrong origin row and interleaved the reprint with
+                     * stale rows. One geometry-tracked redraw below paints
+                     * the whole paste once the body is in (a paste arrives
+                     * as one burst, so nothing visible is delayed). */
                     /* Note: paste always goes to end of buffer — we don't
                      * try to insert at cursor for multi-line pastes. */
                     cursor = len;
@@ -8034,25 +8161,14 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
                             }
                             continue;
                         }
-                        /* Append to buffer; echo so user sees what was pasted. */
+                        if (pc == '\n' || pc == '\r') has_newline = 1;
                         if (len + 1 >= cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
                         buf[len++] = (char)pc;
                         buf[len] = '\0';
-                        if (pc == '\n' || pc == '\r') {
-                            has_newline = 1;
-                            /* Echo newline and an indent for visual clarity */
-                            fputc('\n', stdout);
-                            if (prompt) {
-                                /* Align continuation lines with the prompt width — 2 spaces is a reasonable default */
-                                fputs("  ", stdout);
-                            }
-                        } else {
-                            fputc(pc, stdout);
-                        }
                     }
                     paste_done:
                     cursor = len;
-                    fflush(stdout);
+                    _sw_rl_redraw(prompt, buf, len, cursor);
                     continue;
                 }
                 /* Not a paste marker; discard the sequence. */
