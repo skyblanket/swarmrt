@@ -1,9 +1,15 @@
+<img src="docs/assets/banner.png" alt="swarmrt — erlang's soul, compiled. A BEAM-shaped runtime in C. Up to 100,000 processes. MIT." width="100%"/>
+
 # SwarmRT
 
 [![CI](https://github.com/skyblanket/swarmrt/actions/workflows/linux-quickstart.yml/badge.svg)](https://github.com/skyblanket/swarmrt/actions/workflows/linux-quickstart.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-C81E0F.svg)](LICENSE)
 
 **A from-scratch BEAM-shaped runtime for the AI-agent era — written in C, compiled ahead of time, no VM, no GC pauses.**
+
+https://github.com/skyblanket/swarmrt/raw/main/docs/assets/swarmrt-film.mp4
+
+> **60 seconds, sound on** — the whole pitch: 99,990 processes alive on a laptop, crashed workers respawned by supervisors, sub-250 ns context switches. Every number measured, receipts in the repo.
 
 In plain terms: Erlang's superpower — hundreds of thousands of cheap, crash-isolated processes passing messages, with supervisors that restart the ones that die — but compiled straight to a single native binary. No VM to install, no garbage-collector pauses, boots in milliseconds. The language on top (`sw`) is shaped so an LLM writes it correctly on the first try, because the point is running swarms of AI agents, each one its own process.
 
