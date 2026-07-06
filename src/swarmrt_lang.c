@@ -2303,6 +2303,7 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
     return v;
 }
 
+#define SW_APPLY_INLINE_ARGS 16
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
     if (!fun || fun->type != SW_VAL_FUN || !fun->v.fun.cfunc)
         return sw_val_nil();
@@ -2310,12 +2311,19 @@ sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
     sw_fn_t fn = (sw_fn_t)fun->v.fun.cfunc;
     if (fun->v.fun.ncaptures > 0) {
         int total = nargs + fun->v.fun.ncaptures;
-        sw_val_t **all = malloc(sizeof(sw_val_t*) * total);
+        /* Assemble args+captures on the STACK for the common small case, so a
+         * closure application with captures doesn't malloc/free on every call;
+         * fall back to the heap only for an unusually wide arg+capture list. */
+        sw_val_t *inlinebuf[SW_APPLY_INLINE_ARGS];
+        sw_val_t **all = (total <= SW_APPLY_INLINE_ARGS)
+                           ? inlinebuf
+                           : (sw_val_t **)malloc(sizeof(sw_val_t*) * total);
+        if (!all) return sw_val_nil();
         if (nargs > 0) memcpy(all, args, sizeof(sw_val_t*) * nargs);
         memcpy(all + nargs, fun->v.fun.captures,
                sizeof(sw_val_t*) * fun->v.fun.ncaptures);
         sw_val_t *result = fn(all, total);
-        free(all);
+        if (all != inlinebuf) free(all);
         return result;
     }
     return fn(args, nargs);
