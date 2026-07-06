@@ -27,10 +27,17 @@ echo "soak: running ${SECS}s, RSS budget ${BUDGET}MB"
 SW_QUIET=1 "$BIN" "$SECS" >"$BIN.out" 2>"$BIN.err" &
 pid=$!
 
+# RSS sampler (KB), portable: /proc/<pid>/status VmRSS on Linux (cheap, no
+# fork); `ps -o rss=` elsewhere (macOS has no /proc, so the old /proc-only
+# reader silently sampled 0 → the RSS budget check passed without measuring
+# anything). ps reports RSS in KB on both macOS and Linux.
+if [ -d /proc ]; then rss_of() { awk '/VmRSS/{print $2}' "/proc/$1/status" 2>/dev/null; }
+else                  rss_of() { ps -o rss= -p "$1" 2>/dev/null | tr -d ' '; }
+fi
 peak_kb=0
 while kill -0 "$pid" 2>/dev/null; do
-    rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
-    [ -n "$rss" ] && [ "$rss" -gt "$peak_kb" ] 2>/dev/null && peak_kb=$rss
+    rss=$(rss_of "$pid"); [ -z "$rss" ] && rss=0
+    [ "$rss" -gt "$peak_kb" ] 2>/dev/null && peak_kb=$rss
     sleep 1
 done
 wait "$pid"; ec=$?
