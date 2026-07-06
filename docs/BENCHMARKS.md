@@ -71,14 +71,42 @@ Reduction-counted preemptive scheduling:
 ```
 Time slice:        2000 reductions
 Priority levels:   4 (max, high, normal, low)
-Work stealing:     idle schedulers steal from busy ones
+Work stealing:     idle schedulers steal from a global overflow queue
 ```
+
+Note on work stealing: idle schedulers steal from a shared global overflow
+queue, not from peers' local run queues. A runnable process sitting in a busy
+scheduler's local queue is therefore not stolen — see
+[KNOWN_ISSUES.md](notes/KNOWN_ISSUES.md). This is why a strictly sequential
+cross-scheduler `pingpong` scales worse at N schedulers than at 1 (the
+`bench/actor` suite below shows it); a scheduler-locality fix is in progress.
 
 ---
 
 ## Build & Run
 
 ```bash
-make test-native    # run the full benchmark suite
-make h2h            # head-to-head benchmark
+make test-native        # native micro-benchmarks (spawn/ctx-switch/send)
+./bench/actor/run.sh     # head-to-head vs Erlang/OTP + Go (see below)
 ```
+
+---
+
+## Cross-runtime comparison (swarmrt vs Erlang/OTP vs Go)
+
+`bench/actor/` runs four identical actor workloads — spawn, pingpong, fanout,
+parallel — in `sw`, Erlang, and Go, reporting best-of-3 wall-clock seconds on
+the same machine (`erl`/`go` auto-detected and skipped if absent):
+
+```bash
+./bench/actor/run.sh                    # default scheduler count
+SW_SCHEDULERS=1 ./bench/actor/run.sh    # single-scheduler
+```
+
+On an idle Apple Silicon box (OTP 28 BeamAsm, Go 1.26), a single `sw` scheduler
+beats Erlang/OTP on spawn, pingpong, and fanout; at default schedulers swarmrt
+also beats Erlang on `parallel` and `fanout`. Two multi-scheduler scaling costs
+are called out honestly in [bench/actor/README.md](../bench/actor/README.md)
+(sequential-pingpong cross-scheduler bounce, spawn contention) and are being
+optimized. Go's runtime is the raw-speed leader. Numbers vary by hardware and
+machine load — run the harness on an idle box to get yours.
