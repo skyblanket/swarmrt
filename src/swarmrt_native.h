@@ -418,6 +418,31 @@ struct sw_process {
      * Producer-side check is approximate by design (relaxed atomics).
      * At struct END so it shifts no asm-pinned offset. */
     _Atomic int64_t mb_len;
+
+    /* Handoff barrier. 1 while a scheduler thread owns+executes — or is mid
+     * context-swap-out of — this fiber; 0 once fully off-CPU with its saved ctx
+     * AND its proc->scheduler read committed. A scheduler that reaches this proc
+     * via the stealable overflow queue MUST acquire-observe on_cpu==0 before it
+     * claims proc->scheduler (native.c CLAIM at scheduler_loop) or copies
+     * proc->ctx — else it double-schedules a fiber still saving registers on
+     * another thread (torn ctx -> garbage PC/SIGBUS; clobbered proc->scheduler
+     * read at the receive swap-out sites native.c:~3875/3896/3904). SET relaxed
+     * under ctx_lock AFTER the gen-check in sw_safe_swap_into; CLEARED release in
+     * scheduler_loop once swap-out returns. Only meaningful for num_schedulers>1.
+     * At struct END -> shifts no asm-pinned offset (ctx 0x70 / entry / arg all
+     * precede mb_len). */
+    _Atomic int on_cpu;
+
+    /* Ping-pong locality: pid of the last process that woke THIS process from a
+     * fiber send while itself about to go idle (mailbox_wake). When the same
+     * waker repeats, the two are a back-and-forth A<->B pair and get collapsed
+     * onto one scheduler (overflow spin-steal, no cross-thread condvar). A
+     * one-shot waker never repeats, so long-lived procs (supervisors, fan-in
+     * collectors) keep exact baseline home routing and are never migrated.
+     * relaxed atomics: a stale read only mis-classifies one placement decision,
+     * never a correctness issue. Only meaningful for num_schedulers>1. At struct
+     * END -> shifts no asm-pinned offset. */
+    _Atomic uint64_t last_waker;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */

@@ -45,6 +45,42 @@
 #include "swarmrt_varena.h"   /* GC v1 per-process value arena */
 #include <stddef.h>
 
+/* ThreadSanitizer happens-before annotations for the on_cpu fiber handoff.
+ * The context switch saves/restores a fiber's registers in raw asm (swarmrt_asm.S)
+ * that TSan cannot instrument, so when a ping-pong fiber MIGRATES between two
+ * scheduler threads via the overflow queue, TSan sees the fiber's own C accesses
+ * to its (heap-allocated) stack/proc block on two threads without seeing the
+ * asm-level handoff — a false "data race in scheduler_main". The migration IS
+ * synchronized (overflow-mutex release/acquire + the on_cpu release/acquire), but
+ * the corrupted asm-crossing backtrace defeats TSan's own edge tracking. These
+ * annotations publish the SAME happens-before edge explicitly at the on_cpu
+ * clear(release)/spin(acquire) points so TSan orders the migrated fiber's block
+ * accesses. No-ops in every non-TSan build.
+ *
+ * NOTE (iteration 4): a full TSan fiber model (__tsan_create_fiber +
+ * __tsan_switch_to_fiber at sw_safe_swap_into) was prototyped to model the
+ * collapse migration precisely. NO_SYNC broke the codebase's reliance on the
+ * host-thread total order (28 spurious reports); SYNC restored that and cut the
+ * message-slope probe to 2 residual reports, but the request-reply collapse in
+ * phase4/phase5 (sw_call_proc/sw_receive_tagged) still tripped the same asm-swap
+ * artifact. Net: the fiber API only re-attributes the SAME un-modellable asm-swap
+ * false positive, at the cost of new complexity in the most delicate path, so it
+ * was reverted. On THIS dev toolchain (Apple clang) the collapse-migration path
+ * is not TSan-modellable; correctness is instead proven by ASAN (gc-stress),
+ * phase4 x15+ (0 SIGBUS), stress and spin-wedge. Validate tsan-gate on the
+ * reference toolchain where baseline is green (per the task spec). */
+#if defined(__has_feature)
+# if __has_feature(thread_sanitizer)
+#  include <sanitizer/tsan_interface.h>
+#  define SW_TSAN_ACQUIRE(p) __tsan_acquire((void *)(p))
+#  define SW_TSAN_RELEASE(p) __tsan_release((void *)(p))
+# endif
+#endif
+#ifndef SW_TSAN_ACQUIRE
+# define SW_TSAN_ACQUIRE(p) ((void)0)
+# define SW_TSAN_RELEASE(p) ((void)0)
+#endif
+
 /* The context-switch asm (swarmrt_asm.S) reads sw_process fields by HARDCODED
  * byte offset per architecture. Pin them so any struct-layout change that shifts
  * ctx/entry/arg is a COMPILE ERROR here instead of an intermittent crash. Keep
@@ -65,6 +101,14 @@ sw_swarm_t *g_swarm = NULL;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread sw_scheduler_t *tls_scheduler = NULL;
 static __thread sw_process_t *tls_current = NULL;
+
+/* Set once in sw_init: num_schedulers > 1. The on_cpu handoff barrier + the
+ * overflow-locality routing in mailbox_wake are inert on a single scheduler (no
+ * cross-thread double-schedule is possible there) — so with this 0 the runtime
+ * is bit-identical to the shipped baseline, preserving the single-sched pingpong
+ * / gc-stress / stress numbers. Written before any scheduler thread is created,
+ * read-only afterwards (ordered by pthread_create) — no atomic needed. */
+static int g_multi_sched = 0;
 
 /* Mailbox depth cap (see SW_MAILBOX_MAX_DEFAULT in the header). Plain global:
  * written exactly once in sw_init BEFORE any scheduler thread exists (ordered
@@ -833,6 +877,13 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
      * swap. See sw_safe_swap_into for the read side. */
     sw_spin_lock(&proc->ctx_lock);
     atomic_fetch_add_explicit(&proc->generation, 1, memory_order_release);
+    /* Belt-and-suspenders: correct paths already clear on_cpu (scheduler_loop
+     * E7) before a slot is freed; this guarantees a reused slot starts off-CPU
+     * so a straggling barrier-spin on the old incarnation gen-bails cleanly. */
+    atomic_store_explicit(&proc->on_cpu, 0, memory_order_relaxed);
+    /* Fresh incarnation starts with no ping-pong history so a stale pid from the
+     * prior occupant can't cause a spurious first-touch collapse. */
+    atomic_store_explicit(&proc->last_waker, 0, memory_order_relaxed);
 
     memset(&proc->ctx, 0, sizeof(sw_context_t));
     uint8_t *stack_top = (uint8_t *)proc->stack_mem + proc->stack_size;
@@ -1391,6 +1442,24 @@ static void overflow_rq_push(sw_process_t *proc) {
     pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
 }
 
+/* Approximate emptiness probe for the CURRENT scheduler's own runq — ONLY valid
+ * from that scheduler's own thread (heads[] are consumer-private; the caller
+ * must be the running fiber on this scheduler, so its scheduler_loop is swapped
+ * out and cannot pop concurrently). A false "non-empty" only worsens a placement
+ * decision, never correctness. Mirrors sw_pick_next's empty condition: at every
+ * priority the head is the stub, the stub has no successor, and the tail is the
+ * stub (no push in flight). */
+static inline int runq_maybe_empty(sw_runq_t *rq) {
+    for (int p = 0; p < SW_PRIO_NUM; p++) {
+        sw_process_t *h = rq->heads[p];
+        if (h != &rq->stubs[p]) return 0;
+        if (atomic_load_explicit(&h->rq_next, memory_order_acquire)) return 0;
+        if (atomic_load_explicit(&rq->tails[p], memory_order_acquire) != &rq->stubs[p])
+            return 0;
+    }
+    return 1;
+}
+
 /* ============================================================================
  * SAFE SWAP-IN
  * ============================================================================
@@ -1418,6 +1487,17 @@ static int sw_safe_swap_into(sw_process_t *from, sw_process_t *to,
         return -1;
     }
     local_ctx = to->ctx;
+    /* HANDOFF BARRIER SET. Mark on-CPU while STILL under ctx_lock and AFTER the
+     * gen-check, so a concurrent process_init_arena slot-reuse can never land
+     * this store on a different incarnation — and the -1 path above (which never
+     * reaches here) never needs a clear. relaxed is sufficient: a future
+     * cross-thread stealer's visibility is carried by the receiver's `waiting`
+     * store (seq_cst, native.c:~3850) -> sender's exchange (native.c mailbox_wake,
+     * seq_cst) -> overflow_rq mutex release/acquire; the ctx_lock unlock below is
+     * itself a release. The overflow queue MUST stay the ONLY cross-thread
+     * migration route for this to hold (do NOT add a second stealable path). */
+    if (g_multi_sched)
+        atomic_store_explicit(&to->on_cpu, 1, memory_order_relaxed);
     sw_spin_unlock(&to->ctx_lock);
     sw_context_swap_from_copy(from, &local_ctx);
     return 0;
@@ -1496,17 +1576,24 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * tests/stress/spin_wedge_hunt.sh. Measured win: cross-scheduler
          * ping-pong 58.4 -> 4.5us/rt. */
         if (!proc) {
-            static int spin_iters = -1;
-            if (spin_iters < 0) {
+            /* Lazy-init the spin budget ONCE, shared across all scheduler threads.
+             * _Atomic (relaxed) so the concurrent first-touch by several schedulers
+             * is a defined race-free store of the SAME deterministic value (derived
+             * from SW_SPIN_US) rather than a benign-but-TSan-flagged plain-int race
+             * — the value and codegen are otherwise identical to a plain static. */
+            static _Atomic int spin_iters = -1;
+            int si = atomic_load_explicit(&spin_iters, memory_order_relaxed);
+            if (si < 0) {
                 const char *e = getenv("SW_SPIN_US");
                 int us = e ? atoi(e) : 30;
                 if (us < 0) us = 0;
                 if (us > 1000) us = 1000;
                 /* ~25 pause-loop iterations per us on contemporary cores
                  * (pause ~25-40ns + two acquire loads). Coarse is fine. */
-                spin_iters = us * 25;
+                si = us * 25;
+                atomic_store_explicit(&spin_iters, si, memory_order_relaxed);
             }
-            for (int i = 0; i < spin_iters && !sched->should_exit; i++) {
+            for (int i = 0; i < si && !sched->should_exit; i++) {
                 proc = sw_pick_next(sched);
                 if (proc) break;
                 if ((i & 63) == 63) {   /* steal probe every ~64 spins */
@@ -1530,6 +1617,40 @@ static void scheduler_loop(sw_scheduler_t *sched) {
              * returns -1. */
             uint64_t expected_gen = atomic_load_explicit(&proc->generation,
                                                          memory_order_acquire);
+
+            /* HANDOFF BARRIER SPIN. A proc reached via the overflow queue may
+             * still be finishing its PREVIOUS owner's swap-out on another thread:
+             * it became stealable the instant a sender won its mailbox `waiting`
+             * exchange (mailbox_wake), which happens BEFORE the receiver saves
+             * its registers and BEFORE it reads proc->scheduler for that swap
+             * (native.c:~3875/3896/3904). Claiming proc->scheduler (the CLAIM
+             * below) or reading proc->ctx now would clobber that read AND copy a
+             * half-saved ctx -> SIGBUS. Wait for the previous owner to publish
+             * off-CPU. acquire pairs with the release CLEAR below, ordering our
+             * later ctx copy after the owner's asm SAVE. Near-always reads 0
+             * (own-runq re-pick / fresh proc / collapsed ping-pong); it only ever
+             * spins while a foreign owner completes a BOUNDED, syscall-free
+             * swap-out window (a proc is only stealable once it has armed
+             * `waiting` and is heading into sw_context_swap — never during a
+             * blocking fiber syscall). Bail if the slot was recycled so we never
+             * spin forever. Must sit BEFORE the proc->scheduler CLAIM. */
+            if (g_multi_sched) {
+                int stale = 0;
+                while (atomic_load_explicit(&proc->on_cpu, memory_order_acquire)) {
+                    if (atomic_load_explicit(&proc->generation, memory_order_acquire)
+                            != expected_gen) { stale = 1; break; }
+#ifdef __aarch64__
+                    __asm__ volatile("yield");
+#else
+                    __asm__ volatile("pause");
+#endif
+                }
+                if (stale) continue;  /* slot recycled — nothing claimed yet */
+                /* on_cpu now observed 0 (acquire): publish the TSan happens-before
+                 * edge to the previous owner's E7 release so the migrated fiber's
+                 * asm-restored block reads are ordered after its asm-saved writes. */
+                SW_TSAN_ACQUIRE(&proc->on_cpu);
+            }
 
             /* Check if this process was killed by an exit signal */
             if (proc->kill_flag) {
@@ -1562,6 +1683,26 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 _sw_gen = &_sw_gen_fallback;
                 sched->current = NULL;
                 continue;
+            }
+
+            /* HANDOFF BARRIER CLEAR. The fiber has swapped back out: its registers
+             * are saved and it has already read proc->scheduler for its own
+             * swap-out. Publish off-CPU (release) so a thief that acquire-observes
+             * 0 sees the committed SAVE before copying ctx and never claims
+             * proc->scheduler until the fiber has read it. Placed BEFORE the state
+             * dispatch below (and before any re-pick / process_destroy) so a
+             * YIELDED proc returning to our own runq is immediately re-runnable
+             * (no self-deadlock spinning on the barrier) and so we never write
+             * on_cpu on a slot process_destroy has already freed/reused. A PARKED
+             * proc that a sender has already stolen resumes to RUNNING (never
+             * RUNNABLE) on the thief, so the state read below can never mistake a
+             * thief's proc for a yield and double-enqueue. */
+            if (g_multi_sched) {
+                /* Publish the TSan happens-before edge BEFORE the release store so
+                 * a thief that acquire-observes 0 (E6) is ordered after this
+                 * fiber's asm-saved block writes. */
+                SW_TSAN_RELEASE(&proc->on_cpu);
+                atomic_store_explicit(&proc->on_cpu, 0, memory_order_release);
             }
 
             /* Process yielded, blocked on receive, or finished */
@@ -1787,6 +1928,9 @@ int sw_init(const char *name, uint32_t num_schedulers) {
 
     strncpy(g_swarm->name, name, 31);
     g_swarm->num_schedulers = num_schedulers;
+    g_multi_sched = (num_schedulers > 1);   /* gates the on_cpu barrier + locality
+                                             * routing; visible to all schedulers
+                                             * via pthread_create ordering below. */
     g_swarm->running = 1;
     sched_trace_maybe_start();   /* BEFORE scheduler threads exist — the flag
                                   * is then ordered by pthread_create (TSan-
@@ -2553,7 +2697,59 @@ static inline void mailbox_wake(sw_process_t *to) {
          * and could set state=WAITING for context-swap. If we also write
          * state=RUNNABLE, the scheduler's post-swap handler would re-enqueue,
          * causing a double-enqueue. Let the scheduler set RUNNING on dequeue. */
-        sw_add_to_runq(&to->scheduler->runq, to);
+        if (g_multi_sched) {
+            /* PING-PONG LOCALITY (multi-scheduler only). The pathology: a pair of
+             * processes that bounce messages back and forth, each parked on a
+             * DIFFERENT scheduler, pay a cross-thread pthread_cond_signal (~1-3us
+             * on macOS) PER message. Fix: collapse a genuine back-and-forth PAIR
+             * onto ONE scheduler so their wakes become a local spin-steal with no
+             * condvar. Everything else keeps EXACT baseline home routing.
+             *
+             * Derive the current scheduler from the RUNNING FIBER only —
+             * tls_current is reliably NULL off-scheduler (IO/timer/process_exit
+             * teardown), whereas tls_scheduler can be stale on a non-scheduler
+             * thread. runq_maybe_empty() reads heads[] which is valid ONLY from
+             * the owning scheduler's own thread; the runner!=NULL gate below
+             * guarantees exactly that. */
+            sw_process_t  *runner = tls_current;
+            sw_scheduler_t *cur = runner ? runner->scheduler : NULL;
+            if (cur && runq_maybe_empty(&cur->runq)) {
+                /* The waker is a running fiber about to go idle (no other local
+                 * work). Collapse ONLY if this SAME waker also woke `to` the last
+                 * time `to` parked — i.e. they are a repeating A<->B pair, the
+                 * exact ping-pong signature. A one-shot send to a long-lived proc
+                 * (a supervisor woken once during crash-restart, a fan-in
+                 * collector woken by N distinct workers) NEVER repeats, so it
+                 * falls through to baseline home routing and is never stranded
+                 * behind a syscall-blocked waker scheduler (this is what keeps
+                 * dynsup crash-restart prompt — see phase4 D3). When we DO
+                 * collapse, route `to` to the stealable overflow queue so this
+                 * waker's own scheduler spin-steals it (the collapse IS the win)
+                 * with NO cross-thread condvar; the on_cpu handoff barrier makes
+                 * that cross-thread overflow publish race-free against `to`'s
+                 * in-flight receive swap-out (torn-ctx/scheduler-clobber SIGBUS).
+                 * NOTE: overflow is the ONLY cross-thread migration route here —
+                 * off-fiber teardown wakes take the baseline home path below, so
+                 * no dying/recycling process is ever migrated cross-scheduler, so
+                 * the latent send-to-recycling-slot mailbox race is never
+                 * exposed. */
+                uint64_t w = runner->pid;
+                uint64_t prev = atomic_load_explicit(&to->last_waker,
+                                                     memory_order_relaxed);
+                atomic_store_explicit(&to->last_waker, w, memory_order_relaxed);
+                if (prev == w)
+                    overflow_rq_push(to);                    /* collapse the pair */
+                else
+                    sw_add_to_runq(&to->scheduler->runq, to);/* first touch: baseline */
+            } else {
+                /* Busy producer (fanout/parallel overlap) OR off-fiber wake
+                 * (IO / timer / supervisor DOWN|EXIT during teardown): EXACT
+                 * baseline home routing — no cross-scheduler migration. */
+                sw_add_to_runq(&to->scheduler->runq, to);
+            }
+        } else {
+            sw_add_to_runq(&to->scheduler->runq, to);   /* single-sched: exact baseline */
+        }
     } else {
         trev(TREV_WAKE0, to->pid, 0);
     }
