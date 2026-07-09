@@ -5100,29 +5100,46 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     system(wrapped);
     free(wrapped);
 
-    /* Poll the output file, showing a live tail while the command runs.
-     * Check for the exit file every second — its presence means done.
-     * Show last 2 lines of output as a progress indicator. */
+    /* Poll for the exit file with an ADAPTIVE backoff (2ms -> 250ms).
+     *
+     * This used to sleep a FLAT 1 second before the first check, which put a
+     * 1s floor under EVERY shell() call. That floor froze swarm-code's whole
+     * UI (2026-07-09): the heartbeat handler ran a shell()-based prune on the
+     * main fiber every 2s tick, ticks queued up faster than main could drain
+     * them during long turns, and typed input sat behind an ever-growing
+     * backlog. Fast commands now return in single-digit milliseconds; the
+     * live-tail progress display only engages once the backoff has slowed to
+     * >=50ms (a genuinely long-running command). */
     int is_tty = isatty(fileno(stdout));
     int done = 0;
-    int polls = 0;
-    const int max_poll_seconds = 120;  /* hard cap (was 600): bound the worst
-        case if a backgrounded child is killed before writing its exit file
-        (the orphan-wedge). swarm-code's own tools no longer rely on shell()'s
-        poll for long commands — they use shell_managed (own pgroup + C timeout
-        + killpg). 120s stays well above any legit fast/local shell() use. */
+    int displayed = 0;             /* progress tail actually drawn? */
+    useconds_t delay_us = 2000;    /* 2ms, doubling to a 250ms cap */
+    long long waited_us = 0;
+    const long long max_wait_us = 120LL * 1000000;  /* hard cap (was 600s):
+        bound the worst case if a backgrounded child is killed before writing
+        its exit file (the orphan-wedge). swarm-code's own tools no longer rely
+        on shell()'s poll for long commands — they use shell_managed (own
+        pgroup + C timeout + killpg). 120s stays well above any legit
+        fast/local shell() use. */
     off_t last_size = 0;
 
-    while (!done && polls < max_poll_seconds) {
-        usleep(1000000);  /* 1 second */
-        polls++;
-
-        /* Check if command finished */
+    while (!done && waited_us < max_wait_us) {
+        /* Check if command finished — BEFORE sleeping, so an already-done
+         * command costs one fopen, not a poll interval. */
         FILE *ef = fopen(exitf, "r");
         if (ef) { fclose(ef); done = 1; break; }
 
-        /* Show live tail if terminal */
-        if (is_tty) {
+        usleep(delay_us);
+        waited_us += delay_us;
+        if (delay_us < 250000) {
+            delay_us *= 2;
+            if (delay_us > 250000) delay_us = 250000;
+        }
+
+        /* Show live tail if terminal — only once the command has proven
+         * slow (backoff at/above 50ms), so quick shells never touch the
+         * input row at all. */
+        if (is_tty && delay_us >= 50000) {
             struct stat st;
             if (stat(outf, &st) == 0 && st.st_size > last_size) {
                 last_size = st.st_size;
@@ -5161,6 +5178,7 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
                      * then redraw the input below — so the user's
                      * typing isn't eaten by progress updates. */
                     pthread_mutex_lock(&_sw_term_lock);
+                    displayed = 1;
                     int _act = _sw_rl.active;
                     if (_act) {
                         _sw_rl_wipe_unlocked();   /* erase ALL input rows */
@@ -5183,8 +5201,12 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
         }
     }
     /* Clear the progress line — and redraw the input box below if the
-     * line editor is mid-read, otherwise the wipe eats the user's typing. */
-    if (is_tty) {
+     * line editor is mid-read, otherwise the wipe eats the user's typing.
+     * ONLY when a progress tail was actually drawn: an unconditional
+     * \r\e[K here meant every fast shell() erased whatever row the cursor
+     * was on (the pinned input prompt, once per heartbeat prune — the
+     * "input field not properly rendered" churn). */
+    if (is_tty && displayed) {
         pthread_mutex_lock(&_sw_term_lock);
         if (_sw_rl.active && _sw_rl.cur_buf && *_sw_rl.cur_buf) {
             _sw_rl_wipe_unlocked();   /* erase ALL input rows */
@@ -7631,23 +7653,50 @@ static sw_val_t *_builtin_rl_history_append(sw_val_t **a, int n) {
 }
 
 /* Advance a physical (row,col) cursor by the display width of one byte
- * stream, honouring ANSI CSI escape sequences (zero width), hard newlines,
- * UTF-8 continuation bytes (zero width — only lead bytes advance a column),
- * tabs (next multiple of 8), and soft-wrap at `term_w`. `*row`/`*col` are
- * updated in place. Used by the multi-line redraw to compute geometry
- * identically on the wipe pass and the reprint pass. */
+ * stream, honouring ANSI escape sequences (zero width — CSI, OSC, and
+ * two-byte ESC forms), hard newlines, UTF-8 continuation bytes (zero
+ * width — only lead bytes advance a column), tabs (next multiple of 8),
+ * and soft-wrap at `term_w`. `*row`/`*col` are updated in place. Used by
+ * the multi-line redraw to compute geometry identically on the wipe pass
+ * and the reprint pass.
+ *
+ * The escape skip is a real state machine. The naive version ("after ESC,
+ * skip until a byte in 0x40..0x7e") is WRONG for CSI: the '[' introducer
+ * itself is 0x5b — inside that range — so it terminated the skip
+ * immediately and every SGR parameter byte after it ("38;2;175;0;0m")
+ * was counted as a visible column. That parked the caret 15 columns right
+ * of the true spot for swarm-code's colored "  ❯ " prompt and made the
+ * wrap math fire 15 columns early (the caret-offset / broken-input-box
+ * bug). States: 0 = normal, 1 = just saw ESC, 2 = CSI body (ESC [ params
+ * / intermediates 0x20..0x3f, final byte 0x40..0x7e), 3 = OSC body
+ * (ESC ] ... BEL or ESC \), 4 = OSC saw ESC (ST pending). Any other
+ * byte after a bare ESC is a two-byte sequence: skip it and resume. */
 static void _sw_rl_advance(const char *s, size_t n, int term_w,
                            int *row, int *col) {
-    int in_ansi = 0;
+    int esc = 0;
     if (term_w < 1) term_w = 1;
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (in_ansi) {
-            /* CSI sequence: terminates on a final byte 0x40..0x7e. */
-            if (c >= 0x40 && c <= 0x7e) in_ansi = 0;
+        if (esc == 1) {                              /* byte after ESC */
+            if (c == '[')      esc = 2;              /* CSI opener */
+            else if (c == ']') esc = 3;              /* OSC opener */
+            else               esc = 0;              /* two-byte ESC seq */
             continue;
         }
-        if (c == 0x1b) { in_ansi = 1; continue; }   /* ESC — start of escape */
+        if (esc == 2) {                              /* CSI body */
+            if (c >= 0x40 && c <= 0x7e) esc = 0;     /* final byte ends it */
+            continue;
+        }
+        if (esc == 3) {                              /* OSC body */
+            if (c == 0x07)      esc = 0;             /* BEL terminator */
+            else if (c == 0x1b) esc = 4;             /* maybe ST (ESC \) */
+            continue;
+        }
+        if (esc == 4) {                              /* OSC: ESC seen */
+            esc = (c == '\\') ? 0 : 3;               /* ESC \ = ST */
+            continue;
+        }
+        if (c == 0x1b) { esc = 1; continue; }        /* ESC — start of escape */
         if (c == '\n') { (*row)++; *col = 0; continue; }
         if (c == '\r') { *col = 0; continue; }
         if (c == '\t') {
