@@ -443,6 +443,20 @@ struct sw_process {
      * never a correctness issue. Only meaningful for num_schedulers>1. At struct
      * END -> shifts no asm-pinned offset. */
     _Atomic uint64_t last_waker;
+
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+    /* ThreadSanitizer fiber handle (TSan builds ONLY — compiled out entirely
+     * otherwise, so it shifts NO asm-pinned offset in shipping builds; and being
+     * at struct END it shifts none even under TSan). A sw process is a fiber whose
+     * registers/stack are swapped in raw asm TSan cannot see; with a handle here,
+     * TSan models the process as a continuous fiber whose vector clock TRAVELS
+     * WITH IT across OS-scheduler-thread migration (the overflow-queue steal path).
+     * Created per lifetime in process_init_arena, destroyed in process_destroy.
+     * For a scheduler's embedded sched_proc this instead holds the OS thread's own
+     * fiber, captured via __tsan_get_current_fiber() at scheduler_main entry. See
+     * the fiber-model comment block in swarmrt_native.c. */
+    void *tsan_fiber;
+#endif
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */

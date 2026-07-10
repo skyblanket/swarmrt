@@ -45,40 +45,62 @@
 #include "swarmrt_varena.h"   /* GC v1 per-process value arena */
 #include <stddef.h>
 
-/* ThreadSanitizer happens-before annotations for the on_cpu fiber handoff.
- * The context switch saves/restores a fiber's registers in raw asm (swarmrt_asm.S)
- * that TSan cannot instrument, so when a ping-pong fiber MIGRATES between two
- * scheduler threads via the overflow queue, TSan sees the fiber's own C accesses
- * to its (heap-allocated) stack/proc block on two threads without seeing the
- * asm-level handoff — a false "data race in scheduler_main". The migration IS
- * synchronized (overflow-mutex release/acquire + the on_cpu release/acquire), but
- * the corrupted asm-crossing backtrace defeats TSan's own edge tracking. These
- * annotations publish the SAME happens-before edge explicitly at the on_cpu
- * clear(release)/spin(acquire) points so TSan orders the migrated fiber's block
- * accesses. No-ops in every non-TSan build.
+/* ThreadSanitizer FIBER MODEL for the scheduler context switch.
  *
- * NOTE (iteration 4): a full TSan fiber model (__tsan_create_fiber +
- * __tsan_switch_to_fiber at sw_safe_swap_into) was prototyped to model the
- * collapse migration precisely. NO_SYNC broke the codebase's reliance on the
- * host-thread total order (28 spurious reports); SYNC restored that and cut the
- * message-slope probe to 2 residual reports, but the request-reply collapse in
- * phase4/phase5 (sw_call_proc/sw_receive_tagged) still tripped the same asm-swap
- * artifact. Net: the fiber API only re-attributes the SAME un-modellable asm-swap
- * false positive, at the cost of new complexity in the most delicate path, so it
- * was reverted. On THIS dev toolchain (Apple clang) the collapse-migration path
- * is not TSan-modellable; correctness is instead proven by ASAN (gc-stress),
- * phase4 x15+ (0 SIGBUS), stress and spin-wedge. Validate tsan-gate on the
- * reference toolchain where baseline is green (per the task spec). */
-#if defined(__has_feature)
-# if __has_feature(thread_sanitizer)
+ * A sw process IS a fiber: its registers + C stack are saved/restored in raw asm
+ * (swarmrt_asm.S sw_context_swap) that TSan cannot instrument. With the
+ * scheduler-locality optimization a woken fiber can MIGRATE across OS scheduler
+ * threads via the stealable overflow queue, so a fiber that ran on thread H may
+ * resume on thread W. Seeing only the OS threads, TSan then reports the fiber's
+ * own arena/stack accesses — and the message regions it reads — as races between
+ * H and W, because the asm swap hides the fiber's continuity. The migration IS
+ * synchronized (mailbox release/acquire + the on_cpu handoff barrier), but TSan
+ * cannot carry a fiber's vector clock across an asm swap it never sees.
+ *
+ * The fix is TSan's fiber API: each sw process gets a fiber handle whose vector
+ * clock TRAVELS WITH IT. At EVERY context switch — in BOTH directions — the OS
+ * thread tells TSan which fiber it is now executing, immediately before the raw
+ * asm swap. Switching to the process fiber on swap-IN (SYNC, flags=0) restores
+ * the fiber's accumulated clock so its own reads-after-writes stay ordered across
+ * a migration; switching to the SCHEDULER's own fiber on swap-OUT keeps the
+ * resumed scheduler_loop attributed to the scheduler thread, preserving the
+ * host-thread total order the rest of the codebase relies on. (Iteration 4 hooked
+ * only swap-IN and only with NO_SYNC -> 28 spurious reports; SYNC-only-one-way
+ * still tripped the request-reply collapse. The cure is doing BOTH directions
+ * symmetrically, which is what these do.) The scheduler's handle is the OS
+ * thread's own fiber, captured at scheduler_main entry; process handles are
+ * created in process_init_arena and destroyed in process_destroy. All of this
+ * compiles out to a strict no-op in non-TSan builds. */
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
 #  include <sanitizer/tsan_interface.h>
-#  define SW_TSAN_ACQUIRE(p) __tsan_acquire((void *)(p))
-#  define SW_TSAN_RELEASE(p) __tsan_release((void *)(p))
-# endif
+#  define SW_TSAN_FIBERS 1
 #endif
-#ifndef SW_TSAN_ACQUIRE
-# define SW_TSAN_ACQUIRE(p) ((void)0)
-# define SW_TSAN_RELEASE(p) ((void)0)
+
+#ifdef SW_TSAN_FIBERS
+/* Tell TSan the current OS thread is now executing fiber `f`, right before the
+ * raw asm swap. SYNC (flags=0) so `f` both inherits this thread's happens-before
+ * AND carries its own clock forward across an OS-thread migration. NULL `f` = no
+ * fiber yet (interpreter proc with no scheduler, or a slot not yet through
+ * process_init_arena) -> leave TSan on the host thread's current fiber. */
+static inline void sw_tsan_switch_to(void *f) {
+    if (f) __tsan_switch_to_fiber(f, 0);
+}
+/* Swap `proc` back to its scheduler, first handing TSan back to the scheduler's
+ * own fiber so the resumed scheduler_loop is attributed to the scheduler thread.
+ * proc->scheduler is always the scheduler CURRENTLY running this fiber (updated
+ * by the scheduler_loop CLAIM before every swap-in), so this targets the right OS
+ * thread even after the fiber migrated. */
+static inline void sw_swap_to_scheduler(sw_process_t *proc) {
+    sw_process_t *sched_stub = &proc->scheduler->sched_proc;
+    sw_tsan_switch_to(sched_stub->tsan_fiber);
+    sw_context_swap(proc, sched_stub);
+}
+#else
+#  define sw_tsan_switch_to(f) ((void)0)
+static inline void sw_swap_to_scheduler(sw_process_t *proc) {
+    sw_process_t *sched_stub = &proc->scheduler->sched_proc;
+    sw_context_swap(proc, sched_stub);
+}
 #endif
 
 /* The context-switch asm (swarmrt_asm.S) reads sw_process fields by HARDCODED
@@ -818,6 +840,14 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->on_destroy = NULL;
     proc->on_destroy_arg = NULL;
 
+#ifdef SW_TSAN_FIBERS
+    /* Fresh TSan fiber per process lifetime: its vector clock follows this fiber
+     * across scheduler-thread migration (the raw-asm swap is invisible to TSan).
+     * Destroyed in process_destroy. The slot arrives here off the free list with
+     * its prior handle already destroyed+NULLed, so this never leaks. */
+    proc->tsan_fiber = __tsan_create_fiber(0);
+#endif
+
     /* Core fields */
     proc->entry = entry;
     proc->arg = arg;
@@ -948,6 +978,17 @@ static void process_destroy(sw_process_t *proc) {
      * can immediately reuse this slot and reinitialize it. */
     uint32_t block_idx = proc->heap_block_idx;
     uint32_t slot = proc->arena_slot;
+
+#ifdef SW_TSAN_FIBERS
+    /* Destroy this lifetime's TSan fiber. Always runs on the SCHEDULER fiber
+     * (the exit-path swap-out already switched TSan back to sched_proc), never on
+     * the fiber being destroyed, so this is the required not-current destroy. NULL
+     * it so a reused slot's process_init_arena starts from a clean create. */
+    if (proc->tsan_fiber) {
+        __tsan_destroy_fiber(proc->tsan_fiber);
+        proc->tsan_fiber = NULL;
+    }
+#endif
 
     /* Per-process teardown hook FIRST (snapshot-then-clear-then-call so a
      * re-entrant/double destroy can't fire it twice). Runs before the arena /
@@ -1499,6 +1540,10 @@ static int sw_safe_swap_into(sw_process_t *from, sw_process_t *to,
     if (g_multi_sched)
         atomic_store_explicit(&to->on_cpu, 1, memory_order_relaxed);
     sw_spin_unlock(&to->ctx_lock);
+    /* Swap-IN direction of the TSan fiber model: tell TSan this OS thread is now
+     * running `to`'s fiber (SYNC) BEFORE the raw asm swap, so the fiber's resumed
+     * C accesses carry its accumulated clock across an OS-thread migration. */
+    sw_tsan_switch_to(to->tsan_fiber);
     sw_context_swap_from_copy(from, &local_ctx);
     return 0;
 }
@@ -1646,10 +1691,11 @@ static void scheduler_loop(sw_scheduler_t *sched) {
 #endif
                 }
                 if (stale) continue;  /* slot recycled — nothing claimed yet */
-                /* on_cpu now observed 0 (acquire): publish the TSan happens-before
-                 * edge to the previous owner's E7 release so the migrated fiber's
-                 * asm-restored block reads are ordered after its asm-saved writes. */
-                SW_TSAN_ACQUIRE(&proc->on_cpu);
+                /* on_cpu observed 0 via acquire (pairs with the E7 release store):
+                 * a genuine cross-thread happens-before TSan already models from
+                 * the atomic itself. The migrated fiber's OWN block accesses are
+                 * ordered separately, by the fiber model (its clock travels with
+                 * it) — no explicit __tsan_acquire proxy needed here. */
             }
 
             /* Check if this process was killed by an exit signal */
@@ -1698,10 +1744,11 @@ static void scheduler_loop(sw_scheduler_t *sched) {
              * RUNNABLE) on the thief, so the state read below can never mistake a
              * thief's proc for a yield and double-enqueue. */
             if (g_multi_sched) {
-                /* Publish the TSan happens-before edge BEFORE the release store so
-                 * a thief that acquire-observes 0 (E6) is ordered after this
-                 * fiber's asm-saved block writes. */
-                SW_TSAN_RELEASE(&proc->on_cpu);
+                /* Release-publish off-CPU so a thief that acquire-observes 0 (E6)
+                 * sees this fiber's committed swap-out. The migrated fiber's own
+                 * block reads/writes are ordered by the fiber model (swap-out
+                 * switched TSan to the scheduler fiber; the next swap-in restores
+                 * the fiber's clock), so no explicit __tsan_release proxy here. */
                 atomic_store_explicit(&proc->on_cpu, 0, memory_order_release);
             }
 
@@ -1802,6 +1849,14 @@ int sw_alloc_fault_tick(void) {
 static void *scheduler_main(void *arg) {
     sw_scheduler_t *sched = (sw_scheduler_t *)arg;
     _sw_install_altstack();   /* fiber-stack overflows fault on THIS thread */
+#ifdef SW_TSAN_FIBERS
+    /* Capture THIS OS thread's own fiber as the scheduler's handle. The swap-OUT
+     * direction (sw_swap_to_scheduler) switches TSan back to this before every
+     * asm swap, so the resumed scheduler_loop stays attributed to the scheduler
+     * thread — preserving the host-thread total order across fiber migrations. Not
+     * a created fiber: it's the thread default TSan already owns and reclaims. */
+    sched->sched_proc.tsan_fiber = __tsan_get_current_fiber();
+#endif
     sched->active = 1;
     scheduler_loop(sched);
     return NULL;
@@ -2442,7 +2497,7 @@ sw_process_t *sw_find_by_pid_any(uint64_t pid) {
  */
 void sw_process_done(sw_process_t *proc) {
     atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
-    sw_context_swap(proc, &proc->scheduler->sched_proc);
+    sw_swap_to_scheduler(proc);
     /* Should never reach here */
 }
 
@@ -2472,7 +2527,7 @@ void sw_process_panic(sw_process_t *proc, int reason, const char *msg) {
         proc->panic_msg = strdup(msg);
     }
     atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
-    sw_context_swap(proc, &proc->scheduler->sched_proc);
+    sw_swap_to_scheduler(proc);
     /* Should never reach here — scheduler tears down the process. */
 }
 
@@ -2511,7 +2566,7 @@ void sw_yield(void) {
     /* Context swap back to scheduler — scheduler will re-enqueue us */
     atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
     proc->context_switches++;
-    sw_context_swap(proc, &proc->scheduler->sched_proc);
+    sw_swap_to_scheduler(proc);
     /* Resumed — back on our stack */
 }
 
@@ -2904,7 +2959,7 @@ void *sw_receive(uint64_t timeout_ms) {
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             atomic_fetch_add_explicit(&proc->mb_len, 1, memory_order_relaxed);
-            sw_context_swap(proc, &proc->scheduler->sched_proc);
+            sw_swap_to_scheduler(proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;  /* Loop back — will drain and find the message */
@@ -2925,7 +2980,7 @@ void *sw_receive(uint64_t timeout_ms) {
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
-                sw_context_swap(proc, &proc->scheduler->sched_proc);
+                sw_swap_to_scheduler(proc);
                 atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
@@ -2934,7 +2989,7 @@ void *sw_receive(uint64_t timeout_ms) {
         }
 
         /* Context swap back to scheduler */
-        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        sw_swap_to_scheduler(proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
         atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
@@ -3022,7 +3077,7 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
             return 1;
         }
         /* Sender already enqueued us — context swap for clean dequeue */
-        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        sw_swap_to_scheduler(proc);
         atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
         mailbox_drain(&proc->mailbox);
         return 1;
@@ -3038,7 +3093,7 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
         if (elapsed >= timeout_ms) {
             int was = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was) { atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed); return 0; }
-            sw_context_swap(proc, &proc->scheduler->sched_proc);
+            sw_swap_to_scheduler(proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             return 0;
         }
@@ -3046,7 +3101,7 @@ int sw_mailbox_wait_new(uint64_t timeout_ms) {
     }
 
     /* Context swap — will be woken by sender or timer */
-    sw_context_swap(proc, &proc->scheduler->sched_proc);
+    sw_swap_to_scheduler(proc);
     atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
 
     if (timer_ref) sw_cancel_timer(timer_ref);
@@ -3974,7 +4029,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             atomic_fetch_add_explicit(&proc->mb_len, 1, memory_order_relaxed);
-            sw_context_swap(proc, &proc->scheduler->sched_proc);
+            sw_swap_to_scheduler(proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;
@@ -3995,7 +4050,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
-                sw_context_swap(proc, &proc->scheduler->sched_proc);
+                sw_swap_to_scheduler(proc);
                 atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
@@ -4003,7 +4058,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             timer_ref = sw_send_after(remaining, proc, SW_TAG_NONE, NULL);
         }
 
-        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        sw_swap_to_scheduler(proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
         atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
@@ -4068,7 +4123,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             proc->mailbox.priv_head = m;
             proc->mailbox.count++;
             atomic_fetch_add_explicit(&proc->mb_len, 1, memory_order_relaxed);
-            sw_context_swap(proc, &proc->scheduler->sched_proc);
+            sw_swap_to_scheduler(proc);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             if (proc->kill_flag) return NULL;
             continue;
@@ -4089,7 +4144,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
                 }
                 /* Sender already woke us and enqueued to runq — context-swap
                  * to let scheduler properly dequeue before continuing. */
-                sw_context_swap(proc, &proc->scheduler->sched_proc);
+                sw_swap_to_scheduler(proc);
                 atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
                 return NULL;
             }
@@ -4097,7 +4152,7 @@ static void *sw_receive_any_impl(uint64_t timeout_ms, uint64_t *out_tag, int ado
             timer_ref = sw_send_after(remaining, proc, SW_TAG_NONE, NULL);
         }
 
-        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        sw_swap_to_scheduler(proc);
 
         /* Resumed — sender or timer woke us (already cleared waiting) */
         atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);

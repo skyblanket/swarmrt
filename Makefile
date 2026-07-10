@@ -781,9 +781,11 @@ stats:
 
 # ThreadSanitizer gate (Phase 2.3). Builds the depth-1 message ping-pong
 # and the 80k spawn storm under -fsanitize=thread and fails on any
-# unsuppressed race. The fiber runtime is TSan-clean because cross-thread
-# fiber migration synchronizes through the runq's C11 atomics — TSan sees
-# the happens-before edges; no fiber annotations needed. Suppressions
+# unsuppressed race. Cross-thread fiber migration (scheduler-locality steal
+# path) is modeled with TSan's fiber API in swarmrt_native.c: each process is
+# a fiber whose vector clock travels with it across the raw-asm context swap
+# TSan cannot see, switched symmetrically at every swap-in/swap-out. The
+# runq's C11 atomics carry the remaining edges. Suppressions
 # (tests/stress/tsan.supp) cover only the documented warn-only watchdog
 # scanner. The storm runs its full 80k spawns — ~2 min under TSan.
 .PHONY: tsan-gate
