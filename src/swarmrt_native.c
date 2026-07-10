@@ -71,7 +71,7 @@
  * thread's own fiber, captured at scheduler_main entry; process handles are
  * created in process_init_arena and destroyed in process_destroy. All of this
  * compiles out to a strict no-op in non-TSan builds. */
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+#ifdef SW_TSAN_ENABLED
 #  include <sanitizer/tsan_interface.h>
 #  define SW_TSAN_FIBERS 1
 #endif

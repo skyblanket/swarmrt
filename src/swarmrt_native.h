@@ -19,6 +19,19 @@
 #include <pthread.h>
 #include "swarmrt_arena.h"
 
+/* Portable ThreadSanitizer detection. The one-liner
+ *   defined(__has_feature) && __has_feature(thread_sanitizer)
+ * is UB on GCC: its preprocessor parses __has_feature(x) as 0(x) (a syntax
+ * error) instead of short-circuiting, so use the nested #if form. GCC exposes
+ * __SANITIZE_THREAD__; Clang exposes __has_feature(thread_sanitizer). */
+#if defined(__SANITIZE_THREAD__)
+#  define SW_TSAN_ENABLED 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define SW_TSAN_ENABLED 1
+#  endif
+#endif
+
 /* === Configuration === */
 #define SWARM_MAX_PROCESSES    100000    /* 100K processes (reduced from 1M) */
 #define SWARM_MAX_SCHEDULERS   64
@@ -444,7 +457,7 @@ struct sw_process {
      * END -> shifts no asm-pinned offset. */
     _Atomic uint64_t last_waker;
 
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+#ifdef SW_TSAN_ENABLED
     /* ThreadSanitizer fiber handle (TSan builds ONLY — compiled out entirely
      * otherwise, so it shifts NO asm-pinned offset in shipping builds; and being
      * at struct END it shifts none even under TSan). A sw process is a fiber whose
