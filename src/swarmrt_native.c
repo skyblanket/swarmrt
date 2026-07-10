@@ -1487,7 +1487,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * so the producer's sw_add_to_runq pays NOTHING (no lock, no
          * signal) and the consumer picks the work up within ~ns.
          * Budget is per-idle-transition, env-tunable: SW_SPIN_US
-         * (default 30, 0 disables, capped 1000); the 0.5ms park below is
+         * (default 60, 0 disables, capped 1000); the 0.5ms park below is
          * the safety net. Default ON since the deadlock that briefly
          * forced it opt-in was root-caused to the Dekker StoreLoad bug
          * in the receive waiting-flag handshake (see sw_receive_any) and
@@ -1499,7 +1499,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             static int spin_iters = -1;
             if (spin_iters < 0) {
                 const char *e = getenv("SW_SPIN_US");
-                int us = e ? atoi(e) : 30;
+                int us = e ? atoi(e) : 60;
                 if (us < 0) us = 0;
                 if (us > 1000) us = 1000;
                 /* ~25 pause-loop iterations per us on contemporary cores
