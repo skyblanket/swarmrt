@@ -209,7 +209,7 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
  * pointer (ETS copies values OUT to readers; a one-shot timer frees only after
  * its single apply returns). */
 static void _sw_free_global_val(sw_val_t *v) {
-    if (!v) return;
+    if (!v || v->immortal) return;
     switch (v->type) {
     case SW_VAL_STRING: case SW_VAL_ATOM:
         free(v->v.str); break;

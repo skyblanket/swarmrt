@@ -2219,16 +2219,55 @@ static inline char *val_strdup(const char *s) {
     return p ? p : (char *)val_alloc_oom(strlen(s) + 1);
 }
 
+/* === Immortal constants ===
+ * Values are immutable, so the most common ones are shared statics instead of
+ * a fresh 72-byte allocation per use: nil, the booleans and a few atoms that
+ * every comparison / result tag produces, and ints in [SW_SMALLINT_MIN,
+ * SW_SMALLINT_MAX]. `immortal` makes every free path skip them; a deep copy
+ * onto the GLOBAL heap (whose consumers free graphs node-by-node) re-creates
+ * them, while copies into regions/arenas (bulk-freed) share them. */
+#define SW_SMALLINT_MIN (-1024)
+#define SW_SMALLINT_MAX 1024
+static sw_val_t g_imm_nil   = { .type = SW_VAL_NIL,  .immortal = 1 };
+static sw_val_t g_imm_true  = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"true" };
+static sw_val_t g_imm_false = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"false" };
+static sw_val_t g_imm_anil  = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"nil" };
+static sw_val_t g_imm_ok    = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"ok" };
+static sw_val_t g_imm_error = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"error" };
+static sw_val_t g_imm_ints[SW_SMALLINT_MAX - SW_SMALLINT_MIN + 1];
+
+__attribute__((constructor)) static void sw_init_immortals(void) {
+    for (int i = SW_SMALLINT_MIN; i <= SW_SMALLINT_MAX; i++) {
+        sw_val_t *v = &g_imm_ints[i - SW_SMALLINT_MIN];
+        v->type = SW_VAL_INT;
+        v->immortal = 1;
+        v->v.i = i;
+    }
+}
+
 sw_val_t *sw_val_nil(void) {
-    sw_val_t *v = val_alloc(sizeof(sw_val_t));
-    v->type = SW_VAL_NIL;
-    return v;
+    return &g_imm_nil;
 }
 
 sw_val_t *sw_val_int(int64_t i) {
+    if (i >= SW_SMALLINT_MIN && i <= SW_SMALLINT_MAX)
+        return &g_imm_ints[i - SW_SMALLINT_MIN];
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_INT; v->v.i = i;
     return v;
+}
+
+/* The shared constant for a common atom, or NULL. */
+static sw_val_t *imm_atom(const char *s) {
+    if (!s) return NULL;
+    switch (s[0]) {
+    case 't': return strcmp(s, "true") == 0 ? &g_imm_true : NULL;
+    case 'f': return strcmp(s, "false") == 0 ? &g_imm_false : NULL;
+    case 'n': return strcmp(s, "nil") == 0 ? &g_imm_anil : NULL;
+    case 'o': return strcmp(s, "ok") == 0 ? &g_imm_ok : NULL;
+    case 'e': return strcmp(s, "error") == 0 ? &g_imm_error : NULL;
+    default: return NULL;
+    }
 }
 
 sw_val_t *sw_val_float(double f) {
@@ -2244,6 +2283,8 @@ sw_val_t *sw_val_string(const char *s) {
 }
 
 sw_val_t *sw_val_atom(const char *s) {
+    sw_val_t *imm = imm_atom(s);
+    if (imm) return imm;
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_ATOM; v->v.str = val_strdup(s);
     return v;
@@ -2411,15 +2452,29 @@ sw_val_t *sw_now_iso(void) {
  * only in the single-process interpreter, which has no arena to free). */
 #define SW_COPY_MAX_DEPTH 256
 
+/* A fresh (never immortal) copy of a scalar, for global-heap deep copies. */
+static sw_val_t *fresh_scalar(sw_val_t *v) {
+    sw_val_t *r = val_alloc(sizeof(sw_val_t));
+    r->type = v->type;
+    if (v->type == SW_VAL_INT) r->v.i = v->v.i;
+    else if (v->type == SW_VAL_ATOM) r->v.str = val_strdup(v->v.str ? v->v.str : "");
+    return r;
+}
+
 static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
-    if (!v) return sw_val_nil();
-    if (depth > SW_COPY_MAX_DEPTH) return sw_val_nil();
+    if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
+    if (depth > SW_COPY_MAX_DEPTH) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
+    /* Global-heap graphs are freed node by node (ETS replace/delete, timer
+     * and supervisor closures, v1 message fallback), so they must not share
+     * immortals; copies into regions/arenas (bulk-freed) may. */
+    if (v->immortal)
+        return g_alloc_force_global ? fresh_scalar(v) : v;
     switch (v->type) {
-    case SW_VAL_NIL:    return sw_val_nil();
-    case SW_VAL_INT:    return sw_val_int(v->v.i);
+    case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
+    case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
     case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
     case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
-    case SW_VAL_ATOM:   return sw_val_atom(v->v.str ? v->v.str : "");
+    case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
     case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
     case SW_VAL_PID:    return sw_val_pid(v->v.pid);
     case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
@@ -2589,7 +2644,7 @@ sw_val_t *sw_val_map_put(sw_val_t *map, sw_val_t *key, sw_val_t *val) {
 }
 
 void sw_val_free(sw_val_t *v) {
-    if (!v) return;
+    if (!v || v->immortal) return;
     switch (v->type) {
     case SW_VAL_STRING: case SW_VAL_ATOM: free(v->v.str); break;
     case SW_VAL_TUPLE: case SW_VAL_LIST:

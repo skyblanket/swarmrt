@@ -42,6 +42,11 @@ typedef struct sw_env sw_env_t;
 
 struct sw_val {
     sw_val_type_t type;
+    /* 1 for statically allocated shared constants (nil, true/false, common
+     * atoms, small ints, compiler-hoisted literals). Never freed, never
+     * written; value frees skip them and global-heap deep copies re-create
+     * them. Sits in the padding before the union, so sizeof is unchanged. */
+    uint8_t immortal;
     union {
         int64_t i;
         double f;
