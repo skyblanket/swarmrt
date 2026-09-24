@@ -50,7 +50,8 @@ appended. **Migration:** set `LLM_URL` (or `LLM_PROVIDER=otonomy` for the old de
 to any URL containing `://api.openai.com/`, such as
 `https://evil.example/?://api.openai.com/`; the host is now parsed (https only, no
 userinfo). Model names are JSON-escaped in the request body. Gate:
-`tests/sw/test_llm_endpoint.sw` (10 cases).
+`tests/sw/test_llm_endpoint.sw` (12 cases). An explicit URL wins over an unknown
+provider, and `OLLAMA_HOST=0.0.0.0:PORT` dials loopback on that port.
 
 **fix(watchdog): no "possible deadlock" warning while something can still wake a
 process.** A lone process in `receive ... after` (the fix the warning itself

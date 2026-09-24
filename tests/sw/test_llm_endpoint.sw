@@ -122,6 +122,12 @@ fun main() {
         bad = run_case(me, "badprov", "9262", "LLM_PROVIDER=nosuch")
         f = f + check("unknown_provider_named", has(bad, "unknown provider 'nosuch'"), bad)
 
+        bu = run_case(me, "opts_url", "9269", "LLM_PROVIDER=nosuch")
+        f = f + check("explicit_url_wins_over_unknown_provider", bu == "/opt|Bearer ollama|<none>", bu)
+
+        ob = run_case(me, "ollama", "9270", "LLM_PROVIDER=ollama OLLAMA_HOST=0.0.0.0:9270")
+        f = f + check("ollama_bind_address_keeps_its_port", string_starts_with(ob, "/v1/chat/completions|"), ob)
+
         o = run_case(me, "opts_url", "9263", "")
         f = f + check("opts_url_used_model_left_out", o == "/opt|Bearer ollama|<none>", o)
 
@@ -144,7 +150,7 @@ fun main() {
         m = run_case(me, "model_esc", "9267", "")
         f = f + check("model_name_is_json_escaped", m == "/m|Bearer ollama|a\"b", m)
 
-        if (f == 0) { print("OK llm_endpoint 10/10") ; sys_exit(0) }
+        if (f == 0) { print("OK llm_endpoint 12/12") ; sys_exit(0) }
         else { print("FAIL llm_endpoint") ; sys_exit(1) }
     }
 }

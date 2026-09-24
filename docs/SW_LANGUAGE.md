@@ -1048,7 +1048,7 @@ bin/swc test tests/sw/repl/test_repl_builtins_interp.sw
 #   16 tests, 16 passed (8.9ms)
 ```
 
-The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (80 files, 593 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
+The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (80 files, 595 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
 
 Inside your own `.sw` test files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics or errors with a message containing `expected_msg`. The test runner intercepts the panic before it hits `exit(1)` so the suite continues running.
 

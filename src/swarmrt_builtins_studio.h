@@ -6666,20 +6666,32 @@ static int _sw_llm_resolve(const char *who, const char *opt_url, const char *opt
              * address, so dial loopback instead. */
             const char *oh = getenv("OLLAMA_HOST");
             const char *scheme = (oh && strstr(oh, "://")) ? "" : "http://";
-            if (!oh || !*oh || strncmp(oh, "0.0.0.0", 7) == 0) { oh = "127.0.0.1:11434"; scheme = "http://"; }
+            char oh_buf[256];
+            if (!oh || !*oh) { oh = "127.0.0.1:11434"; scheme = "http://"; }
+            else {
+                /* 0.0.0.0 (bare or http://) → loopback, keeping a configured port. */
+                const char *bind = strncmp(oh, "0.0.0.0", 7) == 0 ? oh + 7
+                                 : strncmp(oh, "http://0.0.0.0", 14) == 0 ? oh + 14 : NULL;
+                if (bind) {
+                    snprintf(oh_buf, sizeof(oh_buf), "127.0.0.1%s", *bind ? bind : ":11434");
+                    oh = oh_buf; scheme = "http://";
+                }
+            }
             size_t ol = strlen(oh);
             while (ol > 0 && oh[ol - 1] == '/') ol--;
             snprintf(ollama_url, sizeof(ollama_url), "%s%.*s/v1/chat/completions", scheme, (int)ol, oh);
             purl = ollama_url;
-        } else {
-            snprintf(err, errsz, "error: %s: unknown provider '%s' (use openai, ollama or otonomy, "
-                     "or set LLM_URL to any OpenAI-compatible chat-completions URL)", who, provider);
-            _sw_llm_report_once(err);
-            return -1;
         }
     }
     const char *url = (opt_url && *opt_url) ? opt_url : getenv("LLM_URL");
     if (url && !*url) url = NULL;
+    /* An explicit URL wins, so an unknown provider only matters without one. */
+    if (!url && provider && !purl) {
+        snprintf(err, errsz, "error: %s: unknown provider '%s' (use openai, ollama or otonomy, "
+                 "or set LLM_URL to any OpenAI-compatible chat-completions URL)", who, provider);
+        _sw_llm_report_once(err);
+        return -1;
+    }
     if (!url) url = purl;
     if (!url) {
         snprintf(err, errsz, "error: %s: no LLM endpoint configured. Set LLM_URL to an "
