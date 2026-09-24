@@ -1,5 +1,7 @@
 module Test_bytes
 
+import Audio
+
 # Tests for SW_VAL_BYTES — the length-carrying, NUL-safe byte vector type.
 #
 # The whole point of this type is that it survives embedded NUL bytes, which

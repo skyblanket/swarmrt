@@ -713,6 +713,7 @@ libswarmrt: core-objs
 swc: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
+		$(SRC_DIR)/swarmrt_battery_interp.c \
 		-o $(BIN_DIR)/swc $(LDFLAGS)
 
 # Example: compile a .sw file

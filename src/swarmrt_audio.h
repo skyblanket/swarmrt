@@ -100,6 +100,10 @@ static uint8_t *_sw_audio_b64_decode(const char *src, size_t *out_len) {
 }
 
 /* === G.711 mu-law companding (ITU-T) === */
+/* Compiled programs get the codecs only with the Audio battery
+ * (swarmrt_builtins_studio.h defines SW_AUDIO_BASE64_ONLY otherwise); the
+ * base64 helpers above are core. */
+#ifndef SW_AUDIO_BASE64_ONLY
 
 #define SW_ULAW_BIAS 0x84
 #define SW_ULAW_CLIP 32635
@@ -201,5 +205,7 @@ static uint8_t *_sw_pcm16_resample(const uint8_t *pcm, size_t len,
     *out_len = n_out * 2;
     return out;
 }
+
+#endif /* SW_AUDIO_BASE64_ONLY */
 
 #endif /* SWARMRT_AUDIO_H */

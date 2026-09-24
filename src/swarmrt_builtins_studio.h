@@ -30,7 +30,10 @@
   #include <sys/ioctl.h>
 #endif
 #include "swarmrt_platform.h"
-#include "swarmrt_audio.h"   /* G.711 mu-law / PCM16 / resample (base64 in/out) */
+#ifndef SW_BATTERY_AUDIO
+#define SW_AUDIO_BASE64_ONLY   /* codecs are the Audio battery; base64 is core */
+#endif
+#include "swarmrt_audio.h"   /* base64; G.711 mu-law / PCM16 / resample with the Audio battery */
 #include <sqlite3.h>
 
 /* Optional OpenSSL for wss:// (WebSocket-over-TLS) in the WS client.
@@ -7900,103 +7903,16 @@ static sw_val_t *_builtin_ets_count(sw_val_t **a, int n) {
     return sw_val_int((int64_t)count);
 }
 
+#ifdef SW_BATTERY_PDF   /* Pdf battery — only when the program imports it (see g_batteries) */
 /* === PDF builtins === */
 #include "swarmrt_pdf.h"
 
-/* pdf_text(path) → string | nil
- * pdf_text(path, %{pages: [0,1]}) → string | nil */
-static sw_val_t *_builtin_pdf_text(sw_val_t **a, int n) {
-    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str)
-        return sw_val_nil();
-
-    /* Read file */
-    FILE *fp = fopen(a[0]->v.str, "rb");
-    if (!fp) return sw_val_nil();
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return sw_val_nil(); } /* 100MB limit */
-    uint8_t *buf = (uint8_t *)malloc(sz);
-    if (!buf) { fclose(fp); return sw_val_nil(); }
-    fread(buf, 1, sz, fp);
-    fclose(fp);
-
-    char *text = NULL;
-    size_t text_len = 0;
-    int rc;
-
-    /* Check for page selection (second arg is map with "pages" key) */
-    if (n >= 2 && a[1] && a[1]->type == SW_VAL_MAP) {
-        /* Look for pages key — simplified: extract pages from map */
-        /* For now, extract all text */
-        rc = sw_pdf_extract_text(buf, sz, &text, &text_len);
-    } else {
-        rc = sw_pdf_extract_text(buf, sz, &text, &text_len);
-    }
-
-    free(buf);
-    if (rc != SW_PDF_OK || !text) { free(text); return sw_val_nil(); }
-    sw_val_t *r = sw_val_string(text);
-    free(text);
-    return r;
-}
-
-/* pdf_pages(path) → int | nil */
-static sw_val_t *_builtin_pdf_pages(sw_val_t **a, int n) {
-    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str)
-        return sw_val_nil();
-
-    FILE *fp = fopen(a[0]->v.str, "rb");
-    if (!fp) return sw_val_nil();
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
-    uint8_t *buf = (uint8_t *)malloc(sz);
-    if (!buf) { fclose(fp); return sw_val_nil(); }
-    fread(buf, 1, sz, fp);
-    fclose(fp);
-
-    int count = 0;
-    int rc = sw_pdf_page_count(buf, sz, &count);
-    free(buf);
-    if (rc != SW_PDF_OK) return sw_val_nil();
-    return sw_val_int(count);
-}
-
-/* pdf_meta(path) → %{title, author, ...} | nil */
-static sw_val_t *_builtin_pdf_meta(sw_val_t **a, int n) {
-    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str)
-        return sw_val_nil();
-
-    FILE *fp = fopen(a[0]->v.str, "rb");
-    if (!fp) return sw_val_nil();
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
-    uint8_t *buf = (uint8_t *)malloc(sz);
-    if (!buf) { fclose(fp); return sw_val_nil(); }
-    fread(buf, 1, sz, fp);
-    fclose(fp);
-
-    sw_pdf_meta_t meta;
-    int rc = sw_pdf_metadata(buf, sz, &meta);
-    free(buf);
-    if (rc != SW_PDF_OK) return sw_val_nil();
-
-    /* Build a map with title, author, subject, creator, creation_date */
-    sw_val_t *keys[5], *vals[5];
-    int mc = 0;
-    if (meta.title) { keys[mc] = sw_val_string("title"); vals[mc] = sw_val_string(meta.title); mc++; }
-    if (meta.author) { keys[mc] = sw_val_string("author"); vals[mc] = sw_val_string(meta.author); mc++; }
-    if (meta.subject) { keys[mc] = sw_val_string("subject"); vals[mc] = sw_val_string(meta.subject); mc++; }
-    if (meta.creator) { keys[mc] = sw_val_string("creator"); vals[mc] = sw_val_string(meta.creator); mc++; }
-    if (meta.creation_date) { keys[mc] = sw_val_string("creation_date"); vals[mc] = sw_val_string(meta.creation_date); mc++; }
-    sw_pdf_meta_free(&meta);
-    if (mc == 0) return sw_val_map_new(NULL, NULL, 0);
-    return sw_val_map_new(keys, vals, mc);
-}
+/* The builtins live in swarmrt_pdf.c (shared with the interpreter), so the
+ * PDF engine is linked only into programs that import Pdf. */
+static sw_val_t *_builtin_pdf_text(sw_val_t **a, int n)  { return sw_pdf_builtin_text(a, n); }
+static sw_val_t *_builtin_pdf_pages(sw_val_t **a, int n) { return sw_pdf_builtin_pages(a, n); }
+static sw_val_t *_builtin_pdf_meta(sw_val_t **a, int n)  { return sw_pdf_builtin_meta(a, n); }
+#endif /* SW_BATTERY_PDF */
 
 /* ============================================================
  * Phase 16: Interactive CLI primitives (swarm-code)
@@ -9875,6 +9791,7 @@ static sw_val_t *_builtin_wsc_connect_tls(sw_val_t **a, int n) {
     return sw_val_int(handle);
 }
 
+#ifdef SW_BATTERY_CHROME   /* Chrome battery — only when the program imports it (see g_batteries) */
 /* ============================================================
  * chrome_launch — find a Chromium binary, spawn detached with
  *                 --remote-debugging-port set, wait for the port
@@ -10014,6 +9931,7 @@ static sw_val_t *_builtin_chrome_launch(sw_val_t **a, int n) {
     }
     return sw_val_nil();
 }
+#endif /* SW_BATTERY_CHROME */
 
 /* ============================================================
  * String + Base64 helpers (added 2026-05-15)
@@ -10036,6 +9954,7 @@ static sw_val_t *_builtin_string_index_of(sw_val_t **a, int n) {
     return sw_val_int((int64_t)(hit - hay));
 }
 
+#ifdef SW_BATTERY_AUDIO   /* Audio battery — only when the program imports it (see g_batteries) */
 /* ================================================================
  * Audio codecs for native voice agents — G.711 mu-law / PCM16 /
  * resample. All are base64-in / base64-out so raw (NUL-bearing) PCM
@@ -10097,6 +10016,7 @@ static sw_val_t *_builtin_audio_resample(sw_val_t **a, int n) {
     free(b64);
     return r;
 }
+#endif /* SW_BATTERY_AUDIO */
 
 /* === ed25519_verify (TLS-gated, openssl EVP) =============================
  *
@@ -10363,6 +10283,7 @@ static sw_val_t *_builtin_byte(sw_val_t **a, int n) {
     return sw_val_bytes(&b, 1);
 }
 
+#ifdef SW_BATTERY_AUDIO   /* Audio battery — only when the program imports it (see g_batteries) */
 /* === Bytes-native audio codec twins (no base64 round-trip) ===============
  * Same _sw_* helpers as the string codecs, but bytes-in / bytes-out so a sw
  * program can slice / index / hash a PCM frame directly. The string audio_*
@@ -10403,6 +10324,7 @@ static sw_val_t *_builtin_audio_resample_b(sw_val_t **a, int n) {
     free(out);
     return r;
 }
+#endif /* SW_BATTERY_AUDIO */
 
 /* ws_send_binary(conn, b64) → 'ok' | 'error' — decode base64 and send as
  * a WebSocket BINARY frame (server→client). For providers/protocols that

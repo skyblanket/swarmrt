@@ -68,6 +68,36 @@ result = LLM.chat(messages, opts)
 export [init, navigate, click, screenshot, close]
 ```
 
+### Batteries: builtins you import
+
+Most builtins are always available. A few are **batteries**: code that most
+programs don't need and that you may not want in every binary. They are
+compiled into a program only when it imports their module:
+
+| Import | Builtins | Module API |
+|---|---|---|
+| `import Pdf` | `pdf_text`, `pdf_pages`, `pdf_meta` | `Pdf.text(path)`, `Pdf.pages(path)`, `Pdf.meta(path)` |
+| `import Chrome` | `chrome_launch` | `Chrome.launch()`, `Chrome.launch_on(port, headless)` |
+| `import Audio` | `audio_ulaw_to_pcm16`, `audio_pcm16_to_ulaw`, `audio_resample` and their `_b` bytes twins | `Audio.ulaw_to_pcm16(b64)`, `Audio.resample(b64, from, to)`, … |
+
+A module may call a battery's builtins only if it imports that battery
+itself; otherwise `swc build`, `swc run` and `swc test` all reject it, naming
+the import to add. So a module's imports say what it can do, and a program
+that imports none of these carries no PDF parser, browser launcher or audio
+codec (a hello-world binary is about 13% smaller than when they were core).
+`Voice` (telephony / Realtime helpers) imports `Audio`; `Mcp` is a plain
+library module. `chrome_launch` works in compiled programs only.
+
+```sw
+module Report
+
+import Pdf
+
+fun summary(path) {
+    to_string(Pdf.pages(path)) ++ " pages: " ++ to_string(Pdf.text(path))
+}
+```
+
 ### Module-level `let` globals
 
 A module may declare up to 16 named constants at the top level using `let`. These are initialized once at compile time and visible to every function in the module.
@@ -578,7 +608,7 @@ bytes too. Bytes copy correctly over `send` and can be used as ETS keys.
 | `string_to_bytes(s)` | string chars → bytes |
 | `string_chars(s)` | list of single-**codepoint** strings (UTF-8 aware — `string_length` is bytes; `length(string_chars(s))` is codepoints; rejoin slices with `Std.join(cs, "")`). No grapheme clustering: combining marks stay separate codepoints |
 | `bytes_to_string(b)` | bytes → string (truncates at first NUL by design) |
-| `audio_ulaw_to_pcm16_b(b)` | mu-law bytes → PCM16 bytes (codec twin) |
+| `audio_ulaw_to_pcm16_b(b)` | mu-law bytes → PCM16 bytes (codec twin; the `audio_*` codecs need `import Audio`) |
 | `audio_pcm16_to_ulaw_b(b)` | PCM16 bytes → mu-law bytes (codec twin) |
 | `audio_resample_b(b, from, to)` | PCM16 bytes resample (codec twin) |
 
@@ -692,6 +722,8 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_connect_tls(wss_url)` → handle (TLS `wss://`), `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_set_handler(h, pid)` (deliver frames to a process as messages), `wsc_close(h)` |
 
 ### Browser
+Needs `import Chrome` (a battery; see §2).
+
 | | |
 |---|---|
 | `chrome_launch(port?, headless?)` | spawn Chrome with `--remote-debugging-port`, return port. Discovers Chrome / Chromium / Brave / Edge / Arc / Playwright cache |
@@ -793,9 +825,11 @@ opts: `api_key`, `max_tokens` (4096), `temperature` (0.7), and for `llm_complete
 ### PDF
 | | |
 |---|---|
-| `pdf_text(path)` | extract text |
+| `pdf_text(path)` | extract text (all pages) |
 | `pdf_pages(path)` | int page count |
-| `pdf_meta(path)` | metadata map |
+| `pdf_meta(path)` | metadata map (`title`, `author`, `subject`, `creator`, `creation_date` when present) |
+
+Needs `import Pdf` (a battery; see §2). Each returns nil for a missing, unreadable or over-100MB file.
 
 ### Verified builtin behavior
 
@@ -1013,7 +1047,7 @@ bin/swc test tests/sw/repl/test_repl_builtins_interp.sw
 #   16 tests, 16 passed (8.9ms)
 ```
 
-The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (78 files, 582 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
+The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (80 files, 592 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
 
 Inside your own `.sw` test files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics or errors with a message containing `expected_msg`. The test runner intercepts the panic before it hits `exit(1)` so the suite continues running.
 

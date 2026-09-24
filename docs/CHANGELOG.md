@@ -4,6 +4,34 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — batteries out of core
+
+**change(lang): PDF, Chrome and the audio codecs are batteries you import.**
+`pdf_text`/`pdf_pages`/`pdf_meta` need `import Pdf`, `chrome_launch` needs
+`import Chrome`, and the `audio_*` codecs need `import Audio` (new `lib/Pdf.sw`,
+`lib/Chrome.sw`, `lib/Audio.sw`, each with a small module API). Every binary used to
+carry all three: the hand-written PDF parser (~3.2K lines of C over untrusted input),
+the browser launcher and the codecs. Now codegen defines `SW_BATTERY_<X>` only for
+the batteries a program imports, the builtins header compiles each under its macro,
+and `swarmrt_pdf.o` is linked only when referenced. A hello-world binary goes from
+1,669,728 to 1,441,768 bytes with no battery symbols left. A module calls a battery's
+builtins only if it imports that battery itself, checked by the shared resolver on
+`swc build`, `swc run` and `swc test` alike, with the import to add in the error.
+`lib/Voice.sw` imports `Audio`. **Migration:** add the import to each module that
+calls these builtins.
+
+**fix(run): `swc run` loads imports transitively and checks each module like `swc
+build`.** It merged only the root file's direct imports, so a local module that
+imported another failed under `swc run` but built fine. The interpreter also gains
+`pdf_*` (shared with the compiled path through `swarmrt_pdf.c`); the interpreter's
+codecs move to `swarmrt_battery_interp.c`, linked into `swc` only. The resolver's
+summary now says "name errors" rather than "undefined names".
+
+Gates: `tests/sw/test_batteries.sw` (7, including a check that a program that doesn't
+import Chrome has no launcher symbol), `tests/sw/compile_fail/battery_without_import.sw`
+(build and run), `tests/sw/conform/t18_batteries.sw` (interpreter = compiled). The PDF
+engine had no test before this.
+
 ## 2026-09-24 — LLM builtins need an endpoint; deadlock watchdog false positives
 
 **change(llm): `llm_complete` / `llm_stream` have no default endpoint.** Without

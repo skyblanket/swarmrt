@@ -11,6 +11,7 @@ module Test_voice_codec
 # Self-contained harness; main() exits non-zero if any assertion fails.
 
 import Voice
+import Audio
 
 fun assert_true(name, cond) {
     if (cond == 'true') { print("PASS " ++ name) ; 0 }

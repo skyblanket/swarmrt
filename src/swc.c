@@ -204,48 +204,68 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
         if (tmp) { snprintf(input_dir, sizeof(input_dir), "%s", dirname(tmp)); free(tmp); }
     }
 
-    /* Resolve + merge imports (same lookup order as the build path). */
-    for (int im = 0; im < root->v.mod.nimports; im++) {
-        const char *imp_name = root->v.mod.imports[im];
-        char lower[128];
-        snprintf(lower, sizeof(lower), "%s", imp_name);
-        for (int c = 0; lower[c]; c++)
-            if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
+    /* Load imports the way the build path does: transitively (an imported
+     * module's own imports too), same lookup order, each module once. */
+    void *mods[64];
+    char *mod_paths[64];
+    int nmods = 0;
+    mods[nmods] = root; mod_paths[nmods++] = strdup(path);
+    for (int a = 0; a < nmods; a++) {
+        node_t *m = (node_t *)mods[a];
+        for (int im = 0; im < m->v.mod.nimports; im++) {
+            const char *imp_name = m->v.mod.imports[im];
+            int loaded = 0;
+            for (int e = 0; e < nmods; e++)
+                if (strcmp(((node_t *)mods[e])->v.mod.name, imp_name) == 0) { loaded = 1; break; }
+            if (loaded) continue;
 
-        char imp_path[512];
-        char *imp_source = NULL;
-        const char *roots[2] = { input_dir, swarmrt_lib };
-        for (int r = 0; r < 2 && !imp_source; r++) {
-            snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
-            imp_source = read_file_quiet(imp_path);
-            if (imp_source) break;
-            snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
-            imp_source = read_file_quiet(imp_path);
+            char lower[128];
+            snprintf(lower, sizeof(lower), "%s", imp_name);
+            for (int c = 0; lower[c]; c++)
+                if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
+
+            char imp_path[512];
+            char *imp_source = NULL;
+            const char *roots[2] = { input_dir, swarmrt_lib };
+            for (int r = 0; r < 2 && !imp_source; r++) {
+                snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
+                imp_source = read_file_quiet(imp_path);
+                if (imp_source) break;
+                snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
+                imp_source = read_file_quiet(imp_path);
+            }
+            if (!imp_source) {
+                fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
+                        imp_name, input_dir, swarmrt_lib);
+                continue;
+            }
+            void *imp_ast = sw_lang_parse(imp_source);
+            free(imp_source);
+            if (!imp_ast) {
+                fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
+                continue;
+            }
+            if (nmods < 64) { mods[nmods] = imp_ast; mod_paths[nmods++] = strdup(imp_path); }
         }
-        if (!imp_source) {
-            fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
-                    imp_name, input_dir, swarmrt_lib);
-            continue;
-        }
-        void *imp_ast = sw_lang_parse(imp_source);
-        free(imp_source);
-        if (!imp_ast) {
-            fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
-            continue;
-        }
-        merge_module_funs(root, (node_t *)imp_ast, 1);
     }
 
-    /* Same static name check as `swc build`, so both paths reject a typo. */
+    /* Same static name check as `swc build` — each module against the whole
+     * set, before merging — so both paths reject the same programs. */
     {
-        void *mods[1] = { root };
-        int unresolved = sw_resolve_module(root, mods, 1, path);
+        int unresolved = 0;
+        for (int a = 0; a < nmods; a++)
+            unresolved += sw_resolve_module(mods[a], mods, nmods, mod_paths[a]);
+        for (int a = 0; a < nmods; a++) free(mod_paths[a]);
         if (unresolved) {
-            fprintf(stderr, "swc: %d undefined name%s — not running\n",
+            fprintf(stderr, "swc: %d name error%s — not running\n",
                     unresolved, unresolved == 1 ? "" : "s");
             return 1;
         }
     }
+
+    /* Merge every imported module's functions into the root module. */
+    for (int a = 1; a < nmods; a++)
+        merge_module_funs(root, (node_t *)mods[a], 1);
 
     /* Run main(). */
     sw_interp_t *interp = sw_lang_new(main_ast);
@@ -330,6 +350,7 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
+    sw_interp_batteries_install();   /* battery builtins for run/test/REPL */
 
     const char *cmd = argv[1];
 
@@ -549,7 +570,7 @@ int main(int argc, char **argv) {
         for (int a = 0; a < nasts; a++)
             unresolved += sw_resolve_module(asts[a], asts, nasts, ast_paths[a]);
         if (unresolved) {
-            fprintf(stderr, "swc: %d undefined name%s — not compiling\n",
+            fprintf(stderr, "swc: %d name error%s — not compiling\n",
                     unresolved, unresolved == 1 ? "" : "s");
             return 1;
         }
