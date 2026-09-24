@@ -67,8 +67,20 @@
   #include <fcntl.h>
   #define sw_mkdir(p, m) mkdir(p, m)
   #define swbs_unlink(p) unlink(p)
-  #define sw_sleep(s) sleep(s)
+  /* Parks the calling process (not its scheduler thread) when on a fiber;
+   * a plain OS sleep otherwise (e.g. on an offload worker). */
+  #define sw_sleep(s) sw_sleep_ms((uint64_t)(s) * 1000)
 #endif
+
+/* Sub-second nap with the same fiber-aware behaviour as sw_sleep. */
+static void _sw_nap_us(unsigned us) {
+#ifdef _WIN32
+    Sleep(us / 1000 ? us / 1000 : 1);
+#else
+    if (sw_self()) sw_sleep_ms(us < 1000 ? 1 : us / 1000);
+    else usleep(us);
+#endif
+}
 
 /* === Registry === */
 
@@ -97,7 +109,7 @@ static sw_val_t *_builtin_link(sw_val_t **a, int n) {
 /* === Value-aware ETS (hashes/compares sw_val_t by value, not pointer) === */
 
 #define _VETS_BUCKETS 256
-#define _VETS_MAX_TABLES 64
+#define _VETS_MAX_TABLES 1024
 
 typedef struct _vets_entry {
     sw_val_t *key;
@@ -113,6 +125,11 @@ typedef struct {
 
 static _vets_table_t _vets_tables[_VETS_MAX_TABLES];
 static int _vets_next_id = 0;
+/* Ids released by ets_drop, reused by ets_new (LIFO). Without reuse the table
+ * space was a lifetime budget: Std.task_stream took two tables per call and
+ * the 33rd call hung. */
+static int _vets_free_ids[_VETS_MAX_TABLES];
+static int _vets_nfree = 0;
 static pthread_mutex_t _vets_meta = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t _vets_hash_val(sw_val_t *v) {
@@ -218,13 +235,62 @@ static void _sw_free_global_val(sw_val_t *v) {
 static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
     (void)a; (void)n;
     pthread_mutex_lock(&_vets_meta);
-    int id = _vets_next_id++;
-    if (id >= _VETS_MAX_TABLES) { pthread_mutex_unlock(&_vets_meta); return sw_val_nil(); }
-    memset(&_vets_tables[id], 0, sizeof(_vets_table_t));
-    pthread_rwlock_init(&_vets_tables[id].lock, NULL);
-    _vets_tables[id].active = 1;
+    int id;
+    if (_vets_nfree > 0) {
+        /* Reused slot: its lock stays initialised (a straggler may still be
+         * blocked on it); only the buckets are reset. */
+        id = _vets_free_ids[--_vets_nfree];
+        pthread_rwlock_wrlock(&_vets_tables[id].lock);
+        memset(_vets_tables[id].buckets, 0, sizeof(_vets_tables[id].buckets));
+        _vets_tables[id].active = 1;
+        pthread_rwlock_unlock(&_vets_tables[id].lock);
+    } else {
+        id = _vets_next_id;
+        if (id >= _VETS_MAX_TABLES) {
+            pthread_mutex_unlock(&_vets_meta);
+            fprintf(stderr, "swarmrt: ets_new: table limit (%d live tables) reached — "
+                            "release unused tables with ets_drop(t)\n", _VETS_MAX_TABLES);
+            return sw_val_nil();
+        }
+        _vets_next_id++;
+        memset(&_vets_tables[id], 0, sizeof(_vets_table_t));
+        pthread_rwlock_init(&_vets_tables[id].lock, NULL);
+        _vets_tables[id].active = 1;
+    }
     pthread_mutex_unlock(&_vets_meta);
     return sw_val_int((int64_t)id);
+}
+
+/* ets_drop(t) → 'ok' | 'error' — delete a whole table: free every entry
+ * (keys and values live on the global heap) and release the id for reuse.
+ * Using the id afterwards reads as an empty/unknown table until ets_new
+ * hands the id out again. */
+static sw_val_t *_builtin_ets_drop(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    int id = (int)a[0]->v.i;
+    pthread_mutex_lock(&_vets_meta);
+    if (id < 0 || id >= _vets_next_id || !_vets_tables[id].active) {
+        pthread_mutex_unlock(&_vets_meta);
+        return sw_val_atom("error");
+    }
+    _vets_table_t *t = &_vets_tables[id];
+    pthread_rwlock_wrlock(&t->lock);
+    t->active = 0;
+    for (int b = 0; b < _VETS_BUCKETS; b++) {
+        _vets_entry_t *e = t->buckets[b];
+        while (e) {
+            _vets_entry_t *next = e->next;
+            _sw_free_global_val(e->key);
+            _sw_free_global_val(e->value);
+            free(e);
+            e = next;
+        }
+        t->buckets[b] = NULL;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    _vets_free_ids[_vets_nfree++] = id;
+    pthread_mutex_unlock(&_vets_meta);
+    return sw_val_atom("ok");
 }
 
 static sw_val_t *_builtin_ets_put(sw_val_t **a, int n) {
@@ -446,10 +512,9 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
 
 static sw_val_t *_builtin_sleep(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_INT) return sw_val_atom("ok");
-    /* Use sw_receive_any with timeout to yield scheduler to other processes */
-    uint64_t tag;
-    void *msg = sw_receive_any((uint64_t)a[0]->v.i, &tag);
-    if (msg) free(msg); /* discard any spurious message */
+    /* Park this process (other processes keep running) without consuming
+     * any message that arrives during the sleep. */
+    if (a[0]->v.i > 0) sw_sleep_ms((uint64_t)a[0]->v.i);
     return sw_val_atom("ok");
 }
 
@@ -1075,7 +1140,7 @@ static int _sw_pkill_close(_sw_popen_pid_t p) {
             int status;
             pid_t r = waitpid(p.pid, &status, WNOHANG);
             if (r == p.pid) break;
-            usleep(10000);
+            _sw_nap_us(10000);
         }
         killpg(p.pid, SIGKILL);
         int status;
@@ -1097,6 +1162,81 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
     return 0;
 #endif
 }
+
+/* ============================================================
+ * Blocking-builtin offload
+ * ============================================================
+ *
+ * The HTTP client builtins spawn curl and wait for it; exec_argv waits on a
+ * subprocess. Run inline, each call pins its whole scheduler THREAD for the
+ * duration — so with N schedulers only N LLM/HTTP calls could be in flight
+ * at once (16 parallel 1s requests took 4s on 4 schedulers). Wrapped with
+ * SW_OFFLOAD_BUILTIN, the call instead runs on a runtime worker thread
+ * (sw_offload_run) while the calling process parks and every other process
+ * keeps running.
+ *
+ * Ownership: the arguments are deep-copied into a private region first (the
+ * worker must never read the caller's arena — a killed caller's arena is
+ * freed without the caller resuming), and the worker allocates the result
+ * into a second region. On return the caller adopts both regions in O(1). */
+static __thread int _sw_offl_depth = 0;
+
+typedef struct {
+    sw_val_t *(*fn)(sw_val_t **, int);
+    sw_val_t **args;
+    int n;
+    sw_value_arena_t *in, *out;
+    sw_val_t *result;
+} _sw_offl_job_t;
+
+static void _sw_offl_work(void *p) {
+    _sw_offl_job_t *j = (_sw_offl_job_t *)p;
+    sw_value_arena_t *prev = sw_swap_alloc_target(j->out);
+    _sw_offl_depth++;
+    j->result = j->fn(j->args, j->n);
+    _sw_offl_depth--;
+    sw_swap_alloc_target(prev);
+}
+
+static sw_val_t *_sw_offload_builtin(sw_val_t *(*fn)(sw_val_t **, int),
+                                     sw_val_t **a, int n) {
+    sw_value_arena_t *mine = sw_self_varena();
+    _sw_offl_job_t *j = (sw_self() && mine) ? (_sw_offl_job_t *)calloc(1, sizeof(*j)) : NULL;
+    if (j) {
+        j->in = sw_varena_create_kind(1024, SW_REGION_MESSAGE);
+        j->out = sw_varena_create_kind(4096, SW_REGION_MESSAGE);
+        j->args = (sw_val_t **)calloc(n > 0 ? (size_t)n : 1, sizeof(sw_val_t *));
+    }
+    if (!j || !j->in || !j->out || !j->args) {
+        if (j) {
+            if (j->in) sw_varena_free_all(j->in);
+            if (j->out) sw_varena_free_all(j->out);
+            free(j->args);
+            free(j);
+        }
+        _sw_offl_depth++;
+        sw_val_t *r = fn(a, n);
+        _sw_offl_depth--;
+        return r;
+    }
+    for (int i = 0; i < n; i++) j->args[i] = a[i] ? deep_copy_into(a[i], j->in) : NULL;
+    j->fn = fn;
+    j->n = n;
+    sw_offload_run(_sw_offl_work, j);
+    /* The result may point into either region (a builtin can hand back one
+     * of its arguments), so the caller's arena adopts both. */
+    sw_varena_adopt(mine, j->in);
+    sw_varena_adopt(mine, j->out);
+    sw_val_t *r = j->result ? j->result : sw_val_nil();
+    free(j->args);
+    free(j);
+    return r;
+}
+
+/* First statement of a blocking builtin: re-dispatches the call through the
+ * offload pool unless we are already running on the worker. */
+#define SW_OFFLOAD_BUILTIN(fn, a, n) \
+    do { if (_sw_offl_depth == 0) return _sw_offload_builtin((fn), (a), (n)); } while (0)
 
 /* ============================================================
  * Pending-input ring buffer — type-ahead captured mid-turn
@@ -1504,13 +1644,13 @@ static sw_val_t *_builtin_subprocess_close(sw_val_t **a, int n) {
     for (int i = 0; i < 10; i++) {
         int st;
         if (waitpid(sp->pid, &st, WNOHANG) == sp->pid) goto cleaned;
-        usleep(10000);
+        _sw_nap_us(10000);
     }
     killpg(sp->pid, SIGTERM);
     for (int i = 0; i < 20; i++) {
         int st;
         if (waitpid(sp->pid, &st, WNOHANG) == sp->pid) goto cleaned;
-        usleep(10000);
+        _sw_nap_us(10000);
     }
     killpg(sp->pid, SIGKILL);
     { int st; waitpid(sp->pid, &st, 0); }
@@ -1542,6 +1682,10 @@ cleaned:
 static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
         return sw_val_nil();
+    /* Interactive sessions keep the ESC-interrupt watcher on the caller's
+     * thread (it reads the TTY); everything else goes through the pool. */
+    if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok))
+        SW_OFFLOAD_BUILTIN(_builtin_http_post, a, n);
     const char *url = a[0]->v.str, *body = a[2]->v.str;
 
     /* Body via temp file — keeps the JSON out of argv entirely (and out
@@ -4613,6 +4757,7 @@ static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
 static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_http_get, a, n);
     const char *url = a[0]->v.str;
 
     char outf[256];
@@ -4810,6 +4955,7 @@ static sw_val_t *_sw_hr_error(const char *reason) {
 static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_hr_error("http_request: url must be a string");
+    SW_OFFLOAD_BUILTIN(_builtin_http_request, a, n);
     const char *url = a[0]->v.str;
 
     /* opts (optional map): method / headers / body */
@@ -5129,7 +5275,7 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
         FILE *ef = fopen(exitf, "r");
         if (ef) { fclose(ef); done = 1; break; }
 
-        usleep(delay_us);
+        _sw_nap_us(delay_us);
         waited_us += delay_us;
         if (delay_us < 250000) {
             delay_us *= 2;
@@ -5517,6 +5663,7 @@ static sw_val_t *_builtin_exec_argv(sw_val_t **a, int n) {
 #else
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_exec_argv, a, n);
     const char *cmd = a[0]->v.str;
 
     /* Collect extra args from the sw list (may be absent or empty). */
@@ -9432,7 +9579,7 @@ static sw_val_t *_builtin_chrome_launch(sw_val_t **a, int n) {
     /* Poll up to 10 seconds for the debug port to come up. */
     for (int i = 0; i < 100; i++) {
         if (system(check) == 0) return sw_val_int(port);
-        usleep(100000);
+        _sw_nap_us(100000);
     }
     return sw_val_nil();
 }

@@ -52,29 +52,23 @@ unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
 **Impact:** recursion-heavy programs must be compiled. **Workaround:**
 `swc build` — the interpreter is for short scripts, tests, and the REPL.
 
-### Blocking C-call builtins occupy their scheduler OS thread
+### A few blocking builtins still occupy their scheduler OS thread
 
-The curl-backed HTTP client builtins (`http_get` / `http_post` /
-`http_request` / `http_post_stream`) and other synchronous C calls block
-the scheduler THREAD, not just the calling fiber. Consequence: a program
-that runs an in-process server fiber AND calls itself over HTTP
-deadlocks under `SW_SCHEDULERS=1` — the blocked client holds the only
-scheduler, the server fiber never runs. At `SW_SCHEDULERS=2` the same
-deadlock fires whenever the client and server fibers happen to be placed
-on the SAME scheduler: a runnable fiber in a blocked scheduler's local
-queue is unstealable (work stealing covers only the global overflow
-queue, not peer local queues). Found by the Phase-2.2 scheduler-count
-matrix (test_http_request hung forever single-sched, all three loopback
-tests failed at S=2; they now SKIP below 3 schedulers and the test
-runner bounds every test with a 180s timeout). The deadlock watchdog did
-not flag this shape — the thread is busy inside libcurl, not parked.
+`http_get`, `http_request`, `http_post` and `exec_argv` now run on the runtime's
+offload pool (see "Recently cleared"). Still inline on the scheduler thread:
+`http_post_stream` (streams chunks to the TTY / a parent process), `http_post` while
+the interactive line editor owns the terminal (its ESC watcher reads the TTY),
+`shell()`'s initial `system()` launch, `db_*` (SQLite) and `llm_*`. A long call there
+blocks every other process queued on the same scheduler.
 
-**Impact:** single-scheduler deployments must not self-call over
-blocking clients; chatty blocking I/O also steals a core from every
-other process on that scheduler. **Workaround:** `SW_SCHEDULERS>=2` for
-self-loopback workloads (the WebSocket client is yield-aware and not
-affected). **Fix direction (Phase 3):** run blocking transports on a
-dedicated I/O thread pool with fiber park/wake, like `wsc_*` does.
+**Workaround:** `SW_SCHEDULERS>=2`, or move the call into its own process.
+
+### The HTTP server never frees a connection's port struct
+
+Closing a connection closes its socket (the per-connection fd leak is fixed), but the
+~64-byte `sw_port_t` is not freed: the IO thread may still hold it in an event batch
+fetched before the close, so freeing it safely needs an event refcount. About 64 MB
+per million connections over a process lifetime.
 
 ### Mutual tail recursion is not TCO'd — but overflow is now a recoverable panic
 
@@ -116,6 +110,20 @@ errors. This is a deliberate tradeoff (matching the dynamic, Erlang-shaped
 model), recorded here so the behavior is not a surprise.
 
 ## Recently cleared
+
+### HTTP client builtins pinned their scheduler thread (cleared 2026-09-24)
+
+`http_get`/`http_request`/`http_post`/`exec_argv` spawned curl and waited for it on the
+scheduler thread, capping in-flight calls at the scheduler count and deadlocking a
+program that called its own in-VM server under `SW_SCHEDULERS=1`. They now run on the
+offload pool while the caller parks. Gate: `tests/sw/test_http_offload.sw`.
+
+### HTTP server dropped requests and leaked fds (cleared 2026-09-24)
+
+A second `sw_io_init` from `http_listen` started a second IO thread on the same sockets
+(data could overtake its connection's accept and be dropped), and peer-closed sockets were
+never closed. Gate: `tests/sw/test_http_fd_leak.sw`.
+
 
 ### Spin-gated scheduler deadlock — root-caused: Dekker StoreLoad bug in the receive handshake
 

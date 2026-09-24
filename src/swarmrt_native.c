@@ -3817,6 +3817,173 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
 }
 
 /*
+ * sw_sleep_ms: park for `ms` without touching the mailbox. A selective receive
+ * on SW_TAG_SLEEP — a tag nothing ever sends — times out after `ms`; any
+ * message that arrives meanwhile wakes us, fails the tag match, and stays
+ * queued. (The old sleep builtins used sw_receive_any and silently discarded
+ * whatever message arrived during the sleep.)
+ */
+void sw_sleep_ms(uint64_t ms) {
+    if (!tls_current) {
+        struct timespec ts = { (time_t)(ms / 1000), (long)((ms % 1000) * 1000000L) };
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        return;
+    }
+    if (ms == 0) { sw_yield(); return; }
+    (void)sw_receive_tagged(SW_TAG_SLEEP, ms);
+}
+
+/*
+ * sw_park_until / sw_wake: park a process on a flag instead of a message.
+ * Same Dekker handshake as the receive paths: we publish `waiting` (seq_cst)
+ * and then re-read the flag (seq_cst); the waker publishes the flag (seq_cst)
+ * and then exchanges `waiting` (seq_cst, in mailbox_wake). At least one side
+ * observes the other, so the wake cannot be lost.
+ */
+void sw_wake(sw_process_t *proc) {
+    if (proc) mailbox_wake(proc);
+}
+
+void sw_park_until(_Atomic int *flag) {
+    sw_process_t *proc = tls_current;
+    if (!proc) {
+        while (!atomic_load_explicit(flag, memory_order_seq_cst)) usleep(200);
+        return;
+    }
+    while (!atomic_load_explicit(flag, memory_order_seq_cst)) {
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(flag, memory_order_seq_cst)) {
+            int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0,
+                                                       memory_order_acq_rel);
+            if (was_waiting) {
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
+                return;
+            }
+            /* A waker already enqueued us — swap so the scheduler dequeues
+             * us through the normal path (no double-enqueue). */
+        }
+        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
+    }
+}
+
+/*
+ * Offload pool: an unbounded FIFO of jobs served by detached worker threads
+ * that are started on demand (when no worker is idle) up to a cap, and exit
+ * after 30s idle. A job is shared by the parked caller and the worker via a
+ * two-count refcount; whoever finishes last frees it.
+ */
+typedef struct sw_offload_job {
+    void (*fn)(void *);
+    void *arg;
+    sw_process_t *waiter;
+    _Atomic int done;
+    _Atomic int refs;
+    struct sw_offload_job *next;
+} sw_offload_job_t;
+
+static pthread_mutex_t g_off_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_off_cond = PTHREAD_COND_INITIALIZER;
+static sw_offload_job_t *g_off_head = NULL, *g_off_tail = NULL;
+static int g_off_threads = 0, g_off_idle = 0, g_off_queued = 0, g_off_max = -1;
+
+static void offload_job_release(sw_offload_job_t *j) {
+    if (atomic_fetch_sub_explicit(&j->refs, 1, memory_order_acq_rel) == 1) free(j);
+}
+
+static void *offload_worker(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&g_off_lock);
+    for (;;) {
+        while (!g_off_head) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 30;
+            g_off_idle++;
+            int rc = pthread_cond_timedwait(&g_off_cond, &g_off_lock, &ts);
+            g_off_idle--;
+            if (rc == ETIMEDOUT && !g_off_head) {
+                g_off_threads--;
+                pthread_mutex_unlock(&g_off_lock);
+                return NULL;
+            }
+        }
+        sw_offload_job_t *j = g_off_head;
+        g_off_head = j->next;
+        if (!g_off_head) g_off_tail = NULL;
+        g_off_queued--;
+        pthread_mutex_unlock(&g_off_lock);
+
+        j->fn(j->arg);
+        sw_process_t *w = j->waiter;
+        atomic_store_explicit(&j->done, 1, memory_order_seq_cst);
+        mailbox_wake(w);
+        offload_job_release(j);
+
+        pthread_mutex_lock(&g_off_lock);
+    }
+}
+
+void sw_offload_run(void (*fn)(void *), void *arg) {
+    sw_process_t *proc = tls_current;
+    if (g_off_max < 0) {
+        const char *e = getenv("SW_OFFLOAD_THREADS");
+        int m = e ? atoi(e) : 256;
+        const char *off = getenv("SW_OFFLOAD");
+        if (off && off[0] == '0') m = 0;
+        g_off_max = m < 0 ? 0 : m;
+    }
+    if (!proc || g_off_max == 0) { fn(arg); return; }
+
+    sw_offload_job_t *j = (sw_offload_job_t *)calloc(1, sizeof(*j));
+    if (!j) { fn(arg); return; }
+    j->fn = fn;
+    j->arg = arg;
+    j->waiter = proc;
+    atomic_store_explicit(&j->refs, 2, memory_order_relaxed);
+
+    pthread_mutex_lock(&g_off_lock);
+    if (g_off_tail) g_off_tail->next = j; else g_off_head = j;
+    g_off_tail = j;
+    g_off_queued++;
+    /* Start a worker unless an idle one is available for EVERY queued job.
+     * (Comparing against idle>0 alone let a burst of callers all signal the
+     * same single idle worker, which then ran their jobs one by one.) */
+    int start = (g_off_queued > g_off_idle && g_off_threads < g_off_max);
+    if (start) g_off_threads++;
+    else pthread_cond_signal(&g_off_cond);
+    pthread_mutex_unlock(&g_off_lock);
+
+    if (start) {
+        pthread_t t;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&attr, 512 * 1024);
+        if (pthread_create(&t, &attr, offload_worker, NULL) != 0) {
+            pthread_mutex_lock(&g_off_lock);
+            g_off_threads--;
+            int none = (g_off_threads == 0);
+            if (none) {
+                /* No worker at all — pull our job back and run it inline. */
+                sw_offload_job_t **pp = &g_off_head, *prev = NULL;
+                while (*pp && *pp != j) { prev = *pp; pp = &(*pp)->next; }
+                if (*pp) { *pp = j->next; if (g_off_tail == j) g_off_tail = prev; g_off_queued--; }
+            }
+            pthread_mutex_unlock(&g_off_lock);
+            pthread_attr_destroy(&attr);
+            if (none) { free(j); fn(arg); return; }
+        } else {
+            pthread_attr_destroy(&attr);
+        }
+    }
+
+    sw_park_until(&j->done);
+    offload_job_release(j);
+}
+
+/*
  * sw_receive_any: Receive any message, returning the tag.
  * Used by GenServer loop to dispatch on message type. `adopt` (a parameter, not
  * a thread-local — it must survive the blocking context switch on THIS fiber's

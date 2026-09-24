@@ -203,6 +203,7 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v);
  * declared here so this header needn't include it. NULL region → global-heap copy. */
 struct sw_value_arena;
 sw_val_t *deep_copy_into(sw_val_t *v, struct sw_value_arena *region);
+struct sw_value_arena *sw_swap_alloc_target(struct sw_value_arena *region);
 
 /* GC v1: type-safe value-send choke point — deep-copies the payload to the
  * global heap, then enqueues via sw_send_tagged. Route every sw_val_t* send

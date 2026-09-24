@@ -4,6 +4,50 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — correctness pass: HTTP no longer pins schedulers, wrong-answer codegen bugs, HTTP server fixes
+
+**fix(runtime): blocking builtins run on an offload pool.** `http_get`, `http_request`,
+`http_post` (outside the interactive ESC-watch mode) and `exec_argv` used to spawn curl and
+wait for it ON the scheduler thread, so N schedulers meant at most N HTTP calls in flight
+(16 parallel 1s requests took 4.06s on 4 schedulers) and a program that served and called
+itself over HTTP deadlocked on one scheduler. They now run on runtime worker threads
+(`sw_offload_run`, pool grows on demand to `SW_OFFLOAD_THREADS`, default 256) while the
+calling process parks (`sw_park_until`); arguments are deep-copied into a private region
+and the result is built in a region the caller adopts in O(1). 16 parallel calls: 1.05s
+(also on `SW_SCHEDULERS=1`). Builtin retry naps and `shell()`'s poll loop park the process
+instead of sleeping the thread. Gate: `tests/sw/test_http_offload.sw` (hangs with
+`SW_OFFLOAD=0`).
+
+**fix(runtime): `sleep(ms)` no longer eats messages.** Both paths waited with a
+receive-any and freed whatever arrived. `sw_sleep_ms` waits on a tag nothing sends, so
+messages stay queued. This exposed `Std.task_stream` leaving `DOWN` messages behind.
+
+**fix(std): `Std.task_stream` survives repeated use.** It stashed work in two ETS tables per
+call and ETS allowed 64 tables per program lifetime, so the 33rd call hung. Rewritten over
+closures with results threaded through the loop, and every worker's monitor is demonitored
+and flushed. New builtin `ets_drop(t)` deletes a table and recycles its id (cap raised to
+1024 live tables).
+
+**fix(codegen): silent wrong answers.** Self-tail-calls assigned parameters sequentially,
+so `f(b, a)` turned a swap into a duplicate; variables assigned inside `if`/`case`/`receive`
+branches were invisible afterwards (they read as an atom); a `receive` arm whose guard
+rejected skipped every later arm; nested lambdas did not capture variables from outer
+scopes; a captured closure could not be called inside a lambda; `spawn(f(args))` with a
+closure-valued `f` failed to link; more than 64 lambdas per module were silently dropped;
+two `for` loops over the same name failed to compile. The interpreter now propagates
+assignments out of `case`/`receive` arms and parses `pat when guard ->` after an unbraced
+arm body. Gates: `tests/sw/test_nested_closures.sw`, `tests/sw/test_sleep_keeps_messages.sw`,
+conformance `t15_nested_closures`.
+
+**fix(http): the server lost requests and leaked a file descriptor per connection.**
+`http_listen` called `sw_io_init` a second time, starting a second IO thread on the same
+sockets, so a connection's data could reach the bridge before its accept and be dropped
+(about 1 in 200 requests under concurrency). `sw_io_init` is now idempotent. Separately, a
+client hanging up freed the connection slot but never closed the socket; 300 requests left
+310 open fds. Gate: `tests/sw/test_http_fd_leak.sw`.
+
+---
+
 ## 2026-07-05 — after-body TCO + recoverable stack overflow (the swarm-code 154s SIGBUS)
 
 **fix(codegen): self-tail-calls in a `receive ... after` body are now TCO'd; stack overflow is

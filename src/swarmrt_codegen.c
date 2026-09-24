@@ -37,7 +37,7 @@ typedef struct {
     node_t *node;          /* the N_FUN node */
     char gen_name[64];     /* generated C function name */
     /* free variables captured from enclosing scope */
-    char captures[32][128];
+    char captures[64][128];
     int ncaptures;
 } lambda_info_t;
 
@@ -92,13 +92,14 @@ typedef struct {
      * "undeclared function" errors out of clang. */
     int had_unknown_fn;
 
-    /* spawn sites collected during pre-scan */
-    spawn_info_t spawns[64];
-    int nspawns;
+    /* spawn sites collected during pre-scan (grown on demand — a fixed
+     * 64-entry table used to drop every site past the cap silently) */
+    spawn_info_t *spawns;
+    int nspawns, spawns_cap;
 
-    /* lambda (anonymous function) sites */
-    lambda_info_t lambdas[64];
-    int nlambdas;
+    /* lambda (anonymous function) sites (grown on demand, same reason) */
+    lambda_info_t *lambdas;
+    int nlambdas, lambdas_cap;
 
     /* Last source line we emitted a #line directive for in the current
      * function. Lets emit_block emit one #line per source line (so a C
@@ -205,6 +206,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "unlink") == 0 || strcmp(name, "demonitor") == 0 ||
            strcmp(name, "exit_proc") == 0 || strcmp(name, "trap_exit") == 0 ||
            strcmp(name, "ets_new") == 0 || strcmp(name, "ets_put") == 0 ||
+           strcmp(name, "ets_drop") == 0 ||
            strcmp(name, "ets_get") == 0 || strcmp(name, "ets_delete") == 0 ||
            strcmp(name, "ets_update_counter") == 0 || strcmp(name, "ets_cas") == 0 ||
            strcmp(name, "ets_take") == 0 || strcmp(name, "ets_update") == 0 ||
@@ -429,11 +431,24 @@ static void check_user_call_arity(cg_ctx_t *ctx, const char *fname, int nargs, i
  * Pre-scan: collect spawn sites
  * ========================================================================= */
 
+/* Ensure room for one more element in a heap table; returns 0 on OOM. */
+static int cg_grow(void **arr, int *cap, int count, size_t elem) {
+    if (count < *cap) return 1;
+    int ncap = *cap ? *cap * 2 : 32;
+    void *p = realloc(*arr, (size_t)ncap * elem);
+    if (!p) return 0;
+    memset((char *)p + (size_t)*cap * elem, 0, (size_t)(ncap - *cap) * elem);
+    *arr = p;
+    *cap = ncap;
+    return 1;
+}
+
 static void scan_spawns(cg_ctx_t *ctx, node_t *n) {
     if (!n) return;
     if (n->type == N_SPAWN) {
         node_t *inner = n->v.spawn.expr;
-        if (inner && inner->type == N_CALL && ctx->nspawns < 64) {
+        if (inner && inner->type == N_CALL &&
+            cg_grow((void **)&ctx->spawns, &ctx->spawns_cap, ctx->nspawns, sizeof(spawn_info_t))) {
             spawn_info_t *sp = &ctx->spawns[ctx->nspawns];
             sp->id = ctx->nspawns;
             strncpy(sp->func_name, inner->v.call.func->v.sval, 127);
@@ -524,6 +539,10 @@ static void scan_spawns(cg_ctx_t *ctx, node_t *n) {
  * Pre-scan: collect lambda (anonymous function) sites
  * ========================================================================= */
 
+static void lambda_free_vars(node_t *fn, char out[][128], int *nout, int max);
+/* The module being scanned, for resolving callee names in lambda_free_vars. */
+static cg_ctx_t *g_scan_ctx = NULL;
+
 /* Collect identifiers used in an expression */
 static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
     if (!n) return;
@@ -545,7 +564,18 @@ static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
         collect_idents(n->v.assign.value, ids, nids, max);
         break;
     case N_CALL:
-        /* Don't collect the function name itself — only args */
+        /* A plain-name callee is collected with a '@' marker: it is a free
+         * variable only if it names a closure-valued variable, not a builtin
+         * or module function (lambda_free_vars resolves the marker). Without
+         * it, `fun wrap(f) { fun(x) { f(x) } }` never captured `f`. */
+        if (n->v.call.func && n->v.call.func->type == N_IDENT &&
+            !strchr(n->v.call.func->v.sval, '.')) {
+            char mk[128];
+            snprintf(mk, sizeof(mk), "@%s", n->v.call.func->v.sval);
+            int dup = 0;
+            for (int i = 0; i < *nids; i++) if (strcmp(ids[i], mk) == 0) { dup = 1; break; }
+            if (!dup && *nids < max) { strncpy(ids[*nids], mk, 127); ids[*nids][127] = '\0'; (*nids)++; }
+        }
         for (int i = 0; i < n->v.call.nargs; i++)
             collect_idents(n->v.call.args[i], ids, nids, max);
         break;
@@ -603,6 +633,36 @@ static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
         collect_idents(n->v.cons.head, ids, nids, max);
         collect_idents(n->v.cons.tail, ids, nids, max);
         break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++)
+            collect_idents(n->v.recv.clauses[i], ids, nids, max);
+        collect_idents(n->v.recv.after_body, ids, nids, max);
+        collect_idents(n->v.recv.after_expr, ids, nids, max);
+        break;
+    case N_CLAUSE:
+        collect_idents(n->v.clause.body, ids, nids, max);
+        collect_idents(n->v.clause.guard, ids, nids, max);
+        break;
+    case N_SPAWN:
+        collect_idents(n->v.spawn.expr, ids, nids, max);
+        break;
+    case N_FUN:
+        /* A nested lambda's FREE variables are free in the enclosing lambda
+         * too: the enclosing closure must capture them so the inner closure
+         * can be built from inside it. Without this, `fun() { fun() { x } }`
+         * compiled the inner capture as a read of an undeclared C `x`. */
+        if (n->v.fun.name[0] == '\0') {
+            char inner[256][128];
+            int ninner = 0;
+            lambda_free_vars(n, inner, &ninner, 256);
+            for (int i = 0; i < ninner; i++) {
+                int dup = 0;
+                for (int k = 0; k < *nids; k++)
+                    if (strcmp(ids[k], inner[i]) == 0) { dup = 1; break; }
+                if (!dup && *nids < max) { strncpy(ids[*nids], inner[i], 127); (*nids)++; }
+            }
+        }
+        break;
     default: break;
     }
 }
@@ -640,6 +700,11 @@ recur:
     case N_TRY:
         collect_assigned_names(n->v.trycatch.body, names, nnames, max);
         collect_assigned_names(n->v.trycatch.catch_body, names, nnames, max);
+        break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++)
+            collect_assigned_names(n->v.recv.clauses[i]->v.clause.body, names, nnames, max);
+        collect_assigned_names(n->v.recv.after_body, names, nnames, max);
         break;
     default: break;
     }
@@ -774,10 +839,54 @@ static void collect_pattern_bound_in_arms(node_t *n, char names[][128],
     }
 }
 
+/* Free variables of an anonymous function: identifiers referenced in its
+ * body (including the free variables of any lambdas nested inside it) that
+ * are neither parameters nor bound inside the body. Without the assigned-
+ * check, a lambda like `fun(t) { total = ... ; f"{total}" }` would try to
+ * capture `total` from the outer scope and fail. */
+static void lambda_free_vars(node_t *fn, char out[][128], int *nout, int max) {
+    char body_idents[256][128];
+    int nbody_idents = 0;
+    collect_idents(fn->v.fun.body, body_idents, &nbody_idents, 256);
+
+    char assigned[256][128];
+    int nassigned = 0;
+    collect_assigned_names(fn->v.fun.body, assigned, &nassigned, 256);
+    /* Also treat case-arm / receive-clause / catch pattern bindings as
+     * lambda-locals (see collect_pattern_bound_in_arms): they're bound
+     * inside the body when an arm matches, so they're never captures. */
+    collect_pattern_bound_in_arms(fn->v.fun.body, assigned, &nassigned, 256);
+
+    for (int i = 0; i < nbody_idents; i++) {
+        const char *name = body_idents[i];
+        if (name[0] == '@') {
+            /* Callee-position name: a builtin or module function is called
+             * directly and needs no capture. */
+            name++;
+            if (is_builtin(name) || (g_scan_ctx && is_module_func(g_scan_ctx, name))) continue;
+        }
+        int dup = 0;
+        for (int k = 0; k < *nout; k++) if (strcmp(out[k], name) == 0) { dup = 1; break; }
+        if (dup) continue;
+        int is_param = 0;
+        for (int j = 0; j < fn->v.fun.nparams; j++)
+            if (strcmp(name, fn->v.fun.params[j]) == 0) { is_param = 1; break; }
+        if (is_param) continue;
+        int is_local = 0;
+        for (int j = 0; j < nassigned; j++)
+            if (strcmp(name, assigned[j]) == 0) { is_local = 1; break; }
+        if (is_local) continue;
+        if (*nout < max)
+            strncpy(out[(*nout)++], name, 127);
+    }
+}
+
 static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
     if (!n) return;
+    g_scan_ctx = ctx;
     /* Anonymous function: N_FUN with empty name */
-    if (n->type == N_FUN && n->v.fun.name[0] == '\0' && ctx->nlambdas < 64) {
+    if (n->type == N_FUN && n->v.fun.name[0] == '\0' &&
+        cg_grow((void **)&ctx->lambdas, &ctx->lambdas_cap, ctx->nlambdas, sizeof(lambda_info_t))) {
         lambda_info_t *li = &ctx->lambdas[ctx->nlambdas];
         li->id = ctx->nlambdas;
         li->node = n;
@@ -788,34 +897,9 @@ static void scan_lambdas(cg_ctx_t *ctx, node_t *n) {
         snprintf(li->gen_name, sizeof(li->gen_name), "_lambda_%s_%d", ctx->mod_name, li->id);
 
         /* Find free variables: identifiers in body that aren't params
-         * AND aren't assigned inside the body. Without the assigned-
-         * check, a lambda like `fun(t) { total = ... ; f"{total}" }`
-         * would try to capture `total` from outer scope and fail. */
-        char body_idents[64][128];
-        int nbody_idents = 0;
-        collect_idents(n->v.fun.body, body_idents, &nbody_idents, 64);
-
-        char assigned[64][128];
-        int nassigned = 0;
-        collect_assigned_names(n->v.fun.body, assigned, &nassigned, 64);
-        /* Also treat case-arm / receive-clause / catch pattern bindings as
-         * lambda-locals (see collect_pattern_bound_in_arms): they're bound
-         * inside the body when an arm matches, so they're never captures. */
-        collect_pattern_bound_in_arms(n->v.fun.body, assigned, &nassigned, 64);
-
+         * AND aren't assigned inside the body (see lambda_free_vars). */
         li->ncaptures = 0;
-        for (int i = 0; i < nbody_idents; i++) {
-            int is_param = 0;
-            for (int j = 0; j < n->v.fun.nparams; j++)
-                if (strcmp(body_idents[i], n->v.fun.params[j]) == 0) { is_param = 1; break; }
-            if (is_param) continue;
-            int is_local = 0;
-            for (int j = 0; j < nassigned; j++)
-                if (strcmp(body_idents[i], assigned[j]) == 0) { is_local = 1; break; }
-            if (is_local) continue;
-            if (li->ncaptures < 32)
-                strncpy(li->captures[li->ncaptures++], body_idents[i], 127);
-        }
+        lambda_free_vars(n, li->captures, &li->ncaptures, 64);
 
         ctx->nlambdas++;
         /* Continue scanning lambda body for nested lambdas */
@@ -1387,12 +1471,28 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
     fprintf(f, "    if (_s->fn) sw_val_apply(_s->fn, NULL, 0);\n");
     fprintf(f, "    free(_s);\n");
     fprintf(f, "}\n");
+    /* spawn(f(a, b)) where `f` is a closure-valued variable: the closure and
+     * its arguments travel in the spawn region; the child applies them. */
+    fprintf(f, "typedef struct { sw_val_t *fn; int n; sw_val_t *args[16]; } _sw_lam_spa_t;\n");
+    fprintf(f, "static void _sw_lambda_spawn_trampoline3(void *_raw) {\n");
+    fprintf(f, "    _sw_lam_spa_t *_s = (_sw_lam_spa_t *)_raw;\n");
+    fprintf(f, "    { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();\n");
+    fprintf(f, "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n");
+    fprintf(f, "    if (_s->fn) sw_val_apply(_s->fn, _s->n > 0 ? _s->args : NULL, _s->n);\n");
+    fprintf(f, "    free(_s);\n");
+    fprintf(f, "}\n");
     fprintf(f, "#endif\n\n");
 
     if (ctx->nspawns == 0) return;
     fprintf(f, "/* === Spawn trampolines === */\n");
     for (int i = 0; i < ctx->nspawns; i++) {
         spawn_info_t *sp = &ctx->spawns[i];
+        /* A spawn of a plain name that is not a module function is a
+         * closure-variable call (or an unknown name, reported at the spawn
+         * site) — it goes through _sw_lambda_spawn_trampoline3, so emitting a
+         * direct-call trampoline here would reference a nonexistent symbol. */
+        if (!strchr(sp->func_name, '.') && !is_module_func(ctx, sp->func_name))
+            continue;
         /* Struct for captured args. Names are module-prefixed so multiple
          * modules in a multi-module build don't collide on _sp0_t etc. */
         fprintf(f, "typedef struct {");
@@ -1432,6 +1532,8 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
 
 /* Forward declaration for emit_expr */
 static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz);
+static void emit_ident_value(cg_ctx_t *ctx, const char *name, char *out, int osz);
+static void hoist_assigned(cg_ctx_t *ctx, node_t *body);
 
 static void emit_lambda_functions(cg_ctx_t *ctx) {
     FILE *f = ctx->out;
@@ -1859,7 +1961,7 @@ static const char *_common_builtins[] = {
     "audio_ulaw_to_pcm16_b", "audio_pcm16_to_ulaw_b", "audio_resample_b",
     "json_encode", "json_decode", "json_get", "json_escape",
     "spawn", "self", "send", "register", "whereis",
-    "ets_new", "ets_put", "ets_get", "ets_delete", "ets_update_counter", "ets_cas",
+    "ets_new", "ets_put", "ets_get", "ets_delete", "ets_drop", "ets_update_counter", "ets_cas",
     "ets_take", "ets_update", "ets_list", "ets_count",
     "file_read", "file_write", "file_read_bytes", "file_write_bytes",
     "file_exists", "file_delete", "file_list",
@@ -2071,6 +2173,17 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
      * no process arena (SW_GC_OFF / interpreter) or on OOM — plain reassign. */
     if (tail && is_self_call(ctx, n)) {
         int np = nargs < ctx->cur_nparams ? nargs : ctx->cur_nparams;
+        /* Parallel assignment: an argument can BE another parameter (the
+         * N_IDENT case yields the bare C name), so `f(b, a)` must read every
+         * argument before writing any parameter — assigning `a = b; b = a`
+         * in sequence turned a swap into a duplicate. Snapshot first. */
+        for (int i = 0; i < np; i++) {
+            char tv[32];
+            fresh_var(ctx, tv, sizeof(tv));
+            fprintf(f, "    sw_val_t *%s = %s;\n", tv, arg_vars[i]);
+            strncpy(arg_vars[i], tv, sizeof(arg_vars[i]) - 1);
+            arg_vars[i][sizeof(arg_vars[i]) - 1] = '\0';
+        }
         /* SCOPED turn-checkpoint: when this function has accumulated more than
          * the reset threshold ABOVE its entry floor, copy the recursion args
          * into a temp region, rewind the arena to the floor (reclaiming this
@@ -2190,6 +2303,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "unlink") == 0 || strcmp(fname, "demonitor") == 0 ||
              strcmp(fname, "exit_proc") == 0 || strcmp(fname, "trap_exit") == 0 ||
              strcmp(fname, "ets_new") == 0 || strcmp(fname, "ets_put") == 0 ||
+             strcmp(fname, "ets_drop") == 0 ||
              strcmp(fname, "ets_get") == 0 || strcmp(fname, "ets_delete") == 0 ||
              strcmp(fname, "ets_update_counter") == 0 || strcmp(fname, "ets_cas") == 0 ||
              strcmp(fname, "ets_take") == 0 || strcmp(fname, "ets_update") == 0 ||
@@ -2470,6 +2584,45 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         return;
     }
 
+    /* spawn(f(args)) where `f` is a closure-valued variable rather than a
+     * module function: evaluate the closure and the arguments here, copy them
+     * into the spawn region, and let the child apply them. */
+    if (inner && inner->type == N_CALL && inner->v.call.func &&
+        inner->v.call.func->type == N_IDENT) {
+        const char *cn = inner->v.call.func->v.sval;
+        if (!strchr(cn, '.') && !is_module_func(ctx, cn) && !is_builtin(cn) &&
+            (is_declared(ctx, cn) || is_global(ctx, cn))) {
+            int na = inner->v.call.nargs;
+            if (na > 16) {
+                fprintf(stderr, "swc: %s:%d: spawn of a closure call supports at most 16 arguments\n",
+                        guess_sw_path(ctx->mod_name), n->line);
+                ctx->had_arity_error = 1;
+                na = 16;
+            }
+            char fn_val[32], avs[16][32];
+            emit_ident_value(ctx, cn, fn_val, sizeof(fn_val));
+            for (int i = 0; i < na; i++)
+                emit_expr(ctx, inner->v.call.args[i], 0, avs[i], sizeof(avs[i]));
+            char pv[32], lr[32], ls[32];
+            fresh_var(ctx, pv, sizeof(pv));
+            fresh_var(ctx, lr, sizeof(lr));
+            fresh_var(ctx, ls, sizeof(ls));
+            fprintf(f, "    sw_value_arena_t *%s = sw_self_varena() ? sw_varena_create_kind(256, SW_REGION_SPAWN) : NULL;\n", lr);
+            fprintf(f, "    _sw_lam_spa_t *%s = calloc(1, sizeof(_sw_lam_spa_t));\n", ls);
+            fprintf(f, "    %s->fn = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
+                    ls, lr, fn_val, lr, fn_val);
+            fprintf(f, "    %s->n = %d;\n", ls, na);
+            for (int i = 0; i < na; i++)
+                fprintf(f, "    %s->args[%d] = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
+                        ls, i, lr, avs[i], lr, avs[i]);
+            fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline3, %s, %s);\n", pv, ls, lr);
+            fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
+            fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
+            emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
+            return;
+        }
+    }
+
     int sp_id = find_spawn_id(ctx, inner);
     if (sp_id < 0) {
         /* An N_CALL we never recorded a spawn-site for (e.g. it lives in a
@@ -2536,6 +2689,9 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
         ? (uint64_t)n->v.recv.after_ms : (uint64_t)-1;
 
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
+    for (int i = 0; i < n->v.recv.nclauses; i++)
+        hoist_assigned(ctx, n->v.recv.clauses[i]->v.clause.body);
+    hoist_assigned(ctx, n->v.recv.after_body);
     fprintf(f, "    { /* selective receive */\n");
 
     /* Dynamic timeout: `after some_var { ... }`. Evaluate the
@@ -2606,9 +2762,13 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     for (int i = 0; i < n->v.recv.nclauses; i++) {
         node_t *cl = n->v.recv.clauses[i];
         check_linear_pattern(ctx, cl->v.clause.pattern, cl->line);
-        fprintf(f, "          %sif (", i == 0 ? "" : "} else ");
+        /* Independent `if (!_matched && pat)` per arm — NOT an else-if chain:
+         * an arm whose pattern matches but whose guard rejects must fall
+         * through to the next arm, exactly like `case`. The chained form
+         * skipped every later arm for this message. */
+        fprintf(f, "          if (!_matched && (");
         emit_pattern_cond(ctx, cl->v.clause.pattern, msg);
-        fprintf(f, ") {\n");
+        fprintf(f, ")) {\n");
 
         int saved_ndeclared = ctx->ndeclared;
 
@@ -2656,11 +2816,9 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
                 fprintf(f, "            %s = %s;\n", res, body_res);
         }
 
+        fprintf(f, "          }\n");
         ctx->ndeclared = saved_ndeclared;
     }
-
-    if (n->v.recv.nclauses > 0)
-        fprintf(f, "          }\n");
 
     fprintf(f, "          if (!_matched) %s = _next;\n", cur);
     fprintf(f, "        }\n");  /* end inner while (cursor) */
@@ -2744,6 +2902,8 @@ static void emit_case(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     fprintf(f, "    sw_val_t *%s = %s;\n", subj, subj0);
     fresh_var(ctx, res, sizeof(res));
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
+    for (int i = 0; i < n->v.casex.nclauses; i++)
+        hoist_assigned(ctx, n->v.casex.clauses[i]->v.clause.body);
 
     /* Wrap in a do-while(0) so each arm can `break` to skip the rest
      * once it matches AND its guard (if any) fires. Without this, a
@@ -2790,10 +2950,33 @@ static void emit_case(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     strncpy(out, res, osz - 1);
 }
 
+/* Branch-assigned variables outlive the branch. `if (c) { l = 1 } else
+ * { l = 2 } ; l` must see `l` after the if, as the interpreter does — but a
+ * C declaration inside a branch block is scoped to that block, and the
+ * declared-set is (correctly) restored when the branch closes, so the later
+ * read used to fall through to the undeclared-identifier path and yield the
+ * atom `:l`. Hoist: before emitting a branching construct, declare every
+ * name assigned anywhere in `body` that is not declared yet, initialised to
+ * nil (the value a not-taken branch leaves). Inside the branch the
+ * assignment then becomes a plain store to the outer variable. */
+static void hoist_assigned(cg_ctx_t *ctx, node_t *body) {
+    if (!body) return;
+    char names[64][128];
+    int nnames = 0;
+    collect_assigned_names(body, names, &nnames, 64);
+    for (int i = 0; i < nnames; i++) {
+        if (is_declared(ctx, names[i])) continue;
+        fprintf(ctx->out, "    sw_val_t *%s = sw_val_nil();\n", mangle_for_c(names[i]));
+        declare_var(ctx, names[i]);
+    }
+}
+
 static void emit_if(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
     char cond[32], res[32];
     emit_expr(ctx, n->v.iff.cond, 0, cond, sizeof(cond));
+    hoist_assigned(ctx, n->v.iff.then_b);
+    hoist_assigned(ctx, n->v.iff.else_b);
     fresh_var(ctx, res, sizeof(res));
     fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", res);
     fprintf(f, "    if (sw_val_is_truthy(%s)) {\n", cond);
@@ -2914,6 +3097,41 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     (void)tail;
 }
 
+/* Emit the value an identifier denotes in the current scope: a declared
+ * variable, a module-level global, a module function used by-name as a
+ * value, or (fallback) an atom. Shared by N_IDENT and closure-capture
+ * construction, so a lambda capture always resolves exactly like a plain
+ * read of the same name at the closure-creation site would. */
+static void emit_ident_value(cg_ctx_t *ctx, const char *name, char *out, int osz) {
+    FILE *f = ctx->out;
+    if (is_declared(ctx, name)) {
+        /* Known variable — return mangled C-side name. */
+        strncpy(out, mangle_for_c(name), osz - 1);
+    } else if (is_global(ctx, name)) {
+        /* Module-level global (let x = ...) — read from static slot. */
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    sw_val_t *%s = _g_%s_%s;\n", v, ctx->mod_name, name);
+        strncpy(out, v, osz - 1);
+    } else if (is_module_func(ctx, name)) {
+        /* Module function used by-name as a value (e.g. passed in
+         * `%{handler: handle_echo}` or stored in a var to call
+         * later). Wrap it as a callable SW_VAL_FUN so sw_val_apply
+         * dispatches correctly. Without this we silently produced
+         * an atom and any later call(args) returned nil. */
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        /* nparams = -1 means "variadic at the C ABI level"; the
+         * generated module functions all take (sw_val_t **, int). */
+        fprintf(f, "    sw_val_t *%s = sw_val_fun_native((void*)%s_%s, -1, NULL, 0);\n",
+                v, ctx->mod_name, name);
+        strncpy(out, v, osz - 1);
+    } else {
+        /* Undeclared identifier → treat as atom (message tag) */
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    sw_val_t *%s = sw_val_atom(\"%s\");\n", v, name);
+        strncpy(out, v, osz - 1);
+    }
+}
+
 static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     FILE *f = ctx->out;
     out[0] = '\0';
@@ -2954,35 +3172,9 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         strncpy(out, v, osz - 1);
         break;
     }
-    case N_IDENT: {
-        if (is_declared(ctx, n->v.sval)) {
-            /* Known variable — return mangled C-side name. */
-            strncpy(out, mangle_for_c(n->v.sval), osz - 1);
-        } else if (is_global(ctx, n->v.sval)) {
-            /* Module-level global (let x = ...) — read from static slot. */
-            char v[32]; fresh_var(ctx, v, sizeof(v));
-            fprintf(f, "    sw_val_t *%s = _g_%s_%s;\n", v, ctx->mod_name, n->v.sval);
-            strncpy(out, v, osz - 1);
-        } else if (is_module_func(ctx, n->v.sval)) {
-            /* Module function used by-name as a value (e.g. passed in
-             * `%{handler: handle_echo}` or stored in a var to call
-             * later). Wrap it as a callable SW_VAL_FUN so sw_val_apply
-             * dispatches correctly. Without this we silently produced
-             * an atom and any later call(args) returned nil. */
-            char v[32]; fresh_var(ctx, v, sizeof(v));
-            /* nparams = -1 means "variadic at the C ABI level"; the
-             * generated module functions all take (sw_val_t **, int). */
-            fprintf(f, "    sw_val_t *%s = sw_val_fun_native((void*)%s_%s, -1, NULL, 0);\n",
-                    v, ctx->mod_name, n->v.sval);
-            strncpy(out, v, osz - 1);
-        } else {
-            /* Undeclared identifier → treat as atom (message tag) */
-            char v[32]; fresh_var(ctx, v, sizeof(v));
-            fprintf(f, "    sw_val_t *%s = sw_val_atom(\"%s\");\n", v, n->v.sval);
-            strncpy(out, v, osz - 1);
-        }
+    case N_IDENT:
+        emit_ident_value(ctx, n->v.sval, out, osz);
         break;
-    }
     case N_ASSIGN: {
         char val[32];
         emit_expr(ctx, n->v.assign.value, 0, val, sizeof(val));
@@ -3096,11 +3288,14 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         lambda_info_t *li = &ctx->lambdas[lid];
         char v[32]; fresh_var(ctx, v, sizeof(v));
         if (li->ncaptures > 0) {
+            char cap_vals[64][32];
+            for (int i = 0; i < li->ncaptures; i++)
+                emit_ident_value(ctx, li->captures[i], cap_vals[i], sizeof(cap_vals[i]));
             char cap_arr[32]; fresh_var(ctx, cap_arr, sizeof(cap_arr));
             fprintf(f, "    sw_val_t *%s[] = {", cap_arr);
             for (int i = 0; i < li->ncaptures; i++) {
                 if (i) fprintf(f, ", ");
-                fprintf(f, "%s", mangle_for_c(li->captures[i]));
+                fprintf(f, "%s", cap_vals[i]);
             }
             fprintf(f, "};\n");
             fprintf(f, "    sw_val_t *%s = sw_val_fun_native((void*)%s, %d, %s, %d);\n",
@@ -3135,38 +3330,45 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         break;
     }
     case N_FOR: {
-        /* for x in iter { body } */
-        char iter_var[32];
-        emit_expr(ctx, n->v.forloop.iter, 0, iter_var, sizeof(iter_var));
+        /* for x in iter { body } — the loop variable and anything declared
+         * in the body are scoped to the loop (as in the interpreter, which
+         * runs the body in a child env). The loop variable is always a
+         * fresh C declaration inside the loop block; the declared-set is
+         * restored afterwards, so a second loop over the same name declares
+         * its own (it used to assign to the first loop's out-of-scope var). */
         char idx[32]; fresh_var(ctx, idx, sizeof(idx));
-        /* Check if iter is a range (N_RANGE produces a special struct) */
+        const char *lv = mangle_for_c(n->v.forloop.var);
+        char lvbuf[128];
+        strncpy(lvbuf, lv, sizeof(lvbuf) - 1);
+        lvbuf[sizeof(lvbuf) - 1] = '\0';
+        int saved_ndecl_for = ctx->ndeclared;
         if (n->v.forloop.iter->type == N_RANGE) {
-            /* Range for: for i in start..end */
+            /* Range for: for i in start..end — iterate the bounds directly
+             * (no list is materialised). */
             char start_v[32], end_v[32];
             emit_expr(ctx, n->v.forloop.iter->v.range.from, 0, start_v, sizeof(start_v));
             emit_expr(ctx, n->v.forloop.iter->v.range.to, 0, end_v, sizeof(end_v));
+            fprintf(f, "    if (%s->type != SW_VAL_INT || %s->type != SW_VAL_INT) _sw_runtime_panic(\"for: range bounds must be integers\");\n",
+                    start_v, end_v);
             fprintf(f, "    for (int64_t %s = %s->v.i; %s <= %s->v.i; %s++) {\n",
                     idx, start_v, idx, end_v, idx);
-            if (!is_declared(ctx, n->v.forloop.var)) {
-                fprintf(f, "    sw_val_t *%s = sw_val_int(%s);\n", n->v.forloop.var, idx);
-                declare_var(ctx, n->v.forloop.var);
-            } else {
-                fprintf(f, "    %s = sw_val_int(%s);\n", n->v.forloop.var, idx);
-            }
+            fprintf(f, "    sw_val_t *%s = sw_val_int(%s);\n", lvbuf, idx);
         } else {
             /* List for: for x in list */
+            char iter_var[32];
+            emit_expr(ctx, n->v.forloop.iter, 0, iter_var, sizeof(iter_var));
+            fprintf(f, "    if (%s->type != SW_VAL_LIST) _sw_runtime_panic(\"for: can only iterate a list or a range\");\n",
+                    iter_var);
             fprintf(f, "    for (int %s = 0; %s < %s->v.tuple.count; %s++) {\n",
                     idx, idx, iter_var, idx);
-            if (!is_declared(ctx, n->v.forloop.var)) {
-                fprintf(f, "    sw_val_t *%s = %s->v.tuple.items[%s];\n", n->v.forloop.var, iter_var, idx);
-                declare_var(ctx, n->v.forloop.var);
-            } else {
-                fprintf(f, "    %s = %s->v.tuple.items[%s];\n", n->v.forloop.var, iter_var, idx);
-            }
+            fprintf(f, "    sw_val_t *%s = %s->v.tuple.items[%s];\n", lvbuf, iter_var, idx);
         }
+        declare_var(ctx, n->v.forloop.var);
         char body_res[32];
         emit_expr(ctx, n->v.forloop.body, 0, body_res, sizeof(body_res));
+        fprintf(f, "    (void)%s;\n", lvbuf);
         fprintf(f, "    }\n");
+        ctx->ndeclared = saved_ndecl_for;
         char v[32]; fresh_var(ctx, v, sizeof(v));
         fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", v);
         strncpy(out, v, osz - 1);

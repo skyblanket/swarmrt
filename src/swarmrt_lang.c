@@ -125,6 +125,7 @@ __attribute__((weak)) void *sw_recv_any_adopt(uint64_t t, uint64_t *tag) { (void
 __attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) { (void)to; (void)tag; (void)msg; }
 __attribute__((weak)) void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload, struct sw_value_arena *region) { (void)to; (void)tag; (void)payload; (void)region; }
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
+__attribute__((weak)) void sw_sleep_ms(uint64_t ms) { usleep((useconds_t)(ms * 1000)); }
 /* Returns the current process's value arena, or NULL (interpreter / pre-fiber).
  * Strong impl in swarmrt_native.c reads tls_current->varena; this weak stub
  * keeps swc linkable without the runtime and makes the interpreter use calloc. */
@@ -1456,8 +1457,9 @@ static node_t *par_primary_inner(par_t *p) {
                     tok_t save_cur = p->cur;
                     int save_err = p->err;
                     node_t *expr = par_stmt(p);
-                    if (p->cur.type == TOK_ARROW) {
-                        /* This is the next clause's pattern — backtrack */
+                    if (p->cur.type == TOK_ARROW || p->cur.type == TOK_WHEN) {
+                        /* This is the next clause's pattern (optionally
+                         * guarded: `pat when g -> ...`) — backtrack */
                         p->lex = save_lex;
                         p->cur = save_cur;
                         p->err = save_err;
@@ -2449,6 +2451,17 @@ static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
     }
 }
 
+/* Redirect this THREAD's value allocations into `region` (NULL restores the
+ * default: the running process's arena, else the global heap). Returns the
+ * previous target so callers can nest/restore. Used by the blocking-builtin
+ * offload: the worker thread builds the builtin's result inside a region the
+ * parked caller then adopts. */
+sw_value_arena_t *sw_swap_alloc_target(sw_value_arena_t *region) {
+    sw_value_arena_t *prev = g_alloc_target;
+    g_alloc_target = region;
+    return prev;
+}
+
 sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     int save = g_alloc_force_global;
     g_alloc_force_global = 1;
@@ -2755,6 +2768,57 @@ static sw_val_t *env_get(sw_env_t *e, const char *name) {
         }
     }
     return NULL;
+}
+
+/* Names assigned (N_ASSIGN) anywhere in a branch body, not descending into
+ * nested lambdas (their assignments are their own locals). */
+static void branch_assigned_names(node_t *n, const char **out, int *cnt, int max) {
+    if (!n || *cnt >= max) return;
+    switch (n->type) {
+    case N_ASSIGN:
+        for (int i = 0; i < *cnt; i++) if (strcmp(out[i], n->v.assign.name) == 0) goto rhs;
+        out[(*cnt)++] = n->v.assign.name;
+    rhs:
+        branch_assigned_names(n->v.assign.value, out, cnt, max);
+        break;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++) branch_assigned_names(n->v.block.stmts[i], out, cnt, max);
+        break;
+    case N_IF:
+        branch_assigned_names(n->v.iff.then_b, out, cnt, max);
+        branch_assigned_names(n->v.iff.else_b, out, cnt, max);
+        break;
+    case N_CASE:
+        for (int i = 0; i < n->v.casex.nclauses; i++)
+            branch_assigned_names(n->v.casex.clauses[i]->v.clause.body, out, cnt, max);
+        break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++)
+            branch_assigned_names(n->v.recv.clauses[i]->v.clause.body, out, cnt, max);
+        branch_assigned_names(n->v.recv.after_body, out, cnt, max);
+        break;
+    case N_TRY:
+        branch_assigned_names(n->v.trycatch.body, out, cnt, max);
+        branch_assigned_names(n->v.trycatch.catch_body, out, cnt, max);
+        break;
+    default: break;
+    }
+}
+
+/* A case/receive arm runs in a child env (its pattern binds are arm-local),
+ * but variables ASSIGNED in the arm body belong to the enclosing scope, the
+ * same as an if-branch — matching the compiled path, which hoists them. Copy
+ * those bindings out of the arm env into `env` before it is released. */
+static void propagate_arm_assigns(node_t *body, sw_env_t *arm, sw_env_t *env) {
+    const char *names[64];
+    int cnt = 0;
+    branch_assigned_names(body, names, &cnt, 64);
+    for (int i = 0; i < cnt; i++) {
+        uint32_t h = env_hash(names[i]);
+        for (sw_env_entry_t *ent = arm->buckets[h]; ent; ent = ent->next) {
+            if (strcmp(ent->name, names[i]) == 0) { env_set(env, names[i], ent->val); break; }
+        }
+    }
 }
 
 /* Drop one ref. Frees buckets + struct (and releases parent) only at 0, so an
@@ -3344,7 +3408,7 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
  */
 
 #define _INTERP_VETS_BUCKETS   256
-#define _INTERP_VETS_MAX_TABLES 64
+#define _INTERP_VETS_MAX_TABLES 1024
 
 typedef struct _interp_vets_entry {
     sw_val_t *key;
@@ -3360,6 +3424,8 @@ typedef struct {
 
 static _interp_vets_table_t _interp_vets_tables[_INTERP_VETS_MAX_TABLES];
 static int _interp_vets_next_id = 0;
+static int _interp_vets_free_ids[_INTERP_VETS_MAX_TABLES];   /* ets_drop'd ids */
+static int _interp_vets_nfree = 0;
 static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t _interp_vets_hash(sw_val_t *v) {
@@ -3677,21 +3743,13 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "sleep") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
         int64_t ms = args[0]->v.i;
         if (ms > 0) {
-            /* Yield to the scheduler (sw_receive_any with a timeout) when
-             * running inside a live process, exactly like the compiled
-             * _builtin_sleep — under the single-scheduler `swc run` path all
+            /* Park on the scheduler when running inside a live process,
+             * exactly like the compiled _builtin_sleep — under the single-scheduler `swc run` path all
              * processes are cooperative fibers on ONE thread, so a raw usleep
              * would block the whole thread and starve spawned children (e.g.
              * `spawn(child) ; sleep(150)` would never let the child run).
-             * Fall back to usleep only outside a process (REPL/test contexts
-             * where tls_current is NULL). */
-            if (sw_self()) {
-                uint64_t tag = 0;
-                void *m = sw_receive_any((uint64_t)ms, &tag);
-                if (m) free(m);  /* discard any spurious message */
-            } else {
-                usleep((useconds_t)(ms * 1000));
-            }
+             * Outside a process (REPL/test contexts) it is a plain OS sleep. */
+            sw_sleep_ms((uint64_t)ms);  /* parks the fiber; mailbox untouched */
         }
         return sw_val_atom("ok");  /* matches codegen path */
     }
@@ -4315,16 +4373,48 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     /* === ETS (value-aware hash tables) ========================= */
     if (strcmp(fname, "ets_new") == 0) {
         pthread_mutex_lock(&_interp_vets_meta);
-        int id = _interp_vets_next_id++;
-        if (id >= _INTERP_VETS_MAX_TABLES) {
-            pthread_mutex_unlock(&_interp_vets_meta);
-            return sw_val_nil();
+        int id;
+        if (_interp_vets_nfree > 0) {
+            id = _interp_vets_free_ids[--_interp_vets_nfree];
+            pthread_rwlock_wrlock(&_interp_vets_tables[id].lock);
+            memset(_interp_vets_tables[id].buckets, 0, sizeof(_interp_vets_tables[id].buckets));
+            _interp_vets_tables[id].active = 1;
+            pthread_rwlock_unlock(&_interp_vets_tables[id].lock);
+        } else {
+            id = _interp_vets_next_id;
+            if (id >= _INTERP_VETS_MAX_TABLES) {
+                pthread_mutex_unlock(&_interp_vets_meta);
+                fprintf(stderr, "swarmrt: ets_new: table limit (%d live tables) reached — "
+                                "release unused tables with ets_drop(t)\n", _INTERP_VETS_MAX_TABLES);
+                return sw_val_nil();
+            }
+            _interp_vets_next_id++;
+            memset(&_interp_vets_tables[id], 0, sizeof(_interp_vets_table_t));
+            pthread_rwlock_init(&_interp_vets_tables[id].lock, NULL);
+            _interp_vets_tables[id].active = 1;
         }
-        memset(&_interp_vets_tables[id], 0, sizeof(_interp_vets_table_t));
-        pthread_rwlock_init(&_interp_vets_tables[id].lock, NULL);
-        _interp_vets_tables[id].active = 1;
         pthread_mutex_unlock(&_interp_vets_meta);
         return sw_val_int((int64_t)id);
+    }
+    if (strcmp(fname, "ets_drop") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        pthread_mutex_lock(&_interp_vets_meta);
+        if (id < 0 || id >= _interp_vets_next_id || !_interp_vets_tables[id].active) {
+            pthread_mutex_unlock(&_interp_vets_meta);
+            return sw_val_atom("error");
+        }
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        pthread_rwlock_wrlock(&t->lock);
+        t->active = 0;
+        for (int b = 0; b < _INTERP_VETS_BUCKETS; b++) {
+            _interp_vets_entry_t *e = t->buckets[b];
+            while (e) { _interp_vets_entry_t *next = e->next; free(e); e = next; }
+            t->buckets[b] = NULL;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        _interp_vets_free_ids[_interp_vets_nfree++] = id;
+        pthread_mutex_unlock(&_interp_vets_meta);
+        return sw_val_atom("ok");
     }
     if (strcmp(fname, "ets_put") == 0 && nargs >= 3 && args[0]->type == SW_VAL_INT) {
         int id = (int)args[0]->v.i;
@@ -5343,6 +5433,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                     }
                 }
                 sw_val_t *r = eval(interp, cl->v.clause.body, child);
+                propagate_arm_assigns(cl->v.clause.body, child, env);
                 env_free(child);
                 return r;
             }
@@ -5965,6 +6056,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                         }
                         sw_msg_release(cur);
                         sw_val_t *r = eval(interp, cl->v.clause.body, cl_env);
+                        propagate_arm_assigns(cl->v.clause.body, cl_env, env);
                         env_free(cl_env);
                         return r;
                     }
@@ -6065,7 +6157,7 @@ static const char *k_interp_builtins[] = {
     "base64_decode","base64_encode","byte","byte_at","byte_size","byte_slice",
     "bytes_concat","bytes_from_base64","bytes_from_ints","bytes_to_base64",
     "bytes_to_string","codepoint_at","db_close","db_exec","db_open","db_query",
-    "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_get",
+    "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_drop","ets_get",
     "ets_list","ets_new","ets_put","ets_take","ets_update","ets_update_counter",
     "exec_argv","expect","file_append","file_delete","file_exists","file_list",
     "file_mkdir","file_read","file_read_bytes","file_write","file_write_bytes",

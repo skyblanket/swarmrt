@@ -427,7 +427,24 @@ static int create_wake_pipe(SOCKET fds[2]) {
 
 /* === Public API === */
 
+static int sw_io_init_locked(void);
+
 int sw_io_init(void) {
+    /* Idempotent. Every compiled main() initialises IO and http_listen() used
+     * to call this again, which started a SECOND io thread on a fresh epoll
+     * set (and overwrote g_kq under the first one): two threads then polled
+     * the same sockets, so a connection's DATA could be delivered to the
+     * bridge before its ACCEPT and was dropped (~1 in 200 requests lost
+     * under concurrency), and reads could be split between threads. */
+    static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&init_lock);
+    if (g_io_running) { pthread_mutex_unlock(&init_lock); return 0; }
+    int rc = sw_io_init_locked();
+    pthread_mutex_unlock(&init_lock);
+    return rc;
+}
+
+static int sw_io_init_locked(void) {
 #ifdef _WIN32
     /* Init Winsock */
     WSADATA wsa;

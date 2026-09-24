@@ -883,7 +883,17 @@ static void http_bridge_entry(void *arg) {
             sw_port_event_t *evt = (sw_port_event_t *)raw;
             int cid = conn_find_by_port(evt->port);
             if (cid >= 0) {
+                /* Peer hung up (the IO thread saw EOF/error and only
+                 * deregistered the fd). Close our end too — conn_free alone
+                 * used to leave the socket open, leaking one fd per
+                 * connection until accept() hit EMFILE (~1000 requests on a
+                 * default ulimit). sw_port_close queues one more CLOSED
+                 * event; it finds no conn and is ignored. (The port struct
+                 * itself is still never freed: another thread may hold it
+                 * in an in-flight event, see KNOWN_ISSUES.) */
+                sw_port_t *port = evt->port;
                 conn_on_close(cid);
+                sw_port_close(port);
             }
             free(evt);
         }

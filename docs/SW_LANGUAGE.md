@@ -486,7 +486,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `getenv(name)` | env var or `nil` |
 | `sys_exit(code?)` | terminate process (0 if omitted) |
 | `timestamp()` | ms since epoch |
-| `sleep(ms)` | block this process for ms |
+| `sleep(ms)` | park this process for ms (other processes keep running; messages that arrive meanwhile stay queued) |
 | `term_cols()` | terminal width via TIOCGWINSZ |
 | `shell(cmd)` | run shell command → `{exit_code, stdout_string}` |
 | `exec_argv(cmd, args)` → `{code, out}` | fork+exec with no shell — safe for user data |
@@ -564,7 +564,7 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `list_append(lst, x)` | new list with x appended |
 | `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
-| `reduce(fn, lst, init)` | foldl |
+| `reduce(fn, lst, init)` | foldl; `fn` is called as `fn(acc, item)` |
 | `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap) and silently maps a slow item to `nil` on a fixed ~5s wall.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
 | `map_new()` | new empty map (same as the `%{}` literal) |
 | `map_get(m, k)` | value or `nil` |
@@ -608,6 +608,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `ets_get(t, k)` / `ets_put(t, k, v)` / `ets_delete(t, k)` | basic ops |
 | `ets_list(t)` | list of `{k, v}` tuples |
 | `ets_count(t)` | size |
+| `ets_drop(t)` | delete the whole table and release its id (tables are a finite resource: at most 1024 live) |
 | `ets_update_counter(t, k, delta, initial)` | atomic `+= delta`, seeds `initial+delta` if missing; returns new int |
 | `ets_cas(t, k, expected, new)` | compare-and-swap; `'true'` if swapped, `'false'` if mismatch / missing |
 | `ets_take(t, k)` | atomic get-and-delete; returns value or `nil` |
