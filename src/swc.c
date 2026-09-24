@@ -708,16 +708,19 @@ int main(int argc, char **argv) {
     char cmd_buf[2048];
 #ifdef __APPLE__
     /* macOS links libm via libSystem implicitly; -lm is harmless.
+     * -lz: the PDF engine (swarmrt_pdf.o, linked when a program imports
+     * Pdf) inflates FlateDecode streams; zlib ships with macOS. Without it
+     * every program that called pdf_* failed to link here.
      * When the host was built with -DSWARMRT_TLS, generated binaries that
      * call wsc_connect_tls(wss://) also need OpenSSL linked. We pass the
      * Homebrew openssl@3 prefix that the Makefile used. */
   #ifdef SWARMRT_TLS
     const char *extra_libs =
-        "-lsqlite3 -lm "
+        "-lsqlite3 -lz -lm "
         "-L" SWARMRT_OPENSSL_PREFIX "/lib -lssl -lcrypto "
         "-I" SWARMRT_OPENSSL_PREFIX "/include";
   #else
-    const char *extra_libs = "-lsqlite3 -lm";
+    const char *extra_libs = "-lsqlite3 -lz -lm";
   #endif
 #else
     /* Linux glibc requires explicit -lm — generated C uses fmod() and

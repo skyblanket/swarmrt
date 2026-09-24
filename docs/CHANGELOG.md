@@ -38,7 +38,9 @@ engine had no test before this.
 `opts.url`, `LLM_URL` or a provider (`opts.provider` / `LLM_PROVIDER`: `openai`,
 `ollama`, `otonomy`) they used to send the prompt to a hosted vendor proxy. Now
 `llm_complete` returns `"error: llm_complete: no LLM endpoint configured. Set LLM_URL
-..."` and `llm_stream` delivers the same as its `{'llm_done', ...}`. The model comes from
+..."` and `llm_stream` delivers the same as its `{'llm_done', ...}`; the first such
+failure is also printed to stderr, since a program that doesn't check the result would
+otherwise just score it as a wrong answer. The model comes from
 `opts.model`, `LLM_MODEL` or the provider's default, and is left out of the request
 otherwise (it was `otonomy-orc` for every endpoint). `llm_stream` now honours `LLM_URL`
 (it ignored it). `OLLAMA_HOST` is the `ollama` provider's base URL, `/v1/chat/completions`
@@ -48,7 +50,7 @@ appended. **Migration:** set `LLM_URL` (or `LLM_PROVIDER=otonomy` for the old de
 to any URL containing `://api.openai.com/`, such as
 `https://evil.example/?://api.openai.com/`; the host is now parsed (https only, no
 userinfo). Model names are JSON-escaped in the request body. Gate:
-`tests/sw/test_llm_endpoint.sw` (9 cases).
+`tests/sw/test_llm_endpoint.sw` (10 cases).
 
 **fix(watchdog): no "possible deadlock" warning while something can still wake a
 process.** A lone process in `receive ... after` (the fix the warning itself

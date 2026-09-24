@@ -6623,6 +6623,16 @@ static const char *_sw_llm_env_key(const char *url) {
     return NULL;
 }
 
+/* A misconfigured endpoint also goes to stderr, once per process: the
+ * "error: ..." result reads like model output to a program that doesn't
+ * check it (an eval run silently scores 0/200). */
+static int _sw_llm_err_reported = 0;
+static void _sw_llm_report_once(const char *msg) {
+    if (__atomic_exchange_n(&_sw_llm_err_reported, 1, __ATOMIC_RELAXED)) return;
+    fprintf(stderr, "swarmrt: %s\n", msg);
+    fflush(stderr);
+}
+
 /* Where llm_complete / llm_stream send the prompt, and with which model.
  *
  *   url    opts.url > LLM_URL > the provider's URL
@@ -6664,6 +6674,7 @@ static int _sw_llm_resolve(const char *who, const char *opt_url, const char *opt
         } else {
             snprintf(err, errsz, "error: %s: unknown provider '%s' (use openai, ollama or otonomy, "
                      "or set LLM_URL to any OpenAI-compatible chat-completions URL)", who, provider);
+            _sw_llm_report_once(err);
             return -1;
         }
     }
@@ -6674,6 +6685,7 @@ static int _sw_llm_resolve(const char *who, const char *opt_url, const char *opt
         snprintf(err, errsz, "error: %s: no LLM endpoint configured. Set LLM_URL to an "
                  "OpenAI-compatible chat-completions URL (e.g. http://127.0.0.1:11434/v1/chat/completions), "
                  "or LLM_PROVIDER to openai, ollama or otonomy, or pass %%{url: ...} or %%{provider: ...}", who);
+        _sw_llm_report_once(err);
         return -1;
     }
     const char *model = (opt_model && *opt_model) ? opt_model : getenv("LLM_MODEL");

@@ -72,7 +72,16 @@ fun run_case(me, which, port, env) {
     clear = "env -u LLM_URL -u LLM_PROVIDER -u LLM_MODEL -u LLM_API_KEY -u OLLAMA_HOST " ++
             "-u OPENAI_API_KEY -u OTONOMY_API_KEY"
     cmd = clear ++ " SW_LLM_CASE=" ++ which ++ " SW_LLM_PORT=" ++ port ++ " SW_SCHEDULERS=4 " ++
-          env ++ " '" ++ me ++ "' 2>&1"
+          env ++ " '" ++ me ++ "' 2>/dev/null"
+    string_trim(elem(shell(cmd), 1))
+}
+
+# The same run, keeping only stderr.
+fun run_case_stderr(me, which, port, env) {
+    clear = "env -u LLM_URL -u LLM_PROVIDER -u LLM_MODEL -u LLM_API_KEY -u OLLAMA_HOST " ++
+            "-u OPENAI_API_KEY -u OTONOMY_API_KEY"
+    cmd = clear ++ " SW_QUIET=1 SW_LLM_CASE=" ++ which ++ " SW_LLM_PORT=" ++ port ++ " SW_SCHEDULERS=4 " ++
+          env ++ " '" ++ me ++ "' 2>&1 >/dev/null"
     string_trim(elem(shell(cmd), 1))
 }
 
@@ -104,6 +113,12 @@ fun main() {
         f = f + check("no_endpoint_stream_fails_clearly",
                       string_starts_with(line(lines, 1), "error: llm_stream: no LLM endpoint configured"), none)
 
+        # Also on stderr — once, although the case calls both builtins.
+        err = run_case_stderr(me, "none", "9268", "")
+        f = f + check("no_endpoint_reported_once_on_stderr",
+                      both(string_starts_with(err, "swarmrt: error: llm_complete: no LLM endpoint configured"),
+                           if (length(string_split(err, "\n")) == 1) { 'true' } else { 'false' }), err)
+
         bad = run_case(me, "badprov", "9262", "LLM_PROVIDER=nosuch")
         f = f + check("unknown_provider_named", has(bad, "unknown provider 'nosuch'"), bad)
 
@@ -129,7 +144,7 @@ fun main() {
         m = run_case(me, "model_esc", "9267", "")
         f = f + check("model_name_is_json_escaped", m == "/m|Bearer ollama|a\"b", m)
 
-        if (f == 0) { print("OK llm_endpoint 9/9") ; sys_exit(0) }
+        if (f == 0) { print("OK llm_endpoint 10/10") ; sys_exit(0) }
         else { print("FAIL llm_endpoint") ; sys_exit(1) }
     }
 }

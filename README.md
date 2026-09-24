@@ -370,7 +370,7 @@ make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search
 - **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run.
 - **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
 
-Together the suite reports `all sw tests passed — 80 files, 592 assertions`, and `make test-sw` then runs the **dual-path conformance gate**: every program in `tests/sw/conform/` executes under BOTH `swc run` (interpreter) and `swc build` (compiled) and must produce byte-identical stdout and exit codes — the structural guard against the two paths drifting apart.
+Together the suite reports `all sw tests passed — 80 files, 593 assertions`, and `make test-sw` then runs the **dual-path conformance gate**: every program in `tests/sw/conform/` executes under BOTH `swc run` (interpreter) and `swc build` (compiled) and must produce byte-identical stdout and exit codes — the structural guard against the two paths drifting apart.
 
 Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
 
@@ -447,7 +447,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
-- `make test-sw` — **80 files, 592 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
+- `make test-sw` — **80 files, 593 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
 - `make test-phase$p` for `p` in **2 through 10** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC scaffolding (phase 8), distribution (phase 9), language frontend (phase 10); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 - `make gc-stress` — GC v1 copy-on-escape correctness: the value-arena stress harness compiled with ASAN + `-DSW_ARENA_POISON`; a missed deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free or a `0xDE`-garbage content assert
