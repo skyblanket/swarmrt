@@ -74,9 +74,10 @@ Priority levels:   4 (max, high, normal, low)
 Work stealing:     none yet (round-robin placement at spawn)
 ```
 
-Note on work stealing: there is none yet. The steal path polls a global
-overflow queue that nothing ever fills, so it never finds work; processes are
-placed round-robin at spawn and stay on their scheduler. A runnable process sitting in a busy
+Note on work stealing: there is no general work stealing. Processes are placed
+round-robin at spawn and stay on their scheduler; the global overflow queue is
+filled only while a scheduler's thread sits in a blocking builtin (its queue is
+handed over so idle schedulers run it). A runnable process sitting in a busy
 scheduler's local queue is therefore not stolen — see
 [KNOWN_ISSUES.md](notes/KNOWN_ISSUES.md). This is why a strictly sequential
 cross-scheduler `pingpong` scales worse at N schedulers than at 1 (the

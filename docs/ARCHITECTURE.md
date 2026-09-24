@@ -76,7 +76,7 @@ Processes come from a pre-allocated slab — no malloc on the spawn hot path.
 
 - One OS thread per scheduler
 - Each scheduler has its own run queue with 4 priority levels
-- No work stealing yet: new processes are placed round-robin and each run queue is drained only by its own scheduler (the global overflow queue the steal path polls is never filled)
+- No general work stealing: new processes are placed round-robin and each run queue is drained by its own scheduler. The one exception is a blocking section (`sw_blocking_enter`/`exit`, around `read_line`, `shell_managed`, TTY streaming, `subprocess_recv_line`, `db_*`): the blocked scheduler moves its queue to the global overflow queue, wake-ups for it go there, and idle schedulers take from it
 - Reduction counting: every compiled call and self-tail-call turn counts one reduction; a process yields after 2000 (BEAM-style preemption at call granularity)
 
 ---
