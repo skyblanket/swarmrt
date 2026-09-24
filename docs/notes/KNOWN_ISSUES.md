@@ -36,21 +36,13 @@ the divergence is the issue.
 when compiled. **Workaround:** add an explicit `after MS -> ...` clause to any
 `receive` that might not match, so compiled and interpreted runs behave the same.
 
-### Interpreter recursion depth is bounded (no TCO in the tree-walker)
+### Interpreter non-tail recursion is bounded
 
-The interpreter (`swc run` / REPL / `swc test`) evaluates on the C stack with
-a stack-margin guard and no tail-call optimisation; deep recursion raises a
-clean, uncatchable `interpreter recursion depth exceeded` panic (exit 1). The
-exact ceiling is environment-dependent (real stack headroom is measured, so it
-shifts with RLIMIT_STACK, compiler frame layout, and any new large locals in
-`eval()`); measured ~350-390 frames for a simple self-recursive two-arg
-function at -O2 on an 8MB main stack (~21KB of C stack per sw call frame —
-each sw call nests several `eval()` frames). Cheaper call shapes go somewhat
-deeper; assume a few hundred frames. Compiled binaries TCO self-tail-calls to
-unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
-
-**Impact:** recursion-heavy programs must be compiled. **Workaround:**
-`swc build` — the interpreter is for short scripts, tests, and the REPL.
+The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see
+"Recently cleared"), but a NON-tail call still nests C frames: plain recursion
+like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
+`interpreter recursion depth exceeded` panic after a few hundred frames.
+**Workaround:** write the loop tail-recursively with an accumulator, or `swc build`.
 
 ### A few blocking builtins still occupy their scheduler OS thread
 
@@ -70,7 +62,7 @@ Closing a connection closes its socket (the per-connection fd leak is fixed), bu
 fetched before the close, so freeing it safely needs an event refcount. About 64 MB
 per million connections over a process lifetime.
 
-### Mutual tail recursion is not TCO'd — but overflow is now a recoverable panic
+### Compiled mutual tail recursion is not TCO'd — but overflow is a recoverable panic
 
 Only **self** tail calls are optimised (including, since 2026-07-05, self
 tail calls inside a `receive ... after` body — previously those stacked a
@@ -104,6 +96,21 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### The interpreter had no tail-call optimisation (cleared 2026-09-24)
+
+Every interpreted call recursed on the C stack, so any loop longer than a few
+hundred iterations died under `swc run` / `swc test`. Tail calls to user functions
+(including mutual recursion and receive-loop servers) now run in place. Gate:
+`tests/sw/run/test_interp_tco.sw`.
+
+### Idiomatic list and value code was quadratic or worse (cleared 2026-09-24)
+
+`tl()`, `[h | t]` patterns, `list_append` and cons copied the whole list; the
+turn checkpoint deep-copied loop state as a tree (exponential on shared
+substructure) and in full every time; every int, nil and boolean was a fresh
+allocation. Summing a 100K list took 162s; it takes 0.1s. Gate:
+`tests/sw/test_value_scaling.sw`.
 
 ### Typo'd variables compiled to atoms (cleared 2026-09-24)
 

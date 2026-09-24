@@ -1288,7 +1288,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    if (a[0]->type != SW_VAL_LIST) _sw_runtime_panic(\"tl: not a list (got type %%d)\", a[0]->type);\n"
         "    if (a[0]->v.tuple.count == 0) _sw_runtime_panic(\"tl: list is empty\");\n"
         "    if (a[0]->v.tuple.count == 1) return sw_val_list(NULL, 0);\n"
-        "    return sw_val_list(a[0]->v.tuple.items + 1, a[0]->v.tuple.count - 1);\n"
+        "    return sw_val_list_view(a[0], 1, a[0]->v.tuple.count - 1);\n"
         "}\n\n");
 
     fprintf(f,
@@ -1734,7 +1734,7 @@ static void emit_pattern_cond(cg_ctx_t *ctx, node_t *pat, const char *val) {
         if (pat->v.cons.tail->type != N_IDENT) {
             char tail_item[512];
             snprintf(tail_item, sizeof(tail_item),
-                     "sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1)", val, val);
+                     "sw_val_list_view(%s, 1, %s->v.tuple.count - 1)", val, val);
             fprintf(f, " && ");
             emit_pattern_cond(ctx, pat->v.cons.tail, tail_item);
         }
@@ -1846,7 +1846,7 @@ static void emit_pattern_bind(cg_ctx_t *ctx, node_t *pat, const char *val) {
          * patterns like `[h | [a, b]]` bind their inner names too. */
         if (pat->v.cons.tail->type == N_IDENT) {
             if (strcmp(pat->v.cons.tail->v.sval, "_") != 0) {
-                fprintf(f, "        sw_val_t *%s = sw_val_list(%s->v.tuple.items + 1, %s->v.tuple.count - 1);\n",
+                fprintf(f, "        sw_val_t *%s = sw_val_list_view(%s, 1, %s->v.tuple.count - 1);\n",
                         mangle_for_c(pat->v.cons.tail->v.sval), val, val);
                 declare_var(ctx, pat->v.cons.tail->v.sval);
             }
@@ -2208,24 +2208,20 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
          * NOT the caller's values below the floor), then splice the args back in.
          * deep_copy_into is transitive (carries forward still-referenced adopted
          * substructure). Bounds long-lived loops without touching callers. */
-        fprintf(f, "    { sw_value_arena_t *_gc_a = sw_self_varena();\n");
-        fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES) {\n");
-        fprintf(f, "        sw_value_arena_t *_gc_r = sw_varena_create_kind(256, SW_REGION_PROCESS);\n");
-        fprintf(f, "        if (_gc_r) {\n");
+        /* sw_turn_checkpoint (swarmrt_lang.c) copies only what the loop keeps
+         * above its entry floor, preserves sharing, and adapts its trigger to
+         * the live size; the inline pre-check keeps the common turn cheap. */
+        fprintf(f, "    {\n");
+        if (np > 0) {
+            fprintf(f, "      sw_val_t *_gc_v[] = {");
+            for (int i = 0; i < np; i++) fprintf(f, "%s%s", i ? ", " : "", arg_vars[i]);
+            fprintf(f, "};\n");
+        }
+        fprintf(f, "      sw_value_arena_t *_gc_a = sw_self_varena();\n");
+        fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
+        fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", np > 0 ? "_gc_v" : "NULL", np);
         for (int i = 0; i < np; i++)
-            fprintf(f, "          sw_val_t *_gc_t%d = deep_copy_into(%s, _gc_r);\n", i, arg_vars[i]);
-        fprintf(f, "          sw_varena_reset_to(_gc_a, _gc_floor);\n");
-        fprintf(f, "          sw_varena_adopt(_gc_a, _gc_r);\n");
-        for (int i = 0; i < np; i++)
-            fprintf(f, "          %s = _gc_t%d;\n", ctx->cur_params[i], i);
-        fprintf(f, "        } else {\n");
-        for (int i = 0; i < np; i++)
-            fprintf(f, "          %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
-        fprintf(f, "        }\n");
-        fprintf(f, "      } else {\n");
-        for (int i = 0; i < np; i++)
-            fprintf(f, "        %s = %s;\n", ctx->cur_params[i], arg_vars[i]);
-        fprintf(f, "      }\n");
+            fprintf(f, "      %s = _gc_v[%d];\n", ctx->cur_params[i], i);
         fprintf(f, "    }\n");
         /* Reduction check at the loop backedge. A self-tail-call is the
          * language's only unbounded loop, and without this the compiled
@@ -3544,16 +3540,10 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         emit_expr(ctx, n->v.cons.head, 0, head_v, sizeof(head_v));
         emit_expr(ctx, n->v.cons.tail, 0, tail_v, sizeof(tail_v));
         char v[32]; fresh_var(ctx, v, sizeof(v));
-        char arr_name[32]; fresh_var(ctx, arr_name, sizeof(arr_name));
-        char cnt_name[32]; fresh_var(ctx, cnt_name, sizeof(cnt_name));
-        fprintf(f, "    int %s = %s->type == SW_VAL_LIST ? %s->v.tuple.count + 1 : 1;\n",
-                cnt_name, tail_v, tail_v);
-        fprintf(f, "    sw_val_t **%s = malloc(sizeof(sw_val_t*) * %s);\n", arr_name, cnt_name);
-        fprintf(f, "    %s[0] = %s;\n", arr_name, head_v);
-        fprintf(f, "    if (%s->type == SW_VAL_LIST) for (int _ci = 0; _ci < %s->v.tuple.count; _ci++) %s[_ci+1] = %s->v.tuple.items[_ci];\n",
-                tail_v, tail_v, arr_name, tail_v);
-        fprintf(f, "    sw_val_t *%s = sw_val_list(%s, %s);\n", v, arr_name, cnt_name);
-        fprintf(f, "    free(%s);\n", arr_name);
+        /* O(1) amortized when the tail owns its store's front edge (the
+         * `build(n - 1, [n | acc])` accumulator); see sw_val_list_prepend. */
+        fprintf(f, "    sw_val_t *%s = %s->type == SW_VAL_LIST ? sw_val_list_prepend(%s, %s) : sw_val_list(&%s, 1);\n",
+                v, tail_v, head_v, tail_v, head_v);
         strncpy(out, v, osz - 1);
         break;
     }

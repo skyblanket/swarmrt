@@ -2341,6 +2341,113 @@ sw_val_t *sw_val_list(sw_val_t **items, int count) {
     return v;
 }
 
+/* A list of `count` elements of `src` starting at `off`. When the result is
+ * allocated in an arena (process arena or an explicit region — bulk-freed,
+ * never walked node by node) it SHARES src's element storage: O(1), which is
+ * what makes `tl()` recursion over a list linear instead of quadratic. On the
+ * global heap, whose graphs are freed item array by item array, it copies. */
+static int list_arena_backed(void) {
+    return !g_alloc_force_global && (g_alloc_target || sw_self_varena());
+}
+
+sw_val_t *sw_val_list_view(sw_val_t *src, int off, int count) {
+    if (!src || count <= 0) return sw_val_list(NULL, 0);
+    if (!list_arena_backed()) return sw_val_list(src->v.tuple.items + off, count);
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_LIST;
+    v->v.tuple.items = src->v.tuple.items + off;
+    v->v.tuple.count = count;
+    v->v.tuple.store = src->v.tuple.store;   /* a tail view still owns the store's end */
+    return v;
+}
+
+/* === List backing stores ===
+ * base[lo, hi) is the claimed part of a store; every list header sharing it
+ * covers a sub-range. A header may extend the store in place only when its
+ * range touches the claimed edge (end == hi to append, start == lo to
+ * prepend): the new slot is then outside every other header's range, so no
+ * existing list value can observe it. Stores live in the arena (bulk-freed).
+ * Single writer: a list's store is only reachable from its owning process
+ * (sends and copies produce fresh, store-less lists). */
+typedef struct sw_list_store {
+    sw_val_t **base;
+    int cap, lo, hi;
+} sw_list_store_t;
+
+static sw_val_t *list_header(sw_list_store_t *st, int start, int count) {
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_LIST;
+    v->v.tuple.items = st->base + start;
+    v->v.tuple.count = count;
+    v->v.tuple.store = st;
+    return v;
+}
+
+/* Fresh store holding `lst`'s elements plus one free slot for `x`, with room
+ * to keep growing on the side being extended. */
+static sw_val_t *list_grow(sw_val_t *lst, sw_val_t *x, int at_front) {
+    int n = (lst && lst->type == SW_VAL_LIST) ? lst->v.tuple.count : 0;
+    int cap = (n + 1) * 2;
+    if (cap < 8) cap = 8;
+    sw_list_store_t *st = val_alloc(sizeof(*st));
+    st->base = val_alloc(sizeof(sw_val_t *) * (size_t)cap);
+    st->cap = cap;
+    if (at_front) {
+        st->hi = cap;
+        st->lo = cap - (n + 1);
+        st->base[st->lo] = x;
+        if (n) memcpy(st->base + st->lo + 1, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+    } else {
+        st->lo = 0;
+        st->hi = n + 1;
+        if (n) memcpy(st->base, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+        st->base[n] = x;
+    }
+    return list_header(st, st->lo, n + 1);
+}
+
+sw_val_t *sw_val_list_append(sw_val_t *lst, sw_val_t *x) {
+    int n = (lst && lst->type == SW_VAL_LIST) ? lst->v.tuple.count : 0;
+    if (!list_arena_backed()) {
+        sw_val_t **items = malloc(sizeof(sw_val_t *) * (size_t)(n + 1));
+        if (n) memcpy(items, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+        items[n] = x;
+        sw_val_t *r = sw_val_list(items, n + 1);
+        free(items);
+        return r;
+    }
+    sw_list_store_t *st = n ? lst->v.tuple.store : NULL;
+    if (st) {
+        int start = (int)(lst->v.tuple.items - st->base);
+        if (start + n == st->hi && st->hi < st->cap) {
+            st->base[st->hi++] = x;
+            return list_header(st, start, n + 1);
+        }
+    }
+    return list_grow(lst, x, 0);
+}
+
+sw_val_t *sw_val_list_prepend(sw_val_t *x, sw_val_t *lst) {
+    int n = (lst && lst->type == SW_VAL_LIST) ? lst->v.tuple.count : 0;
+    if (!list_arena_backed()) {
+        sw_val_t **items = malloc(sizeof(sw_val_t *) * (size_t)(n + 1));
+        items[0] = x;
+        if (n) memcpy(items + 1, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+        sw_val_t *r = sw_val_list(items, n + 1);
+        free(items);
+        return r;
+    }
+    sw_list_store_t *st = n ? lst->v.tuple.store : NULL;
+    if (st) {
+        int start = (int)(lst->v.tuple.items - st->base);
+        if (start == st->lo && st->lo > 0) {
+            st->base[--st->lo] = x;
+            return list_header(st, st->lo, n + 1);
+        }
+    }
+    return list_grow(lst, x, 1);
+}
+
 sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures) {
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
@@ -2452,6 +2559,81 @@ sw_val_t *sw_now_iso(void) {
  * only in the single-process interpreter, which has no arena to free). */
 #define SW_COPY_MAX_DEPTH 256
 
+/* === Deep-copy context ===
+ * One per top-level deep copy (thread-local, nestable). `memo` maps a source
+ * node to its copy so a graph that shares substructure is copied as a graph:
+ * without it `grow({t, t}, k)` — k live cells — copied as 2^k nodes, and a
+ * turn checkpoint over such a value ran the process out of memory. `keep`
+ * lists address ranges whose values are returned as-is instead of copied (the
+ * part of a process arena below a turn-checkpoint floor, which the reset
+ * preserves). */
+typedef struct {
+    const sw_val_t **keys;
+    sw_val_t **vals;
+    size_t cap, n;
+    const sw_varena_range_t *keep;
+    int nkeep;
+} dc_ctx_t;
+static __thread dc_ctx_t *g_dc = NULL;
+
+static inline size_t dc_hash(const void *p, size_t cap) {
+    uintptr_t x = (uintptr_t)p;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (size_t)x & (cap - 1);
+}
+
+static sw_val_t *dc_lookup(dc_ctx_t *c, const sw_val_t *src) {
+    if (!c->cap) return NULL;
+    for (size_t i = dc_hash(src, c->cap);; i = (i + 1) & (c->cap - 1)) {
+        if (!c->keys[i]) return NULL;
+        if (c->keys[i] == src) return c->vals[i];
+    }
+}
+
+static void dc_insert(dc_ctx_t *c, const sw_val_t *src, sw_val_t *dst) {
+    if ((c->n + 1) * 2 > c->cap) {
+        size_t ncap = c->cap ? c->cap * 2 : 64;
+        const sw_val_t **nk = calloc(ncap, sizeof(*nk));
+        sw_val_t **nv = calloc(ncap, sizeof(*nv));
+        if (!nk || !nv) { free(nk); free(nv); return; }   /* degrade: no sharing */
+        for (size_t i = 0; i < c->cap; i++) {
+            if (!c->keys[i]) continue;
+            size_t j = dc_hash(c->keys[i], ncap);
+            while (nk[j]) j = (j + 1) & (ncap - 1);
+            nk[j] = c->keys[i]; nv[j] = c->vals[i];
+        }
+        free(c->keys); free(c->vals);
+        c->keys = nk; c->vals = nv; c->cap = ncap;
+    }
+    size_t i = dc_hash(src, c->cap);
+    while (c->keys[i]) i = (i + 1) & (c->cap - 1);
+    c->keys[i] = src; c->vals[i] = dst; c->n++;
+}
+
+static int dc_kept(dc_ctx_t *c, const void *p) {
+    int lo = 0, hi = c->nkeep - 1;
+    const char *a = (const char *)p;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (a < c->keep[mid].lo) hi = mid - 1;
+        else if (a >= c->keep[mid].hi) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+
+static void dc_begin(dc_ctx_t *c, dc_ctx_t **saved) {
+    memset(c, 0, sizeof(*c));
+    *saved = g_dc;
+    g_dc = c;
+}
+
+static void dc_end(dc_ctx_t *c, dc_ctx_t *saved) {
+    free(c->keys);
+    free(c->vals);
+    g_dc = saved;
+}
+
 /* A fresh (never immortal) copy of a scalar, for global-heap deep copies. */
 static sw_val_t *fresh_scalar(sw_val_t *v) {
     sw_val_t *r = val_alloc(sizeof(sw_val_t));
@@ -2461,6 +2643,8 @@ static sw_val_t *fresh_scalar(sw_val_t *v) {
     return r;
 }
 
+static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
+
 static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
     if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
     if (depth > SW_COPY_MAX_DEPTH) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
@@ -2469,6 +2653,17 @@ static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
      * immortals; copies into regions/arenas (bulk-freed) may. */
     if (v->immortal)
         return g_alloc_force_global ? fresh_scalar(v) : v;
+    if (g_dc) {
+        if (g_dc->nkeep && dc_kept(g_dc, v)) return v;
+        sw_val_t *seen = dc_lookup(g_dc, v);
+        if (seen) return seen;
+    }
+    sw_val_t *copy = deep_copy_node(v, depth);
+    if (g_dc && copy && copy != v) dc_insert(g_dc, v, copy);
+    return copy;
+}
+
+static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
     switch (v->type) {
     case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
     case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
@@ -2529,7 +2724,10 @@ sw_value_arena_t *sw_swap_alloc_target(sw_value_arena_t *region) {
 sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     int save = g_alloc_force_global;
     g_alloc_force_global = 1;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
     sw_val_t *r = deep_copy_rec(v, 0);
+    dc_end(&dc, saved);
     g_alloc_force_global = save;
     return r;
 }
@@ -2544,7 +2742,10 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v) {
     int save_g = g_alloc_force_global;
     g_alloc_target = NULL;
     g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
     sw_val_t *r = deep_copy_rec(v, 0);
+    dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
     return r;
@@ -2560,10 +2761,57 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
     int save_g = g_alloc_force_global;
     g_alloc_target = region;
     g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
     sw_val_t *r = deep_copy_rec(v, 0);
+    dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
     return r;
+}
+
+/* Ownership v2 turn checkpoint (called by compiled self-tail-calls once the
+ * function has allocated enough above its entry floor). Copies the live
+ * recursion arguments into a fresh region, rewinds the process arena to
+ * `floor` (freeing this function's per-turn garbage and unreferenced adopted
+ * message chunks) and splices the region back in; args[] is rewritten in
+ * place. Values at or below the floor survive the rewind, so they are shared
+ * rather than copied, and shared substructure is copied once — the cost is
+ * proportional to what the loop keeps ABOVE its floor, not to everything it
+ * can reach. Returns 1 if the arena was rewound, 0 if skipped (no process
+ * arena, below the adaptive threshold, or OOM: args untouched). */
+int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
+    sw_value_arena_t *a = sw_self_varena();
+    if (!a) return 0;
+    size_t used = a->total_bytes - floor.total_bytes;
+    /* Adaptive trigger: wait until the turn garbage is at least twice what
+     * the last checkpoint carried forward, so copying stays amortised O(1)
+     * per allocated byte even when the loop keeps a large live state. */
+    size_t need = SW_TURN_RESET_BYTES;
+    if (a->turn_live * 2 > need) need = a->turn_live * 2;
+    if (used <= need) return 0;
+    sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_PROCESS);
+    if (!r) return 0;
+    sw_varena_range_t *keep = NULL;
+    int nkeep = sw_varena_ranges_below(a, floor, &keep);
+    sw_value_arena_t *save_t = g_alloc_target;
+    int save_g = g_alloc_force_global;
+    g_alloc_target = r;
+    g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
+    dc.keep = keep;
+    dc.nkeep = nkeep;
+    for (int i = 0; i < n; i++) args[i] = deep_copy_rec(args[i], 0);
+    dc_end(&dc, saved);
+    g_alloc_target = save_t;
+    g_alloc_force_global = save_g;
+    free(keep);
+    size_t live = r->total_bytes;
+    sw_varena_reset_to(a, floor);
+    sw_varena_adopt(a, r);
+    a->turn_live = live;
+    return 1;
 }
 
 /* sw_send_value: enqueue an sw_val_t VALUE message, deep-copied to the global
@@ -2912,6 +3160,7 @@ static void env_free(sw_env_t *e) {
 
 /* Internal: evaluate a node in an environment */
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env);
+static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv);
 
 /* Find function by name in module */
 static node_t *find_fun(node_t *mod, const char *name) {
@@ -2972,7 +3221,7 @@ static int pattern_match(node_t *pattern, sw_val_t *val, sw_env_t *env) {
         if (val->type != SW_VAL_LIST || val->v.tuple.count < 1) return 0;
         if (!pattern_match(pattern->v.cons.head, val->v.tuple.items[0], env)) return 0;
         {
-            sw_val_t *tail = sw_val_list(val->v.tuple.items + 1, val->v.tuple.count - 1);
+            sw_val_t *tail = sw_val_list_view(val, 1, val->v.tuple.count - 1);   /* O(1) */
             if (!pattern_match(pattern->v.cons.tail, tail, env)) return 0;
         }
         return 1;
@@ -3292,7 +3541,7 @@ static sw_val_t *builtin_tl(sw_interp_t *interp, sw_val_t **args, int nargs) {
     if (args[0]->type != SW_VAL_LIST) { interp_raise_panic(interp, 0, "tl: not a list (got type %d)", args[0]->type); return sw_val_nil(); }
     if (args[0]->v.tuple.count == 0) { interp_raise_panic(interp, 0, "tl: list is empty"); return sw_val_nil(); }
     if (args[0]->v.tuple.count == 1) return sw_val_list(NULL, 0);
-    return sw_val_list(args[0]->v.tuple.items + 1, args[0]->v.tuple.count - 1);
+    return sw_val_list_view(args[0], 1, args[0]->v.tuple.count - 1);
 }
 
 /* Built-in function: elem (tuple element access).
@@ -3426,7 +3675,7 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
                              ? fn_val->v.fun.closure_env
                              : interp->global_env);
     /* Zero-arg lambda — no params to bind. */
-    (void)eval(interp, fn_node->v.fun.body, fenv);
+    (void)interp_eval_body(interp, fn_node, fenv);
     env_free(fenv);
 
     interp->try_depth--;
@@ -3617,7 +3866,7 @@ static void spawn_trampoline(void *arg) {
         env_set(fenv, fn->v.fun.params[i], b->args[i]);
     sw_interp_t *interp = b->interp;   /* capture before free(b) below */
     interp->call_depth++;
-    (void)eval(interp, fn->v.fun.body, fenv);
+    (void)interp_eval_body(interp, fn, fenv);
     interp->call_depth--;
     env_free(fenv);
     if (b->args) free(b->args);
@@ -3665,7 +3914,7 @@ static void _sup_interp_entry(void *raw) {
     if (fn && fn->v.fun.body) {
         sw_env_t *fenv = env_new(c->closure_env ? c->closure_env : interp->global_env);
         interp->call_depth++;
-        (void)eval(interp, fn->v.fun.body, fenv);
+        (void)interp_eval_body(interp, fn, fenv);
         interp->call_depth--;
         env_free(fenv);
     }
@@ -3688,7 +3937,7 @@ static sw_val_t *interp_apply_fn(sw_interp_t *interp, sw_val_t *fn,
     for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
         env_set(fenv, fn_node->v.fun.params[i], args[i]);
     interp->call_depth++;
-    sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
+    sw_val_t *r = interp_eval_body(interp, fn_node, fenv);
     interp->call_depth--;
     env_free(fenv);
     return r;
@@ -4652,7 +4901,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
                                   : interp->global_env);
         if (fn_node->v.fun.nparams >= 1)
             env_set(fenv, fn_node->v.fun.params[0], old_val);
-        sw_val_t *new_val = eval(interp, fn_node->v.fun.body, fenv);
+        sw_val_t *new_val = interp_eval_body(interp, fn_node, fenv);
         env_free(fenv);
 
         if (interp->error) return sw_val_nil();
@@ -5252,6 +5501,114 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
 }
 
 /* Evaluate node */
+/* === Interpreter tail calls ===
+ * Recursion is sw's only loop, and the tree-walker used to recurse on the C
+ * stack for every call, so `swc run` / `swc test` / the REPL died after a few
+ * hundred iterations of any loop (the compiled path TCOs self-tail-calls).
+ * At load time every call in tail position of a function or lambda body is
+ * flagged. Evaluating a flagged call to a user function (module function or
+ * closure — never a builtin) records a tail request and unwinds to the
+ * innermost interp_eval_body, which rebinds and loops. EVERY site that
+ * evaluates a function body goes through interp_eval_body, so a request is
+ * always consumed by the body that issued it. This also covers mutual tail
+ * recursion, which the compiled path does not yet. */
+static void mark_tail(node_t *n) {
+    if (!n) return;
+    switch (n->type) {
+    case N_CALL: n->v.call.tail = 1; break;
+    case N_BLOCK: if (n->v.block.nstmts > 0) mark_tail(n->v.block.stmts[n->v.block.nstmts - 1]); break;
+    case N_IF: mark_tail(n->v.iff.then_b); mark_tail(n->v.iff.else_b); break;
+    case N_CASE:
+        for (int i = 0; i < n->v.casex.nclauses; i++) mark_tail(n->v.casex.clauses[i]->v.clause.body);
+        break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) mark_tail(n->v.recv.clauses[i]->v.clause.body);
+        mark_tail(n->v.recv.after_body);
+        break;
+    default: break;
+    }
+}
+
+/* Mark the body of every lambda found anywhere under n. */
+static void mark_lambda_tails(node_t *n) {
+    if (!n) return;
+    switch (n->type) {
+    case N_FUN: mark_tail(n->v.fun.body); mark_lambda_tails(n->v.fun.body); break;
+    case N_BLOCK: for (int i = 0; i < n->v.block.nstmts; i++) mark_lambda_tails(n->v.block.stmts[i]); break;
+    case N_ASSIGN: mark_lambda_tails(n->v.assign.value); break;
+    case N_CALL:
+        mark_lambda_tails(n->v.call.func);
+        for (int i = 0; i < n->v.call.nargs; i++) mark_lambda_tails(n->v.call.args[i]);
+        break;
+    case N_SPAWN: mark_lambda_tails(n->v.spawn.expr); break;
+    case N_SEND: mark_lambda_tails(n->v.send.to); mark_lambda_tails(n->v.send.msg); break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) mark_lambda_tails(n->v.recv.clauses[i]);
+        mark_lambda_tails(n->v.recv.after_body); mark_lambda_tails(n->v.recv.after_expr);
+        break;
+    case N_CLAUSE: mark_lambda_tails(n->v.clause.guard); mark_lambda_tails(n->v.clause.body); break;
+    case N_CASE:
+        mark_lambda_tails(n->v.casex.subject);
+        for (int i = 0; i < n->v.casex.nclauses; i++) mark_lambda_tails(n->v.casex.clauses[i]);
+        break;
+    case N_IF: mark_lambda_tails(n->v.iff.cond); mark_lambda_tails(n->v.iff.then_b); mark_lambda_tails(n->v.iff.else_b); break;
+    case N_BINOP: mark_lambda_tails(n->v.binop.left); mark_lambda_tails(n->v.binop.right); break;
+    case N_UNARY: mark_lambda_tails(n->v.unary.operand); break;
+    case N_PIPE: mark_lambda_tails(n->v.pipe.val); mark_lambda_tails(n->v.pipe.func); break;
+    case N_TUPLE: case N_LIST: for (int i = 0; i < n->v.coll.count; i++) mark_lambda_tails(n->v.coll.items[i]); break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { mark_lambda_tails(n->v.map.keys[i]); mark_lambda_tails(n->v.map.vals[i]); }
+        break;
+    case N_FOR: mark_lambda_tails(n->v.forloop.iter); mark_lambda_tails(n->v.forloop.body); break;
+    case N_LIST_COMP: mark_lambda_tails(n->v.lcomp.iter); mark_lambda_tails(n->v.lcomp.body); mark_lambda_tails(n->v.lcomp.guard); break;
+    case N_RANGE: mark_lambda_tails(n->v.range.from); mark_lambda_tails(n->v.range.to); break;
+    case N_TRY: mark_lambda_tails(n->v.trycatch.body); mark_lambda_tails(n->v.trycatch.catch_body); break;
+    case N_LIST_CONS: mark_lambda_tails(n->v.cons.head); mark_lambda_tails(n->v.cons.tail); break;
+    default: break;
+    }
+}
+
+static void interp_mark_tails(node_t *mod) {
+    if (!mod || mod->type != N_MODULE) return;
+    for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        node_t *fn = mod->v.mod.funs[i];
+        mark_tail(fn->v.fun.body);
+        mark_lambda_tails(fn->v.fun.body);
+    }
+}
+
+/* Bind a user function's parameters: positional args, then defaults, then nil. */
+static void bind_params(sw_interp_t *interp, node_t *fn, sw_env_t *fenv, sw_val_t **args, int nargs) {
+    for (int i = 0; i < fn->v.fun.nparams; i++) {
+        if (i < nargs)
+            env_set(fenv, fn->v.fun.params[i], args[i]);
+        else if (fn->v.fun.defaults[i])
+            env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
+        else
+            env_set(fenv, fn->v.fun.params[i], sw_val_nil());
+    }
+}
+
+/* Evaluate the body of `fn` (an N_FUN) in `fenv` (owned by the caller), then
+ * run any tail calls it requests in this same C frame. */
+static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
+    sw_env_t *own = NULL;          /* env this loop created for a tail target */
+    for (;;) {
+        sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+        if (own) { env_free(own); own = NULL; }
+        if (!interp->tail_pending) return r;
+        interp->tail_pending = 0;
+        if (interp->error) return sw_val_nil();
+        sw_val_t *args[16];
+        int nargs = interp->tail_nargs;
+        memcpy(args, interp->tail_args, sizeof(sw_val_t *) * (size_t)nargs);
+        fn = interp->tail_fn;
+        own = env_new(interp->tail_env ? interp->tail_env : interp->global_env);
+        fenv = own;
+        bind_params(interp, fn, fenv, args, nargs);
+    }
+}
+
 /* Dispatch a call to `fname` with already-evaluated arguments: builtins,
  * module functions, then a closure held in a variable. Shared by N_CALL and
  * N_PIPE so `x |> f` and `f(x)` can never resolve differently. `n` is the
@@ -5451,15 +5808,8 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
         default:                return sw_val_string("unknown");
         }
     }
-    if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST) {
-        int cnt = args[0]->v.tuple.count;
-        sw_val_t **items = malloc(sizeof(sw_val_t*) * (cnt + 1));
-        memcpy(items, args[0]->v.tuple.items, sizeof(sw_val_t*) * cnt);
-        items[cnt] = args[1];
-        sw_val_t *r = sw_val_list(items, cnt + 1);
-        free(items);
-        return r;
-    }
+    if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST)
+        return sw_val_list_append(args[0], args[1]);
 
     /* Test assertion builtins — but let user-defined functions with the
      * same name take precedence. This allows test files to define their
@@ -5498,7 +5848,7 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
                 env_set(fenv, fn->v.fun.params[i], sw_val_nil());
         }
         interp->call_depth++;
-        sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+        sw_val_t *r = interp_eval_body(interp, fn, fenv);
         interp->call_depth--;
         env_free(fenv);
         return r;
@@ -5513,7 +5863,7 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
         for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
             env_set(fenv, fn_node->v.fun.params[i], args[i]);
         interp->call_depth++;
-        sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
+        sw_val_t *r = interp_eval_body(interp, fn_node, fenv);
         interp->call_depth--;
         env_free(fenv);
         return r;
@@ -5872,6 +6222,25 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
          * an f-string interpolation was laundered into the string "nil"
          * by the desugared to_string(...) and the program sailed on. */
         if (interp->error) return sw_val_nil();
+        if (n->v.call.tail && !interp_is_known_builtin(fname)) {
+            node_t *tf = find_fun((node_t *)interp->module_ast, fname);
+            sw_env_t *tenv = NULL;
+            if (!tf) {
+                sw_val_t *fv = env_get(env, fname);
+                if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body) {
+                    tf = (node_t *)fv->v.fun.body;
+                    tenv = fv->v.fun.closure_env;
+                }
+            }
+            if (tf) {
+                interp->tail_pending = 1;
+                interp->tail_fn = tf;
+                interp->tail_env = tenv;
+                interp->tail_nargs = nargs;
+                memcpy(interp->tail_args, args, sizeof(sw_val_t *) * (size_t)nargs);
+                return sw_val_nil();
+            }
+        }
         return interp_call_named(interp, n, env, fname, args, nargs);
     }
 
@@ -6031,10 +6400,18 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (from->type != SW_VAL_INT || to->type != SW_VAL_INT)
             return sw_val_list(NULL, 0);
         int64_t lo = from->v.i, hi = to->v.i;
+        if (hi < lo) return sw_val_list(NULL, 0);
+        /* No silent cap (it was 10000 elements here while the compiled
+         * path built the whole range); refuse only a range that cannot
+         * be a list. */
+        if (hi - lo >= (int64_t)INT32_MAX) {
+            interp_raise_panic(interp, n->line, "range %lld..%lld is too large to build as a list",
+                               (long long)lo, (long long)hi);
+            return sw_val_nil();
+        }
         int cnt = (int)(hi - lo + 1);
-        if (cnt <= 0) return sw_val_list(NULL, 0);
-        if (cnt > 10000) cnt = 10000;
-        sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * (size_t)cnt);
+        if (!items) { interp_raise_panic(interp, n->line, "out of memory building range"); return sw_val_nil(); }
         for (int i = 0; i < cnt; i++) items[i] = sw_val_int(lo + i);
         sw_val_t *r = sw_val_list(items, cnt);
         free(items);
@@ -6067,15 +6444,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         /* [h | t] — cons: prepend head to tail list */
         sw_val_t *head = eval(interp, n->v.cons.head, env);
         sw_val_t *tail = eval(interp, n->v.cons.tail, env);
-        if (tail->type == SW_VAL_LIST) {
-            int cnt = tail->v.tuple.count + 1;
-            sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
-            items[0] = head;
-            memcpy(items + 1, tail->v.tuple.items, sizeof(sw_val_t*) * tail->v.tuple.count);
-            sw_val_t *r = sw_val_list(items, cnt);
-            free(items);
-            return r;
-        }
+        if (tail->type == SW_VAL_LIST) return sw_val_list_prepend(head, tail);
         return sw_val_list(&head, 1);
     }
 
@@ -6195,6 +6564,7 @@ void *sw_lang_parse(const char *source) {
 }
 
 sw_interp_t *sw_lang_new(void *module_ast) {
+    interp_mark_tails((node_t *)module_ast);   /* enable interpreter TCO */
     sw_interp_t *interp = calloc(1, sizeof(sw_interp_t));
     interp->module_ast = module_ast;
     interp->global_env = env_new(NULL);
@@ -6443,7 +6813,7 @@ sw_val_t *sw_lang_call(sw_interp_t *interp, const char *func_name,
     for (int i = 0; i < fn->v.fun.nparams && i < num_args; i++)
         env_set(fenv, fn->v.fun.params[i], args[i]);
 
-    sw_val_t *result = eval(interp, fn->v.fun.body, fenv);
+    sw_val_t *result = interp_eval_body(interp, fn, fenv);
     env_free(fenv);
     return result;
 }

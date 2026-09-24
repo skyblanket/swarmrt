@@ -765,13 +765,7 @@ static sw_val_t *_builtin_list_append(sw_val_t **a, int n) {
         sw_val_t *one = a[1];
         return sw_val_list(&one, 1);
     }
-    int cnt = a[0]->v.tuple.count;
-    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (cnt + 1));
-    for (int i = 0; i < cnt; i++) items[i] = a[0]->v.tuple.items[i];
-    items[cnt] = a[1];
-    sw_val_t *r = sw_val_list(items, cnt + 1);
-    free(items);
-    return r;
+    return sw_val_list_append(a[0], a[1]);
 }
 
 /* === File I/O === */

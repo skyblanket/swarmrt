@@ -43,6 +43,8 @@ typedef struct sw_value_arena {
     size_t chunk_count;            /* stat: number of chunks */
     sw_region_kind_t kind;         /* lifecycle owner class (v2) */
     struct sw_value_arena *list_next; /* per-process region chain (accounting/teardown) */
+    size_t turn_live;              /* bytes carried by the last turn checkpoint
+                                      (adaptive trigger: see sw_turn_checkpoint) */
 } sw_value_arena_t;
 
 /* Create a SW_REGION_PROCESS arena with an initial chunk of at least
@@ -119,6 +121,14 @@ sw_varena_mark_t sw_varena_mark(sw_value_arena_t *a);
  * `mark.used` — reclaiming everything allocated since the mark while preserving
  * everything below it. The arena's alloc point becomes `mark.chunk` again. */
 void sw_varena_reset_to(sw_value_arena_t *a, sw_varena_mark_t mark);
+
+/* Address ranges of `a` at or BELOW `mark` (chunks older than mark.chunk, plus
+ * mark.chunk's first mark.used bytes), sorted by start address. Values there
+ * survive sw_varena_reset_to(a, mark). Returns the count; *out is malloc'd
+ * (caller frees) or NULL when there are none / on OOM. */
+typedef struct { const char *lo, *hi; } sw_varena_range_t;
+int sw_varena_ranges_below(sw_value_arena_t *a, sw_varena_mark_t mark,
+                           sw_varena_range_t **out);
 
 /* Turn-checkpoint threshold: a self-tail-call resets the process arena only once
  * it has handed out more than this many bytes since the last reset (total_bytes

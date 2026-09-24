@@ -16,6 +16,7 @@
 #include <stdio.h>
 
 #include "swarmrt_native.h"
+#include "swarmrt_varena.h"   /* sw_varena_mark_t for sw_turn_checkpoint */
 
 /* === Value Representation === */
 
@@ -55,6 +56,11 @@ struct sw_val {
         struct {
             sw_val_t **items;
             int count;
+            /* Lists only, arena-backed only: the growable backing store the
+             * items live in (NULL = a plain exact-size array). Lets append /
+             * cons extend a list in O(1) when it owns the store's edge —
+             * see sw_val_list_append. */
+            struct sw_list_store *store;
         } tuple;                     /* also used for list */
         struct {
             char *name;
@@ -126,6 +132,15 @@ typedef struct {
      * treats its probe fn as a try (bumps try_depth) and intercepts both. */
     int panicking;
     int try_depth;
+    /* Tail-call request (interpreter TCO): set by a tail-position call to a
+     * user function instead of recursing, consumed by the innermost
+     * interp_eval_body, which runs the target in the same C frame. Never
+     * outstanding across a yield (set and consumed on one fiber). */
+    int tail_pending;
+    struct node *tail_fn;
+    sw_env_t *tail_env;
+    int tail_nargs;
+    sw_val_t *tail_args[16];
 } sw_interp_t;
 
 /* === Public API === */
@@ -188,6 +203,13 @@ sw_val_t *sw_val_pid(sw_process_t *p);
 sw_val_t *sw_val_remote_pid(const char *node, uint64_t id);
 sw_val_t *sw_val_tuple(sw_val_t **items, int count);
 sw_val_t *sw_val_list(sw_val_t **items, int count);
+/* O(1) sub-list sharing src's storage when arena-backed (see swarmrt_lang.c). */
+sw_val_t *sw_val_list_view(sw_val_t *src, int off, int count);
+/* New list = lst ++ [x] / [x | lst]. O(1) amortized when `lst` ends / starts
+ * at its backing store's used edge (the accumulator patterns); otherwise one
+ * copy into a fresh store with room to grow. `lst` itself never changes. */
+sw_val_t *sw_val_list_append(sw_val_t *lst, sw_val_t *x);
+sw_val_t *sw_val_list_prepend(sw_val_t *x, sw_val_t *lst);
 sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures);
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
@@ -209,6 +231,11 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v);
 struct sw_value_arena;
 sw_val_t *deep_copy_into(sw_val_t *v, struct sw_value_arena *region);
 struct sw_value_arena *sw_swap_alloc_target(struct sw_value_arena *region);
+/* Ownership v2 turn checkpoint for compiled self-tail-calls: copy the live
+ * args above `floor`, rewind the process arena to it, rewrite args[] in place.
+ * Returns 1 if rewound (see swarmrt_lang.c). */
+int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor);
+
 /* Static name resolution: report identifiers in value position that no scope
  * binds (see swarmrt_lang.c). `mods` is the full set being linked (must include
  * mod_ast). Returns the number of errors printed to stderr. */
@@ -282,7 +309,9 @@ typedef struct node {
         /* N_ASSIGN */
         struct { char name[128]; struct node *value; } assign;
         /* N_CALL */
-        struct { struct node *func; struct node **args; int nargs; } call;
+        /* tail: set by the interpreter's load-time pass on calls in tail
+         * position of a function/lambda body (see interp_mark_tails). */
+        struct { struct node *func; struct node **args; int nargs; int tail; } call;
         /* N_SPAWN — `monitor` set for spawn_monitor(...) which atomically
          * spawns + monitors and returns {pid, ref} instead of a bare pid. */
         struct { struct node *expr; int monitor; } spawn;

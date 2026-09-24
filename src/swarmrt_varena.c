@@ -48,6 +48,7 @@ static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
     a->chunk_count = 1;
     a->kind = kind;
     a->list_next = NULL;
+    a->turn_live = 0;
     return a;
 }
 
@@ -170,4 +171,33 @@ void sw_varena_free_all(sw_value_arena_t *a) {
         c = next;
     }
     free(a);
+}
+
+static int range_cmp(const void *x, const void *y) {
+    const sw_varena_range_t *a = (const sw_varena_range_t *)x, *b = (const sw_varena_range_t *)y;
+    return a->lo < b->lo ? -1 : (a->lo > b->lo ? 1 : 0);
+}
+
+int sw_varena_ranges_below(sw_value_arena_t *a, sw_varena_mark_t mark,
+                           sw_varena_range_t **out) {
+    *out = NULL;
+    if (!a || !mark.chunk) return 0;
+    sw_varena_chunk_t *c = a->head;
+    while (c && c != mark.chunk) c = c->next;       /* skip chunks above the floor */
+    if (!c) return 0;
+    int n = 0;
+    for (sw_varena_chunk_t *k = c; k; k = k->next) n++;
+    sw_varena_range_t *r = (sw_varena_range_t *)malloc(sizeof(*r) * (size_t)n);
+    if (!r) return 0;
+    int i = 0;
+    for (sw_varena_chunk_t *k = c; k; k = k->next) {
+        size_t used = (k == mark.chunk) ? mark.used : k->used;
+        if (!used) continue;
+        r[i].lo = chunk_data(k);
+        r[i].hi = chunk_data(k) + used;
+        i++;
+    }
+    qsort(r, (size_t)i, sizeof(*r), range_cmp);
+    *out = r;
+    return i;
 }

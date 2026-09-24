@@ -4,6 +4,30 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — linear list code, sharing-preserving copies, interpreter TCO
+
+**perf(values): list operations are O(1) where the idioms need them.** `tl()` and `[h | t]`
+pattern tails are views sharing the parent's storage. Arena lists get a growable backing
+store; `list_append(acc, x)` and `[x | acc]` extend it in place when the list owns the
+store's edge (the accumulator patterns) and copy otherwise, so every existing list value
+still sees only its own elements (conformance `t17_list_sharing` checks every branching
+shape). Summing a 100K list via hd/tl: 162s → 0.1s. `Std.range(0, 100000)`: 30.9s → 41ms.
+
+**fix(gc): the turn checkpoint copies what the loop keeps, as a graph.** Deep copies
+preserve sharing (a memo table per copy), so a loop carrying `{t, t}` nested k deep
+copies k cells instead of 2^k; the old checkpoint ran out of memory at k = 26. The
+checkpoint (`sw_turn_checkpoint`) shares values at or below the function's entry floor,
+which the reset preserves anyway, and triggers adaptively at twice the last carried size.
+
+**feat(interp): tail-call optimisation.** Calls in tail position of a function or lambda
+body run in place (`interp_eval_body` trampolines every body evaluation), so `swc run` /
+`swc test` / the REPL can loop indefinitely — including mutual tail recursion and receive
+loops, where they used to die after a few hundred iterations. The interpreter no longer
+truncates `a..b` ranges at 10,000 elements. Gates: `tests/sw/test_value_scaling.sw`,
+`tests/sw/run/test_interp_tco.sw`.
+
+---
+
 ## 2026-09-24 — names are checked; one call/pipe path; function values
 
 **feat(lang): undefined names are compile errors on every path.** A shared static pass
