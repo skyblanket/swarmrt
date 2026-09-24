@@ -204,6 +204,10 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v);
 struct sw_value_arena;
 sw_val_t *deep_copy_into(sw_val_t *v, struct sw_value_arena *region);
 struct sw_value_arena *sw_swap_alloc_target(struct sw_value_arena *region);
+/* Static name resolution: report identifiers in value position that no scope
+ * binds (see swarmrt_lang.c). `mods` is the full set being linked (must include
+ * mod_ast). Returns the number of errors printed to stderr. */
+int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path);
 
 /* GC v1: type-safe value-send choke point — deep-copies the payload to the
  * global heap, then enqueues via sw_send_tagged. Route every sw_val_t* send

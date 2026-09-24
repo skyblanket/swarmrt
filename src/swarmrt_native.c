@@ -1943,15 +1943,13 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         }
     }
 
-    /* Startup banner — diagnostics, not program output, so it goes to
-     * stderr. That keeps stdout clean for programs whose output is
-     * piped or captured (e.g. a CLI answering `--version`). Silence it
-     * entirely with SW_QUIET=1 or SW_RUNTIME_QUIET=1. The latter is the
-     * runtime-only knob a headless agent sets in the *built binary's*
-     * environment so the two "[SwarmRT] Arena initialized…" lines never
-     * leak into a captured stream, without having to also be set at
-     * compile time. */
-    if (!getenv("SW_QUIET") && !getenv("SW_RUNTIME_QUIET")) {
+    /* Startup banner — diagnostics, not program output. Opt-in with
+     * SW_VERBOSE=1: a compiled program's stderr belongs to the program
+     * (hello world used to print two "[SwarmRT] ..." lines before its own
+     * output). SW_QUIET / SW_RUNTIME_QUIET still force it off. */
+    const char *verbose = getenv("SW_VERBOSE");
+    if (verbose && verbose[0] && verbose[0] != '0' &&
+        !getenv("SW_QUIET") && !getenv("SW_RUNTIME_QUIET")) {
         fprintf(stderr, "[SwarmRT] Arena initialized: %zu MB mmap, %u proc slots, %u heap blocks\n",
                g_swarm->arena.size / (1024 * 1024),
                g_swarm->arena.proc_capacity,

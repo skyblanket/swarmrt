@@ -260,7 +260,7 @@ needed.
 | `SW_MSG_MAX_BYTES` | `0` (off) | Max size of a single local message (bytes). Over-cap sends are dropped loudly, leak-free. |
 | `SW_SHUTDOWN_GRACE_MS` | `5000` | Graceful-shutdown drain deadline. On SIGTERM/SIGINT the node stops accepting work, drains, cancels timers, then tears down within this budget. |
 | `SW_LOG_JSON` | unset | `1` → one JSON `proc_crash` record per abnormal exit on stderr (for log shippers). Human-readable trace stays the default. |
-| `SW_QUIET` | unset | Suppress the `[SwarmRT] Arena initialized…` banner on stderr. Set in scripts/CI. |
+| `SW_VERBOSE` | unset | `1` → print the `[SwarmRT] Arena initialized…` startup banner on stderr (off by default; `SW_QUIET=1` forces it off). |
 
 The full operational config reference (every var, defaults, meanings) and the
 graceful-shutdown / recovery model live in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
@@ -458,7 +458,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
 - **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
-- **No static type or shape checking** — `sw` is dynamically typed by design. Typos in variable names compile to atoms rather than erroring (e.g. `undefined_var` becomes `:undefined_var`); there is no compile-time catch.
+- **No static type checking** — `sw` is dynamically typed by design. Names are checked (an undefined variable is a compile error with a did-you-mean, on both the compiled and interpreted paths), but types and map keys are not.
 - **Memory is bounded under fixed concurrency (Ownership v2), with a few owners still on the global heap.** A process's own working set frees on exit; sent messages, spawn args, and pmap captures/results are adopted into receiver/child ownership and reclaimed (incl. pre-start-killed children); long-lived tail loops are bounded by a scoped turn-checkpoint. `make gc-slope` proves spawn / message / 100k-turn / pmap slopes stay flat. **Still global-heap (reclaimed only at OS exit / table destroy — a high-churn loop grows until then):** (1) **ETS** entries; (2) **supervisor child closures** and **timer/cron closures**; (3) the **interpreter** has no arena (fine for short-lived `swc run`/REPL). Values nested deeper than 256 levels are truncated on cross-process copy.
 
 The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.

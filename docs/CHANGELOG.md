@@ -4,6 +4,36 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — names are checked; one call/pipe path; function values
+
+**feat(lang): undefined names are compile errors on every path.** A shared static pass
+(`sw_resolve_module`, run by `swc build`, `swc run` and `swc test`) rejects any identifier
+that no scope binds — parameters, assignments, pattern variables, `for` / comprehension /
+catch variables, module functions and `let` globals, with lambdas seeing every enclosing
+scope. Scoping is function-wide and flow-insensitive, so no valid program is rejected.
+Before, `print(totl)` compiled to `print(:totl)` and interpreted as `print(nil)`. Messages
+carry a did-you-mean, flag bare words that were meant as atoms, and explain that builtins
+are not yet first-class values. It found nothing in the repo's own code, and found the
+bugs in six of the LLM-written eval programs. Gate: `tests/sw/compile_fail/undefined_names.sw`
+(new must-not-compile category in `run_tests.sh`).
+
+**feat(lang): function values and pipes behave identically compiled and interpreted.**
+`Module.function` without parens is a reference to that function (`xs |> Std.sum`,
+`s = Std.sum`); it used to parse as a map lookup on an undefined variable. The interpreter
+now returns a callable for a module function used by name (it returned nil), and its pipe
+shares the call dispatch (`interp_call_named`) so `|> print`, `|> string_upper`,
+`|> closure_var` and `|> fun(x) {...}` all apply — they returned the piped value untouched.
+The compiler applies `|> fun(x) {...}` and `|> closure_var` (it ignored the first and
+failed to link the second). Gate: conformance `t16_pipes_and_refs`.
+
+**fix(codegen): default parameters.** `fun greet(name = "world")` is documented, but the
+arity check rejected `greet()`.
+
+**chore:** the `[SwarmRT] Arena initialized…` startup banner is opt-in (`SW_VERBOSE=1`);
+a C compile failure of generated code is reported as an internal compiler error.
+
+---
+
 ## 2026-09-24 — correctness pass: HTTP no longer pins schedulers, wrong-answer codegen bugs, HTTP server fixes
 
 **fix(runtime): blocking builtins run on an offload pool.** `http_get`, `http_request`,

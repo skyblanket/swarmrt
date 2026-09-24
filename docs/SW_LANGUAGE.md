@@ -142,6 +142,45 @@ Cron.every(200, fn() { check_inbox() })     # the common scheduler idiom
 
 `fn` is **not** a reserved word — it is only a lambda when written in the `fn(...) { ... }` shape, so it stays a perfectly good ordinary variable / parameter name (the stdlib uses `fn` as a callback parameter throughout).
 
+Lambdas capture variables from **every** enclosing scope (by value, at the moment the lambda is created), so the fan-out-and-reply shape works as written:
+
+```sw
+fun fan_out(items) {
+    me = self()
+    map(fn(x) { spawn(fn() { send(me, {'done', x * x}) }) }, items)
+}
+```
+
+### Functions as values
+
+A module function — or `Module.function` from an imported module — can be passed by name wherever a function value is expected, and piped into directly:
+
+```sw
+import Std
+
+fun double(x) { x * 2 }
+
+fun main() {
+    print(map(double, [1, 2, 3]))                  # [2, 4, 6]
+    print([1, 2, 3] |> map(double) |> Std.sum)     # 12
+    sum = Std.sum
+    print(sum([10, 20]))                           # 30
+}
+```
+
+Builtins (`to_string`, `string_upper`, …) can be piped into (`xs |> length`) but not yet passed as values — wrap them: `map(fn(x) { to_string(x) }, xs)`.
+
+### Names are checked
+
+Every identifier must be bound somewhere — a parameter, an assignment, a pattern variable, a `for` variable, a module function or a module `let`. A name bound nowhere is rejected before the program runs, by `swc build`, `swc run` and `swc test` alike:
+
+```
+swc: src/Main.sw:3: undefined variable 'usr_name' — did you mean 'user_name'?
+swc: src/Main.sw:9: undefined variable 'ok' (atoms are written quoted: 'ok')
+```
+
+A variable assigned in any branch of an `if` / `case` / `receive` is visible after it (it is `nil` if the assigning branch did not run).
+
 ---
 
 ## 4. Values and types

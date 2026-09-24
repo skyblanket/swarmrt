@@ -65,7 +65,8 @@ noted. **Every one is optional**; the defaults are the product defaults.
 | `SW_SHUTDOWN_GRACE_MS` | `5000` | Graceful-shutdown drain deadline in ms (clamped to `[0, 3600000]`). See **Graceful shutdown** below. |
 | `SW_NO_SIGNAL_SHUTDOWN` | off | If set, the runtime does NOT install SIGTERM/SIGINT handlers (for embedders that own signal disposition). |
 | `SW_LOG_JSON` | off | If `1`, every abnormal process exit emits one JSON line on stderr: `{"ev":"proc_crash","pid":N,"reason":R[,"msg"][,"name"],"ts":MS}`. The human-readable panic trace remains the default. |
-| `SW_QUIET` / `SW_RUNTIME_QUIET` | off | Suppress the startup banner and operational stderr notices. |
+| `SW_VERBOSE` | off | `1` prints the startup banner (off by default). |
+| `SW_QUIET` / `SW_RUNTIME_QUIET` | off | Suppress the startup banner (even with `SW_VERBOSE`) and operational stderr notices. |
 | `SW_DEADLOCK_DETECT` / `SW_DEADLOCK_MS` | on / tuned | Deadlock watchdog enable + interval. Leave default unless diagnosing. |
 | `SW_SCHED_TRACE` | off | Scheduler stall/interleave tracing (`1`/`2`) for diagnosing wedges. |
 

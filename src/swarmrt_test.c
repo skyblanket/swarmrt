@@ -59,6 +59,17 @@ int sw_test_run_file(const char *path) {
         return 1;
     }
 
+    /* Same static name check as `swc build`. */
+    {
+        void *mods[1] = { ast };
+        int unresolved = sw_resolve_module(ast, mods, 1, path);
+        if (unresolved) {
+            fprintf(stderr, "test: %d undefined name%s in '%s'\n",
+                    unresolved, unresolved == 1 ? "" : "s", path);
+            return 1;
+        }
+    }
+
     /* Extract test_* function names from AST */
     node_t *mod = (node_t *)ast;
     const char *test_names[256];

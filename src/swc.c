@@ -236,6 +236,17 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
         merge_module_funs(root, (node_t *)imp_ast, 1);
     }
 
+    /* Same static name check as `swc build`, so both paths reject a typo. */
+    {
+        void *mods[1] = { root };
+        int unresolved = sw_resolve_module(root, mods, 1, path);
+        if (unresolved) {
+            fprintf(stderr, "swc: %d undefined name%s — not running\n",
+                    unresolved, unresolved == 1 ? "" : "s");
+            return 1;
+        }
+    }
+
     /* Run main(). */
     sw_interp_t *interp = sw_lang_new(main_ast);
     int has_main = 0;
@@ -405,6 +416,7 @@ int main(int argc, char **argv) {
 
     /* Parse all input files */
     void *asts[64];
+    const char *ast_paths[64];
     int nasts = 0;
     int main_idx = 0;
 
@@ -415,6 +427,7 @@ int main(int argc, char **argv) {
         free(source);
         if (!ast) { fprintf(stderr, "swc: parse failed for %s\n", inputs[i]); return 1; }
         asts[nasts] = ast;
+        ast_paths[nasts] = inputs[i];
         /* Diagnostics + #line directives point at the REAL file. */
         sw_codegen_register_source(get_mod_name(ast), inputs[i]);
 
@@ -519,6 +532,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (nasts < 64) {
+                    ast_paths[nasts] = strdup(imp_path);
                     asts[nasts++] = imp_ast;
                     sw_codegen_register_source(get_mod_name(imp_ast), imp_path);
                     fprintf(stderr, "swc: auto-imported %s from %s\n", imp_name, imp_path);
@@ -528,6 +542,18 @@ int main(int argc, char **argv) {
     }
 
     const char *mod_name = get_mod_name(asts[main_idx]);
+
+    /* Reject undefined variables before generating any code. */
+    {
+        int unresolved = 0;
+        for (int a = 0; a < nasts; a++)
+            unresolved += sw_resolve_module(asts[a], asts, nasts, ast_paths[a]);
+        if (unresolved) {
+            fprintf(stderr, "swc: %d undefined name%s — not compiling\n",
+                    unresolved, unresolved == 1 ? "" : "s");
+            return 1;
+        }
+    }
 
     /* ---- emit command ---- */
     if (strcmp(cmd, "emit") == 0) {
@@ -756,8 +782,12 @@ int main(int argc, char **argv) {
     if (!emit_c) swc_unlink(tmppath);
 
     if (rc != 0) {
-        fprintf(stderr, "swc: compilation failed (cc returned %d)\n", rc);
-        fprintf(stderr, "swc: command was: %s\n", cmd_buf);
+        /* swc validates the program before emitting C, so C that fails to
+         * compile is a compiler bug, not a user error — say so plainly
+         * (the cc output above points at the .sw line via #line). */
+        fprintf(stderr, "swc: internal compiler error: the generated C did not compile (cc returned %d).\n", rc);
+        fprintf(stderr, "swc: this is a bug in swc, not in your program — please report it with the .sw file\n");
+        fprintf(stderr, "swc: (rebuild with --emit-c to keep the generated C; command was: %s)\n", cmd_buf);
         return 1;
     }
 

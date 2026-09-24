@@ -1052,6 +1052,15 @@ static node_t *par_primary_inner(par_t *p) {
                 }
                 par_expect(p, TOK_RPAREN, "')'");
                 return call;
+            } else if (t.text[0] >= 'A' && t.text[0] <= 'Z') {
+                /* `Module.function` without parens is a reference to that
+                 * function (module names are capitalised; variables are
+                 * not): `xs |> Std.sum`, `map(Std.to_upper, names)`. It used
+                 * to parse as map_get(Module, 'function') — a lookup on an
+                 * undefined variable that silently yielded nil. */
+                node_t *ref = mknode(N_IDENT, t.line);
+                snprintf(ref->v.sval, sizeof(ref->v.sval), "%s.%s", t.text, fname.text);
+                return ref;
             } else {
                 /* Dot access: obj.field -> map_get(obj, 'field') */
                 node_t *obj = mknode(N_IDENT, t.line);
@@ -5188,6 +5197,279 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
 }
 
 /* Evaluate node */
+/* Dispatch a call to `fname` with already-evaluated arguments: builtins,
+ * module functions, then a closure held in a variable. Shared by N_CALL and
+ * N_PIPE so `x |> f` and `f(x)` can never resolve differently. `n` is the
+ * call-site node (for line numbers only). */
+static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env,
+                                   const char *fname, sw_val_t **args, int nargs) {
+
+    /* Built-ins */
+    if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
+    if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
+    if (strcmp(fname, "hd") == 0) return builtin_hd(interp, args, nargs);
+    if (strcmp(fname, "tl") == 0) return builtin_tl(interp, args, nargs);
+    if (strcmp(fname, "elem") == 0) return builtin_elem(interp, args, nargs);
+    if (strcmp(fname, "abs") == 0 && nargs >= 1) {
+        /* abs handles both int and float (was int-only, so abs(-2.5)
+         * fell through to "undefined function"). */
+        if (args[0]->type == SW_VAL_INT)
+            return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
+        if (args[0]->type == SW_VAL_FLOAT)
+            return sw_val_float(args[0]->v.f < 0 ? -args[0]->v.f : args[0]->v.f);
+    }
+    if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
+        switch (args[0]->type) {
+        case SW_VAL_STRING: return args[0];
+        case SW_VAL_ATOM:   return sw_val_string(args[0]->v.str);
+        case SW_VAL_NIL:    return sw_val_string("nil");
+        case SW_VAL_INT: { char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf); }
+        case SW_VAL_FLOAT: { char buf[32]; snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf); }
+        default: {
+            /* Composite — render via the shared formatter so REPL
+             * output matches print()/codegen output. */
+            char *buf = NULL;
+            size_t blen = 0;
+            FILE *m = open_memstream(&buf, &blen);
+            if (!m) return sw_val_string("?");
+            sw_val_format(m, args[0]);
+            fclose(m);
+            sw_val_t *r = sw_val_string(buf ? buf : "");
+            free(buf);
+            return r;
+        }
+        }
+    }
+    if (strcmp(fname, "format") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        const char *tpl = args[0]->v.str;
+        char *buf = NULL;
+        size_t blen = 0;
+        FILE *m = open_memstream(&buf, &blen);
+        if (!m) return sw_val_string("");
+        int arg_idx = 1;
+        for (const char *p = tpl; *p; ) {
+            if (p[0] == '{' && p[1] == '}') {
+                if (arg_idx < nargs) sw_val_format(m, args[arg_idx++]);
+                else fputs("{}", m);
+                p += 2;
+            } else if (p[0] == '{' && p[1] == '{') { fputc('{', m); p += 2; }
+            else if (p[0] == '}' && p[1] == '}') { fputc('}', m); p += 2; }
+            else { fputc(*p, m); p++; }
+        }
+        fclose(m);
+        sw_val_t *r = sw_val_string(buf ? buf : "");
+        free(buf);
+        return r;
+    }
+    /* Common string ops — kept minimal so the REPL is useful for
+     * exploring sw without dragging in the full studio builtin
+     * surface (HTTP, WS, browser, etc. live in the codegen path). */
+    if (strcmp(fname, "string_split") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        const char *s = args[0]->v.str;
+        const char *sep = args[1]->v.str;
+        int seplen = (int)strlen(sep);
+        int cap = 16, count = 0;
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * cap);
+        const char *cur = s;
+        if (seplen == 0) {
+            /* Empty separator: whole string as one element (compiled parity). */
+            items[count++] = sw_val_string(s);
+        } else {
+            while (1) {
+                const char *hit = strstr(cur, sep);
+                if (!hit) break;
+                if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
+                int len = (int)(hit - cur);
+                char *piece = malloc(len + 1);
+                memcpy(piece, cur, len); piece[len] = '\0';
+                items[count++] = sw_val_string(piece);
+                free(piece);
+                cur = hit + seplen;
+            }
+            if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
+            items[count++] = sw_val_string(cur);
+        }
+        sw_val_t *r = sw_val_list(items, count);
+        free(items);
+        return r;
+    }
+    if (strcmp(fname, "string_contains") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
+        return sw_val_atom(strstr(args[0]->v.str, args[1]->v.str) ? "true" : "false");
+    if (strcmp(fname, "string_starts_with") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
+        return sw_val_atom(strncmp(args[0]->v.str, args[1]->v.str, strlen(args[1]->v.str)) == 0 ? "true" : "false");
+    if (strcmp(fname, "string_ends_with") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        size_t la = strlen(args[0]->v.str), lb = strlen(args[1]->v.str);
+        return sw_val_atom(la >= lb && strcmp(args[0]->v.str + la - lb, args[1]->v.str) == 0 ? "true" : "false");
+    }
+    if (strcmp(fname, "string_index_of") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        const char *hit = strstr(args[0]->v.str, args[1]->v.str);
+        return sw_val_int(hit ? (int64_t)(hit - args[0]->v.str) : -1);
+    }
+    if (strcmp(fname, "string_upper") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        char *r = strdup(args[0]->v.str);
+        for (char *p = r; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+    if (strcmp(fname, "string_lower") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        char *r = strdup(args[0]->v.str);
+        for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+    if (strcmp(fname, "string_trim") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        const char *s = args[0]->v.str;
+        while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+        const char *end = s + strlen(s);
+        while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
+        int len = (int)(end - s);
+        char *r = malloc(len + 1); memcpy(r, s, len); r[len] = '\0';
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+    if (strcmp(fname, "string_length") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
+        return sw_val_int((int64_t)strlen(args[0]->v.str));
+    if (strcmp(fname, "json_encode") == 0) {
+        /* Real JSON, matching the compiled runtime's _json_encode_val
+         * exactly (see interp_json_encode_val). The old stub emitted
+         * the value debug-repr (e.g. %{:name: alice}) — invalid JSON. */
+        if (nargs < 1) return sw_val_string("null");
+        char *buf = (char *)malloc(256);
+        size_t cap = 256, pos = 0;
+        interp_json_encode_val(args[0], &buf, &cap, &pos);
+        buf[pos] = '\0';
+        sw_val_t *r = sw_val_string(buf);
+        free(buf);
+        return r;
+    }
+    if (strcmp(fname, "json_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        return sw_lang_json_decode(args[0]->v.str);
+    }
+    /* Map ops the REPL is likely to want for shape checks. */
+    if (strcmp(fname, "map_size") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP)
+        return sw_val_int(args[0]->v.map.count);
+    if (strcmp(fname, "map_has_key") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
+        /* Delegate to sw_val_map_get so the atom-vs-string fallback matches:
+         * the bare sw_val_equal loop diverged from map_get (and from the
+         * compiled _builtin_map_has_key) on json_decode'd maps, where a
+         * string-keyed query missed an atom key that map_get still found.
+         * Now byte-for-byte identical to the compiled backend. */
+        sw_val_t *v = sw_val_map_get(args[0], args[1]);
+        return sw_val_atom((v && v->type != SW_VAL_NIL) ? "true" : "false");
+    }
+    if (strcmp(fname, "timestamp") == 0) {
+        struct timeval tv; gettimeofday(&tv, NULL);
+        return sw_val_int((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    }
+    if (strcmp(fname, "map_get") == 0 && nargs >= 2) {
+        sw_val_t *mv = sw_val_map_get(args[0], args[1]);
+        /* 3-arg overload: map_get(m, k, default). */
+        if (nargs >= 3 && (!mv || mv->type == SW_VAL_NIL)) return args[2];
+        return mv;
+    }
+    if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);
+    if (strcmp(fname, "map_new") == 0) return sw_val_map_new(NULL, NULL, 0);
+    if (strcmp(fname, "map_keys") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
+        return sw_val_list(args[0]->v.map.keys, args[0]->v.map.count);
+    }
+    if (strcmp(fname, "map_values") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
+        return sw_val_list(args[0]->v.map.vals, args[0]->v.map.count);
+    }
+    if (strcmp(fname, "typeof") == 0 && nargs >= 1) {
+        /* Switch (not a positional array) so it can't drift if the enum
+         * is reordered, and matches the compiled _builtin_typeof exactly. */
+        switch (args[0]->type) {
+        case SW_VAL_NIL:        return sw_val_string("nil");
+        case SW_VAL_INT:        return sw_val_string("int");
+        case SW_VAL_FLOAT:      return sw_val_string("float");
+        case SW_VAL_STRING:     return sw_val_string("string");
+        case SW_VAL_ATOM:       return sw_val_string("atom");
+        case SW_VAL_PID:        return sw_val_string("pid");
+        case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
+        case SW_VAL_TUPLE:      return sw_val_string("tuple");
+        case SW_VAL_LIST:       return sw_val_string("list");
+        case SW_VAL_FUN:        return sw_val_string("fun");
+        case SW_VAL_MAP:        return sw_val_string("map");
+        case SW_VAL_BYTES:      return sw_val_string("bytes");
+        default:                return sw_val_string("unknown");
+        }
+    }
+    if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST) {
+        int cnt = args[0]->v.tuple.count;
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * (cnt + 1));
+        memcpy(items, args[0]->v.tuple.items, sizeof(sw_val_t*) * cnt);
+        items[cnt] = args[1];
+        sw_val_t *r = sw_val_list(items, cnt + 1);
+        free(items);
+        return r;
+    }
+
+    /* Test assertion builtins — but let user-defined functions with the
+     * same name take precedence. This allows test files to define their
+     * own 3-arg assert_eq(name, actual, expected) helpers without the
+     * 2-arg builtin intercepting the call. */
+    if ((strcmp(fname, "assert") == 0 ||
+         strcmp(fname, "assert_eq") == 0 ||
+         strcmp(fname, "assert_ne") == 0 ||
+         strcmp(fname, "assert_raises") == 0) &&
+        !find_fun(interp->module_ast, fname)) {
+        if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
+    }
+
+    /* Extra REPL builtins — bridges the gap to the codegen surface
+     * (file_*, db_*, shell, panic, expect, error, etc.). See
+     * interp_extra_builtin() above. */
+    {
+        sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
+        if (xr) return xr;
+    }
+
+    /* User-defined function in module */
+    node_t *fn = find_fun(interp->module_ast, fname);
+    if (fn) {
+        if (interp_recursion_blocked(interp)) return sw_val_nil();
+        sw_env_t *fenv = env_new(interp->global_env);
+        for (int i = 0; i < fn->v.fun.nparams; i++) {
+            if (i < nargs)
+                env_set(fenv, fn->v.fun.params[i], args[i]);
+            else if (fn->v.fun.defaults[i])
+                env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
+            else
+                env_set(fenv, fn->v.fun.params[i], sw_val_nil());
+        }
+        interp->call_depth++;
+        sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+        interp->call_depth--;
+        env_free(fenv);
+        return r;
+    }
+
+    /* Dynamic dispatch: variable holds a closure */
+    sw_val_t *fn_val = env_get(env, fname);
+    if (fn_val && fn_val->type == SW_VAL_FUN && fn_val->v.fun.body) {
+        if (interp_recursion_blocked(interp)) return sw_val_nil();
+        node_t *fn_node = (node_t *)fn_val->v.fun.body;
+        sw_env_t *fenv = env_new(fn_val->v.fun.closure_env ? fn_val->v.fun.closure_env : interp->global_env);
+        for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
+            env_set(fenv, fn_node->v.fun.params[i], args[i]);
+        interp->call_depth++;
+        sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
+        interp->call_depth--;
+        env_free(fenv);
+        return r;
+    }
+
+    snprintf(interp->error_msg, sizeof(interp->error_msg),
+             "undefined function: %s/%d", fname, nargs);
+    interp->error = 1;
+    return sw_val_nil();
+}
+
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     if (!n || interp->error) return sw_val_nil();
 
@@ -5201,7 +5483,21 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     case N_IDENT: {
         sw_val_t *v = env_get(env, n->v.sval);
         if (v) return v;
-        /* Could be a function reference */
+        /* A module function used by name as a value (`map(double, xs)`,
+         * `xs |> Std.sum`): build a closure over its definition, the same
+         * value the compiled path produces. (Imported functions are merged
+         * in under their qualified "Mod.fn" names too.) */
+        node_t *fn = interp->module_ast ? find_fun((node_t *)interp->module_ast, n->v.sval) : NULL;
+        if (fn) {
+            sw_val_t *fv = val_alloc(sizeof(sw_val_t));
+            fv->type = SW_VAL_FUN;
+            fv->v.fun.name = strdup(fn->v.fun.name);
+            fv->v.fun.num_params = fn->v.fun.nparams;
+            fv->v.fun.body = fn;
+            fv->v.fun.closure_env = interp->global_env;
+            env_retain(interp->global_env);
+            return fv;
+        }
         return sw_val_nil();
     }
 
@@ -5471,47 +5767,40 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
          * tests/sw/conform/t06 holds this closed). */
         sw_val_t *val = eval(interp, n->v.pipe.val, env);
         if (interp->error) return sw_val_nil();
-        if (n->v.pipe.func->type == N_CALL) {
-            node_t *call = n->v.pipe.func;
-            const char *fname = call->v.call.func->v.sval;
+        /* `val |> f(extra...)` and the bare form `val |> f` (a builtin,
+         * module function, `Mod.fn` or closure variable) share one path;
+         * the bare form used to return `val` untouched, so `|> print` or
+         * `|> Std.sum` silently did nothing under `swc run`. */
+        node_t *pf = n->v.pipe.func;
+        const char *pipe_fname = NULL;
+        node_t **pipe_xargs = NULL;
+        int pipe_nx = 0;
+        if (pf->type == N_CALL && pf->v.call.func->type == N_IDENT) {
+            pipe_fname = pf->v.call.func->v.sval;
+            pipe_xargs = pf->v.call.args;
+            pipe_nx = pf->v.call.nargs;
+        } else if (pf->type == N_IDENT) {
+            pipe_fname = pf->v.sval;
+        } else {
+            /* `val |> fun(x) { ... }` or any expression yielding a closure. */
+            sw_val_t *fv = eval(interp, pf, env);
+            if (interp->error) return sw_val_nil();
+            if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body)
+                return interp_apply_fn(interp, fv, &val, 1);
+            return val;
+        }
+        if (pipe_fname) {
+            const char *fname = pipe_fname;
 
             sw_val_t *args[17];
             args[0] = val;
             int nargs = 1;
-            for (int i = 0; i < call->v.call.nargs && nargs < 16; i++) {
-                args[nargs++] = eval(interp, call->v.call.args[i], env);
+            for (int i = 0; i < pipe_nx && nargs < 16; i++) {
+                args[nargs++] = eval(interp, pipe_xargs[i], env);
                 if (interp->error) return sw_val_nil();
             }
 
-            /* Module function (covers Module.qualified names too). */
-            node_t *fn = find_fun(interp->module_ast, fname);
-            if (fn) {
-                if (interp_recursion_blocked(interp)) return sw_val_nil();
-                sw_env_t *fenv = env_new(interp->global_env);
-                for (int i = 0; i < fn->v.fun.nparams && i < nargs; i++)
-                    env_set(fenv, fn->v.fun.params[i], args[i]);
-                interp->call_depth++;
-                sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
-                interp->call_depth--;
-                env_free(fenv);
-                return r;
-            }
-            /* Primary builtins (N_CALL's head chain). */
-            if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
-            if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
-            if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
-            /* The codegen-surface bridge: map/filter/reduce + the rest. */
-            {
-                sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
-                if (xr) return xr;
-            }
-            /* Lambda held in a variable: x |> f(...) */
-            sw_val_t *fv = env_get(env, fname);
-            if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body)
-                return interp_apply_fn(interp, fv, args, nargs);
+            return interp_call_named(interp, n, env, fname, args, nargs);
         }
         return val;
     }
@@ -5528,271 +5817,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
          * an f-string interpolation was laundered into the string "nil"
          * by the desugared to_string(...) and the program sailed on. */
         if (interp->error) return sw_val_nil();
-
-        /* Built-ins */
-        if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
-        if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
-        if (strcmp(fname, "hd") == 0) return builtin_hd(interp, args, nargs);
-        if (strcmp(fname, "tl") == 0) return builtin_tl(interp, args, nargs);
-        if (strcmp(fname, "elem") == 0) return builtin_elem(interp, args, nargs);
-        if (strcmp(fname, "abs") == 0 && nargs >= 1) {
-            /* abs handles both int and float (was int-only, so abs(-2.5)
-             * fell through to "undefined function"). */
-            if (args[0]->type == SW_VAL_INT)
-                return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
-            if (args[0]->type == SW_VAL_FLOAT)
-                return sw_val_float(args[0]->v.f < 0 ? -args[0]->v.f : args[0]->v.f);
-        }
-        if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
-            switch (args[0]->type) {
-            case SW_VAL_STRING: return args[0];
-            case SW_VAL_ATOM:   return sw_val_string(args[0]->v.str);
-            case SW_VAL_NIL:    return sw_val_string("nil");
-            case SW_VAL_INT: { char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf); }
-            case SW_VAL_FLOAT: { char buf[32]; snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf); }
-            default: {
-                /* Composite — render via the shared formatter so REPL
-                 * output matches print()/codegen output. */
-                char *buf = NULL;
-                size_t blen = 0;
-                FILE *m = open_memstream(&buf, &blen);
-                if (!m) return sw_val_string("?");
-                sw_val_format(m, args[0]);
-                fclose(m);
-                sw_val_t *r = sw_val_string(buf ? buf : "");
-                free(buf);
-                return r;
-            }
-            }
-        }
-        if (strcmp(fname, "format") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            const char *tpl = args[0]->v.str;
-            char *buf = NULL;
-            size_t blen = 0;
-            FILE *m = open_memstream(&buf, &blen);
-            if (!m) return sw_val_string("");
-            int arg_idx = 1;
-            for (const char *p = tpl; *p; ) {
-                if (p[0] == '{' && p[1] == '}') {
-                    if (arg_idx < nargs) sw_val_format(m, args[arg_idx++]);
-                    else fputs("{}", m);
-                    p += 2;
-                } else if (p[0] == '{' && p[1] == '{') { fputc('{', m); p += 2; }
-                else if (p[0] == '}' && p[1] == '}') { fputc('}', m); p += 2; }
-                else { fputc(*p, m); p++; }
-            }
-            fclose(m);
-            sw_val_t *r = sw_val_string(buf ? buf : "");
-            free(buf);
-            return r;
-        }
-        /* Common string ops — kept minimal so the REPL is useful for
-         * exploring sw without dragging in the full studio builtin
-         * surface (HTTP, WS, browser, etc. live in the codegen path). */
-        if (strcmp(fname, "string_split") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
-            const char *s = args[0]->v.str;
-            const char *sep = args[1]->v.str;
-            int seplen = (int)strlen(sep);
-            int cap = 16, count = 0;
-            sw_val_t **items = malloc(sizeof(sw_val_t*) * cap);
-            const char *cur = s;
-            if (seplen == 0) {
-                /* Empty separator: whole string as one element (compiled parity). */
-                items[count++] = sw_val_string(s);
-            } else {
-                while (1) {
-                    const char *hit = strstr(cur, sep);
-                    if (!hit) break;
-                    if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
-                    int len = (int)(hit - cur);
-                    char *piece = malloc(len + 1);
-                    memcpy(piece, cur, len); piece[len] = '\0';
-                    items[count++] = sw_val_string(piece);
-                    free(piece);
-                    cur = hit + seplen;
-                }
-                if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
-                items[count++] = sw_val_string(cur);
-            }
-            sw_val_t *r = sw_val_list(items, count);
-            free(items);
-            return r;
-        }
-        if (strcmp(fname, "string_contains") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
-            return sw_val_atom(strstr(args[0]->v.str, args[1]->v.str) ? "true" : "false");
-        if (strcmp(fname, "string_starts_with") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
-            return sw_val_atom(strncmp(args[0]->v.str, args[1]->v.str, strlen(args[1]->v.str)) == 0 ? "true" : "false");
-        if (strcmp(fname, "string_ends_with") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
-            size_t la = strlen(args[0]->v.str), lb = strlen(args[1]->v.str);
-            return sw_val_atom(la >= lb && strcmp(args[0]->v.str + la - lb, args[1]->v.str) == 0 ? "true" : "false");
-        }
-        if (strcmp(fname, "string_index_of") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
-            const char *hit = strstr(args[0]->v.str, args[1]->v.str);
-            return sw_val_int(hit ? (int64_t)(hit - args[0]->v.str) : -1);
-        }
-        if (strcmp(fname, "string_upper") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            char *r = strdup(args[0]->v.str);
-            for (char *p = r; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
-            sw_val_t *v = sw_val_string(r); free(r); return v;
-        }
-        if (strcmp(fname, "string_lower") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            char *r = strdup(args[0]->v.str);
-            for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
-            sw_val_t *v = sw_val_string(r); free(r); return v;
-        }
-        if (strcmp(fname, "string_trim") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            const char *s = args[0]->v.str;
-            while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-            const char *end = s + strlen(s);
-            while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
-            int len = (int)(end - s);
-            char *r = malloc(len + 1); memcpy(r, s, len); r[len] = '\0';
-            sw_val_t *v = sw_val_string(r); free(r); return v;
-        }
-        if (strcmp(fname, "string_length") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
-            return sw_val_int((int64_t)strlen(args[0]->v.str));
-        if (strcmp(fname, "json_encode") == 0) {
-            /* Real JSON, matching the compiled runtime's _json_encode_val
-             * exactly (see interp_json_encode_val). The old stub emitted
-             * the value debug-repr (e.g. %{:name: alice}) — invalid JSON. */
-            if (nargs < 1) return sw_val_string("null");
-            char *buf = (char *)malloc(256);
-            size_t cap = 256, pos = 0;
-            interp_json_encode_val(args[0], &buf, &cap, &pos);
-            buf[pos] = '\0';
-            sw_val_t *r = sw_val_string(buf);
-            free(buf);
-            return r;
-        }
-        if (strcmp(fname, "json_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            return sw_lang_json_decode(args[0]->v.str);
-        }
-        /* Map ops the REPL is likely to want for shape checks. */
-        if (strcmp(fname, "map_size") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP)
-            return sw_val_int(args[0]->v.map.count);
-        if (strcmp(fname, "map_has_key") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
-            /* Delegate to sw_val_map_get so the atom-vs-string fallback matches:
-             * the bare sw_val_equal loop diverged from map_get (and from the
-             * compiled _builtin_map_has_key) on json_decode'd maps, where a
-             * string-keyed query missed an atom key that map_get still found.
-             * Now byte-for-byte identical to the compiled backend. */
-            sw_val_t *v = sw_val_map_get(args[0], args[1]);
-            return sw_val_atom((v && v->type != SW_VAL_NIL) ? "true" : "false");
-        }
-        if (strcmp(fname, "timestamp") == 0) {
-            struct timeval tv; gettimeofday(&tv, NULL);
-            return sw_val_int((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
-        }
-        if (strcmp(fname, "map_get") == 0 && nargs >= 2) {
-            sw_val_t *mv = sw_val_map_get(args[0], args[1]);
-            /* 3-arg overload: map_get(m, k, default). */
-            if (nargs >= 3 && (!mv || mv->type == SW_VAL_NIL)) return args[2];
-            return mv;
-        }
-        if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);
-        if (strcmp(fname, "map_new") == 0) return sw_val_map_new(NULL, NULL, 0);
-        if (strcmp(fname, "map_keys") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
-            return sw_val_list(args[0]->v.map.keys, args[0]->v.map.count);
-        }
-        if (strcmp(fname, "map_values") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
-            return sw_val_list(args[0]->v.map.vals, args[0]->v.map.count);
-        }
-        if (strcmp(fname, "typeof") == 0 && nargs >= 1) {
-            /* Switch (not a positional array) so it can't drift if the enum
-             * is reordered, and matches the compiled _builtin_typeof exactly. */
-            switch (args[0]->type) {
-            case SW_VAL_NIL:        return sw_val_string("nil");
-            case SW_VAL_INT:        return sw_val_string("int");
-            case SW_VAL_FLOAT:      return sw_val_string("float");
-            case SW_VAL_STRING:     return sw_val_string("string");
-            case SW_VAL_ATOM:       return sw_val_string("atom");
-            case SW_VAL_PID:        return sw_val_string("pid");
-            case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
-            case SW_VAL_TUPLE:      return sw_val_string("tuple");
-            case SW_VAL_LIST:       return sw_val_string("list");
-            case SW_VAL_FUN:        return sw_val_string("fun");
-            case SW_VAL_MAP:        return sw_val_string("map");
-            case SW_VAL_BYTES:      return sw_val_string("bytes");
-            default:                return sw_val_string("unknown");
-            }
-        }
-        if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST) {
-            int cnt = args[0]->v.tuple.count;
-            sw_val_t **items = malloc(sizeof(sw_val_t*) * (cnt + 1));
-            memcpy(items, args[0]->v.tuple.items, sizeof(sw_val_t*) * cnt);
-            items[cnt] = args[1];
-            sw_val_t *r = sw_val_list(items, cnt + 1);
-            free(items);
-            return r;
-        }
-
-        /* Test assertion builtins — but let user-defined functions with the
-         * same name take precedence. This allows test files to define their
-         * own 3-arg assert_eq(name, actual, expected) helpers without the
-         * 2-arg builtin intercepting the call. */
-        if ((strcmp(fname, "assert") == 0 ||
-             strcmp(fname, "assert_eq") == 0 ||
-             strcmp(fname, "assert_ne") == 0 ||
-             strcmp(fname, "assert_raises") == 0) &&
-            !find_fun(interp->module_ast, fname)) {
-            if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
-        }
-
-        /* Extra REPL builtins — bridges the gap to the codegen surface
-         * (file_*, db_*, shell, panic, expect, error, etc.). See
-         * interp_extra_builtin() above. */
-        {
-            sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
-            if (xr) return xr;
-        }
-
-        /* User-defined function in module */
-        node_t *fn = find_fun(interp->module_ast, fname);
-        if (fn) {
-            if (interp_recursion_blocked(interp)) return sw_val_nil();
-            sw_env_t *fenv = env_new(interp->global_env);
-            for (int i = 0; i < fn->v.fun.nparams; i++) {
-                if (i < nargs)
-                    env_set(fenv, fn->v.fun.params[i], args[i]);
-                else if (fn->v.fun.defaults[i])
-                    env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
-                else
-                    env_set(fenv, fn->v.fun.params[i], sw_val_nil());
-            }
-            interp->call_depth++;
-            sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
-            interp->call_depth--;
-            env_free(fenv);
-            return r;
-        }
-
-        /* Dynamic dispatch: variable holds a closure */
-        sw_val_t *fn_val = env_get(env, fname);
-        if (fn_val && fn_val->type == SW_VAL_FUN && fn_val->v.fun.body) {
-            if (interp_recursion_blocked(interp)) return sw_val_nil();
-            node_t *fn_node = (node_t *)fn_val->v.fun.body;
-            sw_env_t *fenv = env_new(fn_val->v.fun.closure_env ? fn_val->v.fun.closure_env : interp->global_env);
-            for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
-                env_set(fenv, fn_node->v.fun.params[i], args[i]);
-            interp->call_depth++;
-            sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
-            interp->call_depth--;
-            env_free(fenv);
-            return r;
-        }
-
-        snprintf(interp->error_msg, sizeof(interp->error_msg),
-                 "undefined function: %s/%d", fname, nargs);
-        interp->error = 1;
-        return sw_val_nil();
+        return interp_call_named(interp, n, env, fname, args, nargs);
     }
 
     case N_SPAWN: {
@@ -6632,4 +6657,299 @@ sw_val_t *sw_lang_json_decode(const char *s) {
     const char *p = s;
     g_jd_depth = 0;   /* reset the per-decode depth guard */
     return _jd_parse(&p);
+}
+
+/* =========================================================================
+ * Name resolution (static check shared by `swc build`, `swc run`, `swc test`)
+ * =========================================================================
+ *
+ * An identifier in value position that names nothing used to compile to an
+ * atom (compiled path) or evaluate to nil (interpreter) — so a typo like
+ * `print(totl)` ran "successfully" and printed garbage, differently on each
+ * path. This pass rejects such programs before either backend runs.
+ *
+ * Scoping is deliberately flow-insensitive and function-wide (like Python's
+ * function locals, and like the compiled path, which hoists branch-assigned
+ * variables): a name is in scope anywhere in a function if the function
+ * binds it anywhere — as a parameter, an assignment target, a case/receive
+ * pattern variable, a for/comprehension variable or a catch variable. A
+ * lambda sees its own bindings plus every enclosing scope. So the pass never
+ * rejects a program that could run correctly; it catches names bound
+ * nowhere, which is the typo class. Callee positions (`f(x)`) are not
+ * checked here: the compiler already reports unknown functions with a
+ * did-you-mean. Dotted names (`Mod.fn`) are left alone. */
+
+typedef struct rs_scope {
+    const char **names;
+    int n, cap;
+    struct rs_scope *parent;
+} rs_scope_t;
+
+typedef struct {
+    node_t **mods;
+    int nmods;
+    const char *path;      /* file of the module being checked */
+    int errors;
+} rs_ctx_t;
+
+static void rs_add(rs_scope_t *s, const char *name) {
+    if (!name || !name[0]) return;
+    for (int i = 0; i < s->n; i++) if (strcmp(s->names[i], name) == 0) return;
+    if (s->n == s->cap) {
+        int nc = s->cap ? s->cap * 2 : 16;
+        const char **nn = realloc(s->names, sizeof(char *) * (size_t)nc);
+        if (!nn) return;
+        s->names = nn;
+        s->cap = nc;
+    }
+    s->names[s->n++] = name;
+}
+
+static int rs_has(rs_scope_t *s, const char *name) {
+    for (; s; s = s->parent)
+        for (int i = 0; i < s->n; i++) if (strcmp(s->names[i], name) == 0) return 1;
+    return 0;
+}
+
+/* Every N_IDENT inside a pattern is a binder (`_`-prefixed ones included). */
+static void rs_pattern_binders(node_t *p, rs_scope_t *s) {
+    if (!p) return;
+    switch (p->type) {
+    case N_IDENT: if (strcmp(p->v.sval, "_") != 0) rs_add(s, p->v.sval); break;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < p->v.coll.count; i++) rs_pattern_binders(p->v.coll.items[i], s);
+        break;
+    case N_LIST_CONS:
+        rs_pattern_binders(p->v.cons.head, s);
+        rs_pattern_binders(p->v.cons.tail, s);
+        break;
+    case N_MAP:
+        for (int i = 0; i < p->v.map.count; i++) rs_pattern_binders(p->v.map.vals[i], s);
+        break;
+    case N_BINOP:
+        rs_pattern_binders(p->v.binop.left, s);
+        rs_pattern_binders(p->v.binop.right, s);
+        break;
+    default: break;
+    }
+}
+
+/* Collect every name a function body binds, not descending into lambdas. */
+static void rs_binders(node_t *n, rs_scope_t *s) {
+    if (!n) return;
+    switch (n->type) {
+    case N_FUN: return;                      /* a lambda's names are its own */
+    case N_ASSIGN: rs_add(s, n->v.assign.name); rs_binders(n->v.assign.value, s); return;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++) rs_binders(n->v.block.stmts[i], s);
+        return;
+    case N_CALL:
+        rs_binders(n->v.call.func, s);
+        for (int i = 0; i < n->v.call.nargs; i++) rs_binders(n->v.call.args[i], s);
+        return;
+    case N_SPAWN: rs_binders(n->v.spawn.expr, s); return;
+    case N_SEND: rs_binders(n->v.send.to, s); rs_binders(n->v.send.msg, s); return;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) rs_binders(n->v.recv.clauses[i], s);
+        rs_binders(n->v.recv.after_body, s);
+        rs_binders(n->v.recv.after_expr, s);
+        return;
+    case N_CLAUSE:
+        rs_pattern_binders(n->v.clause.pattern, s);
+        rs_binders(n->v.clause.guard, s);
+        rs_binders(n->v.clause.body, s);
+        return;
+    case N_CASE:
+        rs_binders(n->v.casex.subject, s);
+        for (int i = 0; i < n->v.casex.nclauses; i++) rs_binders(n->v.casex.clauses[i], s);
+        return;
+    case N_IF:
+        rs_binders(n->v.iff.cond, s); rs_binders(n->v.iff.then_b, s); rs_binders(n->v.iff.else_b, s);
+        return;
+    case N_BINOP: rs_binders(n->v.binop.left, s); rs_binders(n->v.binop.right, s); return;
+    case N_UNARY: rs_binders(n->v.unary.operand, s); return;
+    case N_PIPE: rs_binders(n->v.pipe.val, s); rs_binders(n->v.pipe.func, s); return;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < n->v.coll.count; i++) rs_binders(n->v.coll.items[i], s);
+        return;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { rs_binders(n->v.map.keys[i], s); rs_binders(n->v.map.vals[i], s); }
+        return;
+    case N_FOR: rs_add(s, n->v.forloop.var); rs_binders(n->v.forloop.iter, s); rs_binders(n->v.forloop.body, s); return;
+    case N_LIST_COMP:
+        rs_add(s, n->v.lcomp.var);
+        rs_binders(n->v.lcomp.iter, s); rs_binders(n->v.lcomp.body, s); rs_binders(n->v.lcomp.guard, s);
+        return;
+    case N_RANGE: rs_binders(n->v.range.from, s); rs_binders(n->v.range.to, s); return;
+    case N_TRY:
+        if (strcmp(n->v.trycatch.err_var, "_") != 0) rs_add(s, n->v.trycatch.err_var);
+        rs_binders(n->v.trycatch.body, s); rs_binders(n->v.trycatch.catch_body, s);
+        return;
+    case N_LIST_CONS: rs_binders(n->v.cons.head, s); rs_binders(n->v.cons.tail, s); return;
+    default: return;
+    }
+}
+
+static int rs_is_module_func(rs_ctx_t *c, const char *name) {
+    for (int m = 0; m < c->nmods; m++) {
+        node_t *mod = c->mods[m];
+        for (int i = 0; i < mod->v.mod.nfuns; i++)
+            if (strcmp(mod->v.mod.funs[i]->v.fun.name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int rs_is_global(rs_ctx_t *c, const char *name) {
+    for (int m = 0; m < c->nmods; m++) {
+        node_t *mod = c->mods[m];
+        for (int i = 0; i < mod->v.mod.nglobals; i++)
+            if (strcmp(mod->v.mod.globals[i].name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Levenshtein distance, bounded input (identifiers). */
+static int rs_lev(const char *a, const char *b) {
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la > 63 || lb > 63) return 99;
+    int d[64][64];
+    for (int i = 0; i <= la; i++) d[i][0] = i;
+    for (int j = 0; j <= lb; j++) d[0][j] = j;
+    for (int i = 1; i <= la; i++)
+        for (int j = 1; j <= lb; j++) {
+            int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            int x = d[i - 1][j] + 1, y = d[i][j - 1] + 1, z = d[i - 1][j - 1] + cost;
+            d[i][j] = x < y ? (x < z ? x : z) : (y < z ? y : z);
+        }
+    return d[la][lb];
+}
+
+static void rs_report(rs_ctx_t *c, rs_scope_t *s, const char *name, int line) {
+    c->errors++;
+    fprintf(stderr, "swc: %s:%d: undefined variable '%s'", c->path ? c->path : "?", line, name);
+    /* Best in-scope suggestion. */
+    const char *best = NULL;
+    int bd = 99;
+    int len = (int)strlen(name);
+    int thr = len >= 8 ? 3 : (len >= 3 ? 2 : 1);
+    for (rs_scope_t *sc = s; sc; sc = sc->parent)
+        for (int i = 0; i < sc->n; i++) {
+            int d = rs_lev(name, sc->names[i]);
+            if (d > 0 && d <= thr && d < bd) { bd = d; best = sc->names[i]; }
+        }
+    if (best) fprintf(stderr, " — did you mean '%s'?", best);
+    else if (interp_is_known_builtin(name))
+        fprintf(stderr, " — '%s' is a builtin and can't be passed as a value yet; wrap it: fun(x) { %s(x) }", name, name);
+    else if (name[0] >= 'a' && name[0] <= 'z' && len > 1)
+        fprintf(stderr, " (atoms are written quoted: '%s')", name);
+    fprintf(stderr, "\n");
+}
+
+static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s);
+
+static void rs_check_callee(rs_ctx_t *c, node_t *f, rs_scope_t *s) {
+    /* A plain-name callee is resolved by the backends (builtin, module
+     * function, or closure variable); only a computed callee is an
+     * expression to check. */
+    if (f && f->type != N_IDENT) rs_check(c, f, s);
+}
+
+static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
+    if (!n) return;
+    switch (n->type) {
+    case N_IDENT: {
+        const char *name = n->v.sval;
+        if (strchr(name, '.') || strcmp(name, "_") == 0) return;
+        if (rs_has(s, name) || rs_is_module_func(c, name) || rs_is_global(c, name)) return;
+        rs_report(c, s, name, n->line);
+        return;
+    }
+    case N_FUN: {
+        rs_scope_t inner = { NULL, 0, 0, s };
+        for (int i = 0; i < n->v.fun.nparams; i++) rs_add(&inner, n->v.fun.params[i]);
+        rs_binders(n->v.fun.body, &inner);
+        rs_check(c, n->v.fun.body, &inner);
+        for (int i = 0; i < 16; i++) if (n->v.fun.defaults[i]) rs_check(c, n->v.fun.defaults[i], s);
+        free(inner.names);
+        return;
+    }
+    case N_ASSIGN: rs_check(c, n->v.assign.value, s); return;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++) rs_check(c, n->v.block.stmts[i], s);
+        return;
+    case N_CALL:
+        rs_check_callee(c, n->v.call.func, s);
+        for (int i = 0; i < n->v.call.nargs; i++) rs_check(c, n->v.call.args[i], s);
+        return;
+    case N_SPAWN:
+        if (n->v.spawn.expr && n->v.spawn.expr->type == N_CALL) {
+            rs_check_callee(c, n->v.spawn.expr->v.call.func, s);
+            for (int i = 0; i < n->v.spawn.expr->v.call.nargs; i++)
+                rs_check(c, n->v.spawn.expr->v.call.args[i], s);
+        } else {
+            rs_check(c, n->v.spawn.expr, s);
+        }
+        return;
+    case N_SEND: rs_check(c, n->v.send.to, s); rs_check(c, n->v.send.msg, s); return;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) rs_check(c, n->v.recv.clauses[i], s);
+        rs_check(c, n->v.recv.after_body, s);
+        rs_check(c, n->v.recv.after_expr, s);
+        return;
+    case N_CLAUSE:            /* the pattern binds; guard and body are uses */
+        rs_check(c, n->v.clause.guard, s);
+        rs_check(c, n->v.clause.body, s);
+        return;
+    case N_CASE:
+        rs_check(c, n->v.casex.subject, s);
+        for (int i = 0; i < n->v.casex.nclauses; i++) rs_check(c, n->v.casex.clauses[i], s);
+        return;
+    case N_IF:
+        rs_check(c, n->v.iff.cond, s); rs_check(c, n->v.iff.then_b, s); rs_check(c, n->v.iff.else_b, s);
+        return;
+    case N_BINOP: rs_check(c, n->v.binop.left, s); rs_check(c, n->v.binop.right, s); return;
+    case N_UNARY: rs_check(c, n->v.unary.operand, s); return;
+    case N_PIPE:
+        rs_check(c, n->v.pipe.val, s);
+        if (n->v.pipe.func && n->v.pipe.func->type == N_CALL) {
+            rs_check_callee(c, n->v.pipe.func->v.call.func, s);
+            for (int i = 0; i < n->v.pipe.func->v.call.nargs; i++)
+                rs_check(c, n->v.pipe.func->v.call.args[i], s);
+        } else {
+            rs_check_callee(c, n->v.pipe.func, s);
+        }
+        return;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < n->v.coll.count; i++) rs_check(c, n->v.coll.items[i], s);
+        return;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { rs_check(c, n->v.map.keys[i], s); rs_check(c, n->v.map.vals[i], s); }
+        return;
+    case N_FOR: rs_check(c, n->v.forloop.iter, s); rs_check(c, n->v.forloop.body, s); return;
+    case N_LIST_COMP:
+        rs_check(c, n->v.lcomp.iter, s); rs_check(c, n->v.lcomp.body, s); rs_check(c, n->v.lcomp.guard, s);
+        return;
+    case N_RANGE: rs_check(c, n->v.range.from, s); rs_check(c, n->v.range.to, s); return;
+    case N_TRY: rs_check(c, n->v.trycatch.body, s); rs_check(c, n->v.trycatch.catch_body, s); return;
+    case N_LIST_CONS: rs_check(c, n->v.cons.head, s); rs_check(c, n->v.cons.tail, s); return;
+    default: return;
+    }
+}
+
+/* Check one module against the set it is linked with (`mods`, which must
+ * include `mod`). Prints one line per undefined name; returns the count. */
+int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path) {
+    node_t *mod = (node_t *)mod_ast;
+    if (!mod || mod->type != N_MODULE) return 0;
+    rs_ctx_t c = { (node_t **)mods, nmods, path, 0 };
+    for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        node_t *fn = mod->v.mod.funs[i];
+        rs_scope_t top = { NULL, 0, 0, NULL };
+        for (int p = 0; p < fn->v.fun.nparams; p++) rs_add(&top, fn->v.fun.params[p]);
+        rs_binders(fn->v.fun.body, &top);
+        rs_check(&c, fn->v.fun.body, &top);
+        for (int d = 0; d < 16; d++) if (fn->v.fun.defaults[d]) rs_check(&c, fn->v.fun.defaults[d], &top);
+        free(top.names);
+    }
+    return c.errors;
 }

@@ -95,21 +95,22 @@ one function and dispatch on an argument (`fun fsm(state, n) { case state
 { ... } }`), or raise the per-process stack with `SW_PROC_STACK` (bytes,
 `k`/`m` suffixes; e.g. `SW_PROC_STACK=1m`).
 
-### No static type or shape checking
+### No static type checking
 
-`sw` is dynamically typed by design — there is no compile-time type or arity
-checking. A typo'd variable name compiles cleanly and becomes an atom at
-runtime instead of erroring:
-
-```sw
-print(undefined_var)   # compiles; prints :undefined_var
-```
-
-**Impact:** name typos surface as silent runtime atoms rather than compile
-errors. This is a deliberate tradeoff (matching the dynamic, Erlang-shaped
-model), recorded here so the behavior is not a surprise.
+`sw` is dynamically typed by design — there is no compile-time type checking, and
+arity is checked only for calls to module functions. Names ARE checked: an
+identifier bound nowhere is rejected by `swc build`, `swc run` and `swc test`
+alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
+runtime `nil`.
 
 ## Recently cleared
+
+### Typo'd variables compiled to atoms (cleared 2026-09-24)
+
+`print(totl)` used to compile to `print(:totl)` and interpret as `print(nil)`. A
+shared static pass (`sw_resolve_module`) now reports every name that no scope binds,
+with a did-you-mean, before either backend runs. Gate:
+`tests/sw/compile_fail/undefined_names.sw`.
 
 ### HTTP client builtins pinned their scheduler thread (cleared 2026-09-24)
 

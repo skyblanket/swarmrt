@@ -72,6 +72,7 @@ typedef struct {
      * forward-referenced helper. */
     char func_names[CG_MAX_FUNCS][128];
     int func_nparams[CG_MAX_FUNCS];
+    int func_required[CG_MAX_FUNCS];   /* params before the first default */
     int nfuncs;
 
     /* Sticky flag: set by emit_call when it detects an arity mismatch
@@ -410,6 +411,13 @@ static int module_func_nparams(cg_ctx_t *ctx, const char *name) {
     return -1;
 }
 
+/* Number of leading parameters without a default value. */
+static int module_func_required(cg_ctx_t *ctx, const char *name) {
+    for (int i = 0; i < ctx->nfuncs; i++)
+        if (strcmp(ctx->func_names[i], name) == 0) return ctx->func_required[i];
+    return -1;
+}
+
 /* Compile-time arity check for calls to user-defined module functions.
  * Builtins are skipped (they take an array+count at the C ABI level and
  * each builtin enforces its own arity at runtime); cross-module calls
@@ -421,9 +429,17 @@ static void check_user_call_arity(cg_ctx_t *ctx, const char *fname, int nargs, i
     int expected = module_func_nparams(ctx, fname);
     if (expected < 0) return;            /* not a user-defined module fun */
     if (expected == nargs) return;
-    fprintf(stderr, "swc: %s:%d: function '%s' takes %d arg%s, got %d\n",
-            guess_sw_path(ctx->mod_name), line > 0 ? line : 0,
-            fname, expected, expected == 1 ? "" : "s", nargs);
+    /* Trailing parameters with defaults (`fun f(a, b = 1)`) may be omitted. */
+    int required = module_func_required(ctx, fname);
+    if (nargs >= required && nargs <= expected) return;
+    if (required < expected)
+        fprintf(stderr, "swc: %s:%d: function '%s' takes %d to %d args, got %d\n",
+                guess_sw_path(ctx->mod_name), line > 0 ? line : 0,
+                fname, required, expected, nargs);
+    else
+        fprintf(stderr, "swc: %s:%d: function '%s' takes %d arg%s, got %d\n",
+                guess_sw_path(ctx->mod_name), line > 0 ? line : 0,
+                fname, expected, expected == 1 ? "" : "s", nargs);
     ctx->had_arity_error = 1;
 }
 
@@ -546,6 +562,7 @@ static cg_ctx_t *g_scan_ctx = NULL;
 /* Collect identifiers used in an expression */
 static void collect_idents(node_t *n, char ids[][128], int *nids, int max) {
     if (!n) return;
+    if (n->type == N_IDENT && strchr(n->v.sval, '.')) return;   /* Mod.fn: never a capture */
     if (n->type == N_IDENT) {
         for (int i = 0; i < *nids; i++)
             if (strcmp(ids[i], n->v.sval) == 0) return;
@@ -3076,7 +3093,11 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
 
         /* Same module-qualified handling as the N_CALL branch. */
         const char *dot = strchr(fname, '.');
-        if (dot) {
+        if (!dot && !is_builtin(fname) && !is_module_func(ctx, fname) &&
+            is_declared(ctx, fname)) {
+            /* `x |> f` where f is a closure-valued variable. */
+            fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, %s, 1);\n", res, mangle_for_c(fname), arr);
+        } else if (dot) {
             char mod[128], fn[128];
             int mlen = (int)(dot - fname);
             if (mlen >= (int)sizeof(mod)) mlen = sizeof(mod) - 1;
@@ -3091,8 +3112,15 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
 
         strncpy(out, res, osz - 1);
     } else {
-        /* Can't pipe to this expression type */
-        strncpy(out, val, osz - 1);
+        /* `val |> fun(x) { ... }` or any other expression that yields a
+         * closure: apply it to val. (This used to return val untouched.) */
+        char fv[32], arr[32], res[32];
+        emit_expr(ctx, func, 0, fv, sizeof(fv));
+        fresh_var(ctx, arr, sizeof(arr));
+        fprintf(f, "    sw_val_t *%s[] = {%s};\n", arr, val);
+        fresh_var(ctx, res, sizeof(res));
+        fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, %s, 1);\n", res, fv, arr);
+        strncpy(out, res, osz - 1);
     }
     (void)tail;
 }
@@ -3111,6 +3139,22 @@ static void emit_ident_value(cg_ctx_t *ctx, const char *name, char *out, int osz
         /* Module-level global (let x = ...) — read from static slot. */
         char v[32]; fresh_var(ctx, v, sizeof(v));
         fprintf(f, "    sw_val_t *%s = _g_%s_%s;\n", v, ctx->mod_name, name);
+        strncpy(out, v, osz - 1);
+    } else if (strchr(name, '.')) {
+        /* `Module.function` used as a value (`xs |> Std.sum` or
+         * `map(Std.to_upper, xs)`): a callable wrapping the other module's
+         * compiled function. Unknown functions of a compiled-in module are
+         * reported with a did-you-mean. */
+        const char *dot = strchr(name, '.');
+        char mod[128], fn[128];
+        int mlen = (int)(dot - name);
+        if (mlen >= (int)sizeof(mod)) mlen = sizeof(mod) - 1;
+        memcpy(mod, name, (size_t)mlen); mod[mlen] = '\0';
+        snprintf(fn, sizeof(fn), "%s", dot + 1);
+        check_qualified_call(ctx, mod, fn, 0);
+        char v[32]; fresh_var(ctx, v, sizeof(v));
+        fprintf(f, "    sw_val_t *%s = sw_val_fun_native((void*)%s_%s, -1, NULL, 0);\n",
+                v, mod, fn);
         strncpy(out, v, osz - 1);
     } else if (is_module_func(ctx, name)) {
         /* Module function used by-name as a value (e.g. passed in
@@ -3761,6 +3805,9 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
         strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
         ctx.func_nparams[i] = mod->v.mod.funs[i]->v.fun.nparams;
+        { node_t *_f = mod->v.mod.funs[i]; int _r = _f->v.fun.nparams;
+          while (_r > 0 && _f->v.fun.defaults[_r - 1]) _r--;
+          ctx.func_required[i] = _r; }
         ctx.nfuncs++;
     }
 
@@ -3831,6 +3878,9 @@ int sw_codegen_module(void *ast, FILE *out) {
     for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
         strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
         ctx.func_nparams[i] = mod->v.mod.funs[i]->v.fun.nparams;
+        { node_t *_f = mod->v.mod.funs[i]; int _r = _f->v.fun.nparams;
+          while (_r > 0 && _f->v.fun.defaults[_r - 1]) _r--;
+          ctx.func_required[i] = _r; }
         ctx.nfuncs++;
     }
 
@@ -3899,6 +3949,9 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
         for (int i = 0; i < mod->v.mod.nfuns && i < CG_MAX_FUNCS; i++) {
             strncpy(ctx.func_names[i], mod->v.mod.funs[i]->v.fun.name, 127);
             ctx.func_nparams[i] = mod->v.mod.funs[i]->v.fun.nparams;
+            { node_t *_f = mod->v.mod.funs[i]; int _r = _f->v.fun.nparams;
+              while (_r > 0 && _f->v.fun.defaults[_r - 1]) _r--;
+              ctx.func_required[i] = _r; }
             ctx.nfuncs++;
         }
 

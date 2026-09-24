@@ -244,8 +244,50 @@ if [ -d "$INVM_DIR" ] && [ "${SW_TEST_INVM:-0}" = "1" ]; then
     echo ""
 fi
 
-total_all_files=$((total_files + interp_files + run_files + wd_files + invm_files))
-total_all_failed=$((failed_files + interp_failed + run_failed + wd_failed + invm_failed))
+# === Must-not-compile regressions ========================================
+# Tests under tests/sw/compile_fail/ are programs the toolchain must REJECT:
+# `swc build` AND `swc run` must both exit non-zero, and stderr of each must
+# contain every `# expect-error: <text>` line from the file's header.
+CF_DIR="$SWARMRT_ROOT/tests/sw/compile_fail"
+cf_files=0
+cf_failed=0
+if [ -d "$CF_DIR" ]; then
+    echo "--- compile_fail (must be rejected with the expected diagnostic) ---"
+    for sw in "$CF_DIR"/*.sw; do
+        [ -e "$sw" ] || continue
+        cf_files=$((cf_files + 1))
+        name="$(basename "$sw" .sw)"
+        ok=1
+        for mode in build run; do
+            elog="$BUILD_DIR/cf_${name}_$mode.err"
+            if [ "$mode" = build ]; then
+                "$SWC" build "$sw" -o "$BUILD_DIR/cf_$name" >/dev/null 2>"$elog"
+            else
+                SW_QUIET=1 "$SWC" run "$sw" >/dev/null 2>"$elog"
+            fi
+            if [ $? -eq 0 ]; then
+                ok=0; echo "${RED}ACCEPTED${RESET}     $name — swc $mode should have rejected it"
+                continue
+            fi
+            while IFS= read -r want; do
+                if ! grep -qF -- "$want" "$elog"; then
+                    ok=0; echo "${RED}WRONG ERROR${RESET}  $name — swc $mode stderr lacks: $want"
+                    sed 's/^/    /' "$elog"
+                fi
+            done < <(sed -n 's/^# expect-error: //p' "$sw")
+        done
+        if [ "$ok" -eq 1 ]; then
+            total_assertions=$((total_assertions + $(grep -c '^# expect-error: ' "$sw")))
+            echo "${GREEN}OK${RESET}           $name ${DIM}— rejected by build and run${RESET}"
+        else
+            cf_failed=$((cf_failed + 1))
+        fi
+    done
+    echo ""
+fi
+
+total_all_files=$((total_files + interp_files + run_files + wd_files + invm_files + cf_files))
+total_all_failed=$((failed_files + interp_failed + run_failed + wd_failed + invm_failed + cf_failed))
 
 if [ "$total_all_failed" -eq 0 ]; then
     echo "${GREEN}all sw tests passed${RESET} — $total_all_files files, $total_assertions assertions"
