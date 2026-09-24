@@ -4,6 +4,17 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — reduction-counted preemption at every call
+
+**feat(sched): preemption is real at call granularity.** Only self-tail-call backedges ran
+`sw_check_reds`, so a long non-tail computation monopolised its scheduler thread — on one
+scheduler a heartbeat process ticked 0 times during `fib(32)`. Every compiled function
+and lambda entry (and every interpreted body evaluation) now counts a reduction and
+yields at the end of the slice, BEAM-style; the heartbeat ticks on schedule. No
+measurable cost on fib(35) (0.73s). Gate: `tests/sw/test_preemption.sw`.
+
+---
+
 ## 2026-09-24 — security: sandbox escape, key leak, pid reuse, open distribution
 
 **fix(security): `shell_sandboxed` could be escaped with a quote.** The command was pasted

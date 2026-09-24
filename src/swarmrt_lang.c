@@ -127,6 +127,8 @@ __attribute__((weak)) void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, vo
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
 __attribute__((weak)) void sw_sleep_ms(uint64_t ms) { usleep((useconds_t)(ms * 1000)); }
 __attribute__((weak)) uint64_t sw_monitor_id(sw_process_t *t, uint64_t id) { (void)t; (void)id; return 0; }
+__attribute__((weak)) int sw_check_reds(void) { return 0; }
+__attribute__((weak)) void sw_yield(void) { }
 /* Returns the current process's value arena, or NULL (interpreter / pre-fiber).
  * Strong impl in swarmrt_native.c reads tls_current->varena; this weak stub
  * keeps swc linkable without the runtime and makes the interpreter use calloc. */
@@ -5604,6 +5606,7 @@ static void bind_params(sw_interp_t *interp, node_t *fn, sw_env_t *fenv, sw_val_
 static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
     sw_env_t *own = NULL;          /* env this loop created for a tail target */
     for (;;) {
+        if (sw_check_reds()) sw_yield();   /* reduction-counted preemption */
         sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
         if (own) { env_free(own); own = NULL; }
         if (!interp->tail_pending) return r;

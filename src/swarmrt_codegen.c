@@ -1609,6 +1609,8 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
          * panic, not a native guard-page fault. */
         fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s (lambda) — deep recursion? raise SW_PROC_STACK or restructure the loop\");\n",
                 ctx->mod_name, li->gen_name);
+        /* Reduction check at every call, as for named functions. */
+        fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
 
         /* Body */
         char result[32];
@@ -3675,6 +3677,13 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * self-tail-calls take the goto below and never re-enter here. */
     fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep recursion? mutual tail calls are not TCO'd (self-tail-calls are); keep the loop in one function or raise SW_PROC_STACK\");\n",
             ctx->mod_name, fn->v.fun.name);
+    /* Reduction-counted preemption at every call (BEAM-style): a process
+     * yields once it has made SWARM_CONTEXT_REDS calls or loop turns, so a
+     * long NON-tail computation (a deep fib, a recursive tree walk) no
+     * longer monopolises its scheduler thread — before, only self-tail-call
+     * backedges yielded and such a process starved everything queued
+     * behind it. One TLS decrement per call; a no-op outside a fiber. */
+    fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
 
     /* Tail call label. Ownership v2: record the arena "floor" at entry — the
      * scoped turn-checkpoint (emit_call) reclaims only what THIS function
