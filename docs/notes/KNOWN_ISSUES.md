@@ -37,11 +37,12 @@ like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
 
 `http_get`, `http_request`, `http_post`, `exec_argv`, `shell_sandboxed` and
 subagent-mode `http_post_stream` run on the runtime's offload pool (see "Recently
-cleared"). Still inline on the scheduler thread: TTY-mode `http_post_stream` and
+cleared"), and so does `llm_complete`, whose request goes through `http_post` (200
+completions against a 500ms mock endpoint, 64 in flight, finish in 2.1s on 4
+cores). Still inline on the scheduler thread: TTY-mode `http_post_stream` and
 `http_post` while the interactive line editor owns the terminal (their ESC watcher
-reads the TTY), `shell()`'s initial `system()` launch, `db_*` (SQLite) and
-`llm_complete`. A long call there blocks every other process queued on the same
-scheduler.
+reads the TTY), `shell()`'s initial `system()` launch and `db_*` (SQLite). A long
+call there blocks every other process queued on the same scheduler.
 
 **Workaround:** `SW_SCHEDULERS>=2`, or move the call into its own process.
 
