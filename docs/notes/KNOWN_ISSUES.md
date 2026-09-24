@@ -35,14 +35,21 @@ like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
 
 ### A few blocking builtins still occupy their scheduler OS thread
 
-`http_get`, `http_request`, `http_post` and `exec_argv` now run on the runtime's
-offload pool (see "Recently cleared"). Still inline on the scheduler thread:
-`http_post_stream` (streams chunks to the TTY / a parent process), `http_post` while
-the interactive line editor owns the terminal (its ESC watcher reads the TTY),
-`shell()`'s initial `system()` launch, `db_*` (SQLite) and `llm_*`. A long call there
-blocks every other process queued on the same scheduler.
+`http_get`, `http_request`, `http_post`, `exec_argv`, `shell_sandboxed` and
+subagent-mode `http_post_stream` run on the runtime's offload pool (see "Recently
+cleared"). Still inline on the scheduler thread: TTY-mode `http_post_stream` and
+`http_post` while the interactive line editor owns the terminal (their ESC watcher
+reads the TTY), `shell()`'s initial `system()` launch, `db_*` (SQLite) and
+`llm_complete`. A long call there blocks every other process queued on the same
+scheduler.
 
 **Workaround:** `SW_SCHEDULERS>=2`, or move the call into its own process.
+
+### Maps are association arrays
+
+`map_get` / `map_put` are O(n) in the number of keys (`map_put` copies the map), so
+building a 20K-key map one key at a time is quadratic (~7s). Fine for the small maps
+agents pass around (JSON objects, options); for large keyed state use ETS.
 
 ### The HTTP server never frees a connection's port struct
 

@@ -4,6 +4,18 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — parallel subagent streams
+
+**fix(runtime): subagent-mode `http_post_stream` runs on the offload pool.** The
+parallel-subagents shape (each agent streams `{'stream_chunk', name, text}` to its parent)
+pinned one scheduler thread per stream. It now runs on a worker (it touches no TTY state);
+the offload wrapper exposes the parked caller so the stream still stops when that process
+is killed, and `sw_send_value` uses a message region when called from a worker. 6
+concurrent 300 ms streams finish in ~0.3 s on one scheduler. Gate:
+`tests/sw/test_stream_parallel.sw` (hangs with `SW_OFFLOAD=0`).
+
+---
+
 ## 2026-09-24 — startup, and docs that match measurements
 
 **perf(runtime): 29 ms → 12 ms startup; hello world 50 MB → 5.6 MB RSS.** Arena init wrote

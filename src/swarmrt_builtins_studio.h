@@ -1178,6 +1178,16 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
  * freed without the caller resuming), and the worker allocates the result
  * into a second region. On return the caller adopts both regions in O(1). */
 static __thread int _sw_offl_depth = 0;
+/* On an offload worker: the parked process the current builtin runs for (so
+ * a long builtin can honour that process being killed). NULL elsewhere. */
+static __thread sw_process_t *_sw_offl_waiter = NULL;
+
+/* The process a builtin is running on behalf of: the current fiber, or the
+ * parked caller when running on an offload worker. */
+static inline sw_process_t *_sw_offl_self(void) {
+    sw_process_t *p = sw_self();
+    return p ? p : _sw_offl_waiter;
+}
 
 typedef struct {
     sw_val_t *(*fn)(sw_val_t **, int);
@@ -1185,13 +1195,16 @@ typedef struct {
     int n;
     sw_value_arena_t *in, *out;
     sw_val_t *result;
+    sw_process_t *waiter;
 } _sw_offl_job_t;
 
 static void _sw_offl_work(void *p) {
     _sw_offl_job_t *j = (_sw_offl_job_t *)p;
     sw_value_arena_t *prev = sw_swap_alloc_target(j->out);
     _sw_offl_depth++;
+    _sw_offl_waiter = j->waiter;
     j->result = j->fn(j->args, j->n);
+    _sw_offl_waiter = NULL;
     _sw_offl_depth--;
     sw_swap_alloc_target(prev);
 }
@@ -1220,6 +1233,7 @@ static sw_val_t *_sw_offload_builtin(sw_val_t *(*fn)(sw_val_t **, int),
     for (int i = 0; i < n; i++) j->args[i] = a[i] ? deep_copy_into(a[i], j->in) : NULL;
     j->fn = fn;
     j->n = n;
+    j->waiter = sw_self();
     sw_offload_run(_sw_offl_work, j);
     /* The result may point into either region (a builtin can hand back one
      * of its arguments), so the caller's arena adopts both. */
@@ -2444,11 +2458,17 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     sw_val_t *headers = a[1];
     const char *body = a[2]->v.str;
 
-    /* Subagent mode: route content+reasoning as messages, skip TTY UI. */
+    /* Subagent mode: route content+reasoning as messages, skip TTY UI. It
+     * touches no terminal state, so it runs on the offload pool — parallel
+     * subagents stream concurrently instead of one per scheduler thread.
+     * (TTY mode keeps its spinner / ESC watcher on the caller's thread.) */
     sw_process_t *subagent_target = NULL;
     const char *subagent_name = "agent";
     if (n >= 5 && a[3] && a[3]->type == SW_VAL_PID && a[4] && a[4]->type == SW_VAL_STRING) {
-        subagent_target = a[3]->v.pid;
+        SW_OFFLOAD_BUILTIN(_builtin_http_post_stream, a, n);
+        subagent_target = sw_pid_of(a[3]);
+        if (!subagent_target)   /* the target exited: nowhere to stream (and never fall into TTY mode) */
+            return _sw_hps_err("http_post_stream: subagent target process is gone");
         subagent_name = a[4]->v.str;
     }
     _stream_out_t so;
@@ -2702,7 +2722,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
          * Poll the flag each loop pass (≤ one spinner tick of latency),
          * kill the child, and bail exactly like a user interrupt. */
         {
-            sw_process_t *hps_self = sw_self();
+            sw_process_t *hps_self = _sw_offl_self();
             if (hps_self && hps_self->kill_flag) {
                 interrupted = 1;
                 _sw_pkill_close(ch);

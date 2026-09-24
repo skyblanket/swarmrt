@@ -2838,7 +2838,9 @@ void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v) {
      * binary does — the receiver will too), copy the payload into a MESSAGE
      * region the receiver adopts on match and that process_destroy bulk-frees if
      * undelivered. SW_GC_OFF / no arena / region-OOM → v1 global-heap copy. */
-    if (sw_self_varena()) {
+    /* g_alloc_target: sending from an offload worker (a builtin running for a
+     * parked process) — the receiver has an arena, so use a region too. */
+    if (sw_self_varena() || g_alloc_target) {
         sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_MESSAGE);
         if (r) { sw_send_tagged_msg(to, tag, deep_copy_into(v, r), r); return; }
     }
