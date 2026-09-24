@@ -4,6 +4,23 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — startup, and docs that match measurements
+
+**perf(runtime): 29 ms → 12 ms startup; hello world 50 MB → 5.6 MB RSS.** Arena init wrote
+zeros into every one of the 100K process slots — values the anonymous mmap already
+provides — faulting in ~48 MB. The loop now runs only if the spinlock initialiser is not
+all-zero bytes.
+
+**docs: claims corrected against measurements on Linux x86_64.** "Native C speed" (it is
+boxed dynamic values, about CPython speed on arithmetic), "work stealing between cores"
+(none: the steal path polls a queue nothing fills), "100K+ concurrent processes" (~30K live
+on stock Linux, bounded by `vm.max_map_count`), "~100–500 ns spawn" (that is the slot
+pop; spawn-to-first-run is ~4–13 µs), "<10 ms boot" (12 ms default, 3 ms with
+`SW_MAX_PROCS=1024`), stale test counts, and the interpreter's no-longer-existing 5 s
+default receive timeout.
+
+---
+
 ## 2026-09-24 — reduction-counted preemption at every call
 
 **feat(sched): preemption is real at call granularity.** Only self-tail-call backedges ran

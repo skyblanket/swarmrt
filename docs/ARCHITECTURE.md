@@ -76,8 +76,8 @@ Processes come from a pre-allocated slab — no malloc on the spawn hot path.
 
 - One OS thread per scheduler
 - Each scheduler has its own run queue with 4 priority levels
-- Work stealing: idle schedulers steal from busy ones
-- Reduction counting: 2000 reductions per time slice
+- No work stealing yet: new processes are placed round-robin and each run queue is drained only by its own scheduler (the global overflow queue the steal path polls is never filled)
+- Reduction counting: every compiled call and self-tail-call turn counts one reduction; a process yields after 2000 (BEAM-style preemption at call granularity)
 
 ---
 
@@ -136,12 +136,12 @@ The compiler emits C code that calls the runtime API directly:
 
 | Metric | Value |
 |--------|-------|
-| Process spawn | ~100-500ns |
+| Process spawn | ~4–13 µs spawn-to-first-run (slot allocation alone ~100–500 ns) |
 | Context switch | ~100-200ns |
 | Message send | ~10ns enqueue + payload deep-copy (O(message size), no shared heap) |
 | Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
-| Max processes | 100K+ (configurable) |
-| Compute | native C speed |
+| Max processes | `SW_MAX_PROCS` (default 100K slots); live processes are capped near 30K on stock Linux by `vm.max_map_count` (one stack mmap each) |
+| Compute | boxed dynamic values — roughly CPython speed on arithmetic-heavy code (fib(35) ≈ 0.7 s) |
 
 ---
 

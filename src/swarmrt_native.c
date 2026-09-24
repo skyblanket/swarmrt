@@ -681,9 +681,17 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
     }
 
     /* Pre-initialize mailbox state.
-     * Each mailbox uses a lock-free LIFO signal stack + private FIFO queue. */
+     * Each mailbox uses a lock-free LIFO signal stack + private FIFO queue.
+     * Every field below starts at zero/NULL, and the slab comes from an
+     * anonymous mmap (zero-filled), so the loop is only needed when the
+     * spinlock initialiser is not all-zero bytes. Skipping it keeps the
+     * untouched slots unfaulted: writing them touched every page of the
+     * slab (~48 MB at the default 100K slots) and cost ~25 ms of startup. */
     sw_process_t *slab = (sw_process_t *)arena->proc_slab;
-    for (uint32_t i = 0; i < max_procs; i++) {
+    sw_spinlock_t lock_init = (sw_spinlock_t)SW_SPINLOCK_INIT;
+    static const unsigned char zero_lock[sizeof(sw_spinlock_t)];
+    int need_init = memcmp(&lock_init, zero_lock, sizeof(lock_init)) != 0;
+    for (uint32_t i = 0; need_init && i < max_procs; i++) {
         sw_mailbox_t *mb = &slab[i].mailbox;
         atomic_store(&mb->sig_head, NULL);
         mb->priv_head = NULL;

@@ -25,17 +25,6 @@ under heavy core contention. **Workaround (in `tests/sw/run/test_spawn_value.sw`
 re-spawn the idempotent closure if its effect hasn't appeared. A real fix needs
 a Linux repro host to bisect the interp scheduler's first-fiber enqueue.
 
-### Compiled `receive` has no default timeout (interpreter/compiled divergence)
-
-A bare `receive` with no `after` clause blocks forever in a compiled binary
-(codegen emits an infinite wait), whereas the interpreter defaults to a 5s
-timeout. The compiled behavior is the correct Erlang-style selective receive;
-the divergence is the issue.
-
-**Impact:** code that relies on the interpreter's implicit 5s timeout will hang
-when compiled. **Workaround:** add an explicit `after MS -> ...` clause to any
-`receive` that might not match, so compiled and interpreted runs behave the same.
-
 ### Interpreter non-tail recursion is bounded
 
 The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see
@@ -96,6 +85,11 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### Bare `receive` differed between paths (cleared)
+
+Both the interpreter and compiled binaries now block forever on a bare `receive`
+with no `after` clause (Erlang semantics); the old interpreter-only 5s default is gone.
 
 ### The interpreter had no tail-call optimisation (cleared 2026-09-24)
 

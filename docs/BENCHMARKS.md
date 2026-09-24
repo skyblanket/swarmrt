@@ -9,11 +9,11 @@
 
 | Metric | Value |
 |--------|-------|
-| Process spawn | ~100-500ns |
+| Process spawn | ~4–13 µs spawn-to-first-run on Linux x86_64 (slot allocation alone ~100–500 ns) |
 | Context switch | ~100-200ns (assembly) |
 | Message send (local) | ~10ns enqueue + payload deep-copy (O(message size); no shared heap) |
 | Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
-| Max concurrent processes | 100K+ |
+| Max concurrent processes | ~30K live on stock Linux (`vm.max_map_count=65530`, one stack mmap per live process); 100K after raising it |
 
 ---
 
@@ -66,16 +66,17 @@ copy that is then lifecycle-reclaimed). Cross-node messages are marshaled over T
 
 ## Scheduling
 
-Reduction-counted preemptive scheduling:
+Reduction-counted preemptive scheduling (a reduction per compiled call and per self-tail-call turn):
 
 ```
 Time slice:        2000 reductions
 Priority levels:   4 (max, high, normal, low)
-Work stealing:     idle schedulers steal from a global overflow queue
+Work stealing:     none yet (round-robin placement at spawn)
 ```
 
-Note on work stealing: idle schedulers steal from a shared global overflow
-queue, not from peers' local run queues. A runnable process sitting in a busy
+Note on work stealing: there is none yet. The steal path polls a global
+overflow queue that nothing ever fills, so it never finds work; processes are
+placed round-robin at spawn and stay on their scheduler. A runnable process sitting in a busy
 scheduler's local queue is therefore not stolen — see
 [KNOWN_ISSUES.md](notes/KNOWN_ISSUES.md). This is why a strictly sequential
 cross-scheduler `pingpong` scales worse at N schedulers than at 1 (the
