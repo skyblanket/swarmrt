@@ -48,7 +48,7 @@ Counter stopped at 8
 
 SwarmRT is a runtime + language for writing concurrent programs that compile to a single native binary.
 
-It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, distribution — and reimplements them as a ~12K-line core C runtime + ~8.5K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~4K-line ahead-of-time compiler that emits native code. (A ~5.5K-line tree-walking interpreter powers the REPL, `swc run`, and the tests — but `swc build` compiles your `.sw` straight to native machine code: no bytecode, no VM warm-up.) Each `.sw` file becomes a standalone executable that boots in <10ms and runs at native C speed.
+It takes the parts of the BEAM (Erlang/Elixir's VM) that turned out to matter — lightweight processes, lock-free message passing, supervisors, distribution — and reimplements them as a ~12K-line core C runtime + ~8.5K lines of studio builtins (HTTP, WebSocket, SQLite, JSON, files, etc.), plus a ~4K-line ahead-of-time compiler that emits native code. (A ~5.5K-line tree-walking interpreter powers the REPL, `swc run`, and the tests — but `swc build` compiles your `.sw` straight to native machine code: no bytecode, no VM warm-up.) Each `.sw` file becomes a standalone executable that starts in ~12 ms (~3 ms with `SW_MAX_PROCS=1024`). Values are dynamically typed and boxed, so compute-heavy code runs at scripting-language speed (fib(35) ≈ 0.7 s — a little faster than CPython, far slower than C); the runtime's strength is concurrency and fault tolerance, not arithmetic.
 
 (The full `src/` tree is ~50K lines; the rest is C-side tests, benchmarks, three earlier prototype runtimes kept for reference, and tools like the search CLI and MCP server.)
 
@@ -86,8 +86,8 @@ That's it. No package manager for the language, no language server install, no V
 |---|---|
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
 | **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Process linking and monitoring. Versioned module registry with rollback for C embedders (no `sw`-level hot reload yet — see below). |
-| **Writing concurrent programs** | 100K+ lightweight processes per node. ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
-| **Avoiding language overhead** | One binary, no VM, no GC pauses, <10ms startup. (Memory model — **Ownership v2**: each sw process has a **value arena** freed when the process exits. Escaped values get a lifecycle owner: a **sent message** is deep-copied into a region the receiver *adopts* on match (and reclaims at exit / next turn); **spawn arguments** are adopted into the child's arena; and a long-lived tail-recursive loop is bounded by a **scoped turn-checkpoint** that reclaims each turn's garbage above the function's entry floor. So memory stays bounded under fixed concurrency: a fixed-width spawn workload with 32 KB args, a fixed-depth large-message stream, and a 100k-turn loop all hold **flat** peak RSS as the job count scales 10× (`make gc-slope`). Cross-process messages are deep-copied (BEAM no-shared-heap). **Remaining caveat:** ETS entries, supervisor child closures, and timer/cron closures are still global-heap (reclaimed at OS exit / table destroy); the interpreter has no arena (short-lived). The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
+| **Writing concurrent programs** | Tens of thousands of live processes per node (each live process owns an mmap'd stack, so stock Linux's `vm.max_map_count=65530` caps it near 30K — raise it for 100K). ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses, ~12ms startup. (Memory model — **Ownership v2**: each sw process has a **value arena** freed when the process exits. Escaped values get a lifecycle owner: a **sent message** is deep-copied into a region the receiver *adopts* on match (and reclaims at exit / next turn); **spawn arguments** are adopted into the child's arena; and a long-lived tail-recursive loop is bounded by a **scoped turn-checkpoint** that reclaims each turn's garbage above the function's entry floor. So memory stays bounded under fixed concurrency: a fixed-width spawn workload with 32 KB args, a fixed-depth large-message stream, and a 100k-turn loop all hold **flat** peak RSS as the job count scales 10× (`make gc-slope`). Cross-process messages are deep-copied (BEAM no-shared-heap). **Remaining caveat:** ETS entries, supervisor child closures, and timer/cron closures are still global-heap (reclaimed at OS exit / table destroy); the interpreter has no arena (short-lived). The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
 
 ---
 
@@ -234,7 +234,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 
 | Subsystem | What it does |
 |---|---|
-| **Scheduler** | One OS thread per core. Per-scheduler run queue with 4 priority levels. Reduction-counted preemption. Work stealing between cores. |
+| **Scheduler** | One OS thread per core. Per-scheduler run queue with 4 priority levels. Reduction-counted preemption at every call and loop turn (BEAM-style). New processes are placed round-robin; there is no general work stealing, so each queue is drained by its own scheduler — except while that scheduler's thread is inside a blocking builtin (terminal input, a synchronous subprocess wait), when its queue moves to a shared overflow queue that idle schedulers take from. Blocking HTTP and exec builtins run on an offload pool so they don't pin a scheduler at all. |
 | **Process** | 2KB arena-allocated PCB + 128KB stack. Lock-free MPSC mailbox. Per-process **value arena** freed at process exit. **Ownership v2:** sent messages + spawn args are deep-copied into regions the receiver/child *adopts* and reclaims; long-lived tail loops are bounded by a scoped turn-checkpoint. Cross-process messages deep-copied (no shared heap). (ETS values still global-heap until table destroy.) |
 | **Behaviours** | GenServer, Supervisor, Task, GenStateMachine, ETS, Registry — all built on top of the bare `spawn`/`send`/`receive` primitives. |
 | **IO** | kqueue-based async ports. TCP accept/read/write as port messages. HTTP / WebSocket / Chrome DevTools as builtins. |
@@ -242,7 +242,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 | **Hot reload** | Versioned module registry with rollback: re-points a named slot to another C function already compiled into the binary and notifies tracked processes — does not load new code. *(C API only — no `sw`-level builtin; compiled `.sw` code can't be swapped at runtime.)* |
 | **Compiler (`swc`)** | `.sw` → AST → C → native binary. Tail-call optimisation, optional XOR-string obfuscation, optional symbol stripping. |
 
-Numbers: process spawn ~100-500ns, context switch ~150ns, message send ~10ns to enqueue plus a deep-copy of the payload into the receiver (BEAM-style no-shared-heap — O(message size); small messages stay cheap), 100K+ concurrent processes per node. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Numbers (Linux x86_64, 4 cores): spawn-to-first-run ~4–13 µs (the slot allocation itself is ~100–500 ns), context switch ~115–185 ns, message round-trip ~0.5 µs (a send is a ~10 ns enqueue plus a deep copy of the payload — BEAM-style no shared heap), ~30K live processes on stock Linux / 100K with a raised `vm.max_map_count`. Full breakdown in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ### Runtime env vars
 
@@ -260,7 +260,7 @@ needed.
 | `SW_MSG_MAX_BYTES` | `0` (off) | Max size of a single local message (bytes). Over-cap sends are dropped loudly, leak-free. |
 | `SW_SHUTDOWN_GRACE_MS` | `5000` | Graceful-shutdown drain deadline. On SIGTERM/SIGINT the node stops accepting work, drains, cancels timers, then tears down within this budget. |
 | `SW_LOG_JSON` | unset | `1` → one JSON `proc_crash` record per abnormal exit on stderr (for log shippers). Human-readable trace stays the default. |
-| `SW_QUIET` | unset | Suppress the `[SwarmRT] Arena initialized…` banner on stderr. Set in scripts/CI. |
+| `SW_VERBOSE` | unset | `1` → print the `[SwarmRT] Arena initialized…` startup banner on stderr (off by default; `SW_QUIET=1` forces it off). |
 
 The full operational config reference (every var, defaults, meanings) and the
 graceful-shutdown / recovery model live in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
@@ -370,7 +370,7 @@ make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search
 - **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run.
 - **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
 
-Together the suite reports `all sw tests passed — 56 files, 493 assertions`, and `make test-sw` then runs the **dual-path conformance gate**: every program in `tests/sw/conform/` executes under BOTH `swc run` (interpreter) and `swc build` (compiled) and must produce byte-identical stdout and exit codes — the structural guard against the two paths drifting apart.
+Together the suite reports `all sw tests passed — 74 files, 573 assertions`, and `make test-sw` then runs the **dual-path conformance gate**: every program in `tests/sw/conform/` executes under BOTH `swc run` (interpreter) and `swc build` (compiled) and must produce byte-identical stdout and exit codes — the structural guard against the two paths drifting apart.
 
 Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
 
@@ -447,7 +447,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
-- `make test-sw` — **59 files, 514 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
+- `make test-sw` — **74 files, 573 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
 - `make test-phase$p` for `p` in **2 through 10** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC scaffolding (phase 8), distribution (phase 9), language frontend (phase 10); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 - `make gc-stress` — GC v1 copy-on-escape correctness: the value-arena stress harness compiled with ASAN + `-DSW_ARENA_POISON`; a missed deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free or a `0xDE`-garbage content assert
@@ -457,8 +457,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 - **Operational-limit + isolation gates**, each **bidirectional** (proven to fail without its fix): `quota-gate` (per-process memory), `msgsize-gate` (message size), `slowloris-gate` (HTTP idle timeout), `isolation-gate` (a crashing process can't take down siblings/node), `crashlog-gate` (`SW_LOG_JSON`), `health-gate` (`/healthz` + `/readyz`), `shutdown-gate` (graceful drain, deadline-bounded even for a hung workload)
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
-- **Compiled `receive` has no default timeout.** A bare `receive` (no `after`) blocks forever in a compiled binary, while the interpreter defaults to a 5s timeout — so use an explicit `after MS` in compiled `receive`s that might not match, to avoid a silent divergence.
-- **No static type or shape checking** — `sw` is dynamically typed by design. Typos in variable names compile to atoms rather than erroring (e.g. `undefined_var` becomes `:undefined_var`); there is no compile-time catch.
+- **No static type checking** — `sw` is dynamically typed by design. Names are checked (an undefined variable is a compile error with a did-you-mean, on both the compiled and interpreted paths), but types and map keys are not.
 - **Memory is bounded under fixed concurrency (Ownership v2), with a few owners still on the global heap.** A process's own working set frees on exit; sent messages, spawn args, and pmap captures/results are adopted into receiver/child ownership and reclaimed (incl. pre-start-killed children); long-lived tail loops are bounded by a scoped turn-checkpoint. `make gc-slope` proves spawn / message / 100k-turn / pmap slopes stay flat. **Still global-heap (reclaimed only at OS exit / table destroy — a high-churn loop grows until then):** (1) **ETS** entries; (2) **supervisor child closures** and **timer/cron closures**; (3) the **interpreter** has no arena (fine for short-lived `swc run`/REPL). Values nested deeper than 256 levels are truncated on cross-process copy.
 
 The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.

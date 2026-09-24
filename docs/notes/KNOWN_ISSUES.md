@@ -25,58 +25,42 @@ under heavy core contention. **Workaround (in `tests/sw/run/test_spawn_value.sw`
 re-spawn the idempotent closure if its effect hasn't appeared. A real fix needs
 a Linux repro host to bisect the interp scheduler's first-fiber enqueue.
 
-### Compiled `receive` has no default timeout (interpreter/compiled divergence)
+### Interpreter non-tail recursion is bounded
 
-A bare `receive` with no `after` clause blocks forever in a compiled binary
-(codegen emits an infinite wait), whereas the interpreter defaults to a 5s
-timeout. The compiled behavior is the correct Erlang-style selective receive;
-the divergence is the issue.
+The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see
+"Recently cleared"), but a NON-tail call still nests C frames: plain recursion
+like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
+`interpreter recursion depth exceeded` panic after a few hundred frames.
+**Workaround:** write the loop tail-recursively with an accumulator, or `swc build`.
 
-**Impact:** code that relies on the interpreter's implicit 5s timeout will hang
-when compiled. **Workaround:** add an explicit `after MS -> ...` clause to any
-`receive` that might not match, so compiled and interpreted runs behave the same.
+### A few blocking builtins still occupy their scheduler OS thread
 
-### Interpreter recursion depth is bounded (no TCO in the tree-walker)
+`http_get`, `http_request`, `http_post`, `exec_argv`, `shell_sandboxed` and
+subagent-mode `http_post_stream` run on the runtime's offload pool (see "Recently
+cleared"), and so does `llm_complete`, whose request goes through `http_post` (200
+completions against a 500ms mock endpoint, 64 in flight, finish in 2.1s on 4
+cores). Still on the calling scheduler's thread: `read_line`/`read_key`/`read_choice`,
+`shell_managed`, TTY-mode `http_post_stream`, `subprocess_recv_line` and `db_*`.
+Those run inside a blocking section, so the processes queued behind them move to
+idle schedulers (see "Recently cleared"); what they cost is one OS thread each for
+the duration. With every scheduler thread inside one, nothing else runs.
 
-The interpreter (`swc run` / REPL / `swc test`) evaluates on the C stack with
-a stack-margin guard and no tail-call optimisation; deep recursion raises a
-clean, uncatchable `interpreter recursion depth exceeded` panic (exit 1). The
-exact ceiling is environment-dependent (real stack headroom is measured, so it
-shifts with RLIMIT_STACK, compiler frame layout, and any new large locals in
-`eval()`); measured ~350-390 frames for a simple self-recursive two-arg
-function at -O2 on an 8MB main stack (~21KB of C stack per sw call frame —
-each sw call nests several `eval()` frames). Cheaper call shapes go somewhat
-deeper; assume a few hundred frames. Compiled binaries TCO self-tail-calls to
-unbounded depth (gated by `tests/sw/test_tco_depth.sw`).
+**Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
-**Impact:** recursion-heavy programs must be compiled. **Workaround:**
-`swc build` — the interpreter is for short scripts, tests, and the REPL.
+### Maps are association arrays
 
-### Blocking C-call builtins occupy their scheduler OS thread
+`map_get` / `map_put` are O(n) in the number of keys (`map_put` copies the map), so
+building a 20K-key map one key at a time is quadratic (~7s). Fine for the small maps
+agents pass around (JSON objects, options); for large keyed state use ETS.
 
-The curl-backed HTTP client builtins (`http_get` / `http_post` /
-`http_request` / `http_post_stream`) and other synchronous C calls block
-the scheduler THREAD, not just the calling fiber. Consequence: a program
-that runs an in-process server fiber AND calls itself over HTTP
-deadlocks under `SW_SCHEDULERS=1` — the blocked client holds the only
-scheduler, the server fiber never runs. At `SW_SCHEDULERS=2` the same
-deadlock fires whenever the client and server fibers happen to be placed
-on the SAME scheduler: a runnable fiber in a blocked scheduler's local
-queue is unstealable (work stealing covers only the global overflow
-queue, not peer local queues). Found by the Phase-2.2 scheduler-count
-matrix (test_http_request hung forever single-sched, all three loopback
-tests failed at S=2; they now SKIP below 3 schedulers and the test
-runner bounds every test with a 180s timeout). The deadlock watchdog did
-not flag this shape — the thread is busy inside libcurl, not parked.
+### The HTTP server never frees a connection's port struct
 
-**Impact:** single-scheduler deployments must not self-call over
-blocking clients; chatty blocking I/O also steals a core from every
-other process on that scheduler. **Workaround:** `SW_SCHEDULERS>=2` for
-self-loopback workloads (the WebSocket client is yield-aware and not
-affected). **Fix direction (Phase 3):** run blocking transports on a
-dedicated I/O thread pool with fiber park/wake, like `wsc_*` does.
+Closing a connection closes its socket (the per-connection fd leak is fixed), but the
+~64-byte `sw_port_t` is not freed: the IO thread may still hold it in an event batch
+fetched before the close, so freeing it safely needs an event refcount. About 64 MB
+per million connections over a process lifetime.
 
-### Mutual tail recursion is not TCO'd — but overflow is now a recoverable panic
+### Compiled mutual tail recursion is not TCO'd — but overflow is a recoverable panic
 
 Only **self** tail calls are optimised (including, since 2026-07-05, self
 tail calls inside a `receive ... after` body — previously those stacked a
@@ -101,21 +85,75 @@ one function and dispatch on an argument (`fun fsm(state, n) { case state
 { ... } }`), or raise the per-process stack with `SW_PROC_STACK` (bytes,
 `k`/`m` suffixes; e.g. `SW_PROC_STACK=1m`).
 
-### No static type or shape checking
+### No static type checking
 
-`sw` is dynamically typed by design — there is no compile-time type or arity
-checking. A typo'd variable name compiles cleanly and becomes an atom at
-runtime instead of erroring:
-
-```sw
-print(undefined_var)   # compiles; prints :undefined_var
-```
-
-**Impact:** name typos surface as silent runtime atoms rather than compile
-errors. This is a deliberate tradeoff (matching the dynamic, Erlang-shaped
-model), recorded here so the behavior is not a surprise.
+`sw` is dynamically typed by design — there is no compile-time type checking, and
+arity is checked only for calls to module functions. Names ARE checked: an
+identifier bound nowhere is rejected by `swc build`, `swc run` and `swc test`
+alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
+runtime `nil`.
 
 ## Recently cleared
+
+### Processes starved behind a blocked scheduler thread (cleared 2026-09-24)
+
+There is no general work stealing, so a process queued on a scheduler whose thread
+sat in a blocking builtin waited for that builtin to return, even with every other
+scheduler idle. swarm-code's interactive session hung forever this way whenever its
+agent process shared a scheduler with the line reader (starting an MCP server
+changed the placement). Blocking builtins now run inside `sw_blocking_enter`/
+`sw_blocking_exit`: the scheduler's queue moves to the shared overflow queue that idle
+schedulers steal from, and wake-ups aimed at it go there until the builtin returns.
+Gate: `tests/sw/test_blocking_section.sw` (16 workers behind a 3s blocker: 3066ms
+before, ~1ms after).
+
+### Shell output lost every non-ASCII character (cleared 2026-09-24)
+
+`shell`/`shell_managed` kept only printable ASCII, so `echo café` returned `caf` and
+CJK file names vanished from grep/glob results. Valid UTF-8 is kept; invalid bytes
+become U+FFFD; ANSI escape sequences are removed whole.
+
+
+### Bare `receive` differed between paths (cleared)
+
+Both the interpreter and compiled binaries now block forever on a bare `receive`
+with no `after` clause (Erlang semantics); the old interpreter-only 5s default is gone.
+
+### The interpreter had no tail-call optimisation (cleared 2026-09-24)
+
+Every interpreted call recursed on the C stack, so any loop longer than a few
+hundred iterations died under `swc run` / `swc test`. Tail calls to user functions
+(including mutual recursion and receive-loop servers) now run in place. Gate:
+`tests/sw/run/test_interp_tco.sw`.
+
+### Idiomatic list and value code was quadratic or worse (cleared 2026-09-24)
+
+`tl()`, `[h | t]` patterns, `list_append` and cons copied the whole list; the
+turn checkpoint deep-copied loop state as a tree (exponential on shared
+substructure) and in full every time; every int, nil and boolean was a fresh
+allocation. Summing a 100K list took 162s; it takes 0.1s. Gate:
+`tests/sw/test_value_scaling.sw`.
+
+### Typo'd variables compiled to atoms (cleared 2026-09-24)
+
+`print(totl)` used to compile to `print(:totl)` and interpret as `print(nil)`. A
+shared static pass (`sw_resolve_module`) now reports every name that no scope binds,
+with a did-you-mean, before either backend runs. Gate:
+`tests/sw/compile_fail/undefined_names.sw`.
+
+### HTTP client builtins pinned their scheduler thread (cleared 2026-09-24)
+
+`http_get`/`http_request`/`http_post`/`exec_argv` spawned curl and waited for it on the
+scheduler thread, capping in-flight calls at the scheduler count and deadlocking a
+program that called its own in-VM server under `SW_SCHEDULERS=1`. They now run on the
+offload pool while the caller parks. Gate: `tests/sw/test_http_offload.sw`.
+
+### HTTP server dropped requests and leaked fds (cleared 2026-09-24)
+
+A second `sw_io_init` from `http_listen` started a second IO thread on the same sockets
+(data could overtake its connection's accept and be dropped), and peer-closed sockets were
+never closed. Gate: `tests/sw/test_http_fd_leak.sw`.
+
 
 ### Spin-gated scheduler deadlock — root-caused: Dekker StoreLoad bug in the receive handshake
 

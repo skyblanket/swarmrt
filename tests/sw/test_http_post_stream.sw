@@ -38,6 +38,34 @@ fun sse_no_space() {
     "data:[DONE]\n\n"
 }
 
+# `"key": "value"` with spaces (Python json.dumps style) — used to yield nothing.
+fun sse_spaced() {
+    "data: {\"choices\": [{\"delta\": {\"content\": \"spaced\"}}]}\n\n" ++
+    "data: {\"choices\": [{\"delta\": {\"content\": \" keys\"}, \"finish_reason\": \"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n"
+}
+
+fun rep(s, n) { if (n == 0) { s } else { rep(s ++ s, n - 1) } }
+
+# One content delta of 16384 chars — deltas used to be cut at 8KB.
+fun sse_big_delta() {
+    "data: {\"choices\":[{\"delta\":{\"content\":\"" ++ rep("y", 14) ++ "\"}}]}\n\n" ++
+    "data: [DONE]\n\n"
+}
+
+# A whole tool call in ONE frame far past the old 16KB line cap, plus two
+# calls without an `index` (they used to merge into one).
+fun sse_tool_frames() {
+    big = rep("x", 15)
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"content\\\":\\\"" ++ big ++ "\\\"}\"}}]}}]}\n\n" ++
+    "data: [DONE]\n\n"
+}
+
+fun sse_no_index() {
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"ca\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo A\\\"}\"}},{\"id\":\"cb\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo B\\\"}\"}}]}}]}\n\n" ++
+    "data: [DONE]\n\n"
+}
+
 # Server: route by path so one listener can serve several SSE fixtures and a
 # 404 case in one test run.
 fun serve(port) {
@@ -52,6 +80,10 @@ fun serve_loop() {
             case path {
                 "/space"    -> http_respond(conn, 200, sse_hdr, sse_with_space())
                 "/nospace"  -> http_respond(conn, 200, sse_hdr, sse_no_space())
+                "/spaced"   -> http_respond(conn, 200, sse_hdr, sse_spaced())
+                "/bigdelta" -> http_respond(conn, 200, sse_hdr, sse_big_delta())
+                "/bigtool"  -> http_respond(conn, 200, sse_hdr, sse_tool_frames())
+                "/noindex"  -> http_respond(conn, 200, sse_hdr, sse_no_index())
                 "/notfound" -> http_respond(conn, 404,
                                   "Content-Type: application/json\r\n",
                                   "{\"error\":{\"message\":\"model not found\"}}")
@@ -84,16 +116,28 @@ fun content_of(json) {
     map_get(map_get(hd(choices), 'message'), 'content')
 }
 
+fun tool_calls_of(json) {
+    decoded = json_decode(json)
+    msg = map_get(hd(map_get(decoded, 'choices')), 'message')
+    tcs = map_get(msg, 'tool_calls')
+    if (tcs == nil) { [] } else { tcs }
+}
+
+fun ok_json(r) {
+    case r {
+        {'ok', j} -> j
+        _ -> nil
+    }
+}
+
 fun main() {
-    # Self-loopback test: an in-process HTTP server fiber + a BLOCKING
-    # curl-backed client on the same runtime. The client call occupies its
-    # scheduler OS THREAD (not just the fiber), so with one scheduler the
-    # server can never run -> deadlock/timeout (found by the Phase-2.2
-    # scheduler matrix). Needs >=2 schedulers until blocking builtins are
-    # moved off the scheduler thread (see KNOWN_ISSUES).
+    # Self-loopback test: an in-process HTTP server fiber + a TTY-mode
+    # client that occupies its scheduler OS THREAD (not just the fiber). The
+    # client runs in a blocking section, so the server moves to another
+    # scheduler — with only one there is none, and it deadlocks.
     nsched = getenv("SW_SCHEDULERS")
-    if (nsched == "1" || nsched == "2") {
-        print("OK test_http_post_stream 0/0 (SKIP: needs >=3 schedulers — blocking client + in-process server)")
+    if (nsched == "1") {
+        print("OK test_http_post_stream 0/0 (SKIP: needs >=2 schedulers — blocking client + in-process server)")
         sys_exit(0)
     }
     port = 9131
@@ -146,6 +190,26 @@ fun main() {
                                       string_index_of(w4, "curl exit") >= 0, 'true')
     }
 
-    if (fails == 0) { print("OK test_http_post_stream 4/4") ; sys_exit(0) }
+    # 5. Spaces around the colon.
+    j5 = ok_json(post_retry(f"{base}/spaced", body, 100))
+    fails = fails + assert_eq("spaced_keys_content", if (j5 == nil) { nil } else { content_of(j5) }, "spaced keys")
+
+    # 6. One 16KB content delta arrives whole.
+    j6 = ok_json(post_retry(f"{base}/bigdelta", body, 100))
+    fails = fails + assert_eq("big_delta_len", if (j6 == nil) { 0 } else { string_length(content_of(j6)) }, 16384)
+
+    # 7. A ~32KB single-frame tool call is kept, arguments intact.
+    j7 = ok_json(post_retry(f"{base}/bigtool", body, 100))
+    tc7 = if (j7 == nil) { [] } else { tool_calls_of(j7) }
+    args7 = if (length(tc7) == 1) { json_decode(map_get(map_get(hd(tc7), 'function'), 'arguments')) } else { nil }
+    fails = fails + assert_eq("big_frame_tool_call",
+                              if (args7 == nil) { 0 } else { string_length(map_get(args7, 'content')) }, 32768)
+
+    # 8. Two index-less calls stay two calls.
+    j8 = ok_json(post_retry(f"{base}/noindex", body, 100))
+    tc8 = if (j8 == nil) { [] } else { tool_calls_of(j8) }
+    fails = fails + assert_eq("no_index_calls", length(tc8), 2)
+
+    if (fails == 0) { print("OK test_http_post_stream 8/8") ; sys_exit(0) }
     else { print(f"FAIL test_http_post_stream {fails} failed") ; sys_exit(1) }
 }

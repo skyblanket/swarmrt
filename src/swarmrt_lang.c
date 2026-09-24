@@ -125,6 +125,10 @@ __attribute__((weak)) void *sw_recv_any_adopt(uint64_t t, uint64_t *tag) { (void
 __attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) { (void)to; (void)tag; (void)msg; }
 __attribute__((weak)) void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload, struct sw_value_arena *region) { (void)to; (void)tag; (void)payload; (void)region; }
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
+__attribute__((weak)) void sw_sleep_ms(uint64_t ms) { usleep((useconds_t)(ms * 1000)); }
+__attribute__((weak)) uint64_t sw_monitor_id(sw_process_t *t, uint64_t id) { (void)t; (void)id; return 0; }
+__attribute__((weak)) int sw_check_reds(void) { return 0; }
+__attribute__((weak)) void sw_yield(void) { }
 /* Returns the current process's value arena, or NULL (interpreter / pre-fiber).
  * Strong impl in swarmrt_native.c reads tls_current->varena; this weak stub
  * keeps swc linkable without the runtime and makes the interpreter use calloc. */
@@ -1051,6 +1055,15 @@ static node_t *par_primary_inner(par_t *p) {
                 }
                 par_expect(p, TOK_RPAREN, "')'");
                 return call;
+            } else if (t.text[0] >= 'A' && t.text[0] <= 'Z') {
+                /* `Module.function` without parens is a reference to that
+                 * function (module names are capitalised; variables are
+                 * not): `xs |> Std.sum`, `map(Std.to_upper, names)`. It used
+                 * to parse as map_get(Module, 'function') — a lookup on an
+                 * undefined variable that silently yielded nil. */
+                node_t *ref = mknode(N_IDENT, t.line);
+                snprintf(ref->v.sval, sizeof(ref->v.sval), "%s.%s", t.text, fname.text);
+                return ref;
             } else {
                 /* Dot access: obj.field -> map_get(obj, 'field') */
                 node_t *obj = mknode(N_IDENT, t.line);
@@ -1456,8 +1469,9 @@ static node_t *par_primary_inner(par_t *p) {
                     tok_t save_cur = p->cur;
                     int save_err = p->err;
                     node_t *expr = par_stmt(p);
-                    if (p->cur.type == TOK_ARROW) {
-                        /* This is the next clause's pattern — backtrack */
+                    if (p->cur.type == TOK_ARROW || p->cur.type == TOK_WHEN) {
+                        /* This is the next clause's pattern (optionally
+                         * guarded: `pat when g -> ...`) — backtrack */
                         p->lex = save_lex;
                         p->cur = save_cur;
                         p->err = save_err;
@@ -2208,16 +2222,55 @@ static inline char *val_strdup(const char *s) {
     return p ? p : (char *)val_alloc_oom(strlen(s) + 1);
 }
 
+/* === Immortal constants ===
+ * Values are immutable, so the most common ones are shared statics instead of
+ * a fresh 72-byte allocation per use: nil, the booleans and a few atoms that
+ * every comparison / result tag produces, and ints in [SW_SMALLINT_MIN,
+ * SW_SMALLINT_MAX]. `immortal` makes every free path skip them; a deep copy
+ * onto the GLOBAL heap (whose consumers free graphs node-by-node) re-creates
+ * them, while copies into regions/arenas (bulk-freed) share them. */
+#define SW_SMALLINT_MIN (-1024)
+#define SW_SMALLINT_MAX 1024
+static sw_val_t g_imm_nil   = { .type = SW_VAL_NIL,  .immortal = 1 };
+static sw_val_t g_imm_true  = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"true" };
+static sw_val_t g_imm_false = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"false" };
+static sw_val_t g_imm_anil  = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"nil" };
+static sw_val_t g_imm_ok    = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"ok" };
+static sw_val_t g_imm_error = { .type = SW_VAL_ATOM, .immortal = 1, .v.str = (char *)"error" };
+static sw_val_t g_imm_ints[SW_SMALLINT_MAX - SW_SMALLINT_MIN + 1];
+
+__attribute__((constructor)) static void sw_init_immortals(void) {
+    for (int i = SW_SMALLINT_MIN; i <= SW_SMALLINT_MAX; i++) {
+        sw_val_t *v = &g_imm_ints[i - SW_SMALLINT_MIN];
+        v->type = SW_VAL_INT;
+        v->immortal = 1;
+        v->v.i = i;
+    }
+}
+
 sw_val_t *sw_val_nil(void) {
-    sw_val_t *v = val_alloc(sizeof(sw_val_t));
-    v->type = SW_VAL_NIL;
-    return v;
+    return &g_imm_nil;
 }
 
 sw_val_t *sw_val_int(int64_t i) {
+    if (i >= SW_SMALLINT_MIN && i <= SW_SMALLINT_MAX)
+        return &g_imm_ints[i - SW_SMALLINT_MIN];
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_INT; v->v.i = i;
     return v;
+}
+
+/* The shared constant for a common atom, or NULL. */
+static sw_val_t *imm_atom(const char *s) {
+    if (!s) return NULL;
+    switch (s[0]) {
+    case 't': return strcmp(s, "true") == 0 ? &g_imm_true : NULL;
+    case 'f': return strcmp(s, "false") == 0 ? &g_imm_false : NULL;
+    case 'n': return strcmp(s, "nil") == 0 ? &g_imm_anil : NULL;
+    case 'o': return strcmp(s, "ok") == 0 ? &g_imm_ok : NULL;
+    case 'e': return strcmp(s, "error") == 0 ? &g_imm_error : NULL;
+    default: return NULL;
+    }
 }
 
 sw_val_t *sw_val_float(double f) {
@@ -2233,6 +2286,8 @@ sw_val_t *sw_val_string(const char *s) {
 }
 
 sw_val_t *sw_val_atom(const char *s) {
+    sw_val_t *imm = imm_atom(s);
+    if (imm) return imm;
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_ATOM; v->v.str = val_strdup(s);
     return v;
@@ -2253,8 +2308,14 @@ sw_val_t *sw_val_bytes(const uint8_t *data, size_t len) {
 }
 
 sw_val_t *sw_val_pid(sw_process_t *p) {
+    return sw_val_pid_id(p, p ? p->pid : 0);
+}
+
+sw_val_t *sw_val_pid_id(sw_process_t *p, uint64_t id) {
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
-    v->type = SW_VAL_PID; v->v.pid = p;
+    v->type = SW_VAL_PID;
+    v->v.pidv.ptr = p;
+    v->v.pidv.id = id;
     return v;
 }
 
@@ -2287,6 +2348,113 @@ sw_val_t *sw_val_list(sw_val_t **items, int count) {
     if (count > 0) memcpy(v->v.tuple.items, items, sizeof(sw_val_t*) * count);
     v->v.tuple.count = count;
     return v;
+}
+
+/* A list of `count` elements of `src` starting at `off`. When the result is
+ * allocated in an arena (process arena or an explicit region — bulk-freed,
+ * never walked node by node) it SHARES src's element storage: O(1), which is
+ * what makes `tl()` recursion over a list linear instead of quadratic. On the
+ * global heap, whose graphs are freed item array by item array, it copies. */
+static int list_arena_backed(void) {
+    return !g_alloc_force_global && (g_alloc_target || sw_self_varena());
+}
+
+sw_val_t *sw_val_list_view(sw_val_t *src, int off, int count) {
+    if (!src || count <= 0) return sw_val_list(NULL, 0);
+    if (!list_arena_backed()) return sw_val_list(src->v.tuple.items + off, count);
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_LIST;
+    v->v.tuple.items = src->v.tuple.items + off;
+    v->v.tuple.count = count;
+    v->v.tuple.store = src->v.tuple.store;   /* a tail view still owns the store's end */
+    return v;
+}
+
+/* === List backing stores ===
+ * base[lo, hi) is the claimed part of a store; every list header sharing it
+ * covers a sub-range. A header may extend the store in place only when its
+ * range touches the claimed edge (end == hi to append, start == lo to
+ * prepend): the new slot is then outside every other header's range, so no
+ * existing list value can observe it. Stores live in the arena (bulk-freed).
+ * Single writer: a list's store is only reachable from its owning process
+ * (sends and copies produce fresh, store-less lists). */
+typedef struct sw_list_store {
+    sw_val_t **base;
+    int cap, lo, hi;
+} sw_list_store_t;
+
+static sw_val_t *list_header(sw_list_store_t *st, int start, int count) {
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_LIST;
+    v->v.tuple.items = st->base + start;
+    v->v.tuple.count = count;
+    v->v.tuple.store = st;
+    return v;
+}
+
+/* Fresh store holding `lst`'s elements plus one free slot for `x`, with room
+ * to keep growing on the side being extended. */
+static sw_val_t *list_grow(sw_val_t *lst, sw_val_t *x, int at_front) {
+    int n = (lst && lst->type == SW_VAL_LIST) ? lst->v.tuple.count : 0;
+    int cap = (n + 1) * 2;
+    if (cap < 8) cap = 8;
+    sw_list_store_t *st = val_alloc(sizeof(*st));
+    st->base = val_alloc(sizeof(sw_val_t *) * (size_t)cap);
+    st->cap = cap;
+    if (at_front) {
+        st->hi = cap;
+        st->lo = cap - (n + 1);
+        st->base[st->lo] = x;
+        if (n) memcpy(st->base + st->lo + 1, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+    } else {
+        st->lo = 0;
+        st->hi = n + 1;
+        if (n) memcpy(st->base, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+        st->base[n] = x;
+    }
+    return list_header(st, st->lo, n + 1);
+}
+
+sw_val_t *sw_val_list_append(sw_val_t *lst, sw_val_t *x) {
+    int n = (lst && lst->type == SW_VAL_LIST) ? lst->v.tuple.count : 0;
+    if (!list_arena_backed()) {
+        sw_val_t **items = malloc(sizeof(sw_val_t *) * (size_t)(n + 1));
+        if (n) memcpy(items, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+        items[n] = x;
+        sw_val_t *r = sw_val_list(items, n + 1);
+        free(items);
+        return r;
+    }
+    sw_list_store_t *st = n ? lst->v.tuple.store : NULL;
+    if (st) {
+        int start = (int)(lst->v.tuple.items - st->base);
+        if (start + n == st->hi && st->hi < st->cap) {
+            st->base[st->hi++] = x;
+            return list_header(st, start, n + 1);
+        }
+    }
+    return list_grow(lst, x, 0);
+}
+
+sw_val_t *sw_val_list_prepend(sw_val_t *x, sw_val_t *lst) {
+    int n = (lst && lst->type == SW_VAL_LIST) ? lst->v.tuple.count : 0;
+    if (!list_arena_backed()) {
+        sw_val_t **items = malloc(sizeof(sw_val_t *) * (size_t)(n + 1));
+        items[0] = x;
+        if (n) memcpy(items + 1, lst->v.tuple.items, sizeof(sw_val_t *) * (size_t)n);
+        sw_val_t *r = sw_val_list(items, n + 1);
+        free(items);
+        return r;
+    }
+    sw_list_store_t *st = n ? lst->v.tuple.store : NULL;
+    if (st) {
+        int start = (int)(lst->v.tuple.items - st->base);
+        if (start == st->lo && st->lo > 0) {
+            st->base[--st->lo] = x;
+            return list_header(st, st->lo, n + 1);
+        }
+    }
+    return list_grow(lst, x, 1);
 }
 
 sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
@@ -2400,17 +2568,119 @@ sw_val_t *sw_now_iso(void) {
  * only in the single-process interpreter, which has no arena to free). */
 #define SW_COPY_MAX_DEPTH 256
 
+/* === Deep-copy context ===
+ * One per top-level deep copy (thread-local, nestable). `memo` maps a source
+ * node to its copy so a graph that shares substructure is copied as a graph:
+ * without it `grow({t, t}, k)` — k live cells — copied as 2^k nodes, and a
+ * turn checkpoint over such a value ran the process out of memory. `keep`
+ * lists address ranges whose values are returned as-is instead of copied (the
+ * part of a process arena below a turn-checkpoint floor, which the reset
+ * preserves). */
+typedef struct {
+    const sw_val_t **keys;
+    sw_val_t **vals;
+    size_t cap, n;
+    const sw_varena_range_t *keep;
+    int nkeep;
+} dc_ctx_t;
+static __thread dc_ctx_t *g_dc = NULL;
+
+static inline size_t dc_hash(const void *p, size_t cap) {
+    uintptr_t x = (uintptr_t)p;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (size_t)x & (cap - 1);
+}
+
+static sw_val_t *dc_lookup(dc_ctx_t *c, const sw_val_t *src) {
+    if (!c->cap) return NULL;
+    for (size_t i = dc_hash(src, c->cap);; i = (i + 1) & (c->cap - 1)) {
+        if (!c->keys[i]) return NULL;
+        if (c->keys[i] == src) return c->vals[i];
+    }
+}
+
+static void dc_insert(dc_ctx_t *c, const sw_val_t *src, sw_val_t *dst) {
+    if ((c->n + 1) * 2 > c->cap) {
+        size_t ncap = c->cap ? c->cap * 2 : 64;
+        const sw_val_t **nk = calloc(ncap, sizeof(*nk));
+        sw_val_t **nv = calloc(ncap, sizeof(*nv));
+        if (!nk || !nv) { free(nk); free(nv); return; }   /* degrade: no sharing */
+        for (size_t i = 0; i < c->cap; i++) {
+            if (!c->keys[i]) continue;
+            size_t j = dc_hash(c->keys[i], ncap);
+            while (nk[j]) j = (j + 1) & (ncap - 1);
+            nk[j] = c->keys[i]; nv[j] = c->vals[i];
+        }
+        free(c->keys); free(c->vals);
+        c->keys = nk; c->vals = nv; c->cap = ncap;
+    }
+    size_t i = dc_hash(src, c->cap);
+    while (c->keys[i]) i = (i + 1) & (c->cap - 1);
+    c->keys[i] = src; c->vals[i] = dst; c->n++;
+}
+
+static int dc_kept(dc_ctx_t *c, const void *p) {
+    int lo = 0, hi = c->nkeep - 1;
+    const char *a = (const char *)p;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (a < c->keep[mid].lo) hi = mid - 1;
+        else if (a >= c->keep[mid].hi) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+
+static void dc_begin(dc_ctx_t *c, dc_ctx_t **saved) {
+    memset(c, 0, sizeof(*c));
+    *saved = g_dc;
+    g_dc = c;
+}
+
+static void dc_end(dc_ctx_t *c, dc_ctx_t *saved) {
+    free(c->keys);
+    free(c->vals);
+    g_dc = saved;
+}
+
+/* A fresh (never immortal) copy of a scalar, for global-heap deep copies. */
+static sw_val_t *fresh_scalar(sw_val_t *v) {
+    sw_val_t *r = val_alloc(sizeof(sw_val_t));
+    r->type = v->type;
+    if (v->type == SW_VAL_INT) r->v.i = v->v.i;
+    else if (v->type == SW_VAL_ATOM) r->v.str = val_strdup(v->v.str ? v->v.str : "");
+    return r;
+}
+
+static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
+
 static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
-    if (!v) return sw_val_nil();
-    if (depth > SW_COPY_MAX_DEPTH) return sw_val_nil();
+    if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
+    if (depth > SW_COPY_MAX_DEPTH) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
+    /* Global-heap graphs are freed node by node (ETS replace/delete, timer
+     * and supervisor closures, v1 message fallback), so they must not share
+     * immortals; copies into regions/arenas (bulk-freed) may. */
+    if (v->immortal)
+        return g_alloc_force_global ? fresh_scalar(v) : v;
+    if (g_dc) {
+        if (g_dc->nkeep && dc_kept(g_dc, v)) return v;
+        sw_val_t *seen = dc_lookup(g_dc, v);
+        if (seen) return seen;
+    }
+    sw_val_t *copy = deep_copy_node(v, depth);
+    if (g_dc && copy && copy != v) dc_insert(g_dc, v, copy);
+    return copy;
+}
+
+static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
     switch (v->type) {
-    case SW_VAL_NIL:    return sw_val_nil();
-    case SW_VAL_INT:    return sw_val_int(v->v.i);
+    case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
+    case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
     case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
     case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
-    case SW_VAL_ATOM:   return sw_val_atom(v->v.str ? v->v.str : "");
+    case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
     case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
-    case SW_VAL_PID:    return sw_val_pid(v->v.pid);
+    case SW_VAL_PID:    return sw_val_pid_id(v->v.pidv.ptr, v->v.pidv.id);
     case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
     case SW_VAL_TUPLE:
     case SW_VAL_LIST: {
@@ -2449,10 +2719,24 @@ static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
     }
 }
 
+/* Redirect this THREAD's value allocations into `region` (NULL restores the
+ * default: the running process's arena, else the global heap). Returns the
+ * previous target so callers can nest/restore. Used by the blocking-builtin
+ * offload: the worker thread builds the builtin's result inside a region the
+ * parked caller then adopts. */
+sw_value_arena_t *sw_swap_alloc_target(sw_value_arena_t *region) {
+    sw_value_arena_t *prev = g_alloc_target;
+    g_alloc_target = region;
+    return prev;
+}
+
 sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     int save = g_alloc_force_global;
     g_alloc_force_global = 1;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
     sw_val_t *r = deep_copy_rec(v, 0);
+    dc_end(&dc, saved);
     g_alloc_force_global = save;
     return r;
 }
@@ -2467,7 +2751,10 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v) {
     int save_g = g_alloc_force_global;
     g_alloc_target = NULL;
     g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
     sw_val_t *r = deep_copy_rec(v, 0);
+    dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
     return r;
@@ -2483,10 +2770,57 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
     int save_g = g_alloc_force_global;
     g_alloc_target = region;
     g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
     sw_val_t *r = deep_copy_rec(v, 0);
+    dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
     return r;
+}
+
+/* Ownership v2 turn checkpoint (called by compiled self-tail-calls once the
+ * function has allocated enough above its entry floor). Copies the live
+ * recursion arguments into a fresh region, rewinds the process arena to
+ * `floor` (freeing this function's per-turn garbage and unreferenced adopted
+ * message chunks) and splices the region back in; args[] is rewritten in
+ * place. Values at or below the floor survive the rewind, so they are shared
+ * rather than copied, and shared substructure is copied once — the cost is
+ * proportional to what the loop keeps ABOVE its floor, not to everything it
+ * can reach. Returns 1 if the arena was rewound, 0 if skipped (no process
+ * arena, below the adaptive threshold, or OOM: args untouched). */
+int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
+    sw_value_arena_t *a = sw_self_varena();
+    if (!a) return 0;
+    size_t used = a->total_bytes - floor.total_bytes;
+    /* Adaptive trigger: wait until the turn garbage is at least twice what
+     * the last checkpoint carried forward, so copying stays amortised O(1)
+     * per allocated byte even when the loop keeps a large live state. */
+    size_t need = SW_TURN_RESET_BYTES;
+    if (a->turn_live * 2 > need) need = a->turn_live * 2;
+    if (used <= need) return 0;
+    sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_PROCESS);
+    if (!r) return 0;
+    sw_varena_range_t *keep = NULL;
+    int nkeep = sw_varena_ranges_below(a, floor, &keep);
+    sw_value_arena_t *save_t = g_alloc_target;
+    int save_g = g_alloc_force_global;
+    g_alloc_target = r;
+    g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
+    dc.keep = keep;
+    dc.nkeep = nkeep;
+    for (int i = 0; i < n; i++) args[i] = deep_copy_rec(args[i], 0);
+    dc_end(&dc, saved);
+    g_alloc_target = save_t;
+    g_alloc_force_global = save_g;
+    free(keep);
+    size_t live = r->total_bytes;
+    sw_varena_reset_to(a, floor);
+    sw_varena_adopt(a, r);
+    a->turn_live = live;
+    return 1;
 }
 
 /* sw_send_value: enqueue an sw_val_t VALUE message, deep-copied to the global
@@ -2504,7 +2838,9 @@ void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v) {
      * binary does — the receiver will too), copy the payload into a MESSAGE
      * region the receiver adopts on match and that process_destroy bulk-frees if
      * undelivered. SW_GC_OFF / no arena / region-OOM → v1 global-heap copy. */
-    if (sw_self_varena()) {
+    /* g_alloc_target: sending from an offload worker (a builtin running for a
+     * parked process) — the receiver has an arena, so use a region too. */
+    if (sw_self_varena() || g_alloc_target) {
         sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_MESSAGE);
         if (r) { sw_send_tagged_msg(to, tag, deep_copy_into(v, r), r); return; }
     }
@@ -2567,7 +2903,7 @@ sw_val_t *sw_val_map_put(sw_val_t *map, sw_val_t *key, sw_val_t *val) {
 }
 
 void sw_val_free(sw_val_t *v) {
-    if (!v) return;
+    if (!v || v->immortal) return;
     switch (v->type) {
     case SW_VAL_STRING: case SW_VAL_ATOM: free(v->v.str); break;
     case SW_VAL_TUPLE: case SW_VAL_LIST:
@@ -2626,7 +2962,7 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
          * slab slot today, but comparing the id keeps them equal even if
          * one side carries a freshly-resolved pointer. NULL pids (id 0)
          * only equal other NULL pids. */
-        return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
+        return a->v.pidv.id == b->v.pidv.id;
     case SW_VAL_REMOTE_PID:
         return a->v.rpid.id == b->v.rpid.id &&
                ((a->v.rpid.node == b->v.rpid.node) ||
@@ -2656,7 +2992,7 @@ void sw_val_format(FILE *f, sw_val_t *v) {
     case SW_VAL_FLOAT: fprintf(f, "%.17g", v->v.f); break;
     case SW_VAL_STRING: fprintf(f, "%s", v->v.str); break;
     case SW_VAL_ATOM: fprintf(f, ":%s", v->v.str); break;
-    case SW_VAL_PID: fprintf(f, "<pid:%llu>", (unsigned long long)(v->v.pid ? v->v.pid->pid : 0)); break;
+    case SW_VAL_PID: fprintf(f, "<pid:%llu>", (unsigned long long)v->v.pidv.id); break;
     case SW_VAL_REMOTE_PID:
         fprintf(f, "<rpid:%s:%llu>",
                 v->v.rpid.node ? v->v.rpid.node : "?",
@@ -2757,6 +3093,57 @@ static sw_val_t *env_get(sw_env_t *e, const char *name) {
     return NULL;
 }
 
+/* Names assigned (N_ASSIGN) anywhere in a branch body, not descending into
+ * nested lambdas (their assignments are their own locals). */
+static void branch_assigned_names(node_t *n, const char **out, int *cnt, int max) {
+    if (!n || *cnt >= max) return;
+    switch (n->type) {
+    case N_ASSIGN:
+        for (int i = 0; i < *cnt; i++) if (strcmp(out[i], n->v.assign.name) == 0) goto rhs;
+        out[(*cnt)++] = n->v.assign.name;
+    rhs:
+        branch_assigned_names(n->v.assign.value, out, cnt, max);
+        break;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++) branch_assigned_names(n->v.block.stmts[i], out, cnt, max);
+        break;
+    case N_IF:
+        branch_assigned_names(n->v.iff.then_b, out, cnt, max);
+        branch_assigned_names(n->v.iff.else_b, out, cnt, max);
+        break;
+    case N_CASE:
+        for (int i = 0; i < n->v.casex.nclauses; i++)
+            branch_assigned_names(n->v.casex.clauses[i]->v.clause.body, out, cnt, max);
+        break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++)
+            branch_assigned_names(n->v.recv.clauses[i]->v.clause.body, out, cnt, max);
+        branch_assigned_names(n->v.recv.after_body, out, cnt, max);
+        break;
+    case N_TRY:
+        branch_assigned_names(n->v.trycatch.body, out, cnt, max);
+        branch_assigned_names(n->v.trycatch.catch_body, out, cnt, max);
+        break;
+    default: break;
+    }
+}
+
+/* A case/receive arm runs in a child env (its pattern binds are arm-local),
+ * but variables ASSIGNED in the arm body belong to the enclosing scope, the
+ * same as an if-branch — matching the compiled path, which hoists them. Copy
+ * those bindings out of the arm env into `env` before it is released. */
+static void propagate_arm_assigns(node_t *body, sw_env_t *arm, sw_env_t *env) {
+    const char *names[64];
+    int cnt = 0;
+    branch_assigned_names(body, names, &cnt, 64);
+    for (int i = 0; i < cnt; i++) {
+        uint32_t h = env_hash(names[i]);
+        for (sw_env_entry_t *ent = arm->buckets[h]; ent; ent = ent->next) {
+            if (strcmp(ent->name, names[i]) == 0) { env_set(env, names[i], ent->val); break; }
+        }
+    }
+}
+
 /* Drop one ref. Frees buckets + struct (and releases parent) only at 0, so an
  * env that an escaping closure still references survives the frame's release. */
 static void env_free(sw_env_t *e) {
@@ -2784,6 +3171,7 @@ static void env_free(sw_env_t *e) {
 
 /* Internal: evaluate a node in an environment */
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env);
+static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv);
 
 /* Find function by name in module */
 static node_t *find_fun(node_t *mod, const char *name) {
@@ -2844,7 +3232,7 @@ static int pattern_match(node_t *pattern, sw_val_t *val, sw_env_t *env) {
         if (val->type != SW_VAL_LIST || val->v.tuple.count < 1) return 0;
         if (!pattern_match(pattern->v.cons.head, val->v.tuple.items[0], env)) return 0;
         {
-            sw_val_t *tail = sw_val_list(val->v.tuple.items + 1, val->v.tuple.count - 1);
+            sw_val_t *tail = sw_val_list_view(val, 1, val->v.tuple.count - 1);   /* O(1) */
             if (!pattern_match(pattern->v.cons.tail, tail, env)) return 0;
         }
         return 1;
@@ -2900,7 +3288,7 @@ static sw_val_t *recv_msg_to_val(sw_msg_t *m) {
         sw_val_t *reason = sig->reason_str ? sw_val_string(sig->reason_str)
                                            : sw_val_int((int64_t)sig->reason);
         sw_val_t *items[3] = { sw_val_atom("EXIT"),
-                               sw_val_pid(sw_find_by_pid_any(sig->pid)),
+                               sw_val_pid_id(sw_find_by_pid_any(sig->pid), sig->pid),
                                reason };
         return sw_val_tuple(items, 3);
     }
@@ -2911,7 +3299,7 @@ static sw_val_t *recv_msg_to_val(sw_msg_t *m) {
         sw_val_t *items[5] = { sw_val_atom("DOWN"),
                                sw_val_int((int64_t)sig->ref),
                                sw_val_atom("process"),
-                               sw_val_pid(sw_find_by_pid_any(sig->pid)),
+                               sw_val_pid_id(sw_find_by_pid_any(sig->pid), sig->pid),
                                reason };
         return sw_val_tuple(items, 5);
     }
@@ -3059,6 +3447,65 @@ static void interp_json_putc(char **buf, size_t *cap, size_t *pos, char c) {
     (*buf)[(*pos)++] = c;
 }
 
+/* Length of the valid UTF-8 sequence at p (2-4 bytes), 0 if invalid:
+ * overlongs, surrogates and > U+10FFFF are invalid. */
+static int interp_utf8_valid_len(const unsigned char *p, size_t avail) {
+    unsigned char c = p[0];
+    int n; uint32_t cp;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; cp = c & 0x07; }
+    else return 0;
+    if ((size_t)n > avail) return 0;
+    for (int i = 1; i < n; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    if ((n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000)) return 0;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+    if (cp > 0x10FFFF) return 0;
+    return n;
+}
+
+/* Same as the compiled _json_encode_str: escaped, always valid UTF-8
+ * (each invalid byte becomes \ufffd). */
+static void interp_json_encode_str(const char *str, char **buf, size_t *cap, size_t *pos) {
+    interp_json_putc(buf, cap, pos, '"');
+    const unsigned char *p = (const unsigned char *)str;
+    size_t n = strlen(str), i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        switch (c) {
+            case '"':  interp_json_append(buf, cap, pos, "\\\""); i++; continue;
+            case '\\': interp_json_append(buf, cap, pos, "\\\\"); i++; continue;
+            case '\n': interp_json_append(buf, cap, pos, "\\n"); i++; continue;
+            case '\r': interp_json_append(buf, cap, pos, "\\r"); i++; continue;
+            case '\t': interp_json_append(buf, cap, pos, "\\t"); i++; continue;
+            default: break;
+        }
+        if (c < 0x20 || c == 0x7F) {
+            char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", c);
+            interp_json_append(buf, cap, pos, esc);
+            i++;
+        } else if (c < 0x80) {
+            interp_json_putc(buf, cap, pos, (char)c);
+            i++;
+        } else {
+            int len = interp_utf8_valid_len(p + i, n - i);
+            if (len > 0) {
+                interp_json_grow(buf, cap, *pos, (size_t)len);
+                memcpy(*buf + *pos, p + i, (size_t)len);
+                *pos += (size_t)len;
+                i += (size_t)len;
+            } else {
+                interp_json_append(buf, cap, pos, "\\ufffd");
+                i++;
+            }
+        }
+    }
+    interp_json_putc(buf, cap, pos, '"');
+}
+
 static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) {
     if (!v || v->type == SW_VAL_NIL) {
         interp_json_append(buf, cap, pos, "null");
@@ -3067,37 +3514,19 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
         snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.i);
         interp_json_append(buf, cap, pos, tmp);
     } else if (v->type == SW_VAL_FLOAT) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
-        interp_json_append(buf, cap, pos, tmp);
-    } else if (v->type == SW_VAL_STRING) {
-        interp_json_append(buf, cap, pos, "\"");
-        for (const char *p = v->v.str; *p; p++) {
-            switch (*p) {
-                case '"':  interp_json_append(buf, cap, pos, "\\\""); break;
-                case '\\': interp_json_append(buf, cap, pos, "\\\\"); break;
-                case '\n': interp_json_append(buf, cap, pos, "\\n"); break;
-                case '\r': interp_json_append(buf, cap, pos, "\\r"); break;
-                case '\t': interp_json_append(buf, cap, pos, "\\t"); break;
-                default:
-                    if ((unsigned char)*p < 0x20) {
-                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
-                        interp_json_append(buf, cap, pos, esc);
-                    } else {
-                        interp_json_putc(buf, cap, pos, *p);
-                    }
-            }
+        if (isnan(v->v.f) || isinf(v->v.f)) { interp_json_append(buf, cap, pos, "null"); }
+        else {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            interp_json_append(buf, cap, pos, tmp);
         }
-        interp_json_append(buf, cap, pos, "\"");
+    } else if (v->type == SW_VAL_STRING) {
+        interp_json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_ATOM) {
         if (strcmp(v->v.str, "true") == 0) interp_json_append(buf, cap, pos, "true");
         else if (strcmp(v->v.str, "false") == 0) interp_json_append(buf, cap, pos, "false");
         else if (strcmp(v->v.str, "nil") == 0) interp_json_append(buf, cap, pos, "null");
-        else {
-            interp_json_append(buf, cap, pos, "\"");
-            interp_json_append(buf, cap, pos, v->v.str);
-            interp_json_append(buf, cap, pos, "\"");
-        }
+        else interp_json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_LIST || v->type == SW_VAL_TUPLE) {
         interp_json_append(buf, cap, pos, "[");
         for (int i = 0; i < v->v.tuple.count; i++) {
@@ -3109,16 +3538,15 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
         interp_json_append(buf, cap, pos, "{");
         for (int i = 0; i < v->v.map.count; i++) {
             if (i > 0) interp_json_append(buf, cap, pos, ",");
-            interp_json_append(buf, cap, pos, "\"");
             if (v->v.map.keys[i]->type == SW_VAL_STRING ||
                 v->v.map.keys[i]->type == SW_VAL_ATOM)
-                interp_json_append(buf, cap, pos, v->v.map.keys[i]->v.str);
+                interp_json_encode_str(v->v.map.keys[i]->v.str, buf, cap, pos);
             else {
                 char tmp[64];
-                snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.map.keys[i]->v.i);
+                snprintf(tmp, sizeof(tmp), "\"%lld\"", (long long)v->v.map.keys[i]->v.i);
                 interp_json_append(buf, cap, pos, tmp);
             }
-            interp_json_append(buf, cap, pos, "\":");
+            interp_json_append(buf, cap, pos, ":");
             interp_json_encode_val(v->v.map.vals[i], buf, cap, pos);
         }
         interp_json_append(buf, cap, pos, "}");
@@ -3164,7 +3592,7 @@ static sw_val_t *builtin_tl(sw_interp_t *interp, sw_val_t **args, int nargs) {
     if (args[0]->type != SW_VAL_LIST) { interp_raise_panic(interp, 0, "tl: not a list (got type %d)", args[0]->type); return sw_val_nil(); }
     if (args[0]->v.tuple.count == 0) { interp_raise_panic(interp, 0, "tl: list is empty"); return sw_val_nil(); }
     if (args[0]->v.tuple.count == 1) return sw_val_list(NULL, 0);
-    return sw_val_list(args[0]->v.tuple.items + 1, args[0]->v.tuple.count - 1);
+    return sw_val_list_view(args[0], 1, args[0]->v.tuple.count - 1);
 }
 
 /* Built-in function: elem (tuple element access).
@@ -3298,7 +3726,7 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
                              ? fn_val->v.fun.closure_env
                              : interp->global_env);
     /* Zero-arg lambda — no params to bind. */
-    (void)eval(interp, fn_node->v.fun.body, fenv);
+    (void)interp_eval_body(interp, fn_node, fenv);
     env_free(fenv);
 
     interp->try_depth--;
@@ -3344,7 +3772,7 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
  */
 
 #define _INTERP_VETS_BUCKETS   256
-#define _INTERP_VETS_MAX_TABLES 64
+#define _INTERP_VETS_MAX_TABLES 1024
 
 typedef struct _interp_vets_entry {
     sw_val_t *key;
@@ -3360,6 +3788,8 @@ typedef struct {
 
 static _interp_vets_table_t _interp_vets_tables[_INTERP_VETS_MAX_TABLES];
 static int _interp_vets_next_id = 0;
+static int _interp_vets_free_ids[_INTERP_VETS_MAX_TABLES];   /* ets_drop'd ids */
+static int _interp_vets_nfree = 0;
 static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t _interp_vets_hash(sw_val_t *v) {
@@ -3400,7 +3830,7 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
             return a->v.bytes.len == b->v.bytes.len &&
                    memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
         case SW_VAL_PID:    /* compare by numeric pid id, see sw_val_equal */
-            return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
+            return a->v.pidv.id == b->v.pidv.id;
         default:            return a == b;
     }
 }
@@ -3487,7 +3917,7 @@ static void spawn_trampoline(void *arg) {
         env_set(fenv, fn->v.fun.params[i], b->args[i]);
     sw_interp_t *interp = b->interp;   /* capture before free(b) below */
     interp->call_depth++;
-    (void)eval(interp, fn->v.fun.body, fenv);
+    (void)interp_eval_body(interp, fn, fenv);
     interp->call_depth--;
     env_free(fenv);
     if (b->args) free(b->args);
@@ -3535,7 +3965,7 @@ static void _sup_interp_entry(void *raw) {
     if (fn && fn->v.fun.body) {
         sw_env_t *fenv = env_new(c->closure_env ? c->closure_env : interp->global_env);
         interp->call_depth++;
-        (void)eval(interp, fn->v.fun.body, fenv);
+        (void)interp_eval_body(interp, fn, fenv);
         interp->call_depth--;
         env_free(fenv);
     }
@@ -3558,7 +3988,7 @@ static sw_val_t *interp_apply_fn(sw_interp_t *interp, sw_val_t *fn,
     for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
         env_set(fenv, fn_node->v.fun.params[i], args[i]);
     interp->call_depth++;
-    sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
+    sw_val_t *r = interp_eval_body(interp, fn_node, fenv);
     interp->call_depth--;
     env_free(fenv);
     return r;
@@ -3677,21 +4107,13 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "sleep") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
         int64_t ms = args[0]->v.i;
         if (ms > 0) {
-            /* Yield to the scheduler (sw_receive_any with a timeout) when
-             * running inside a live process, exactly like the compiled
-             * _builtin_sleep — under the single-scheduler `swc run` path all
+            /* Park on the scheduler when running inside a live process,
+             * exactly like the compiled _builtin_sleep — under the single-scheduler `swc run` path all
              * processes are cooperative fibers on ONE thread, so a raw usleep
              * would block the whole thread and starve spawned children (e.g.
              * `spawn(child) ; sleep(150)` would never let the child run).
-             * Fall back to usleep only outside a process (REPL/test contexts
-             * where tls_current is NULL). */
-            if (sw_self()) {
-                uint64_t tag = 0;
-                void *m = sw_receive_any((uint64_t)ms, &tag);
-                if (m) free(m);  /* discard any spurious message */
-            } else {
-                usleep((useconds_t)(ms * 1000));
-            }
+             * Outside a process (REPL/test contexts) it is a plain OS sleep. */
+            sw_sleep_ms((uint64_t)ms);  /* parks the fiber; mailbox untouched */
         }
         return sw_val_atom("ok");  /* matches codegen path */
     }
@@ -3892,6 +4314,39 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_list(items, sw_prog_argc);
         free(items);
         return r;
+    }
+    if (strcmp(fname, "stdout_to_stderr") == 0) {
+        static int saved_fd = -1;
+        if (saved_fd < 0) {
+            fflush(stdout);
+            int fd = dup(STDOUT_FILENO);
+            if (fd >= 0 && dup2(STDERR_FILENO, STDOUT_FILENO) >= 0) saved_fd = fd;
+            else if (fd >= 0) close(fd);
+        }
+        return sw_val_int(saved_fd);
+    }
+    if (strcmp(fname, "fd_write") == 0) {
+        if (nargs < 2 || args[0]->type != SW_VAL_INT || args[1]->type != SW_VAL_STRING)
+            return sw_val_atom("error");
+        const char *s = args[1]->v.str;
+        size_t len = strlen(s), off = 0;
+        fflush(stdout);
+        while (off < len) {
+            ssize_t w = write((int)args[0]->v.i, s + off, len - off);
+            if (w < 0) { if (errno == EINTR) continue; return sw_val_atom("error"); }
+            off += (size_t)w;
+        }
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "eprint") == 0) {
+        fflush(stdout);
+        for (int i = 0; i < nargs; i++) {
+            if (i) fputc(' ', stderr);
+            sw_val_format(stderr, args[i]);
+        }
+        fputc('\n', stderr);
+        fflush(stderr);
+        return sw_val_atom("ok");
     }
     if (strcmp(fname, "print_above") == 0) {
         /* No raw line editor under the interpreter — behaves as print. */
@@ -4185,7 +4640,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             size_t wlen = strlen(cmd) + strlen(exit_path) + 32;
             char *wrapper = (char *)malloc(wlen);
             if (!wrapper) _exit(127);
-            snprintf(wrapper, wlen, "( %s ); echo $? > %s", cmd, exit_path);
+            snprintf(wrapper, wlen, "( %s\n); echo $? > %s", cmd, exit_path);
             execl("/bin/sh", "sh", "-c", wrapper, (char *)NULL);
             _exit(127);
         }
@@ -4315,16 +4770,48 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     /* === ETS (value-aware hash tables) ========================= */
     if (strcmp(fname, "ets_new") == 0) {
         pthread_mutex_lock(&_interp_vets_meta);
-        int id = _interp_vets_next_id++;
-        if (id >= _INTERP_VETS_MAX_TABLES) {
-            pthread_mutex_unlock(&_interp_vets_meta);
-            return sw_val_nil();
+        int id;
+        if (_interp_vets_nfree > 0) {
+            id = _interp_vets_free_ids[--_interp_vets_nfree];
+            pthread_rwlock_wrlock(&_interp_vets_tables[id].lock);
+            memset(_interp_vets_tables[id].buckets, 0, sizeof(_interp_vets_tables[id].buckets));
+            _interp_vets_tables[id].active = 1;
+            pthread_rwlock_unlock(&_interp_vets_tables[id].lock);
+        } else {
+            id = _interp_vets_next_id;
+            if (id >= _INTERP_VETS_MAX_TABLES) {
+                pthread_mutex_unlock(&_interp_vets_meta);
+                fprintf(stderr, "swarmrt: ets_new: table limit (%d live tables) reached — "
+                                "release unused tables with ets_drop(t)\n", _INTERP_VETS_MAX_TABLES);
+                return sw_val_nil();
+            }
+            _interp_vets_next_id++;
+            memset(&_interp_vets_tables[id], 0, sizeof(_interp_vets_table_t));
+            pthread_rwlock_init(&_interp_vets_tables[id].lock, NULL);
+            _interp_vets_tables[id].active = 1;
         }
-        memset(&_interp_vets_tables[id], 0, sizeof(_interp_vets_table_t));
-        pthread_rwlock_init(&_interp_vets_tables[id].lock, NULL);
-        _interp_vets_tables[id].active = 1;
         pthread_mutex_unlock(&_interp_vets_meta);
         return sw_val_int((int64_t)id);
+    }
+    if (strcmp(fname, "ets_drop") == 0 && nargs >= 1 && args[0]->type == SW_VAL_INT) {
+        int id = (int)args[0]->v.i;
+        pthread_mutex_lock(&_interp_vets_meta);
+        if (id < 0 || id >= _interp_vets_next_id || !_interp_vets_tables[id].active) {
+            pthread_mutex_unlock(&_interp_vets_meta);
+            return sw_val_atom("error");
+        }
+        _interp_vets_table_t *t = &_interp_vets_tables[id];
+        pthread_rwlock_wrlock(&t->lock);
+        t->active = 0;
+        for (int b = 0; b < _INTERP_VETS_BUCKETS; b++) {
+            _interp_vets_entry_t *e = t->buckets[b];
+            while (e) { _interp_vets_entry_t *next = e->next; free(e); e = next; }
+            t->buckets[b] = NULL;
+        }
+        pthread_rwlock_unlock(&t->lock);
+        _interp_vets_free_ids[_interp_vets_nfree++] = id;
+        pthread_mutex_unlock(&_interp_vets_meta);
+        return sw_val_atom("ok");
     }
     if (strcmp(fname, "ets_put") == 0 && nargs >= 3 && args[0]->type == SW_VAL_INT) {
         int id = (int)args[0]->v.i;
@@ -4498,7 +4985,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
                                   : interp->global_env);
         if (fn_node->v.fun.nparams >= 1)
             env_set(fenv, fn_node->v.fun.params[0], old_val);
-        sw_val_t *new_val = eval(interp, fn_node->v.fun.body, fenv);
+        sw_val_t *new_val = interp_eval_body(interp, fn_node, fenv);
         env_free(fenv);
 
         if (interp->error) return sw_val_nil();
@@ -4798,12 +5285,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     /* link/unlink/trap_exit/exit_proc — {'EXIT',from,reason} delivery */
     if (strcmp(fname, "link") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
-        sw_link(args[0]->v.pid);
+        if (!sw_pid_of(args[0])) return sw_val_atom("error");   /* noproc */
+        sw_link(sw_pid_of(args[0]));
         return sw_val_atom("ok");
     }
     if (strcmp(fname, "unlink") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
-        return sw_val_atom(sw_unlink(args[0]->v.pid) == 0 ? "ok" : "error");
+        if (!sw_pid_of(args[0])) return sw_val_atom("ok");
+        return sw_val_atom(sw_unlink(sw_pid_of(args[0])) == 0 ? "ok" : "error");
     }
     if (strcmp(fname, "trap_exit") == 0) {
         if (nargs < 1 || !args[0]) return sw_val_atom("error");
@@ -4821,14 +5310,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             else if (strcmp(args[1]->v.str, "killed") == 0) reason = 2;
             else reason = 3;
         }
-        sw_process_kill(args[0]->v.pid, reason);
+        if (sw_pid_of(args[0])) sw_process_kill(sw_pid_of(args[0]), reason);   /* gone: no-op */
         return sw_val_atom("ok");
     }
 
     /* monitor/demonitor — same machinery spawn_monitor already uses */
     if (strcmp(fname, "monitor") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_nil();
-        return sw_val_int((int64_t)sw_monitor(args[0]->v.pid));
+        return sw_val_int((int64_t)sw_monitor_id(args[0]->v.pidv.ptr, args[0]->v.pidv.id));
     }
     if (strcmp(fname, "demonitor") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_INT) return sw_val_atom("error");
@@ -4841,7 +5330,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             (args[0]->type != SW_VAL_STRING && args[0]->type != SW_VAL_ATOM) ||
             args[1]->type != SW_VAL_PID)
             return sw_val_atom("error");
-        return sw_val_atom(sw_register(args[0]->v.str, args[1]->v.pid) == 0 ? "ok" : "error");
+        if (!sw_pid_of(args[1])) return sw_val_atom("error");
+        return sw_val_atom(sw_register(args[0]->v.str, sw_pid_of(args[1])) == 0 ? "ok" : "error");
     }
     if (strcmp(fname, "whereis") == 0) {
         if (nargs < 1 || !args[0]->v.str ||
@@ -5098,6 +5588,381 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
 }
 
 /* Evaluate node */
+/* === Interpreter tail calls ===
+ * Recursion is sw's only loop, and the tree-walker used to recurse on the C
+ * stack for every call, so `swc run` / `swc test` / the REPL died after a few
+ * hundred iterations of any loop (the compiled path TCOs self-tail-calls).
+ * At load time every call in tail position of a function or lambda body is
+ * flagged. Evaluating a flagged call to a user function (module function or
+ * closure — never a builtin) records a tail request and unwinds to the
+ * innermost interp_eval_body, which rebinds and loops. EVERY site that
+ * evaluates a function body goes through interp_eval_body, so a request is
+ * always consumed by the body that issued it. This also covers mutual tail
+ * recursion, which the compiled path does not yet. */
+static void mark_tail(node_t *n) {
+    if (!n) return;
+    switch (n->type) {
+    case N_CALL: n->v.call.tail = 1; break;
+    case N_BLOCK: if (n->v.block.nstmts > 0) mark_tail(n->v.block.stmts[n->v.block.nstmts - 1]); break;
+    case N_IF: mark_tail(n->v.iff.then_b); mark_tail(n->v.iff.else_b); break;
+    case N_CASE:
+        for (int i = 0; i < n->v.casex.nclauses; i++) mark_tail(n->v.casex.clauses[i]->v.clause.body);
+        break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) mark_tail(n->v.recv.clauses[i]->v.clause.body);
+        mark_tail(n->v.recv.after_body);
+        break;
+    default: break;
+    }
+}
+
+/* Mark the body of every lambda found anywhere under n. */
+static void mark_lambda_tails(node_t *n) {
+    if (!n) return;
+    switch (n->type) {
+    case N_FUN: mark_tail(n->v.fun.body); mark_lambda_tails(n->v.fun.body); break;
+    case N_BLOCK: for (int i = 0; i < n->v.block.nstmts; i++) mark_lambda_tails(n->v.block.stmts[i]); break;
+    case N_ASSIGN: mark_lambda_tails(n->v.assign.value); break;
+    case N_CALL:
+        mark_lambda_tails(n->v.call.func);
+        for (int i = 0; i < n->v.call.nargs; i++) mark_lambda_tails(n->v.call.args[i]);
+        break;
+    case N_SPAWN: mark_lambda_tails(n->v.spawn.expr); break;
+    case N_SEND: mark_lambda_tails(n->v.send.to); mark_lambda_tails(n->v.send.msg); break;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) mark_lambda_tails(n->v.recv.clauses[i]);
+        mark_lambda_tails(n->v.recv.after_body); mark_lambda_tails(n->v.recv.after_expr);
+        break;
+    case N_CLAUSE: mark_lambda_tails(n->v.clause.guard); mark_lambda_tails(n->v.clause.body); break;
+    case N_CASE:
+        mark_lambda_tails(n->v.casex.subject);
+        for (int i = 0; i < n->v.casex.nclauses; i++) mark_lambda_tails(n->v.casex.clauses[i]);
+        break;
+    case N_IF: mark_lambda_tails(n->v.iff.cond); mark_lambda_tails(n->v.iff.then_b); mark_lambda_tails(n->v.iff.else_b); break;
+    case N_BINOP: mark_lambda_tails(n->v.binop.left); mark_lambda_tails(n->v.binop.right); break;
+    case N_UNARY: mark_lambda_tails(n->v.unary.operand); break;
+    case N_PIPE: mark_lambda_tails(n->v.pipe.val); mark_lambda_tails(n->v.pipe.func); break;
+    case N_TUPLE: case N_LIST: for (int i = 0; i < n->v.coll.count; i++) mark_lambda_tails(n->v.coll.items[i]); break;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { mark_lambda_tails(n->v.map.keys[i]); mark_lambda_tails(n->v.map.vals[i]); }
+        break;
+    case N_FOR: mark_lambda_tails(n->v.forloop.iter); mark_lambda_tails(n->v.forloop.body); break;
+    case N_LIST_COMP: mark_lambda_tails(n->v.lcomp.iter); mark_lambda_tails(n->v.lcomp.body); mark_lambda_tails(n->v.lcomp.guard); break;
+    case N_RANGE: mark_lambda_tails(n->v.range.from); mark_lambda_tails(n->v.range.to); break;
+    case N_TRY: mark_lambda_tails(n->v.trycatch.body); mark_lambda_tails(n->v.trycatch.catch_body); break;
+    case N_LIST_CONS: mark_lambda_tails(n->v.cons.head); mark_lambda_tails(n->v.cons.tail); break;
+    default: break;
+    }
+}
+
+static void interp_mark_tails(node_t *mod) {
+    if (!mod || mod->type != N_MODULE) return;
+    for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        node_t *fn = mod->v.mod.funs[i];
+        mark_tail(fn->v.fun.body);
+        mark_lambda_tails(fn->v.fun.body);
+    }
+}
+
+/* Bind a user function's parameters: positional args, then defaults, then nil. */
+static void bind_params(sw_interp_t *interp, node_t *fn, sw_env_t *fenv, sw_val_t **args, int nargs) {
+    for (int i = 0; i < fn->v.fun.nparams; i++) {
+        if (i < nargs)
+            env_set(fenv, fn->v.fun.params[i], args[i]);
+        else if (fn->v.fun.defaults[i])
+            env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
+        else
+            env_set(fenv, fn->v.fun.params[i], sw_val_nil());
+    }
+}
+
+/* Evaluate the body of `fn` (an N_FUN) in `fenv` (owned by the caller), then
+ * run any tail calls it requests in this same C frame. */
+static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
+    sw_env_t *own = NULL;          /* env this loop created for a tail target */
+    for (;;) {
+        if (sw_check_reds()) sw_yield();   /* reduction-counted preemption */
+        sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
+        if (own) { env_free(own); own = NULL; }
+        if (!interp->tail_pending) return r;
+        interp->tail_pending = 0;
+        if (interp->error) return sw_val_nil();
+        sw_val_t *args[16];
+        int nargs = interp->tail_nargs;
+        memcpy(args, interp->tail_args, sizeof(sw_val_t *) * (size_t)nargs);
+        fn = interp->tail_fn;
+        own = env_new(interp->tail_env ? interp->tail_env : interp->global_env);
+        fenv = own;
+        bind_params(interp, fn, fenv, args, nargs);
+    }
+}
+
+/* Dispatch a call to `fname` with already-evaluated arguments: builtins,
+ * module functions, then a closure held in a variable. Shared by N_CALL and
+ * N_PIPE so `x |> f` and `f(x)` can never resolve differently. `n` is the
+ * call-site node (for line numbers only). */
+static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env,
+                                   const char *fname, sw_val_t **args, int nargs) {
+
+    /* Built-ins */
+    if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
+    if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
+    if (strcmp(fname, "hd") == 0) return builtin_hd(interp, args, nargs);
+    if (strcmp(fname, "tl") == 0) return builtin_tl(interp, args, nargs);
+    if (strcmp(fname, "elem") == 0) return builtin_elem(interp, args, nargs);
+    if (strcmp(fname, "abs") == 0 && nargs >= 1) {
+        /* abs handles both int and float (was int-only, so abs(-2.5)
+         * fell through to "undefined function"). */
+        if (args[0]->type == SW_VAL_INT)
+            return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
+        if (args[0]->type == SW_VAL_FLOAT)
+            return sw_val_float(args[0]->v.f < 0 ? -args[0]->v.f : args[0]->v.f);
+    }
+    if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
+        switch (args[0]->type) {
+        case SW_VAL_STRING: return args[0];
+        case SW_VAL_ATOM:   return sw_val_string(args[0]->v.str);
+        case SW_VAL_NIL:    return sw_val_string("nil");
+        case SW_VAL_INT: { char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf); }
+        case SW_VAL_FLOAT: { char buf[32]; snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf); }
+        default: {
+            /* Composite — render via the shared formatter so REPL
+             * output matches print()/codegen output. */
+            char *buf = NULL;
+            size_t blen = 0;
+            FILE *m = open_memstream(&buf, &blen);
+            if (!m) return sw_val_string("?");
+            sw_val_format(m, args[0]);
+            fclose(m);
+            sw_val_t *r = sw_val_string(buf ? buf : "");
+            free(buf);
+            return r;
+        }
+        }
+    }
+    if (strcmp(fname, "format") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        const char *tpl = args[0]->v.str;
+        char *buf = NULL;
+        size_t blen = 0;
+        FILE *m = open_memstream(&buf, &blen);
+        if (!m) return sw_val_string("");
+        int arg_idx = 1;
+        for (const char *p = tpl; *p; ) {
+            if (p[0] == '{' && p[1] == '}') {
+                if (arg_idx < nargs) sw_val_format(m, args[arg_idx++]);
+                else fputs("{}", m);
+                p += 2;
+            } else if (p[0] == '{' && p[1] == '{') { fputc('{', m); p += 2; }
+            else if (p[0] == '}' && p[1] == '}') { fputc('}', m); p += 2; }
+            else { fputc(*p, m); p++; }
+        }
+        fclose(m);
+        sw_val_t *r = sw_val_string(buf ? buf : "");
+        free(buf);
+        return r;
+    }
+    /* Common string ops — kept minimal so the REPL is useful for
+     * exploring sw without dragging in the full studio builtin
+     * surface (HTTP, WS, browser, etc. live in the codegen path). */
+    if (strcmp(fname, "string_split") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        const char *s = args[0]->v.str;
+        const char *sep = args[1]->v.str;
+        int seplen = (int)strlen(sep);
+        int cap = 16, count = 0;
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * cap);
+        const char *cur = s;
+        if (seplen == 0) {
+            /* Empty separator: whole string as one element (compiled parity). */
+            items[count++] = sw_val_string(s);
+        } else {
+            while (1) {
+                const char *hit = strstr(cur, sep);
+                if (!hit) break;
+                if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
+                int len = (int)(hit - cur);
+                char *piece = malloc(len + 1);
+                memcpy(piece, cur, len); piece[len] = '\0';
+                items[count++] = sw_val_string(piece);
+                free(piece);
+                cur = hit + seplen;
+            }
+            if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
+            items[count++] = sw_val_string(cur);
+        }
+        sw_val_t *r = sw_val_list(items, count);
+        free(items);
+        return r;
+    }
+    if (strcmp(fname, "string_contains") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
+        return sw_val_atom(strstr(args[0]->v.str, args[1]->v.str) ? "true" : "false");
+    if (strcmp(fname, "string_starts_with") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
+        return sw_val_atom(strncmp(args[0]->v.str, args[1]->v.str, strlen(args[1]->v.str)) == 0 ? "true" : "false");
+    if (strcmp(fname, "string_ends_with") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        size_t la = strlen(args[0]->v.str), lb = strlen(args[1]->v.str);
+        return sw_val_atom(la >= lb && strcmp(args[0]->v.str + la - lb, args[1]->v.str) == 0 ? "true" : "false");
+    }
+    if (strcmp(fname, "string_index_of") == 0 && nargs >= 2 &&
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
+        const char *hit = strstr(args[0]->v.str, args[1]->v.str);
+        return sw_val_int(hit ? (int64_t)(hit - args[0]->v.str) : -1);
+    }
+    if (strcmp(fname, "string_upper") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        char *r = strdup(args[0]->v.str);
+        for (char *p = r; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+    if (strcmp(fname, "string_lower") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        char *r = strdup(args[0]->v.str);
+        for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+    if (strcmp(fname, "string_trim") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        const char *s = args[0]->v.str;
+        while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+        const char *end = s + strlen(s);
+        while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
+        int len = (int)(end - s);
+        char *r = malloc(len + 1); memcpy(r, s, len); r[len] = '\0';
+        sw_val_t *v = sw_val_string(r); free(r); return v;
+    }
+    if (strcmp(fname, "string_length") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
+        return sw_val_int((int64_t)strlen(args[0]->v.str));
+    if (strcmp(fname, "json_encode") == 0) {
+        /* Real JSON, matching the compiled runtime's _json_encode_val
+         * exactly (see interp_json_encode_val). The old stub emitted
+         * the value debug-repr (e.g. %{:name: alice}) — invalid JSON. */
+        if (nargs < 1) return sw_val_string("null");
+        char *buf = (char *)malloc(256);
+        size_t cap = 256, pos = 0;
+        interp_json_encode_val(args[0], &buf, &cap, &pos);
+        buf[pos] = '\0';
+        sw_val_t *r = sw_val_string(buf);
+        free(buf);
+        return r;
+    }
+    if (strcmp(fname, "json_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+        return sw_lang_json_decode(args[0]->v.str);
+    }
+    /* Map ops the REPL is likely to want for shape checks. */
+    if (strcmp(fname, "map_size") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP)
+        return sw_val_int(args[0]->v.map.count);
+    if (strcmp(fname, "map_has_key") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
+        /* Delegate to sw_val_map_get so the atom-vs-string fallback matches:
+         * the bare sw_val_equal loop diverged from map_get (and from the
+         * compiled _builtin_map_has_key) on json_decode'd maps, where a
+         * string-keyed query missed an atom key that map_get still found.
+         * Now byte-for-byte identical to the compiled backend. */
+        sw_val_t *v = sw_val_map_get(args[0], args[1]);
+        return sw_val_atom((v && v->type != SW_VAL_NIL) ? "true" : "false");
+    }
+    if (strcmp(fname, "timestamp") == 0) {
+        struct timeval tv; gettimeofday(&tv, NULL);
+        return sw_val_int((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    }
+    if (strcmp(fname, "map_get") == 0 && nargs >= 2) {
+        sw_val_t *mv = sw_val_map_get(args[0], args[1]);
+        /* 3-arg overload: map_get(m, k, default). */
+        if (nargs >= 3 && (!mv || mv->type == SW_VAL_NIL)) return args[2];
+        return mv;
+    }
+    if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);
+    if (strcmp(fname, "map_new") == 0) return sw_val_map_new(NULL, NULL, 0);
+    if (strcmp(fname, "map_keys") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
+        return sw_val_list(args[0]->v.map.keys, args[0]->v.map.count);
+    }
+    if (strcmp(fname, "map_values") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
+        return sw_val_list(args[0]->v.map.vals, args[0]->v.map.count);
+    }
+    if (strcmp(fname, "typeof") == 0 && nargs >= 1) {
+        /* Switch (not a positional array) so it can't drift if the enum
+         * is reordered, and matches the compiled _builtin_typeof exactly. */
+        switch (args[0]->type) {
+        case SW_VAL_NIL:        return sw_val_string("nil");
+        case SW_VAL_INT:        return sw_val_string("int");
+        case SW_VAL_FLOAT:      return sw_val_string("float");
+        case SW_VAL_STRING:     return sw_val_string("string");
+        case SW_VAL_ATOM:       return sw_val_string("atom");
+        case SW_VAL_PID:        return sw_val_string("pid");
+        case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
+        case SW_VAL_TUPLE:      return sw_val_string("tuple");
+        case SW_VAL_LIST:       return sw_val_string("list");
+        case SW_VAL_FUN:        return sw_val_string("fun");
+        case SW_VAL_MAP:        return sw_val_string("map");
+        case SW_VAL_BYTES:      return sw_val_string("bytes");
+        default:                return sw_val_string("unknown");
+        }
+    }
+    if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST)
+        return sw_val_list_append(args[0], args[1]);
+
+    /* Test assertion builtins — but let user-defined functions with the
+     * same name take precedence. This allows test files to define their
+     * own 3-arg assert_eq(name, actual, expected) helpers without the
+     * 2-arg builtin intercepting the call. */
+    if ((strcmp(fname, "assert") == 0 ||
+         strcmp(fname, "assert_eq") == 0 ||
+         strcmp(fname, "assert_ne") == 0 ||
+         strcmp(fname, "assert_raises") == 0) &&
+        !find_fun(interp->module_ast, fname)) {
+        if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
+        if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
+    }
+
+    /* Extra REPL builtins — bridges the gap to the codegen surface
+     * (file_*, db_*, shell, panic, expect, error, etc.). See
+     * interp_extra_builtin() above. */
+    {
+        sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
+        if (xr) return xr;
+    }
+
+    /* User-defined function in module */
+    node_t *fn = find_fun(interp->module_ast, fname);
+    if (fn) {
+        if (interp_recursion_blocked(interp)) return sw_val_nil();
+        sw_env_t *fenv = env_new(interp->global_env);
+        for (int i = 0; i < fn->v.fun.nparams; i++) {
+            if (i < nargs)
+                env_set(fenv, fn->v.fun.params[i], args[i]);
+            else if (fn->v.fun.defaults[i])
+                env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
+            else
+                env_set(fenv, fn->v.fun.params[i], sw_val_nil());
+        }
+        interp->call_depth++;
+        sw_val_t *r = interp_eval_body(interp, fn, fenv);
+        interp->call_depth--;
+        env_free(fenv);
+        return r;
+    }
+
+    /* Dynamic dispatch: variable holds a closure */
+    sw_val_t *fn_val = env_get(env, fname);
+    if (fn_val && fn_val->type == SW_VAL_FUN && fn_val->v.fun.body) {
+        if (interp_recursion_blocked(interp)) return sw_val_nil();
+        node_t *fn_node = (node_t *)fn_val->v.fun.body;
+        sw_env_t *fenv = env_new(fn_val->v.fun.closure_env ? fn_val->v.fun.closure_env : interp->global_env);
+        for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
+            env_set(fenv, fn_node->v.fun.params[i], args[i]);
+        interp->call_depth++;
+        sw_val_t *r = interp_eval_body(interp, fn_node, fenv);
+        interp->call_depth--;
+        env_free(fenv);
+        return r;
+    }
+
+    snprintf(interp->error_msg, sizeof(interp->error_msg),
+             "undefined function: %s/%d", fname, nargs);
+    interp->error = 1;
+    return sw_val_nil();
+}
+
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     if (!n || interp->error) return sw_val_nil();
 
@@ -5111,7 +5976,21 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     case N_IDENT: {
         sw_val_t *v = env_get(env, n->v.sval);
         if (v) return v;
-        /* Could be a function reference */
+        /* A module function used by name as a value (`map(double, xs)`,
+         * `xs |> Std.sum`): build a closure over its definition, the same
+         * value the compiled path produces. (Imported functions are merged
+         * in under their qualified "Mod.fn" names too.) */
+        node_t *fn = interp->module_ast ? find_fun((node_t *)interp->module_ast, n->v.sval) : NULL;
+        if (fn) {
+            sw_val_t *fv = val_alloc(sizeof(sw_val_t));
+            fv->type = SW_VAL_FUN;
+            fv->v.fun.name = strdup(fn->v.fun.name);
+            fv->v.fun.num_params = fn->v.fun.nparams;
+            fv->v.fun.body = fn;
+            fv->v.fun.closure_env = interp->global_env;
+            env_retain(interp->global_env);
+            return fv;
+        }
         return sw_val_nil();
     }
 
@@ -5343,6 +6222,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                     }
                 }
                 sw_val_t *r = eval(interp, cl->v.clause.body, child);
+                propagate_arm_assigns(cl->v.clause.body, child, env);
                 env_free(child);
                 return r;
             }
@@ -5380,47 +6260,40 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
          * tests/sw/conform/t06 holds this closed). */
         sw_val_t *val = eval(interp, n->v.pipe.val, env);
         if (interp->error) return sw_val_nil();
-        if (n->v.pipe.func->type == N_CALL) {
-            node_t *call = n->v.pipe.func;
-            const char *fname = call->v.call.func->v.sval;
+        /* `val |> f(extra...)` and the bare form `val |> f` (a builtin,
+         * module function, `Mod.fn` or closure variable) share one path;
+         * the bare form used to return `val` untouched, so `|> print` or
+         * `|> Std.sum` silently did nothing under `swc run`. */
+        node_t *pf = n->v.pipe.func;
+        const char *pipe_fname = NULL;
+        node_t **pipe_xargs = NULL;
+        int pipe_nx = 0;
+        if (pf->type == N_CALL && pf->v.call.func->type == N_IDENT) {
+            pipe_fname = pf->v.call.func->v.sval;
+            pipe_xargs = pf->v.call.args;
+            pipe_nx = pf->v.call.nargs;
+        } else if (pf->type == N_IDENT) {
+            pipe_fname = pf->v.sval;
+        } else {
+            /* `val |> fun(x) { ... }` or any expression yielding a closure. */
+            sw_val_t *fv = eval(interp, pf, env);
+            if (interp->error) return sw_val_nil();
+            if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body)
+                return interp_apply_fn(interp, fv, &val, 1);
+            return val;
+        }
+        if (pipe_fname) {
+            const char *fname = pipe_fname;
 
             sw_val_t *args[17];
             args[0] = val;
             int nargs = 1;
-            for (int i = 0; i < call->v.call.nargs && nargs < 16; i++) {
-                args[nargs++] = eval(interp, call->v.call.args[i], env);
+            for (int i = 0; i < pipe_nx && nargs < 16; i++) {
+                args[nargs++] = eval(interp, pipe_xargs[i], env);
                 if (interp->error) return sw_val_nil();
             }
 
-            /* Module function (covers Module.qualified names too). */
-            node_t *fn = find_fun(interp->module_ast, fname);
-            if (fn) {
-                if (interp_recursion_blocked(interp)) return sw_val_nil();
-                sw_env_t *fenv = env_new(interp->global_env);
-                for (int i = 0; i < fn->v.fun.nparams && i < nargs; i++)
-                    env_set(fenv, fn->v.fun.params[i], args[i]);
-                interp->call_depth++;
-                sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
-                interp->call_depth--;
-                env_free(fenv);
-                return r;
-            }
-            /* Primary builtins (N_CALL's head chain). */
-            if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
-            if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
-            if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
-            /* The codegen-surface bridge: map/filter/reduce + the rest. */
-            {
-                sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
-                if (xr) return xr;
-            }
-            /* Lambda held in a variable: x |> f(...) */
-            sw_val_t *fv = env_get(env, fname);
-            if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body)
-                return interp_apply_fn(interp, fv, args, nargs);
+            return interp_call_named(interp, n, env, fname, args, nargs);
         }
         return val;
     }
@@ -5437,271 +6310,26 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
          * an f-string interpolation was laundered into the string "nil"
          * by the desugared to_string(...) and the program sailed on. */
         if (interp->error) return sw_val_nil();
-
-        /* Built-ins */
-        if (strcmp(fname, "print") == 0) return builtin_print(args, nargs);
-        if (strcmp(fname, "length") == 0) return builtin_length(args, nargs);
-        if (strcmp(fname, "hd") == 0) return builtin_hd(interp, args, nargs);
-        if (strcmp(fname, "tl") == 0) return builtin_tl(interp, args, nargs);
-        if (strcmp(fname, "elem") == 0) return builtin_elem(interp, args, nargs);
-        if (strcmp(fname, "abs") == 0 && nargs >= 1) {
-            /* abs handles both int and float (was int-only, so abs(-2.5)
-             * fell through to "undefined function"). */
-            if (args[0]->type == SW_VAL_INT)
-                return sw_val_int(args[0]->v.i < 0 ? -args[0]->v.i : args[0]->v.i);
-            if (args[0]->type == SW_VAL_FLOAT)
-                return sw_val_float(args[0]->v.f < 0 ? -args[0]->v.f : args[0]->v.f);
-        }
-        if (strcmp(fname, "to_string") == 0 && nargs >= 1) {
-            switch (args[0]->type) {
-            case SW_VAL_STRING: return args[0];
-            case SW_VAL_ATOM:   return sw_val_string(args[0]->v.str);
-            case SW_VAL_NIL:    return sw_val_string("nil");
-            case SW_VAL_INT: { char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)args[0]->v.i); return sw_val_string(buf); }
-            case SW_VAL_FLOAT: { char buf[32]; snprintf(buf, sizeof(buf), "%g", args[0]->v.f); return sw_val_string(buf); }
-            default: {
-                /* Composite — render via the shared formatter so REPL
-                 * output matches print()/codegen output. */
-                char *buf = NULL;
-                size_t blen = 0;
-                FILE *m = open_memstream(&buf, &blen);
-                if (!m) return sw_val_string("?");
-                sw_val_format(m, args[0]);
-                fclose(m);
-                sw_val_t *r = sw_val_string(buf ? buf : "");
-                free(buf);
-                return r;
-            }
-            }
-        }
-        if (strcmp(fname, "format") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            const char *tpl = args[0]->v.str;
-            char *buf = NULL;
-            size_t blen = 0;
-            FILE *m = open_memstream(&buf, &blen);
-            if (!m) return sw_val_string("");
-            int arg_idx = 1;
-            for (const char *p = tpl; *p; ) {
-                if (p[0] == '{' && p[1] == '}') {
-                    if (arg_idx < nargs) sw_val_format(m, args[arg_idx++]);
-                    else fputs("{}", m);
-                    p += 2;
-                } else if (p[0] == '{' && p[1] == '{') { fputc('{', m); p += 2; }
-                else if (p[0] == '}' && p[1] == '}') { fputc('}', m); p += 2; }
-                else { fputc(*p, m); p++; }
-            }
-            fclose(m);
-            sw_val_t *r = sw_val_string(buf ? buf : "");
-            free(buf);
-            return r;
-        }
-        /* Common string ops — kept minimal so the REPL is useful for
-         * exploring sw without dragging in the full studio builtin
-         * surface (HTTP, WS, browser, etc. live in the codegen path). */
-        if (strcmp(fname, "string_split") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
-            const char *s = args[0]->v.str;
-            const char *sep = args[1]->v.str;
-            int seplen = (int)strlen(sep);
-            int cap = 16, count = 0;
-            sw_val_t **items = malloc(sizeof(sw_val_t*) * cap);
-            const char *cur = s;
-            if (seplen == 0) {
-                /* Empty separator: whole string as one element (compiled parity). */
-                items[count++] = sw_val_string(s);
-            } else {
-                while (1) {
-                    const char *hit = strstr(cur, sep);
-                    if (!hit) break;
-                    if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
-                    int len = (int)(hit - cur);
-                    char *piece = malloc(len + 1);
-                    memcpy(piece, cur, len); piece[len] = '\0';
-                    items[count++] = sw_val_string(piece);
-                    free(piece);
-                    cur = hit + seplen;
+        if (n->v.call.tail && !interp_is_known_builtin(fname)) {
+            node_t *tf = find_fun((node_t *)interp->module_ast, fname);
+            sw_env_t *tenv = NULL;
+            if (!tf) {
+                sw_val_t *fv = env_get(env, fname);
+                if (fv && fv->type == SW_VAL_FUN && fv->v.fun.body) {
+                    tf = (node_t *)fv->v.fun.body;
+                    tenv = fv->v.fun.closure_env;
                 }
-                if (count >= cap) { cap *= 2; items = realloc(items, sizeof(sw_val_t*) * cap); }
-                items[count++] = sw_val_string(cur);
             }
-            sw_val_t *r = sw_val_list(items, count);
-            free(items);
-            return r;
-        }
-        if (strcmp(fname, "string_contains") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
-            return sw_val_atom(strstr(args[0]->v.str, args[1]->v.str) ? "true" : "false");
-        if (strcmp(fname, "string_starts_with") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING)
-            return sw_val_atom(strncmp(args[0]->v.str, args[1]->v.str, strlen(args[1]->v.str)) == 0 ? "true" : "false");
-        if (strcmp(fname, "string_ends_with") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
-            size_t la = strlen(args[0]->v.str), lb = strlen(args[1]->v.str);
-            return sw_val_atom(la >= lb && strcmp(args[0]->v.str + la - lb, args[1]->v.str) == 0 ? "true" : "false");
-        }
-        if (strcmp(fname, "string_index_of") == 0 && nargs >= 2 &&
-            args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
-            const char *hit = strstr(args[0]->v.str, args[1]->v.str);
-            return sw_val_int(hit ? (int64_t)(hit - args[0]->v.str) : -1);
-        }
-        if (strcmp(fname, "string_upper") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            char *r = strdup(args[0]->v.str);
-            for (char *p = r; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
-            sw_val_t *v = sw_val_string(r); free(r); return v;
-        }
-        if (strcmp(fname, "string_lower") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            char *r = strdup(args[0]->v.str);
-            for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
-            sw_val_t *v = sw_val_string(r); free(r); return v;
-        }
-        if (strcmp(fname, "string_trim") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            const char *s = args[0]->v.str;
-            while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-            const char *end = s + strlen(s);
-            while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
-            int len = (int)(end - s);
-            char *r = malloc(len + 1); memcpy(r, s, len); r[len] = '\0';
-            sw_val_t *v = sw_val_string(r); free(r); return v;
-        }
-        if (strcmp(fname, "string_length") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
-            return sw_val_int((int64_t)strlen(args[0]->v.str));
-        if (strcmp(fname, "json_encode") == 0) {
-            /* Real JSON, matching the compiled runtime's _json_encode_val
-             * exactly (see interp_json_encode_val). The old stub emitted
-             * the value debug-repr (e.g. %{:name: alice}) — invalid JSON. */
-            if (nargs < 1) return sw_val_string("null");
-            char *buf = (char *)malloc(256);
-            size_t cap = 256, pos = 0;
-            interp_json_encode_val(args[0], &buf, &cap, &pos);
-            buf[pos] = '\0';
-            sw_val_t *r = sw_val_string(buf);
-            free(buf);
-            return r;
-        }
-        if (strcmp(fname, "json_decode") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-            return sw_lang_json_decode(args[0]->v.str);
-        }
-        /* Map ops the REPL is likely to want for shape checks. */
-        if (strcmp(fname, "map_size") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP)
-            return sw_val_int(args[0]->v.map.count);
-        if (strcmp(fname, "map_has_key") == 0 && nargs >= 2 && args[0]->type == SW_VAL_MAP) {
-            /* Delegate to sw_val_map_get so the atom-vs-string fallback matches:
-             * the bare sw_val_equal loop diverged from map_get (and from the
-             * compiled _builtin_map_has_key) on json_decode'd maps, where a
-             * string-keyed query missed an atom key that map_get still found.
-             * Now byte-for-byte identical to the compiled backend. */
-            sw_val_t *v = sw_val_map_get(args[0], args[1]);
-            return sw_val_atom((v && v->type != SW_VAL_NIL) ? "true" : "false");
-        }
-        if (strcmp(fname, "timestamp") == 0) {
-            struct timeval tv; gettimeofday(&tv, NULL);
-            return sw_val_int((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
-        }
-        if (strcmp(fname, "map_get") == 0 && nargs >= 2) {
-            sw_val_t *mv = sw_val_map_get(args[0], args[1]);
-            /* 3-arg overload: map_get(m, k, default). */
-            if (nargs >= 3 && (!mv || mv->type == SW_VAL_NIL)) return args[2];
-            return mv;
-        }
-        if (strcmp(fname, "map_put") == 0 && nargs >= 3) return sw_val_map_put(args[0], args[1], args[2]);
-        if (strcmp(fname, "map_new") == 0) return sw_val_map_new(NULL, NULL, 0);
-        if (strcmp(fname, "map_keys") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
-            return sw_val_list(args[0]->v.map.keys, args[0]->v.map.count);
-        }
-        if (strcmp(fname, "map_values") == 0 && nargs >= 1 && args[0]->type == SW_VAL_MAP) {
-            return sw_val_list(args[0]->v.map.vals, args[0]->v.map.count);
-        }
-        if (strcmp(fname, "typeof") == 0 && nargs >= 1) {
-            /* Switch (not a positional array) so it can't drift if the enum
-             * is reordered, and matches the compiled _builtin_typeof exactly. */
-            switch (args[0]->type) {
-            case SW_VAL_NIL:        return sw_val_string("nil");
-            case SW_VAL_INT:        return sw_val_string("int");
-            case SW_VAL_FLOAT:      return sw_val_string("float");
-            case SW_VAL_STRING:     return sw_val_string("string");
-            case SW_VAL_ATOM:       return sw_val_string("atom");
-            case SW_VAL_PID:        return sw_val_string("pid");
-            case SW_VAL_REMOTE_PID: return sw_val_string("rpid");
-            case SW_VAL_TUPLE:      return sw_val_string("tuple");
-            case SW_VAL_LIST:       return sw_val_string("list");
-            case SW_VAL_FUN:        return sw_val_string("fun");
-            case SW_VAL_MAP:        return sw_val_string("map");
-            case SW_VAL_BYTES:      return sw_val_string("bytes");
-            default:                return sw_val_string("unknown");
+            if (tf) {
+                interp->tail_pending = 1;
+                interp->tail_fn = tf;
+                interp->tail_env = tenv;
+                interp->tail_nargs = nargs;
+                memcpy(interp->tail_args, args, sizeof(sw_val_t *) * (size_t)nargs);
+                return sw_val_nil();
             }
         }
-        if (strcmp(fname, "list_append") == 0 && nargs >= 2 && args[0]->type == SW_VAL_LIST) {
-            int cnt = args[0]->v.tuple.count;
-            sw_val_t **items = malloc(sizeof(sw_val_t*) * (cnt + 1));
-            memcpy(items, args[0]->v.tuple.items, sizeof(sw_val_t*) * cnt);
-            items[cnt] = args[1];
-            sw_val_t *r = sw_val_list(items, cnt + 1);
-            free(items);
-            return r;
-        }
-
-        /* Test assertion builtins — but let user-defined functions with the
-         * same name take precedence. This allows test files to define their
-         * own 3-arg assert_eq(name, actual, expected) helpers without the
-         * 2-arg builtin intercepting the call. */
-        if ((strcmp(fname, "assert") == 0 ||
-             strcmp(fname, "assert_eq") == 0 ||
-             strcmp(fname, "assert_ne") == 0 ||
-             strcmp(fname, "assert_raises") == 0) &&
-            !find_fun(interp->module_ast, fname)) {
-            if (strcmp(fname, "assert") == 0) return builtin_assert(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_eq") == 0) return builtin_assert_eq(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_ne") == 0) return builtin_assert_ne(interp, args, nargs, n->line);
-            if (strcmp(fname, "assert_raises") == 0) return builtin_assert_raises(interp, args, nargs, n->line);
-        }
-
-        /* Extra REPL builtins — bridges the gap to the codegen surface
-         * (file_*, db_*, shell, panic, expect, error, etc.). See
-         * interp_extra_builtin() above. */
-        {
-            sw_val_t *xr = interp_extra_builtin(interp, fname, args, nargs, n->line);
-            if (xr) return xr;
-        }
-
-        /* User-defined function in module */
-        node_t *fn = find_fun(interp->module_ast, fname);
-        if (fn) {
-            if (interp_recursion_blocked(interp)) return sw_val_nil();
-            sw_env_t *fenv = env_new(interp->global_env);
-            for (int i = 0; i < fn->v.fun.nparams; i++) {
-                if (i < nargs)
-                    env_set(fenv, fn->v.fun.params[i], args[i]);
-                else if (fn->v.fun.defaults[i])
-                    env_set(fenv, fn->v.fun.params[i], eval(interp, fn->v.fun.defaults[i], fenv));
-                else
-                    env_set(fenv, fn->v.fun.params[i], sw_val_nil());
-            }
-            interp->call_depth++;
-            sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
-            interp->call_depth--;
-            env_free(fenv);
-            return r;
-        }
-
-        /* Dynamic dispatch: variable holds a closure */
-        sw_val_t *fn_val = env_get(env, fname);
-        if (fn_val && fn_val->type == SW_VAL_FUN && fn_val->v.fun.body) {
-            if (interp_recursion_blocked(interp)) return sw_val_nil();
-            node_t *fn_node = (node_t *)fn_val->v.fun.body;
-            sw_env_t *fenv = env_new(fn_val->v.fun.closure_env ? fn_val->v.fun.closure_env : interp->global_env);
-            for (int i = 0; i < fn_node->v.fun.nparams && i < nargs; i++)
-                env_set(fenv, fn_node->v.fun.params[i], args[i]);
-            interp->call_depth++;
-            sw_val_t *r = eval(interp, fn_node->v.fun.body, fenv);
-            interp->call_depth--;
-            env_free(fenv);
-            return r;
-        }
-
-        snprintf(interp->error_msg, sizeof(interp->error_msg),
-                 "undefined function: %s/%d", fname, nargs);
-        interp->error = 1;
-        return sw_val_nil();
+        return interp_call_named(interp, n, env, fname, args, nargs);
     }
 
     case N_SPAWN: {
@@ -5860,10 +6488,18 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         if (from->type != SW_VAL_INT || to->type != SW_VAL_INT)
             return sw_val_list(NULL, 0);
         int64_t lo = from->v.i, hi = to->v.i;
+        if (hi < lo) return sw_val_list(NULL, 0);
+        /* No silent cap (it was 10000 elements here while the compiled
+         * path built the whole range); refuse only a range that cannot
+         * be a list. */
+        if (hi - lo >= (int64_t)INT32_MAX) {
+            interp_raise_panic(interp, n->line, "range %lld..%lld is too large to build as a list",
+                               (long long)lo, (long long)hi);
+            return sw_val_nil();
+        }
         int cnt = (int)(hi - lo + 1);
-        if (cnt <= 0) return sw_val_list(NULL, 0);
-        if (cnt > 10000) cnt = 10000;
-        sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
+        sw_val_t **items = malloc(sizeof(sw_val_t*) * (size_t)cnt);
+        if (!items) { interp_raise_panic(interp, n->line, "out of memory building range"); return sw_val_nil(); }
         for (int i = 0; i < cnt; i++) items[i] = sw_val_int(lo + i);
         sw_val_t *r = sw_val_list(items, cnt);
         free(items);
@@ -5896,15 +6532,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
         /* [h | t] — cons: prepend head to tail list */
         sw_val_t *head = eval(interp, n->v.cons.head, env);
         sw_val_t *tail = eval(interp, n->v.cons.tail, env);
-        if (tail->type == SW_VAL_LIST) {
-            int cnt = tail->v.tuple.count + 1;
-            sw_val_t **items = malloc(sizeof(sw_val_t*) * cnt);
-            items[0] = head;
-            memcpy(items + 1, tail->v.tuple.items, sizeof(sw_val_t*) * tail->v.tuple.count);
-            sw_val_t *r = sw_val_list(items, cnt);
-            free(items);
-            return r;
-        }
+        if (tail->type == SW_VAL_LIST) return sw_val_list_prepend(head, tail);
         return sw_val_list(&head, 1);
     }
 
@@ -5965,6 +6593,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                         }
                         sw_msg_release(cur);
                         sw_val_t *r = eval(interp, cl->v.clause.body, cl_env);
+                        propagate_arm_assigns(cl->v.clause.body, cl_env, env);
                         env_free(cl_env);
                         return r;
                     }
@@ -6023,6 +6652,7 @@ void *sw_lang_parse(const char *source) {
 }
 
 sw_interp_t *sw_lang_new(void *module_ast) {
+    interp_mark_tails((node_t *)module_ast);   /* enable interpreter TCO */
     sw_interp_t *interp = calloc(1, sizeof(sw_interp_t));
     interp->module_ast = module_ast;
     interp->global_env = env_new(NULL);
@@ -6065,13 +6695,13 @@ static const char *k_interp_builtins[] = {
     "base64_decode","base64_encode","byte","byte_at","byte_size","byte_slice",
     "bytes_concat","bytes_from_base64","bytes_from_ints","bytes_to_base64",
     "bytes_to_string","codepoint_at","db_close","db_exec","db_open","db_query",
-    "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_get",
+    "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_drop","ets_get",
     "ets_list","ets_new","ets_put","ets_take","ets_update","ets_update_counter",
     "exec_argv","expect","file_append","file_delete","file_exists","file_list",
     "file_mkdir","file_read","file_read_bytes","file_write","file_write_bytes",
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
-    "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
+    "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above","eprint","stdout_to_stderr","fd_write",
     "pid_kill_group","random_int","read_key","reduce","rl_history_append","rl_history_load",
     "shell","shell_detached","shell_managed","shell_sandboxed","sleep",
     "stdin_pending_push","stdin_take_pending","string_replace",
@@ -6271,7 +6901,7 @@ sw_val_t *sw_lang_call(sw_interp_t *interp, const char *func_name,
     for (int i = 0; i < fn->v.fun.nparams && i < num_args; i++)
         env_set(fenv, fn->v.fun.params[i], args[i]);
 
-    sw_val_t *result = eval(interp, fn->v.fun.body, fenv);
+    sw_val_t *result = interp_eval_body(interp, fn, fenv);
     env_free(fenv);
     return result;
 }
@@ -6411,11 +7041,19 @@ static int _jd_utf8(unsigned int cp, char *buf) {
     return 4;
 }
 
+/* Malformed input flag (unterminated string/array/object, bad token,
+ * garbage between elements, trailing data) — json_decode returns nil, the
+ * same contract as the compiled decoder. */
+static __thread int g_jd_err = 0;
+
 static sw_val_t *_jd_parse_string(const char **pp) {
     (*pp)++;
-    char buf[8192];
+    /* Growable: a fixed 8KB buffer used to cut long strings silently. */
+    size_t cap = 4096;
+    char *buf = (char *)malloc(cap);
     int len = 0;
-    while (**pp && **pp != '"' && len < (int)sizeof(buf) - 5) {
+    while (**pp && **pp != '"') {
+        if ((size_t)len + 8 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
         if (**pp == '\\') {
             (*pp)++;
             /* A backslash as the last byte before the NUL: stop. Otherwise
@@ -6464,12 +7102,15 @@ static sw_val_t *_jd_parse_string(const char **pp) {
         } else { buf[len++] = **pp; (*pp)++; }
     }
     if (**pp == '"') (*pp)++;
+    else g_jd_err = 1;                    /* unterminated string */
     buf[len] = 0;
-    return sw_val_string(buf);
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
 }
 
 static sw_val_t *_jd_parse(const char **pp) {
-    if (g_jd_depth >= SW_JD_MAX_DEPTH) return sw_val_nil();  /* too deep */
+    if (g_jd_depth >= SW_JD_MAX_DEPTH) { g_jd_err = 1; return sw_val_nil(); }  /* too deep */
     g_jd_depth++;
     sw_val_t *r = _jd_parse_inner(pp);
     g_jd_depth--;
@@ -6480,34 +7121,55 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
     _jd_skip_ws(pp);
     if (**pp == '"') return _jd_parse_string(pp);
     if (**pp == '[') {
+        /* Growable (it stopped at 256 elements, silently). */
         (*pp)++; _jd_skip_ws(pp);
-        sw_val_t *items[256]; int cnt = 0;
-        while (**pp && **pp != ']' && cnt < 256) {
+        int cap = 64, cnt = 0;
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        while (**pp && **pp != ']' && !g_jd_err) {
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
             items[cnt++] = _jd_parse(pp);
             _jd_skip_ws(pp);
             if (**pp == ',') (*pp)++;
+            else if (**pp != ']') g_jd_err = 1;
             _jd_skip_ws(pp);
         }
         if (**pp == ']') (*pp)++;
-        return sw_val_list(items, cnt);
+        else g_jd_err = 1;
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
     }
     if (**pp == '{') {
+        /* Growable (it stopped at 128 keys, silently). */
         (*pp)++; _jd_skip_ws(pp);
-        sw_val_t *keys[128], *vals[128]; int cnt = 0;
-        while (**pp && **pp != '}' && cnt < 128) {
+        int cap = 32, cnt = 0;
+        sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        while (**pp && **pp != '}' && !g_jd_err) {
             _jd_skip_ws(pp);
-            if (**pp != '"') break;
+            if (**pp != '"') { if (**pp != '}') g_jd_err = 1; break; }
+            if (cnt >= cap) {
+                cap *= 2;
+                keys = (sw_val_t **)realloc(keys, sizeof(sw_val_t *) * cap);
+                vals = (sw_val_t **)realloc(vals, sizeof(sw_val_t *) * cap);
+            }
             sw_val_t *k = _jd_parse_string(pp);
             keys[cnt] = sw_val_atom(k->v.str);
             _jd_skip_ws(pp);
             if (**pp == ':') (*pp)++;
+            else { g_jd_err = 1; break; }
             vals[cnt] = _jd_parse(pp);
             cnt++;
             _jd_skip_ws(pp);
             if (**pp == ',') (*pp)++;
+            else if (**pp != '}') g_jd_err = 1;
+            _jd_skip_ws(pp);
         }
         if (**pp == '}') (*pp)++;
-        return sw_val_map_new(keys, vals, cnt);
+        else g_jd_err = 1;
+        sw_val_t *r = sw_val_map_new(keys, vals, cnt);
+        free(keys); free(vals);
+        return r;
     }
     if (**pp == 't' && strncmp(*pp, "true", 4) == 0)  { *pp += 4; return sw_val_atom("true"); }
     if (**pp == 'f' && strncmp(*pp, "false", 5) == 0) { *pp += 5; return sw_val_atom("false"); }
@@ -6525,6 +7187,7 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
          * at end-of-input (e.g. `{"a":` then EOF) stepping past `\0` is a
          * heap-buffer-overflow (found by fuzz-json). The enclosing array/
          * object loops gate on `**pp`, so leaving pp at the NUL ends them. */
+        g_jd_err = 1;
         if (**pp != '\0') (*pp)++;
         return sw_val_nil();
     }
@@ -6538,6 +7201,304 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
 sw_val_t *sw_lang_json_decode(const char *s) {
     if (!s) return sw_val_nil();
     const char *p = s;
-    g_jd_depth = 0;   /* reset the per-decode depth guard */
-    return _jd_parse(&p);
+    g_jd_depth = 0; g_jd_err = 0;   /* per-decode state */
+    sw_val_t *r = _jd_parse(&p);
+    _jd_skip_ws(&p);
+    if (*p) g_jd_err = 1;           /* trailing data after the value */
+    return g_jd_err ? sw_val_nil() : r;
+}
+
+/* =========================================================================
+ * Name resolution (static check shared by `swc build`, `swc run`, `swc test`)
+ * =========================================================================
+ *
+ * An identifier in value position that names nothing used to compile to an
+ * atom (compiled path) or evaluate to nil (interpreter) — so a typo like
+ * `print(totl)` ran "successfully" and printed garbage, differently on each
+ * path. This pass rejects such programs before either backend runs.
+ *
+ * Scoping is deliberately flow-insensitive and function-wide (like Python's
+ * function locals, and like the compiled path, which hoists branch-assigned
+ * variables): a name is in scope anywhere in a function if the function
+ * binds it anywhere — as a parameter, an assignment target, a case/receive
+ * pattern variable, a for/comprehension variable or a catch variable. A
+ * lambda sees its own bindings plus every enclosing scope. So the pass never
+ * rejects a program that could run correctly; it catches names bound
+ * nowhere, which is the typo class. Callee positions (`f(x)`) are not
+ * checked here: the compiler already reports unknown functions with a
+ * did-you-mean. Dotted names (`Mod.fn`) are left alone. */
+
+typedef struct rs_scope {
+    const char **names;
+    int n, cap;
+    struct rs_scope *parent;
+} rs_scope_t;
+
+typedef struct {
+    node_t **mods;
+    int nmods;
+    const char *path;      /* file of the module being checked */
+    int errors;
+} rs_ctx_t;
+
+static void rs_add(rs_scope_t *s, const char *name) {
+    if (!name || !name[0]) return;
+    for (int i = 0; i < s->n; i++) if (strcmp(s->names[i], name) == 0) return;
+    if (s->n == s->cap) {
+        int nc = s->cap ? s->cap * 2 : 16;
+        const char **nn = realloc(s->names, sizeof(char *) * (size_t)nc);
+        if (!nn) return;
+        s->names = nn;
+        s->cap = nc;
+    }
+    s->names[s->n++] = name;
+}
+
+static int rs_has(rs_scope_t *s, const char *name) {
+    for (; s; s = s->parent)
+        for (int i = 0; i < s->n; i++) if (strcmp(s->names[i], name) == 0) return 1;
+    return 0;
+}
+
+/* Every N_IDENT inside a pattern is a binder (`_`-prefixed ones included). */
+static void rs_pattern_binders(node_t *p, rs_scope_t *s) {
+    if (!p) return;
+    switch (p->type) {
+    case N_IDENT: if (strcmp(p->v.sval, "_") != 0) rs_add(s, p->v.sval); break;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < p->v.coll.count; i++) rs_pattern_binders(p->v.coll.items[i], s);
+        break;
+    case N_LIST_CONS:
+        rs_pattern_binders(p->v.cons.head, s);
+        rs_pattern_binders(p->v.cons.tail, s);
+        break;
+    case N_MAP:
+        for (int i = 0; i < p->v.map.count; i++) rs_pattern_binders(p->v.map.vals[i], s);
+        break;
+    case N_BINOP:
+        rs_pattern_binders(p->v.binop.left, s);
+        rs_pattern_binders(p->v.binop.right, s);
+        break;
+    default: break;
+    }
+}
+
+/* Collect every name a function body binds, not descending into lambdas. */
+static void rs_binders(node_t *n, rs_scope_t *s) {
+    if (!n) return;
+    switch (n->type) {
+    case N_FUN: return;                      /* a lambda's names are its own */
+    case N_ASSIGN: rs_add(s, n->v.assign.name); rs_binders(n->v.assign.value, s); return;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++) rs_binders(n->v.block.stmts[i], s);
+        return;
+    case N_CALL:
+        rs_binders(n->v.call.func, s);
+        for (int i = 0; i < n->v.call.nargs; i++) rs_binders(n->v.call.args[i], s);
+        return;
+    case N_SPAWN: rs_binders(n->v.spawn.expr, s); return;
+    case N_SEND: rs_binders(n->v.send.to, s); rs_binders(n->v.send.msg, s); return;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) rs_binders(n->v.recv.clauses[i], s);
+        rs_binders(n->v.recv.after_body, s);
+        rs_binders(n->v.recv.after_expr, s);
+        return;
+    case N_CLAUSE:
+        rs_pattern_binders(n->v.clause.pattern, s);
+        rs_binders(n->v.clause.guard, s);
+        rs_binders(n->v.clause.body, s);
+        return;
+    case N_CASE:
+        rs_binders(n->v.casex.subject, s);
+        for (int i = 0; i < n->v.casex.nclauses; i++) rs_binders(n->v.casex.clauses[i], s);
+        return;
+    case N_IF:
+        rs_binders(n->v.iff.cond, s); rs_binders(n->v.iff.then_b, s); rs_binders(n->v.iff.else_b, s);
+        return;
+    case N_BINOP: rs_binders(n->v.binop.left, s); rs_binders(n->v.binop.right, s); return;
+    case N_UNARY: rs_binders(n->v.unary.operand, s); return;
+    case N_PIPE: rs_binders(n->v.pipe.val, s); rs_binders(n->v.pipe.func, s); return;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < n->v.coll.count; i++) rs_binders(n->v.coll.items[i], s);
+        return;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { rs_binders(n->v.map.keys[i], s); rs_binders(n->v.map.vals[i], s); }
+        return;
+    case N_FOR: rs_add(s, n->v.forloop.var); rs_binders(n->v.forloop.iter, s); rs_binders(n->v.forloop.body, s); return;
+    case N_LIST_COMP:
+        rs_add(s, n->v.lcomp.var);
+        rs_binders(n->v.lcomp.iter, s); rs_binders(n->v.lcomp.body, s); rs_binders(n->v.lcomp.guard, s);
+        return;
+    case N_RANGE: rs_binders(n->v.range.from, s); rs_binders(n->v.range.to, s); return;
+    case N_TRY:
+        if (strcmp(n->v.trycatch.err_var, "_") != 0) rs_add(s, n->v.trycatch.err_var);
+        rs_binders(n->v.trycatch.body, s); rs_binders(n->v.trycatch.catch_body, s);
+        return;
+    case N_LIST_CONS: rs_binders(n->v.cons.head, s); rs_binders(n->v.cons.tail, s); return;
+    default: return;
+    }
+}
+
+static int rs_is_module_func(rs_ctx_t *c, const char *name) {
+    for (int m = 0; m < c->nmods; m++) {
+        node_t *mod = c->mods[m];
+        for (int i = 0; i < mod->v.mod.nfuns; i++)
+            if (strcmp(mod->v.mod.funs[i]->v.fun.name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int rs_is_global(rs_ctx_t *c, const char *name) {
+    for (int m = 0; m < c->nmods; m++) {
+        node_t *mod = c->mods[m];
+        for (int i = 0; i < mod->v.mod.nglobals; i++)
+            if (strcmp(mod->v.mod.globals[i].name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Levenshtein distance, bounded input (identifiers). */
+static int rs_lev(const char *a, const char *b) {
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la > 63 || lb > 63) return 99;
+    int d[64][64];
+    for (int i = 0; i <= la; i++) d[i][0] = i;
+    for (int j = 0; j <= lb; j++) d[0][j] = j;
+    for (int i = 1; i <= la; i++)
+        for (int j = 1; j <= lb; j++) {
+            int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            int x = d[i - 1][j] + 1, y = d[i][j - 1] + 1, z = d[i - 1][j - 1] + cost;
+            d[i][j] = x < y ? (x < z ? x : z) : (y < z ? y : z);
+        }
+    return d[la][lb];
+}
+
+static void rs_report(rs_ctx_t *c, rs_scope_t *s, const char *name, int line) {
+    c->errors++;
+    fprintf(stderr, "swc: %s:%d: undefined variable '%s'", c->path ? c->path : "?", line, name);
+    /* Best in-scope suggestion. */
+    const char *best = NULL;
+    int bd = 99;
+    int len = (int)strlen(name);
+    int thr = len >= 8 ? 3 : (len >= 3 ? 2 : 1);
+    for (rs_scope_t *sc = s; sc; sc = sc->parent)
+        for (int i = 0; i < sc->n; i++) {
+            int d = rs_lev(name, sc->names[i]);
+            if (d > 0 && d <= thr && d < bd) { bd = d; best = sc->names[i]; }
+        }
+    if (best) fprintf(stderr, " — did you mean '%s'?", best);
+    else if (interp_is_known_builtin(name))
+        fprintf(stderr, " — '%s' is a builtin and can't be passed as a value yet; wrap it: fun(x) { %s(x) }", name, name);
+    else if (name[0] >= 'a' && name[0] <= 'z' && len > 1)
+        fprintf(stderr, " (atoms are written quoted: '%s')", name);
+    fprintf(stderr, "\n");
+}
+
+static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s);
+
+static void rs_check_callee(rs_ctx_t *c, node_t *f, rs_scope_t *s) {
+    /* A plain-name callee is resolved by the backends (builtin, module
+     * function, or closure variable); only a computed callee is an
+     * expression to check. */
+    if (f && f->type != N_IDENT) rs_check(c, f, s);
+}
+
+static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
+    if (!n) return;
+    switch (n->type) {
+    case N_IDENT: {
+        const char *name = n->v.sval;
+        if (strchr(name, '.') || strcmp(name, "_") == 0) return;
+        if (rs_has(s, name) || rs_is_module_func(c, name) || rs_is_global(c, name)) return;
+        rs_report(c, s, name, n->line);
+        return;
+    }
+    case N_FUN: {
+        rs_scope_t inner = { NULL, 0, 0, s };
+        for (int i = 0; i < n->v.fun.nparams; i++) rs_add(&inner, n->v.fun.params[i]);
+        rs_binders(n->v.fun.body, &inner);
+        rs_check(c, n->v.fun.body, &inner);
+        for (int i = 0; i < 16; i++) if (n->v.fun.defaults[i]) rs_check(c, n->v.fun.defaults[i], s);
+        free(inner.names);
+        return;
+    }
+    case N_ASSIGN: rs_check(c, n->v.assign.value, s); return;
+    case N_BLOCK:
+        for (int i = 0; i < n->v.block.nstmts; i++) rs_check(c, n->v.block.stmts[i], s);
+        return;
+    case N_CALL:
+        rs_check_callee(c, n->v.call.func, s);
+        for (int i = 0; i < n->v.call.nargs; i++) rs_check(c, n->v.call.args[i], s);
+        return;
+    case N_SPAWN:
+        if (n->v.spawn.expr && n->v.spawn.expr->type == N_CALL) {
+            rs_check_callee(c, n->v.spawn.expr->v.call.func, s);
+            for (int i = 0; i < n->v.spawn.expr->v.call.nargs; i++)
+                rs_check(c, n->v.spawn.expr->v.call.args[i], s);
+        } else {
+            rs_check(c, n->v.spawn.expr, s);
+        }
+        return;
+    case N_SEND: rs_check(c, n->v.send.to, s); rs_check(c, n->v.send.msg, s); return;
+    case N_RECEIVE:
+        for (int i = 0; i < n->v.recv.nclauses; i++) rs_check(c, n->v.recv.clauses[i], s);
+        rs_check(c, n->v.recv.after_body, s);
+        rs_check(c, n->v.recv.after_expr, s);
+        return;
+    case N_CLAUSE:            /* the pattern binds; guard and body are uses */
+        rs_check(c, n->v.clause.guard, s);
+        rs_check(c, n->v.clause.body, s);
+        return;
+    case N_CASE:
+        rs_check(c, n->v.casex.subject, s);
+        for (int i = 0; i < n->v.casex.nclauses; i++) rs_check(c, n->v.casex.clauses[i], s);
+        return;
+    case N_IF:
+        rs_check(c, n->v.iff.cond, s); rs_check(c, n->v.iff.then_b, s); rs_check(c, n->v.iff.else_b, s);
+        return;
+    case N_BINOP: rs_check(c, n->v.binop.left, s); rs_check(c, n->v.binop.right, s); return;
+    case N_UNARY: rs_check(c, n->v.unary.operand, s); return;
+    case N_PIPE:
+        rs_check(c, n->v.pipe.val, s);
+        if (n->v.pipe.func && n->v.pipe.func->type == N_CALL) {
+            rs_check_callee(c, n->v.pipe.func->v.call.func, s);
+            for (int i = 0; i < n->v.pipe.func->v.call.nargs; i++)
+                rs_check(c, n->v.pipe.func->v.call.args[i], s);
+        } else {
+            rs_check_callee(c, n->v.pipe.func, s);
+        }
+        return;
+    case N_TUPLE: case N_LIST:
+        for (int i = 0; i < n->v.coll.count; i++) rs_check(c, n->v.coll.items[i], s);
+        return;
+    case N_MAP:
+        for (int i = 0; i < n->v.map.count; i++) { rs_check(c, n->v.map.keys[i], s); rs_check(c, n->v.map.vals[i], s); }
+        return;
+    case N_FOR: rs_check(c, n->v.forloop.iter, s); rs_check(c, n->v.forloop.body, s); return;
+    case N_LIST_COMP:
+        rs_check(c, n->v.lcomp.iter, s); rs_check(c, n->v.lcomp.body, s); rs_check(c, n->v.lcomp.guard, s);
+        return;
+    case N_RANGE: rs_check(c, n->v.range.from, s); rs_check(c, n->v.range.to, s); return;
+    case N_TRY: rs_check(c, n->v.trycatch.body, s); rs_check(c, n->v.trycatch.catch_body, s); return;
+    case N_LIST_CONS: rs_check(c, n->v.cons.head, s); rs_check(c, n->v.cons.tail, s); return;
+    default: return;
+    }
+}
+
+/* Check one module against the set it is linked with (`mods`, which must
+ * include `mod`). Prints one line per undefined name; returns the count. */
+int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path) {
+    node_t *mod = (node_t *)mod_ast;
+    if (!mod || mod->type != N_MODULE) return 0;
+    rs_ctx_t c = { (node_t **)mods, nmods, path, 0 };
+    for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        node_t *fn = mod->v.mod.funs[i];
+        rs_scope_t top = { NULL, 0, 0, NULL };
+        for (int p = 0; p < fn->v.fun.nparams; p++) rs_add(&top, fn->v.fun.params[p]);
+        rs_binders(fn->v.fun.body, &top);
+        rs_check(&c, fn->v.fun.body, &top);
+        for (int d = 0; d < 16; d++) if (fn->v.fun.defaults[d]) rs_check(&c, fn->v.fun.defaults[d], &top);
+        free(top.names);
+    }
+    return c.errors;
 }

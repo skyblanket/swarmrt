@@ -4,6 +4,223 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — runtime fixes from the swarm-code review
+
+**fix(sched): blocking builtins no longer strand the processes queued behind them.**
+`read_line`/`read_key`/`read_choice`, `shell_managed`, TTY `http_post_stream`,
+`subprocess_recv_line` and `db_*` run inside a blocking section: the scheduler's queue
+moves to the overflow queue idle schedulers steal from, and new wake-ups for it go
+there. swarm-code's interactive session hung forever whenever the agent shared a
+scheduler with the line reader. Gate: `tests/sw/test_blocking_section.sw`.
+
+**fix(runtime): SIGPIPE no longer kills the process.** A write to a pipe whose reader
+died (an MCP server that exited) terminated the binary with status 141. A no-op
+handler turns it into EPIPE; children still get the default action after exec.
+
+**fix(shell): output keeps UTF-8.** `shell`/`shell_managed` stripped everything outside
+printable ASCII (`echo café` → `caf`). Valid UTF-8 is kept, invalid bytes become
+U+FFFD, ANSI sequences are removed whole. The shell wrappers end the command with a
+newline, so a trailing `# comment`, heredoc or `&` no longer breaks them, and a
+command `/bin/sh` cannot start fails at once instead of after the 120s poll.
+
+**fix(json): `json_decode` rejects malformed input; `json_encode` always emits valid
+JSON.** A truncated `{"command":"rm -rf build` decoded to a complete map, so a tool
+call cut off mid-argument still ran; unterminated strings/arrays/objects, bad tokens
+and trailing data now return nil (trailing commas stay accepted). The interpreter's
+decoder no longer truncates strings at 8KB, arrays at 256 or objects at 128. The
+encoder replaces invalid UTF-8 with `\ufffd`, escapes map keys and atoms, and writes
+NaN/Infinity as null — on both paths.
+
+**fix(sse): the stream parser drops nothing.** Lines over 16KB (a whole tool call in one
+frame), content deltas over 8KB, `"key": "value"` with a space after the colon, and
+tool calls without an `index` (they merged into one) are all handled; a
+reasoning-only reply is an answer, not a failure to retry four times; curl no longer
+retries on top of the caller's retries (12 POSTs per failed turn → 4).
+
+---
+
+## 2026-09-24 — stderr and a clean stdout for CLIs
+
+**feat(lang): `eprint`, `stdout_to_stderr`, `fd_write`.** `sw` had no way to write to
+stderr, so a CLI could not keep diagnostics out of its output, and a headless agent's
+`--json` line arrived mixed into the tool transcript and streamed tokens (C-level writes
+included). `eprint(...)` prints to stderr. `stdout_to_stderr()` points fd 1 at stderr and
+returns the original stdout's fd (idempotent, close-on-exec); `fd_write(fd, s)` writes the
+result there. Both paths (compiled and interpreter). Unblocks: swarm-code's
+`-p --json | jq`. Gate: `tests/sw/test_stdio_routing.sw`.
+
+---
+
+## 2026-09-24 — parallel subagent streams
+
+**fix(runtime): subagent-mode `http_post_stream` runs on the offload pool.** The
+parallel-subagents shape (each agent streams `{'stream_chunk', name, text}` to its parent)
+pinned one scheduler thread per stream. It now runs on a worker (it touches no TTY state);
+the offload wrapper exposes the parked caller so the stream still stops when that process
+is killed, and `sw_send_value` uses a message region when called from a worker. 6
+concurrent 300 ms streams finish in ~0.3 s on one scheduler. Gate:
+`tests/sw/test_stream_parallel.sw` (hangs with `SW_OFFLOAD=0`).
+
+---
+
+## 2026-09-24 — startup, and docs that match measurements
+
+**perf(runtime): 29 ms → 12 ms startup; hello world 50 MB → 5.6 MB RSS.** Arena init wrote
+zeros into every one of the 100K process slots — values the anonymous mmap already
+provides — faulting in ~48 MB. The loop now runs only if the spinlock initialiser is not
+all-zero bytes.
+
+**docs: claims corrected against measurements on Linux x86_64.** "Native C speed" (it is
+boxed dynamic values, about CPython speed on arithmetic), "work stealing between cores"
+(none: the steal path polls a queue nothing fills), "100K+ concurrent processes" (~30K live
+on stock Linux, bounded by `vm.max_map_count`), "~100–500 ns spawn" (that is the slot
+pop; spawn-to-first-run is ~4–13 µs), "<10 ms boot" (12 ms default, 3 ms with
+`SW_MAX_PROCS=1024`), stale test counts, and the interpreter's no-longer-existing 5 s
+default receive timeout.
+
+---
+
+## 2026-09-24 — reduction-counted preemption at every call
+
+**feat(sched): preemption is real at call granularity.** Only self-tail-call backedges ran
+`sw_check_reds`, so a long non-tail computation monopolised its scheduler thread — on one
+scheduler a heartbeat process ticked 0 times during `fib(32)`. Every compiled function
+and lambda entry (and every interpreted body evaluation) now counts a reduction and
+yields at the end of the slice, BEAM-style; the heartbeat ticks on schedule. No
+measurable cost on fib(35) (0.73s). Gate: `tests/sw/test_preemption.sw`.
+
+---
+
+## 2026-09-24 — security: sandbox escape, key leak, pid reuse, open distribution
+
+**fix(security): `shell_sandboxed` could be escaped with a quote.** The command was pasted
+unescaped into an outer `sh -c '...'` around the sandbox tool, so `x'; cmd; '` ran `cmd`
+outside the sandbox. The sandbox tool is now exec'd with the command as one argv element
+(and the call runs on the offload pool, reads all output, merges stderr).
+
+**fix(security): LLM builtins leaked keys and were injectable.** `llm_complete` /
+`llm_stream` fell back to sending `OPENAI_API_KEY` to whatever URL was in effect, the
+vendor default included. Keys are now per-provider (`LLM_API_KEY` explicit;
+`OPENAI_API_KEY` only to api.openai.com; `OTONOMY_API_KEY` only to the Otonomy endpoint).
+`llm_stream` built a single-quoted shell string from the URL and key (injectable) and
+unlinked its body file right after spawning curl (racing curl reading it); it now execs
+curl with an argv, passes the Authorization header via a 0600 file (`-H @file`, out of
+`ps`), and cleans up after curl exits.
+
+**fix(runtime): pids survive slot reuse.** A pid value held only the slab pointer, so once
+a dead process's slot was reused, its stale pid compared equal to the new occupant,
+`send` delivered to it, `exit_proc` killed it and `monitor` watched it. Pid values now
+capture the numeric id; a stale pid is dead (`send`/`exit_proc` no-op, `monitor` → DOWN
+`"noproc"`, `link` → `'error'`). Gate: `tests/sw/test_pid_reuse.sw` (fails on the old
+build on all four counts).
+
+**fix(security): distribution was open to the network.** `node_start` listened on 0.0.0.0
+with no authentication and delivered the wire's `tag` verbatim, letting a peer make the
+receiver reinterpret a payload as an EXIT/DOWN/CALL struct. It now binds 127.0.0.1 unless
+`SW_NODE_BIND` is set, authenticates frames with an optional `SW_NODE_COOKIE` (SHA-256
+MAC), delivers only value messages (other tags arrive as `SW_TAG_REMOTE_MSG`), and
+NUL-terminates wire name fields before use.
+
+---
+
+## 2026-09-24 — linear list code, sharing-preserving copies, interpreter TCO
+
+**perf(values): list operations are O(1) where the idioms need them.** `tl()` and `[h | t]`
+pattern tails are views sharing the parent's storage. Arena lists get a growable backing
+store; `list_append(acc, x)` and `[x | acc]` extend it in place when the list owns the
+store's edge (the accumulator patterns) and copy otherwise, so every existing list value
+still sees only its own elements (conformance `t17_list_sharing` checks every branching
+shape). Summing a 100K list via hd/tl: 162s → 0.1s. `Std.range(0, 100000)`: 30.9s → 41ms.
+
+**fix(gc): the turn checkpoint copies what the loop keeps, as a graph.** Deep copies
+preserve sharing (a memo table per copy), so a loop carrying `{t, t}` nested k deep
+copies k cells instead of 2^k; the old checkpoint ran out of memory at k = 26. The
+checkpoint (`sw_turn_checkpoint`) shares values at or below the function's entry floor,
+which the reset preserves anyway, and triggers adaptively at twice the last carried size.
+
+**feat(interp): tail-call optimisation.** Calls in tail position of a function or lambda
+body run in place (`interp_eval_body` trampolines every body evaluation), so `swc run` /
+`swc test` / the REPL can loop indefinitely — including mutual tail recursion and receive
+loops, where they used to die after a few hundred iterations. The interpreter no longer
+truncates `a..b` ranges at 10,000 elements. Gates: `tests/sw/test_value_scaling.sw`,
+`tests/sw/run/test_interp_tco.sw`.
+
+---
+
+## 2026-09-24 — names are checked; one call/pipe path; function values
+
+**feat(lang): undefined names are compile errors on every path.** A shared static pass
+(`sw_resolve_module`, run by `swc build`, `swc run` and `swc test`) rejects any identifier
+that no scope binds — parameters, assignments, pattern variables, `for` / comprehension /
+catch variables, module functions and `let` globals, with lambdas seeing every enclosing
+scope. Scoping is function-wide and flow-insensitive, so no valid program is rejected.
+Before, `print(totl)` compiled to `print(:totl)` and interpreted as `print(nil)`. Messages
+carry a did-you-mean, flag bare words that were meant as atoms, and explain that builtins
+are not yet first-class values. It found nothing in the repo's own code, and found the
+bugs in six of the LLM-written eval programs. Gate: `tests/sw/compile_fail/undefined_names.sw`
+(new must-not-compile category in `run_tests.sh`).
+
+**feat(lang): function values and pipes behave identically compiled and interpreted.**
+`Module.function` without parens is a reference to that function (`xs |> Std.sum`,
+`s = Std.sum`); it used to parse as a map lookup on an undefined variable. The interpreter
+now returns a callable for a module function used by name (it returned nil), and its pipe
+shares the call dispatch (`interp_call_named`) so `|> print`, `|> string_upper`,
+`|> closure_var` and `|> fun(x) {...}` all apply — they returned the piped value untouched.
+The compiler applies `|> fun(x) {...}` and `|> closure_var` (it ignored the first and
+failed to link the second). Gate: conformance `t16_pipes_and_refs`.
+
+**fix(codegen): default parameters.** `fun greet(name = "world")` is documented, but the
+arity check rejected `greet()`.
+
+**chore:** the `[SwarmRT] Arena initialized…` startup banner is opt-in (`SW_VERBOSE=1`);
+a C compile failure of generated code is reported as an internal compiler error.
+
+---
+
+## 2026-09-24 — correctness pass: HTTP no longer pins schedulers, wrong-answer codegen bugs, HTTP server fixes
+
+**fix(runtime): blocking builtins run on an offload pool.** `http_get`, `http_request`,
+`http_post` (outside the interactive ESC-watch mode) and `exec_argv` used to spawn curl and
+wait for it ON the scheduler thread, so N schedulers meant at most N HTTP calls in flight
+(16 parallel 1s requests took 4.06s on 4 schedulers) and a program that served and called
+itself over HTTP deadlocked on one scheduler. They now run on runtime worker threads
+(`sw_offload_run`, pool grows on demand to `SW_OFFLOAD_THREADS`, default 256) while the
+calling process parks (`sw_park_until`); arguments are deep-copied into a private region
+and the result is built in a region the caller adopts in O(1). 16 parallel calls: 1.05s
+(also on `SW_SCHEDULERS=1`). Builtin retry naps and `shell()`'s poll loop park the process
+instead of sleeping the thread. Gate: `tests/sw/test_http_offload.sw` (hangs with
+`SW_OFFLOAD=0`).
+
+**fix(runtime): `sleep(ms)` no longer eats messages.** Both paths waited with a
+receive-any and freed whatever arrived. `sw_sleep_ms` waits on a tag nothing sends, so
+messages stay queued. This exposed `Std.task_stream` leaving `DOWN` messages behind.
+
+**fix(std): `Std.task_stream` survives repeated use.** It stashed work in two ETS tables per
+call and ETS allowed 64 tables per program lifetime, so the 33rd call hung. Rewritten over
+closures with results threaded through the loop, and every worker's monitor is demonitored
+and flushed. New builtin `ets_drop(t)` deletes a table and recycles its id (cap raised to
+1024 live tables).
+
+**fix(codegen): silent wrong answers.** Self-tail-calls assigned parameters sequentially,
+so `f(b, a)` turned a swap into a duplicate; variables assigned inside `if`/`case`/`receive`
+branches were invisible afterwards (they read as an atom); a `receive` arm whose guard
+rejected skipped every later arm; nested lambdas did not capture variables from outer
+scopes; a captured closure could not be called inside a lambda; `spawn(f(args))` with a
+closure-valued `f` failed to link; more than 64 lambdas per module were silently dropped;
+two `for` loops over the same name failed to compile. The interpreter now propagates
+assignments out of `case`/`receive` arms and parses `pat when guard ->` after an unbraced
+arm body. Gates: `tests/sw/test_nested_closures.sw`, `tests/sw/test_sleep_keeps_messages.sw`,
+conformance `t15_nested_closures`.
+
+**fix(http): the server lost requests and leaked a file descriptor per connection.**
+`http_listen` called `sw_io_init` a second time, starting a second IO thread on the same
+sockets, so a connection's data could reach the bridge before its accept and be dropped
+(about 1 in 200 requests under concurrency). `sw_io_init` is now idempotent. Separately, a
+client hanging up freed the connection slot but never closed the socket; 300 requests left
+310 open fds. Gate: `tests/sw/test_http_fd_leak.sw`.
+
+---
+
 ## 2026-07-05 — after-body TCO + recoverable stack overflow (the swarm-code 154s SIGBUS)
 
 **fix(codegen): self-tail-calls in a `receive ... after` body are now TCO'd; stack overflow is

@@ -417,71 +417,77 @@ fun task_stream(lst, fn, opts) {
         }
         tmo = case map_get(opts, 'timeout_ms') { nil -> 0 ; t -> t }
         on_tmo = case map_get(opts, 'on_timeout') { nil -> 'error' ; o -> o }
-        # `fn` cannot be closed over across a top-level worker fun, and
-        # spawn only accepts named functions — so we stash fn + each item
-        # in a shared ETS table the worker reads back by index.
-        items = ets_new()                          # idx -> item ; '__fn' -> fn
-        results = ets_new()                        # idx -> tagged result
-        ets_put(items, '__fn', fn)
-        _ts_index(lst, 0, items)
         coord = self()
-        # Prime the pool: start min(max_c, n) workers for indices 0..k-1.
+        # Workers are closures over (fn, item) — no shared table. State is
+        # threaded through the loop: `pending` holds the undispatched items
+        # (in order, starting at index next_idx) and `results` maps
+        # idx -> tagged result.
         k = _ts_min(max_c, n)
-        in_flight = _ts_start_range(0, k, items, tmo, coord, [])
-        _ts_loop(in_flight, k, n, max_c, items, tmo, on_tmo, coord, results)
+        started = _ts_refill([], lst, 0, k, fn, tmo, coord)
+        results = _ts_loop(elem(started, 0), elem(started, 1), elem(started, 2),
+                           n, max_c, fn, tmo, on_tmo, coord, %{})
         _ts_collect(0, n, results, [])
     }
 }
 
 fun _ts_min(a, b) { if (a < b) { a } else { b } }
 
-# Stash each item under its 0-based index.
-fun _ts_index(lst, i, items) {
-    if (length(lst) == 0) { 'ok' }
-    else { ets_put(items, i, hd(lst)) ; _ts_index(tl(lst), i + 1, items) }
-}
-
-# Start workers for indices [from, to) and append their handles to acc.
-fun _ts_start_range(from, to, items, tmo, coord, acc) {
-    if (from >= to) { acc }
-    else { _ts_start_range(from + 1, to, items, tmo, coord,
-                           list_append(acc, _ts_spawn_one(from, items, tmo, coord))) }
+# Dispatch items from `pending` until `max_c` are in flight or none remain.
+# Returns {in_flight, pending, next_idx}.
+fun _ts_refill(in_flight, pending, next_idx, max_c, fn, tmo, coord) {
+    if (length(in_flight) >= max_c || length(pending) == 0) { {in_flight, pending, next_idx} }
+    else {
+        spawned = _ts_spawn_one(next_idx, hd(pending), fn, tmo, coord)
+        _ts_refill(list_append(in_flight, spawned), tl(pending), next_idx + 1, max_c, fn, tmo, coord)
+    }
 }
 
 # Spawn one monitored worker for index `idx`. Returns {ref, pid, idx, deadline}.
-# deadline is an absolute ms timestamp; 0 means "no timeout".
-fun _ts_spawn_one(idx, items, tmo, coord) {
-    pair = spawn_monitor(_ts_worker(items, idx, coord))
-    pid = elem(pair, 0)
-    ref = elem(pair, 1)
+# deadline is an absolute ms timestamp; 0 means "no timeout". The worker runs
+# fn(item) inside a try so a panic becomes {'error', reason} (never a hang).
+fun _ts_spawn_one(idx, item, fn, tmo, coord) {
+    pair = spawn_monitor(fun() {
+        tagged = try { {'ok', fn(item)} } catch e { {'error', e} }
+        send(coord, {'task_done', idx, tagged})
+    })
     deadline = if (tmo > 0) { timestamp() + tmo } else { 0 }
-    {ref, pid, idx, deadline}
+    {elem(pair, 1), elem(pair, 0), idx, deadline}
 }
 
-# The worker: read fn + item from the shared table, run fn(item) inside a
-# try so a panic becomes {'error', reason} (never a hang), send it home.
-fun _ts_worker(items, idx, coord) {
-    fn = ets_get(items, '__fn')
-    item = ets_get(items, idx)
-    tagged = try { {'ok', fn(item)} } catch e { {'error', e} }
-    send(coord, {'task_done', idx, tagged})
+# Stop watching a finished worker and drop its DOWN if it is already queued,
+# so task_stream never leaves monitor messages in the caller's mailbox.
+fun _ts_forget(entry) {
+    case entry {
+        nil -> 'ok'
+        e ->
+            ref = elem(e, 0)
+            demonitor(ref)
+            receive {
+                {'DOWN', r, _, _, _} when r == ref -> 'ok'
+                after 0 -> 'ok'
+            }
+    }
 }
 
-# The coordinator loop. `done` counts recorded results; loop until done==n.
+fun _ts_record(results, idx, tagged) {
+    if (map_has_key(results, idx)) { results } else { map_put(results, idx, tagged) }
+}
+
+# The coordinator loop. Returns the results map once all n are recorded.
 #   in_flight : [{ref, pid, idx, deadline}, ...] currently-running workers
-#   next_idx  : next undispatched item index
-#   n, max_c  : total items, concurrency cap
-fun _ts_loop(in_flight, next_idx, n, max_c, items, tmo, on_tmo, coord, results) {
-    if (ets_count(results) >= n) { 'ok' }
+#   pending   : undispatched items, the first of which has index next_idx
+fun _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, results) {
+    if (map_size(results) >= n) { results }
     else {
         wait = _ts_wait_ms(in_flight, tmo, on_tmo)
         receive {
             {'task_done', idx, tagged} ->
-                ets_put(results, idx, tagged)
+                _ts_forget(_ts_find_idx(in_flight, idx))
+                recorded = _ts_record(results, idx, tagged)
                 rest = _ts_remove_idx(in_flight, idx, [])
-                refilled = _ts_refill(rest, next_idx, n, max_c, items, tmo, coord)
-                _ts_loop(elem(refilled, 0), elem(refilled, 1), n, max_c,
-                         items, tmo, on_tmo, coord, results)
+                refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
+                _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
+                         fn, tmo, on_tmo, coord, recorded)
 
             {'DOWN', ref, _, _, reason} ->
                 # A worker died. If we already recorded its task_done the ref
@@ -490,27 +496,24 @@ fun _ts_loop(in_flight, next_idx, n, max_c, items, tmo, on_tmo, coord, results) 
                 entry = _ts_find_ref(in_flight, ref)
                 case entry {
                     nil ->
-                        _ts_loop(in_flight, next_idx, n, max_c, items, tmo, on_tmo, coord, results)
+                        _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, results)
                     e ->
-                        idx = elem(e, 2)
-                        if (ets_get(results, idx) == nil) {
-                            ets_put(results, idx, {'error', reason})
-                        }
+                        recorded = _ts_record(results, elem(e, 2), {'error', reason})
                         rest = _ts_remove_ref(in_flight, ref, [])
-                        refilled = _ts_refill(rest, next_idx, n, max_c, items, tmo, coord)
-                        _ts_loop(elem(refilled, 0), elem(refilled, 1), n, max_c,
-                                 items, tmo, on_tmo, coord, results)
+                        refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
+                        _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
+                                 fn, tmo, on_tmo, coord, recorded)
                 }
 
             after wait {
                 # Deadline reached: time out every expired in-flight worker.
                 now = timestamp()
                 expired = _ts_expired(in_flight, now, [])
-                _ts_timeout_each(expired, results)
+                recorded = _ts_timeout_each(expired, results)
                 rest = _ts_keep_unexpired(in_flight, now, [])
-                refilled = _ts_refill(rest, next_idx, n, max_c, items, tmo, coord)
-                _ts_loop(elem(refilled, 0), elem(refilled, 1), n, max_c,
-                         items, tmo, on_tmo, coord, results)
+                refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
+                _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
+                         fn, tmo, on_tmo, coord, recorded)
             }
         }
     }
@@ -537,26 +540,15 @@ fun _ts_soonest_deadline(in_flight, best) {
     }
 }
 
-# Refill empty slots up to max_c by starting workers for the next indices.
-# Returns {new_in_flight, new_next_idx}.
-fun _ts_refill(in_flight, next_idx, n, max_c, items, tmo, coord) {
-    if (length(in_flight) >= max_c || next_idx >= n) { {in_flight, next_idx} }
-    else {
-        spawned = _ts_spawn_one(next_idx, items, tmo, coord)
-        _ts_refill(list_append(in_flight, spawned), next_idx + 1, n, max_c, items, tmo, coord)
-    }
-}
-
-# Record {'error','timeout'} for each expired worker and kill it.
+# Record {'error','timeout'} for each expired worker, kill it, and forget its
+# monitor. Returns the updated results map.
 fun _ts_timeout_each(expired, results) {
-    if (length(expired) == 0) { 'ok' }
+    if (length(expired) == 0) { results }
     else {
         e = hd(expired)
-        pid = elem(e, 1)
-        idx = elem(e, 2)
-        exit_proc(pid, 'kill')
-        if (ets_get(results, idx) == nil) { ets_put(results, idx, {'error', 'timeout'}) }
-        _ts_timeout_each(tl(expired), results)
+        exit_proc(elem(e, 1), 'kill')
+        _ts_forget(e)
+        _ts_timeout_each(tl(expired), _ts_record(results, elem(e, 2), {'error', 'timeout'}))
     }
 }
 
@@ -585,6 +577,11 @@ fun _ts_find_ref(in_flight, ref) {
     else { if (elem(hd(in_flight), 0) == ref) { hd(in_flight) } else { _ts_find_ref(tl(in_flight), ref) } }
 }
 
+fun _ts_find_idx(in_flight, idx) {
+    if (length(in_flight) == 0) { nil }
+    else { if (elem(hd(in_flight), 2) == idx) { hd(in_flight) } else { _ts_find_idx(tl(in_flight), idx) } }
+}
+
 fun _ts_remove_ref(in_flight, ref, acc) {
     if (length(in_flight) == 0) { acc }
     else {
@@ -603,13 +600,13 @@ fun _ts_remove_idx(in_flight, idx, acc) {
     }
 }
 
-# Collect results 0..n-1 from ETS into an ordered list. Any gap (should
-# never happen) defaults to {'error','missing'} so the return is total —
-# every cell is a {'ok'|'error', _} tuple, never a bare nil.
+# Collect results 0..n-1 into an ordered list. Any gap (should never happen)
+# defaults to {'error','missing'} so the return is total — every cell is a
+# {'ok'|'error', _} tuple, never a bare nil.
 fun _ts_collect(i, n, results, acc) {
     if (i >= n) { acc }
     else {
-        cell = case ets_get(results, i) { nil -> ({'error', 'missing'}) ; c -> c }
+        cell = case map_get(results, i) { nil -> ({'error', 'missing'}) ; c -> c }
         _ts_collect(i + 1, n, results, list_append(acc, cell))
     }
 }

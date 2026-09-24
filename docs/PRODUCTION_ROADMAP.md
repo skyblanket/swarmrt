@@ -41,7 +41,7 @@ make swc libswarmrt        # must be ZERO warnings (the "no unexplained warnings
 make gc-stress             # ASAN + -DSW_ARENA_POISON: UAF / double-free tripwires (9 gates)
 SW_SCHEDULERS=1 make gc-stress   # deterministic single-scheduler interleave
 make gc-slope              # memory-slope gates: every long-lived owner must hold FLAT RSS (10 probes)
-make test-sw               # 53 sw files / 475 assertions (compiled + interpreter parity)
+make test-sw               # 74 sw files / 573 assertions (compiled + interpreter parity)
 for p in 2 3 4 5 6 7 8 9 10; do make phase$p && ./bin/test-phase$p; done   # runtime/OTP tests
 ```
 

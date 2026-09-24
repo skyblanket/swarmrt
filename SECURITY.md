@@ -36,6 +36,21 @@ In scope: memory-safety bugs in the runtime or compiler, crashes
 reachable from well-formed `sw` source, and `shell_sandboxed` failing
 to contain what it documents.
 
+## Security-relevant defaults
+
+- **Distribution** (`node_start`) listens on `127.0.0.1` unless `SW_NODE_BIND`
+  says otherwise. Set the same `SW_NODE_COOKIE` on every node to authenticate
+  frames (SHA-256 MAC per frame; frames are not encrypted or replay-protected,
+  so run clusters on a private network or through a tunnel). A remote peer can
+  only deliver plain value messages — never runtime-internal signals.
+- **LLM builtins** send a provider key only to that provider: `LLM_API_KEY` to
+  any URL, `OPENAI_API_KEY` only to `api.openai.com`, `OTONOMY_API_KEY` only to
+  the Otonomy endpoint.
+- **`shell_sandboxed`** execs the sandbox tool directly; the command string is
+  interpreted only by the shell *inside* the sandbox.
+- **The HTTP server** (`http_listen`) binds all interfaces (it is meant to be
+  reachable, e.g. for health checks); WebSocket upgrades do not check `Origin`.
+
 ## Known issues
 
 Non-security stability bugs are tracked openly in

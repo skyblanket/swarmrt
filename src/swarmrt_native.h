@@ -201,6 +201,8 @@ typedef struct {
 #define SW_TAG_CAST    11     /* GenServer async cast */
 #define SW_TAG_STOP    12     /* GenServer stop request */
 #define SW_TAG_TASK_RESULT 13 /* Task result from child */
+#define SW_TAG_SLEEP   30     /* Never sent: sw_sleep_ms waits on it so the
+                                 mailbox is left untouched */
 
 /* === Link (bidirectional, intrusive list) === */
 typedef struct sw_link {
@@ -434,6 +436,12 @@ typedef struct {
     _Atomic int idle;
     pthread_mutex_t idle_lock;
     pthread_cond_t idle_cond;
+
+    /* Non-zero while this scheduler's thread is inside a blocking builtin
+     * (sw_blocking_enter): producers divert wake-ups to the global overflow
+     * queue, which idle schedulers steal from, instead of stranding them
+     * behind the blocked thread. */
+    _Atomic int blocking;
 } sw_runq_t;
 
 /* === Scheduler (per OS thread) === */
@@ -691,6 +699,9 @@ sw_process_t *sw_spawn_link(void (*func)(void*), void *arg);
 
 /* Monitors */
 uint64_t sw_monitor(sw_process_t *target);
+/* sw_monitor for a pid value (ptr + captured numeric id): DOWN(noproc) at
+ * once if that process is gone, even if its slot was reused. */
+uint64_t sw_monitor_id(sw_process_t *target, uint64_t expect_id);
 int sw_demonitor(uint64_t ref);
 
 /* Process flags */
@@ -714,6 +725,40 @@ void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
                         struct sw_value_arena *region);
 void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms);
 void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
+/* Blocking-call offload. Runs fn(arg) on a runtime worker thread while the
+ * calling process PARKS (its scheduler thread keeps running other processes),
+ * then returns once fn has finished. Outside a process — or with
+ * SW_OFFLOAD=0 — fn runs inline on the caller's thread. Intended for calls
+ * that block in the kernel for a long time (spawning curl and waiting on
+ * it, running a subprocess): without it each one pins a whole scheduler
+ * thread, so N schedulers could only have N such calls in flight.
+ *
+ * Contract for fn: it runs on a thread with NO current process — it must not
+ * send/receive/yield or touch the caller's process state — and `arg` must not
+ * live on the caller's stack (a caller killed mid-call is torn down without
+ * resuming; the worker still finishes with `arg`). If the caller is killed,
+ * its `arg` is leaked rather than freed under the worker. Pool size grows on
+ * demand up to SW_OFFLOAD_THREADS (default 256); idle workers exit after 30s. */
+void sw_offload_run(void (*fn)(void *), void *arg);
+/* Park the calling process until *flag becomes non-zero. The waker stores the
+ * flag (seq_cst) and then calls sw_wake(proc). The mailbox is untouched:
+ * messages arriving meanwhile wake us, we re-check, and they stay queued. */
+void sw_park_until(_Atomic int *flag);
+/* Bracket a builtin that blocks its OS thread without parking (terminal
+ * input, a synchronous subprocess wait). While inside, processes queued on
+ * this scheduler move to the shared overflow queue and new wake-ups for it
+ * go there too, so idle schedulers run them — there is no general work
+ * stealing, and a process whose home scheduler sat in read_line starved
+ * even with every other scheduler idle. No-ops off a scheduler thread.
+ * The builtin must not park or yield inside the section. */
+void sw_blocking_enter(void);
+void sw_blocking_exit(void);
+/* Wake a parked process (spurious wakes are harmless: every wait re-checks). */
+void sw_wake(sw_process_t *proc);
+/* Park the calling process for `ms` milliseconds WITHOUT consuming any
+ * message (messages that arrive meanwhile stay queued for the next receive).
+ * Outside a process it falls back to a plain OS sleep. */
+void sw_sleep_ms(uint64_t ms);
 /* Ownership v2: sw_receive_any that adopts a VALUE region into the caller's
  * arena (caller incorporates the payload; must NOT free it). Used by pmap. */
 void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag);

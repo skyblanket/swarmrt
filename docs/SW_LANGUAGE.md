@@ -142,6 +142,45 @@ Cron.every(200, fn() { check_inbox() })     # the common scheduler idiom
 
 `fn` is **not** a reserved word — it is only a lambda when written in the `fn(...) { ... }` shape, so it stays a perfectly good ordinary variable / parameter name (the stdlib uses `fn` as a callback parameter throughout).
 
+Lambdas capture variables from **every** enclosing scope (by value, at the moment the lambda is created), so the fan-out-and-reply shape works as written:
+
+```sw
+fun fan_out(items) {
+    me = self()
+    map(fn(x) { spawn(fn() { send(me, {'done', x * x}) }) }, items)
+}
+```
+
+### Functions as values
+
+A module function — or `Module.function` from an imported module — can be passed by name wherever a function value is expected, and piped into directly:
+
+```sw
+import Std
+
+fun double(x) { x * 2 }
+
+fun main() {
+    print(map(double, [1, 2, 3]))                  # [2, 4, 6]
+    print([1, 2, 3] |> map(double) |> Std.sum)     # 12
+    sum = Std.sum
+    print(sum([10, 20]))                           # 30
+}
+```
+
+Builtins (`to_string`, `string_upper`, …) can be piped into (`xs |> length`) but not yet passed as values — wrap them: `map(fn(x) { to_string(x) }, xs)`.
+
+### Names are checked
+
+Every identifier must be bound somewhere — a parameter, an assignment, a pattern variable, a `for` variable, a module function or a module `let`. A name bound nowhere is rejected before the program runs, by `swc build`, `swc run` and `swc test` alike:
+
+```
+swc: src/Main.sw:3: undefined variable 'usr_name' — did you mean 'user_name'?
+swc: src/Main.sw:9: undefined variable 'ok' (atoms are written quoted: 'ok')
+```
+
+A variable assigned in any branch of an `if` / `case` / `receive` is visible after it (it is `nil` if the assigning branch did not run).
+
 ---
 
 ## 4. Values and types
@@ -480,13 +519,16 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 |---|---|
 | `print(...)` | stdout, trailing newline |
 | `print_inline(...)` | stdout, no newline |
+| `eprint(...)` | stderr, trailing newline — diagnostics that must stay out of stdout |
+| `stdout_to_stderr()` → fd | point stdout at stderr from now on (print, streamed tokens) and return the original stdout's fd; idempotent. For CLIs whose stdout carries one machine-readable result |
+| `fd_write(fd, s)` → `'ok'` \| `'error'` | write a string to a file descriptor, e.g. the one `stdout_to_stderr()` returned |
 | `read_line(prompt?)` | stdin, returns string or `nil` on EOF |
 | `read_char()` | single keypress (raw mode) |
 | `read_choice(header, options)` | arrow-key picker → int index, -1 on cancel |
 | `getenv(name)` | env var or `nil` |
 | `sys_exit(code?)` | terminate process (0 if omitted) |
 | `timestamp()` | ms since epoch |
-| `sleep(ms)` | block this process for ms |
+| `sleep(ms)` | park this process for ms (other processes keep running; messages that arrive meanwhile stay queued) |
 | `term_cols()` | terminal width via TIOCGWINSZ |
 | `shell(cmd)` | run shell command → `{exit_code, stdout_string}` |
 | `exec_argv(cmd, args)` → `{code, out}` | fork+exec with no shell — safe for user data |
@@ -564,8 +606,10 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `list_append(lst, x)` | new list with x appended |
 | `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
-| `reduce(fn, lst, init)` | foldl |
+| `reduce(fn, lst, init)` | foldl; `fn` is called as `fn(acc, item)` |
 | `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap) and silently maps a slow item to `nil` on a fixed ~5s wall.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
+| `a..b` | inclusive integer range as a list: `1..3` is `[1, 2, 3]` (`Std.range(a, b)` is end-exclusive, Python-style) |
+| `[h \| t]` / `list_append(lst, x)` | prepend / append — both O(1) amortized for the accumulator patterns (`build(n - 1, [n \| acc])`, `grow(list_append(acc, x))`); `tl(lst)` is O(1) |
 | `map_new()` | new empty map (same as the `%{}` literal) |
 | `map_get(m, k)` | value or `nil` |
 | `map_get(m, k, default)` | 3-arg form: value, or `default` if `k` is absent |
@@ -608,6 +652,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `ets_get(t, k)` / `ets_put(t, k, v)` / `ets_delete(t, k)` | basic ops |
 | `ets_list(t)` | list of `{k, v}` tuples |
 | `ets_count(t)` | size |
+| `ets_drop(t)` | delete the whole table and release its id (tables are a finite resource: at most 1024 live) |
 | `ets_update_counter(t, k, delta, initial)` | atomic `+= delta`, seeds `initial+delta` if missing; returns new int |
 | `ets_cas(t, k, expected, new)` | compare-and-swap; `'true'` if swapped, `'false'` if mismatch / missing |
 | `ets_take(t, k)` | atomic get-and-delete; returns value or `nil` |
@@ -960,7 +1005,7 @@ bin/swc test tests/sw/repl/test_repl_builtins_interp.sw
 #   16 tests, 16 passed (8.9ms)
 ```
 
-The broader test suite (`make test-sw`) compiles and runs the 8 files under `tests/sw/` (110 sw assertions total). The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
+The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (74 files, 573 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
 
 Inside your own `.sw` test files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics or errors with a message containing `expected_msg`. The test runner intercepts the panic before it hits `exit(1)` so the suite continues running.
 

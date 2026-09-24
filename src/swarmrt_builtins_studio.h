@@ -67,14 +67,26 @@
   #include <fcntl.h>
   #define sw_mkdir(p, m) mkdir(p, m)
   #define swbs_unlink(p) unlink(p)
-  #define sw_sleep(s) sleep(s)
+  /* Parks the calling process (not its scheduler thread) when on a fiber;
+   * a plain OS sleep otherwise (e.g. on an offload worker). */
+  #define sw_sleep(s) sw_sleep_ms((uint64_t)(s) * 1000)
 #endif
+
+/* Sub-second nap with the same fiber-aware behaviour as sw_sleep. */
+static void _sw_nap_us(unsigned us) {
+#ifdef _WIN32
+    Sleep(us / 1000 ? us / 1000 : 1);
+#else
+    if (sw_self()) sw_sleep_ms(us < 1000 ? 1 : us / 1000);
+    else usleep(us);
+#endif
+}
 
 /* === Registry === */
 
 static sw_val_t *_builtin_register(sw_val_t **a, int n) {
-    if (n < 2 || !a[0]->v.str || !a[1]->v.pid) return sw_val_atom("error");
-    return sw_val_atom(sw_register(a[0]->v.str, a[1]->v.pid) == 0 ? "ok" : "error");
+    if (n < 2 || !a[0]->v.str || !sw_pid_of(a[1])) return sw_val_atom("error");
+    return sw_val_atom(sw_register(a[0]->v.str, sw_pid_of(a[1])) == 0 ? "ok" : "error");
 }
 
 static sw_val_t *_builtin_whereis(sw_val_t **a, int n) {
@@ -85,19 +97,23 @@ static sw_val_t *_builtin_whereis(sw_val_t **a, int n) {
 
 static sw_val_t *_builtin_monitor(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_PID) return sw_val_nil();
-    return sw_val_int((int64_t)sw_monitor(a[0]->v.pid));
+    /* A stale pid (process gone, slot reused) gets an immediate
+     * {'DOWN', ref, 'process', pid, "noproc"} instead of a monitor on
+     * whatever process now occupies the slot. */
+    return sw_val_int((int64_t)sw_monitor_id(a[0]->v.pidv.ptr, a[0]->v.pidv.id));
 }
 
 static sw_val_t *_builtin_link(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_PID) return sw_val_atom("error");
-    sw_link(a[0]->v.pid);
+    if (!sw_pid_of(a[0])) return sw_val_atom("error");   /* noproc */
+    sw_link(sw_pid_of(a[0]));
     return sw_val_atom("ok");
 }
 
 /* === Value-aware ETS (hashes/compares sw_val_t by value, not pointer) === */
 
 #define _VETS_BUCKETS 256
-#define _VETS_MAX_TABLES 64
+#define _VETS_MAX_TABLES 1024
 
 typedef struct _vets_entry {
     sw_val_t *key;
@@ -113,6 +129,11 @@ typedef struct {
 
 static _vets_table_t _vets_tables[_VETS_MAX_TABLES];
 static int _vets_next_id = 0;
+/* Ids released by ets_drop, reused by ets_new (LIFO). Without reuse the table
+ * space was a lifetime budget: Std.task_stream took two tables per call and
+ * the 33rd call hung. */
+static int _vets_free_ids[_VETS_MAX_TABLES];
+static int _vets_nfree = 0;
 static pthread_mutex_t _vets_meta = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t _vets_hash_val(sw_val_t *v) {
@@ -142,7 +163,7 @@ static uint32_t _vets_hash_val(sw_val_t *v) {
              * different arena-copied sw_val_t landed in different buckets yet
              * compared equal, so a pid-keyed put never found the prior entry
              * and the table accumulated duplicates + mislooked-up. */
-            uint64_t k = v->v.pid ? v->v.pid->pid : 0;
+            uint64_t k = v->v.pidv.id;
             for (int i = 0; i < 8; i++) { h ^= (k & 0xff); h *= 1099511628211ULL; k >>= 8; }
             break;
         }
@@ -176,7 +197,7 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
                 if (!_vets_key_eq(a->v.tuple.items[i], b->v.tuple.items[i])) return 0;
             return 1;
         case SW_VAL_PID: /* compare by numeric pid id (see sw_val_equal) */
-            return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
+            return a->v.pidv.id == b->v.pidv.id;
         default: return a == b;
     }
 }
@@ -192,7 +213,7 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
  * pointer (ETS copies values OUT to readers; a one-shot timer frees only after
  * its single apply returns). */
 static void _sw_free_global_val(sw_val_t *v) {
-    if (!v) return;
+    if (!v || v->immortal) return;
     switch (v->type) {
     case SW_VAL_STRING: case SW_VAL_ATOM:
         free(v->v.str); break;
@@ -218,13 +239,62 @@ static void _sw_free_global_val(sw_val_t *v) {
 static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
     (void)a; (void)n;
     pthread_mutex_lock(&_vets_meta);
-    int id = _vets_next_id++;
-    if (id >= _VETS_MAX_TABLES) { pthread_mutex_unlock(&_vets_meta); return sw_val_nil(); }
-    memset(&_vets_tables[id], 0, sizeof(_vets_table_t));
-    pthread_rwlock_init(&_vets_tables[id].lock, NULL);
-    _vets_tables[id].active = 1;
+    int id;
+    if (_vets_nfree > 0) {
+        /* Reused slot: its lock stays initialised (a straggler may still be
+         * blocked on it); only the buckets are reset. */
+        id = _vets_free_ids[--_vets_nfree];
+        pthread_rwlock_wrlock(&_vets_tables[id].lock);
+        memset(_vets_tables[id].buckets, 0, sizeof(_vets_tables[id].buckets));
+        _vets_tables[id].active = 1;
+        pthread_rwlock_unlock(&_vets_tables[id].lock);
+    } else {
+        id = _vets_next_id;
+        if (id >= _VETS_MAX_TABLES) {
+            pthread_mutex_unlock(&_vets_meta);
+            fprintf(stderr, "swarmrt: ets_new: table limit (%d live tables) reached — "
+                            "release unused tables with ets_drop(t)\n", _VETS_MAX_TABLES);
+            return sw_val_nil();
+        }
+        _vets_next_id++;
+        memset(&_vets_tables[id], 0, sizeof(_vets_table_t));
+        pthread_rwlock_init(&_vets_tables[id].lock, NULL);
+        _vets_tables[id].active = 1;
+    }
     pthread_mutex_unlock(&_vets_meta);
     return sw_val_int((int64_t)id);
+}
+
+/* ets_drop(t) → 'ok' | 'error' — delete a whole table: free every entry
+ * (keys and values live on the global heap) and release the id for reuse.
+ * Using the id afterwards reads as an empty/unknown table until ets_new
+ * hands the id out again. */
+static sw_val_t *_builtin_ets_drop(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    int id = (int)a[0]->v.i;
+    pthread_mutex_lock(&_vets_meta);
+    if (id < 0 || id >= _vets_next_id || !_vets_tables[id].active) {
+        pthread_mutex_unlock(&_vets_meta);
+        return sw_val_atom("error");
+    }
+    _vets_table_t *t = &_vets_tables[id];
+    pthread_rwlock_wrlock(&t->lock);
+    t->active = 0;
+    for (int b = 0; b < _VETS_BUCKETS; b++) {
+        _vets_entry_t *e = t->buckets[b];
+        while (e) {
+            _vets_entry_t *next = e->next;
+            _sw_free_global_val(e->key);
+            _sw_free_global_val(e->value);
+            free(e);
+            e = next;
+        }
+        t->buckets[b] = NULL;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    _vets_free_ids[_vets_nfree++] = id;
+    pthread_mutex_unlock(&_vets_meta);
+    return sw_val_atom("ok");
 }
 
 static sw_val_t *_builtin_ets_put(sw_val_t **a, int n) {
@@ -446,10 +516,9 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
 
 static sw_val_t *_builtin_sleep(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_INT) return sw_val_atom("ok");
-    /* Use sw_receive_any with timeout to yield scheduler to other processes */
-    uint64_t tag;
-    void *msg = sw_receive_any((uint64_t)a[0]->v.i, &tag);
-    if (msg) free(msg); /* discard any spurious message */
+    /* Park this process (other processes keep running) without consuming
+     * any message that arrives during the sleep. */
+    if (a[0]->v.i > 0) sw_sleep_ms((uint64_t)a[0]->v.i);
     return sw_val_atom("ok");
 }
 
@@ -700,13 +769,7 @@ static sw_val_t *_builtin_list_append(sw_val_t **a, int n) {
         sw_val_t *one = a[1];
         return sw_val_list(&one, 1);
     }
-    int cnt = a[0]->v.tuple.count;
-    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (cnt + 1));
-    for (int i = 0; i < cnt; i++) items[i] = a[0]->v.tuple.items[i];
-    items[cnt] = a[1];
-    sw_val_t *r = sw_val_list(items, cnt + 1);
-    free(items);
-    return r;
+    return sw_val_list_append(a[0], a[1]);
 }
 
 /* === File I/O === */
@@ -1075,7 +1138,7 @@ static int _sw_pkill_close(_sw_popen_pid_t p) {
             int status;
             pid_t r = waitpid(p.pid, &status, WNOHANG);
             if (r == p.pid) break;
-            usleep(10000);
+            _sw_nap_us(10000);
         }
         killpg(p.pid, SIGKILL);
         int status;
@@ -1097,6 +1160,104 @@ static int _sw_popen_pid_close(_sw_popen_pid_t p) {
     return 0;
 #endif
 }
+
+/* ============================================================
+ * Blocking-builtin offload
+ * ============================================================
+ *
+ * The HTTP client builtins spawn curl and wait for it; exec_argv waits on a
+ * subprocess. Run inline, each call pins its whole scheduler THREAD for the
+ * duration — so with N schedulers only N LLM/HTTP calls could be in flight
+ * at once (16 parallel 1s requests took 4s on 4 schedulers). Wrapped with
+ * SW_OFFLOAD_BUILTIN, the call instead runs on a runtime worker thread
+ * (sw_offload_run) while the calling process parks and every other process
+ * keeps running.
+ *
+ * Ownership: the arguments are deep-copied into a private region first (the
+ * worker must never read the caller's arena — a killed caller's arena is
+ * freed without the caller resuming), and the worker allocates the result
+ * into a second region. On return the caller adopts both regions in O(1). */
+static __thread int _sw_offl_depth = 0;
+/* On an offload worker: the parked process the current builtin runs for (so
+ * a long builtin can honour that process being killed). NULL elsewhere. */
+static __thread sw_process_t *_sw_offl_waiter = NULL;
+
+/* The process a builtin is running on behalf of: the current fiber, or the
+ * parked caller when running on an offload worker. */
+static inline sw_process_t *_sw_offl_self(void) {
+    sw_process_t *p = sw_self();
+    return p ? p : _sw_offl_waiter;
+}
+
+typedef struct {
+    sw_val_t *(*fn)(sw_val_t **, int);
+    sw_val_t **args;
+    int n;
+    sw_value_arena_t *in, *out;
+    sw_val_t *result;
+    sw_process_t *waiter;
+} _sw_offl_job_t;
+
+static void _sw_offl_work(void *p) {
+    _sw_offl_job_t *j = (_sw_offl_job_t *)p;
+    sw_value_arena_t *prev = sw_swap_alloc_target(j->out);
+    _sw_offl_depth++;
+    _sw_offl_waiter = j->waiter;
+    j->result = j->fn(j->args, j->n);
+    _sw_offl_waiter = NULL;
+    _sw_offl_depth--;
+    sw_swap_alloc_target(prev);
+}
+
+static sw_val_t *_sw_offload_builtin(sw_val_t *(*fn)(sw_val_t **, int),
+                                     sw_val_t **a, int n) {
+    sw_value_arena_t *mine = sw_self_varena();
+    _sw_offl_job_t *j = (sw_self() && mine) ? (_sw_offl_job_t *)calloc(1, sizeof(*j)) : NULL;
+    if (j) {
+        j->in = sw_varena_create_kind(1024, SW_REGION_MESSAGE);
+        j->out = sw_varena_create_kind(4096, SW_REGION_MESSAGE);
+        j->args = (sw_val_t **)calloc(n > 0 ? (size_t)n : 1, sizeof(sw_val_t *));
+    }
+    if (!j || !j->in || !j->out || !j->args) {
+        if (j) {
+            if (j->in) sw_varena_free_all(j->in);
+            if (j->out) sw_varena_free_all(j->out);
+            free(j->args);
+            free(j);
+        }
+        _sw_offl_depth++;
+        sw_val_t *r = fn(a, n);
+        _sw_offl_depth--;
+        return r;
+    }
+    for (int i = 0; i < n; i++) j->args[i] = a[i] ? deep_copy_into(a[i], j->in) : NULL;
+    j->fn = fn;
+    j->n = n;
+    j->waiter = sw_self();
+    sw_offload_run(_sw_offl_work, j);
+    /* The result may point into either region (a builtin can hand back one
+     * of its arguments), so the caller's arena adopts both. */
+    sw_varena_adopt(mine, j->in);
+    sw_varena_adopt(mine, j->out);
+    sw_val_t *r = j->result ? j->result : sw_val_nil();
+    free(j->args);
+    free(j);
+    return r;
+}
+
+/* First statement of a blocking builtin: re-dispatches the call through the
+ * offload pool unless we are already running on the worker. */
+/* SW_BLOCKING_SCOPE(): the rest of this builtin blocks its OS thread
+ * without parking (terminal input, a synchronous wait on a child), so let
+ * idle schedulers take over the processes queued behind it
+ * (sw_blocking_enter). Ends automatically at every return. */
+static inline void _sw_blocking_scope_end(int *unused) { (void)unused; sw_blocking_exit(); }
+#define SW_BLOCKING_SCOPE() \
+    int _sw_blocking_scope __attribute__((cleanup(_sw_blocking_scope_end), unused)) = \
+        (sw_blocking_enter(), 0)
+
+#define SW_OFFLOAD_BUILTIN(fn, a, n) \
+    do { if (_sw_offl_depth == 0) return _sw_offload_builtin((fn), (a), (n)); } while (0)
 
 /* ============================================================
  * Pending-input ring buffer — type-ahead captured mid-turn
@@ -1443,6 +1604,7 @@ static sw_val_t *_builtin_subprocess_send_line(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_subprocess_recv_line(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_nil();
     int slot = (int)a[0]->v.i;
     if (slot < 0 || slot >= _SW_SUBPROC_MAX || !_sw_subprocs[slot].active) return sw_val_nil();
@@ -1504,13 +1666,13 @@ static sw_val_t *_builtin_subprocess_close(sw_val_t **a, int n) {
     for (int i = 0; i < 10; i++) {
         int st;
         if (waitpid(sp->pid, &st, WNOHANG) == sp->pid) goto cleaned;
-        usleep(10000);
+        _sw_nap_us(10000);
     }
     killpg(sp->pid, SIGTERM);
     for (int i = 0; i < 20; i++) {
         int st;
         if (waitpid(sp->pid, &st, WNOHANG) == sp->pid) goto cleaned;
-        usleep(10000);
+        _sw_nap_us(10000);
     }
     killpg(sp->pid, SIGKILL);
     { int st; waitpid(sp->pid, &st, 0); }
@@ -1542,6 +1704,10 @@ cleaned:
 static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
         return sw_val_nil();
+    /* Interactive sessions keep the ESC-interrupt watcher on the caller's
+     * thread (it reads the TTY); everything else goes through the pool. */
+    if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok))
+        SW_OFFLOAD_BUILTIN(_builtin_http_post, a, n);
     const char *url = a[0]->v.str, *body = a[2]->v.str;
 
     /* Body via temp file — keeps the JSON out of argv entirely (and out
@@ -2162,13 +2328,53 @@ static const char *_sw_json_str_end(const char *p) {
     return NULL;
 }
 
+/* Find `"key"` followed by optional whitespace, ':', optional whitespace
+ * and a string value; return a pointer just past the value's opening
+ * quote, or NULL. Servers differ on spacing — Python's json.dumps emits
+ * `"content": "hi"` — and an exact `"key":"` match silently dropped every
+ * chunk from them. `end` (may be NULL) bounds the search. */
+static const char *_sw_json_key_str(const char *json, const char *key, const char *end) {
+    size_t klen = strlen(key);
+    for (const char *p = strstr(json, key); p && (!end || p < end); p = strstr(p + 1, key)) {
+        if (p == json || p[-1] != '"' || p[klen] != '"') continue;
+        const char *q = p + klen + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q != ':') continue;
+        q++;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q != '"') return NULL;   /* key present, value not a string (null, number) */
+        if (end && q >= end) return NULL;
+        return q + 1;
+    }
+    return NULL;
+}
+
+/* Same for a numeric value: pointer to its first digit/sign, or NULL. */
+static const char *_sw_json_key_num(const char *json, const char *key, const char *end) {
+    size_t klen = strlen(key);
+    for (const char *p = strstr(json, key); p && (!end || p < end); p = strstr(p + 1, key)) {
+        if (p == json || p[-1] != '"' || p[klen] != '"') continue;
+        const char *q = p + klen + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q != ':') continue;
+        q++;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == '-' || (*q >= '0' && *q <= '9')) return (end && q >= end) ? NULL : q;
+        return NULL;
+    }
+    return NULL;
+}
+
 /* Parse the `tool_calls` array out of one SSE `data:` JSON line and
  * fold each fragment into the per-index accumulator set. */
 static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_count) {
-    const char *arr = strstr(json, "\"tool_calls\":");
+    const char *arr = strstr(json, "\"tool_calls\"");
     if (!arr) return;
-    arr += 13;
-    while (*arr == ' ') arr++;
+    arr += 12;
+    while (*arr == ' ' || *arr == '\t') arr++;
+    if (*arr != ':') return;
+    arr++;
+    while (*arr == ' ' || *arr == '\t') arr++;
     if (*arr != '[') return;            /* e.g. "tool_calls":null */
     const char *arr_end = _sw_match_bracket(arr);
     const char *q = arr + 1;
@@ -2177,17 +2383,35 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
         const char *obj_end = _sw_match_bracket(q);
         if (!obj_end) break;
 
+        /* Fragments are keyed by `index`. Some servers omit it: then a
+         * fragment carrying a NEW id starts a new call, and one without an
+         * id continues the last call (defaulting everything to 0 merged
+         * two calls' arguments into one). */
         int idx = 0;
-        const char *ip = strstr(q, "\"index\":");
-        if (ip && ip < obj_end) idx = (int)strtol(ip + 8, NULL, 10);
+        const char *ip = _sw_json_key_num(q, "index", obj_end);
+        if (ip) {
+            idx = (int)strtol(ip, NULL, 10);
+        } else {
+            const char *idv = _sw_json_key_str(q, "id", obj_end);
+            if (idv) {
+                const char *ide = _sw_json_str_end(idv);
+                size_t il = ide ? (size_t)(ide - idv) : 0;
+                idx = *tc_count;
+                for (int k = 0; k < *tc_count; k++) {
+                    if (tcs[k].used && strlen(tcs[k].id) == il && strncmp(tcs[k].id, idv, il) == 0) { idx = k; break; }
+                }
+            } else {
+                idx = (*tc_count > 0) ? *tc_count - 1 : 0;
+            }
+        }
         if (idx < 0 || idx >= SW_MAX_TOOL_CALLS) { q = obj_end + 1; continue; }
         _sw_toolcall_t *tc = &tcs[idx];
         tc->used = 1;
         if (idx + 1 > *tc_count) *tc_count = idx + 1;
 
-        const char *idp = strstr(q, "\"id\":\"");
-        if (idp && idp < obj_end && tc->id[0] == '\0') {
-            const char *s = idp + 6;
+        const char *idp = _sw_json_key_str(q, "id", obj_end);
+        if (idp && tc->id[0] == '\0') {
+            const char *s = idp;
             const char *e = _sw_json_str_end(s);
             if (e && e < obj_end) {
                 size_t l = (size_t)(e - s);
@@ -2195,9 +2419,9 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
                 memcpy(tc->id, s, l); tc->id[l] = '\0';
             }
         }
-        const char *np = strstr(q, "\"name\":\"");
-        if (np && np < obj_end && tc->name[0] == '\0') {
-            const char *s = np + 8;
+        const char *np = _sw_json_key_str(q, "name", obj_end);
+        if (np && tc->name[0] == '\0') {
+            const char *s = np;
             const char *e = _sw_json_str_end(s);
             if (e && e < obj_end) {
                 size_t l = (size_t)(e - s);
@@ -2205,9 +2429,9 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
                 memcpy(tc->name, s, l); tc->name[l] = '\0';
             }
         }
-        const char *ap = strstr(q, "\"arguments\":\"");
-        if (ap && ap < obj_end) {
-            const char *s = ap + 13;
+        const char *ap = _sw_json_key_str(q, "arguments", obj_end);
+        if (ap) {
+            const char *s = ap;
             const char *e = _sw_json_str_end(s);
             if (e && e <= obj_end) {
                 size_t l = (size_t)(e - s);
@@ -2302,13 +2526,20 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     sw_val_t *headers = a[1];
     const char *body = a[2]->v.str;
 
-    /* Subagent mode: route content+reasoning as messages, skip TTY UI. */
+    /* Subagent mode: route content+reasoning as messages, skip TTY UI. It
+     * touches no terminal state, so it runs on the offload pool — parallel
+     * subagents stream concurrently instead of one per scheduler thread.
+     * (TTY mode keeps its spinner / ESC watcher on the caller's thread.) */
     sw_process_t *subagent_target = NULL;
     const char *subagent_name = "agent";
     if (n >= 5 && a[3] && a[3]->type == SW_VAL_PID && a[4] && a[4]->type == SW_VAL_STRING) {
-        subagent_target = a[3]->v.pid;
+        SW_OFFLOAD_BUILTIN(_builtin_http_post_stream, a, n);
+        subagent_target = sw_pid_of(a[3]);
+        if (!subagent_target)   /* the target exited: nowhere to stream (and never fall into TTY mode) */
+            return _sw_hps_err("http_post_stream: subagent target process is gone");
         subagent_name = a[4]->v.str;
     }
+    SW_BLOCKING_SCOPE();   /* TTY mode: spinner + ESC watcher on this thread */
     _stream_out_t so;
     _stream_out_init(&so, subagent_target, subagent_name);
 
@@ -2368,10 +2599,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * --keepalive-time 30: send TCP keepalives so flaky long-distance
      *   routes (api.z.ai, sushi, anything overseas) don't silently drop
      *   an idle stream during long reasoning chains.
-     * --retry 2 --retry-delay 1 --retry-connrefused --retry-all-errors:
-     *   curl auto-retries connection failures BEFORE any data arrives;
-     *   does NOT restart an already-streaming response (so safe for
-     *   streaming). Catches transient SSL/connect timeouts (curl 28/35).
+     * No curl-level --retry: the sw caller already retries transient
+     *   failures (status 0 / 5xx / 429) with backoff, and curl's own retries
+     *   (which also fire on 429/5xx) multiplied them: 12 POSTs per failed
+     *   turn, 40s on a 429 with Retry-After: 4.
      * --max-time 1800: hard ceiling at 30 min — long reasoning is fine
      *   but eventually we want to surface a failure rather than hang.
      * NOTE (F3c): we deliberately DO NOT pass curl --speed-limit/--speed-time
@@ -2400,12 +2631,6 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     argv[argc++] = "1800";
     argv[argc++] = "--keepalive-time";
     argv[argc++] = "30";
-    argv[argc++] = "--retry";
-    argv[argc++] = "2";
-    argv[argc++] = "--retry-delay";
-    argv[argc++] = "1";
-    argv[argc++] = "--retry-connrefused";
-    argv[argc++] = "--retry-all-errors";
     /* (F3c) No --speed-limit/--speed-time: the prefill-aware first-byte and
      * inter-byte stall guards are enforced in the select loop below so a
      * silent prefill is never mistaken for a dead stream. */
@@ -2515,12 +2740,13 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * buffer and split lines ourselves — fgets() would block and prevent
      * spinner ticking during dead air. Heap-allocated (see SW_HPS_*). */
     char *line = (char *)malloc(SW_HPS_LINE_CAP);
-    size_t line_len = 0;
+    size_t line_len = 0, line_cap = SW_HPS_LINE_CAP;
     char *readbuf = (char *)malloc(SW_HPS_READ_CAP);
     /* Per-delta token scratch for content + reasoning. Hoisted out of
      * the loop and onto the heap to keep the stack frame small. */
-    char *tok = (char *)malloc(SW_HPS_TOK_CAP);
-    char *rtok = (char *)malloc(SW_HPS_TOK_CAP);
+    size_t tok_cap = SW_HPS_TOK_CAP;
+    char *tok = (char *)malloc(tok_cap);
+    char *rtok = (char *)malloc(tok_cap);
     int done = 0;
     const int spinner_tick_ms = 80;
 
@@ -2560,7 +2786,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
          * Poll the flag each loop pass (≤ one spinner tick of latency),
          * kill the child, and bail exactly like a user interrupt. */
         {
-            sw_process_t *hps_self = sw_self();
+            sw_process_t *hps_self = _sw_offl_self();
             if (hps_self && hps_self->kill_flag) {
                 interrupted = 1;
                 _sw_pkill_close(ch);
@@ -2689,11 +2915,29 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
 
         for (ssize_t ri = 0; ri < rn && !done; ri++) {
             char ch = readbuf[ri];
-            if (line_len < SW_HPS_LINE_CAP - 1) line[line_len++] = ch;
+            /* The line buffer grows: a whole tool call in one frame
+             * (Ollama-style) can be far past 16KB, and a capped line lost it
+             * silently. 256MB bounds a runaway server. */
+            if (line_len + 1 >= line_cap && line_cap < ((size_t)256 << 20)) {
+                char *nl = (char *)realloc(line, line_cap * 2);
+                if (nl) { line = nl; line_cap *= 2; }
+            }
+            if (line_len + 1 < line_cap) line[line_len++] = ch;
             if (ch != '\n') continue;
             line[line_len] = '\0';
             size_t this_line_len = line_len;
             line_len = 0;
+            /* Decoded deltas are never longer than their line (escapes only
+             * shrink; \uXXXX is 6 bytes in, at most 4 out): size the token
+             * scratch to the line so a long delta isn't cut at 8KB. */
+            if (this_line_len + 8 > tok_cap) {
+                size_t nc = tok_cap;
+                while (this_line_len + 8 > nc) nc *= 2;
+                char *nt = (char *)realloc(tok, nc);
+                char *nr = nt ? (char *)realloc(rtok, nc) : NULL;
+                if (nt) tok = nt;
+                if (nr) { rtok = nr; tok_cap = nc; }
+            }
 
             /* SSE field parse. The WHATWG spec makes the space after the
              * colon OPTIONAL: "data: {...}" and "data:{...}" are both legal,
@@ -2731,16 +2975,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
              * that includes a `usage` object. Final chunk usually
              * does; intermediate chunks usually don't. */
             {
-                const char *u = strstr(json, "\"prompt_tokens\":");
-                if (u) { prompt_tokens = strtoll(u + 16, NULL, 10); }
-                u = strstr(json, "\"completion_tokens\":");
-                if (u) { completion_tokens = strtoll(u + 20, NULL, 10); }
-                u = strstr(json, "\"total_tokens\":");
-                if (u) { total_tokens = strtoll(u + 15, NULL, 10); }
+                const char *u = _sw_json_key_num(json, "prompt_tokens", NULL);
+                if (u) { prompt_tokens = strtoll(u, NULL, 10); }
+                u = _sw_json_key_num(json, "completion_tokens", NULL);
+                if (u) { completion_tokens = strtoll(u, NULL, 10); }
+                u = _sw_json_key_num(json, "total_tokens", NULL);
+                if (u) { total_tokens = strtoll(u, NULL, 10); }
                 /* finish_reason — capture on the last chunk that has one */
-                const char *fr = strstr(json, "\"finish_reason\":\"");
+                const char *fr = _sw_json_key_str(json, "finish_reason", NULL);
                 if (fr) {
-                    fr += 17;
                     size_t k = 0;
                     while (*fr && *fr != '"' && k < sizeof(finish_reason) - 1) {
                         finish_reason[k++] = *fr++;
@@ -2754,11 +2997,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
              * or neither. The `"reasoning_content":"` prefix can't false-
              * match `"content":"` because of the underscore boundary. */
             {
-                const char *rp = strstr(json, "\"reasoning_content\":\"");
+                const char *rp = _sw_json_key_str(json, "reasoning_content", NULL);
                 if (rp) {
-                    rp += 21;
                     size_t rtok_len = 0;
-                    while (*rp && *rp != '"' && rtok_len < SW_HPS_TOK_CAP - 4) {
+                    while (*rp && *rp != '"' && rtok_len < tok_cap - 4) {
                         if (*rp == '\\' && *(rp + 1)) {
                             char esc = *(rp + 1);
                             switch (esc) {
@@ -2836,16 +3078,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             /* Native function-calling channel: reassemble fragmented
              * tool_calls. Runs BEFORE the content `continue` below — a
              * tool-call-only delta usually carries no `content` field. */
-            if (tcs && strstr(json, "\"tool_calls\":")) {
+            if (tcs && strstr(json, "\"tool_calls\"")) {
                 _sw_parse_tc_deltas(json, tcs, &tc_count);
             }
 
-            const char *p = strstr(json, "\"content\":\"");
+            const char *p = _sw_json_key_str(json, "content", NULL);
             if (!p) continue;
-            p += 11;
 
             size_t tok_len = 0;
-            while (*p && *p != '"' && tok_len < SW_HPS_TOK_CAP - 4) {
+            while (*p && *p != '"' && tok_len < tok_cap - 4) {
                 if (*p == '\\' && *(p + 1)) {
                     char esc = *(p + 1);
                     switch (esc) {
@@ -3157,8 +3398,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * previous response was incomplete. */
     /* Snapshot whether the stream produced anything real BEFORE we append
      * any truncation marker (the marker would otherwise mask an empty turn).
-     * "Real" = streamed content OR at least one reassembled tool call. */
-    int produced_output = (buf_len > 0) || (tc_count > 0);
+     * "Real" = streamed content, a reassembled tool call, or reasoning: a
+     * reasoning-only reply is the model's answer (the agent tells the user
+     * it reasoned but said nothing), not a transport failure to retry. */
+    int produced_output = (buf_len > 0) || (tc_count > 0) || (reason_len > 0);
 
     const char *trunc_marker = NULL;
     if (interrupted) {
@@ -4405,7 +4648,8 @@ static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
  * the missing pieces here: unlink, demonitor, exit_proc, trap_exit. */
 static sw_val_t *_builtin_unlink(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_PID) return sw_val_atom("error");
-    return sw_val_atom(sw_unlink(a[0]->v.pid) == 0 ? "ok" : "error");
+    if (!sw_pid_of(a[0])) return sw_val_atom("ok");
+    return sw_val_atom(sw_unlink(sw_pid_of(a[0])) == 0 ? "ok" : "error");
 }
 
 static sw_val_t *_builtin_demonitor(sw_val_t **a, int n) {
@@ -4421,7 +4665,9 @@ static sw_val_t *_builtin_exit_proc(sw_val_t **a, int n) {
         else if (strcmp(a[1]->v.str, "killed") == 0) reason = 2;
         else reason = 3;
     }
-    sw_process_kill(a[0]->v.pid, reason);
+    /* exit_proc on a process that is gone is a no-op — it must not kill
+     * an unrelated process that reused the slot. */
+    if (sw_pid_of(a[0])) sw_process_kill(sw_pid_of(a[0]), reason);
     return sw_val_atom("ok");
 }
 
@@ -4535,6 +4781,7 @@ static sw_val_t *_sw_db_row_to_map(sqlite3_stmt *stmt) {
 }
 
 static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
     int slot = (int)a[0]->v.i;
@@ -4568,6 +4815,7 @@ static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_list(NULL, 0);
     int slot = (int)a[0]->v.i;
@@ -4613,6 +4861,7 @@ static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
 static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_http_get, a, n);
     const char *url = a[0]->v.str;
 
     char outf[256];
@@ -4810,6 +5059,7 @@ static sw_val_t *_sw_hr_error(const char *reason) {
 static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_hr_error("http_request: url must be a string");
+    SW_OFFLOAD_BUILTIN(_builtin_http_request, a, n);
     const char *url = a[0]->v.str;
 
     /* opts (optional map): method / headers / body */
@@ -4991,27 +5241,75 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
  * opts is currently a placeholder for future knobs (allow_net,
  * extra_read_paths, cpu_seconds…). Pass nil for the default policy.
  */
+#ifndef _WIN32
+/* Run argv (execvp, no outer shell) with stdout AND stderr on one pipe; read
+ * everything; return {exit_code, output} or nil if it could not start. */
+static sw_val_t *_sw_run_argv_merged(char *const argv[]) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return sw_val_nil();
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return sw_val_nil(); }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
+        setpgid(0, 0);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    size_t cap = 65536, got = 0;
+    char *buf = (char *)malloc(cap);
+    for (;;) {
+        if (!buf) break;
+        if (got + 4096 + 1 > cap) {
+            char *nb = (char *)realloc(buf, cap * 2);
+            if (!nb) break;
+            buf = nb; cap *= 2;
+        }
+        ssize_t r = read(pipefd[0], buf + got, cap - got - 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(pipefd[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!buf) return sw_val_nil();
+    buf[got] = '\0';
+    sw_val_t *items[2];
+    items[0] = sw_val_int(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    items[1] = sw_val_string(buf);
+    free(buf);
+    return sw_val_tuple(items, 2);
+}
+#endif
+
+/* shell_sandboxed(cmd) → {exit_code, output} | nil — run `cmd` with /bin/sh
+ * inside the platform sandbox (sandbox-exec on macOS, firejail on Linux; nil
+ * if unavailable — never a silent unsandboxed fallback). The sandbox tool is
+ * exec'd directly with `cmd` as ONE argv element, so only the sandboxed
+ * shell ever interprets it. (It used to be pasted into an outer `sh -c '...'`
+ * unescaped: a `'` in cmd broke out and ran the rest UNSANDBOXED.) */
 static sw_val_t *_builtin_shell_sandboxed(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
-    const char *cmd = a[0]->v.str;
-    (void)n; /* opts arg reserved for future knobs */
+    SW_OFFLOAD_BUILTIN(_builtin_shell_sandboxed, a, n);
+    char *cmd = a[0]->v.str;
 
 #ifdef __APPLE__
-    /* Write a minimal sandbox-exec profile. Restrictive by default:
-     * - no network
-     * - read-only outside /tmp + /private/tmp + standard system dirs
-     * - no writes outside /tmp + /private/tmp
-     */
-    char profile_path[256];
-    snprintf(profile_path, sizeof(profile_path), "%s/sw_sandbox_%d_%u.sb",
-             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
-    FILE *pf = fopen(profile_path, "w");
-    if (!pf) return sw_val_nil();
     /* Permissive-but-network-blocked profile. macOS dyld + libc need
      * a surprising amount of access to even load `sh`, so a strict
      * "deny default" profile aborts with SIGABRT before the user's
      * command runs. Instead we "allow default" then selectively
      * deny network + writes outside /tmp. Future opts can tighten. */
+    char profile_path[256];
+    snprintf(profile_path, sizeof(profile_path), "%s/sw_sandbox_%d_%u.sb",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    FILE *pf = fopen(profile_path, "w");
+    if (!pf) return sw_val_nil();
     fprintf(pf,
         "(version 1)\n"
         "(allow default)\n"
@@ -5022,59 +5320,100 @@ static sw_val_t *_builtin_shell_sandboxed(sw_val_t **a, int n) {
         "(allow file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
     );
     fclose(pf);
-
-    /* Capture output via popen — easier than the tmp-file dance of shell(). */
-    size_t cmdlen = strlen(cmd) + strlen(profile_path) + 256;
-    char *full = (char *)malloc(cmdlen);
-    snprintf(full, cmdlen, "sandbox-exec -f %s /bin/sh -c %c%s%c 2>&1",
-             profile_path, '\'', cmd, '\'');
-    FILE *fp = popen(full, "r");
-    free(full);
-    if (!fp) { swbs_unlink(profile_path); return sw_val_nil(); }
-    /* sw processes have small per-process stacks; allocate the read
-     * buffer on the heap instead of using a 64 KB stack array. */
-    size_t out_cap = 65536;
-    char *outbuf = (char *)malloc(out_cap);
-    if (!outbuf) { pclose(fp); swbs_unlink(profile_path); return sw_val_nil(); }
-    size_t got = fread(outbuf, 1, out_cap - 1, fp);
-    outbuf[got] = '\0';
-    int status = pclose(fp);
+    char *argv[] = { "sandbox-exec", "-f", profile_path, "/bin/sh", "-c", cmd, NULL };
+    sw_val_t *r = _sw_run_argv_merged(argv);
     swbs_unlink(profile_path);
-
-    sw_val_t *items[2];
-    items[0] = sw_val_int(WEXITSTATUS(status));
-    items[1] = sw_val_string(outbuf);
-    free(outbuf);
-    return sw_val_tuple(items, 2);
+    return r;
 #elif !defined(_WIN32)
-    /* Linux — try firejail. If absent, return nil (don't silently
-     * fall back to un-sandboxed). */
-    if (system("command -v firejail >/dev/null 2>&1") != 0) {
-        return sw_val_nil();
-    }
-    size_t cmdlen = strlen(cmd) + 256;
-    char *full = (char *)malloc(cmdlen);
-    snprintf(full, cmdlen,
-        "firejail --quiet --net=none --private-tmp -- /bin/sh -c %c%s%c 2>&1",
-        '\'', cmd, '\'');
-    FILE *fp = popen(full, "r");
-    free(full);
-    if (!fp) return sw_val_nil();
-    size_t out_cap = 65536;
-    char *outbuf = (char *)malloc(out_cap);
-    if (!outbuf) { pclose(fp); return sw_val_nil(); }
-    size_t got = fread(outbuf, 1, out_cap - 1, fp);
-    outbuf[got] = '\0';
-    int status = pclose(fp);
-    sw_val_t *items[2];
-    items[0] = sw_val_int(WEXITSTATUS(status));
-    items[1] = sw_val_string(outbuf);
-    free(outbuf);
-    return sw_val_tuple(items, 2);
+    if (system("command -v firejail >/dev/null 2>&1") != 0) return sw_val_nil();
+    char *argv[] = { "firejail", "--quiet", "--net=none", "--private-tmp", "--",
+                     "/bin/sh", "-c", cmd, NULL };
+    return _sw_run_argv_merged(argv);
 #else
-    (void)cmd;
+    (void)cmd; (void)n;
     return sw_val_nil();
 #endif
+}
+
+/* Make command output safe to hand to a model: valid UTF-8 is kept (it used
+ * to be stripped to printable ASCII, so `echo café` came back as "caf" and
+ * every CJK file name vanished), each run of invalid bytes becomes one
+ * U+FFFD, ANSI escape sequences are removed whole, and other control bytes
+ * are dropped (\t \n \r kept). Output that is mostly undecodable is
+ * binary: the caller gets a "[binary output — N bytes, not text]"
+ * placeholder instead. Returns a malloc'd NUL-terminated string. */
+static int _sw_utf8_valid_len(const unsigned char *p, size_t avail) {
+    unsigned char c = p[0];
+    int n; uint32_t cp;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; cp = c & 0x07; }
+    else return 0;
+    if ((size_t)n > avail) return 0;
+    for (int i = 1; i < n; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    if ((n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000)) return 0;  /* overlong */
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0;                          /* surrogate */
+    if (cp > 0x10FFFF) return 0;
+    return n;
+}
+
+static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_len) {
+    /* Worst case every byte starts an invalid run: 3 bytes of U+FFFD each. */
+    char *buf = (char *)malloc(raw_len * 3 + 64);
+    if (!buf) return NULL;
+    const unsigned char *u = (const unsigned char *)raw;
+    size_t len = 0, bad = 0, i = 0;
+    int in_bad_run = 0;
+    while (i < raw_len) {
+        unsigned char c = u[i];
+        if (c == 0x1B) {                         /* ANSI escape: skip it whole */
+            i++;
+            if (i < raw_len && u[i] == '[') {    /* CSI ... final byte 0x40-0x7E */
+                i++;
+                while (i < raw_len && !(u[i] >= 0x40 && u[i] <= 0x7E)) i++;
+                if (i < raw_len) i++;
+            } else if (i < raw_len && u[i] == ']') {   /* OSC ... BEL or ESC \ */
+                i++;
+                while (i < raw_len && u[i] != 0x07 && !(u[i] == 0x1B && i + 1 < raw_len && u[i + 1] == '\\')) i++;
+                if (i < raw_len) i += (u[i] == 0x07) ? 1 : 2;
+            } else if (i < raw_len) {
+                i++;
+            }
+            in_bad_run = 0;
+            continue;
+        }
+        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E)) {
+            buf[len++] = (char)c; i++; in_bad_run = 0; continue;
+        }
+        if (c >= 0x80) {
+            int n = _sw_utf8_valid_len(u + i, raw_len - i);
+            if (n > 0) {
+                memcpy(buf + len, u + i, (size_t)n);
+                len += (size_t)n; i += (size_t)n; in_bad_run = 0;
+                continue;
+            }
+            bad++;
+            if (!in_bad_run) {                   /* one U+FFFD per invalid run */
+                buf[len++] = (char)0xEF; buf[len++] = (char)0xBF; buf[len++] = (char)0xBD;
+                in_bad_run = 1;
+            }
+            i++;
+            continue;
+        }
+        bad++;                                   /* other C0 control / DEL: drop */
+        i++;
+    }
+    buf[len] = 0;
+    /* Mostly undecodable (or nothing decodable at all) means binary. */
+    if (raw_len > 0 && (len == 0 || (raw_len >= 32 && bad * 10 > raw_len * 3))) {
+        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
+        len = strlen(buf);
+    }
+    *out_len = len;
+    return buf;
 }
 
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
@@ -5095,10 +5434,28 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     size_t wrapcap = cmdlen + 1024;
     char *wrapped = (char *)malloc(wrapcap);
     if (!wrapped) return sw_val_nil();
+    /* The newline (not "; ") ends cmd: a trailing `# comment` or heredoc
+     * terminator used to swallow the rest of the wrapper, and a trailing
+     * `&` made "& ;" a syntax error. */
     snprintf(wrapped, wrapcap,
-        "{ %s ; echo $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
-    system(wrapped);
+        "{ %s\necho $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
+    int launch = system(wrapped);
     free(wrapped);
+    /* The launching sh backgrounds the group and exits 0. Anything else
+     * means the command never started (a parse error, or E2BIG for a huge
+     * command line) — the exit file will never appear, so fail now instead
+     * of polling for the full timeout. */
+    if (launch != 0) {
+        swbs_unlink(outf);
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "error: /bin/sh could not start the command (%s)",
+                 launch == -1 ? "fork/exec failed" : "syntax error or argument list too long");
+        sw_val_t *items[2];
+        items[0] = sw_val_int(launch == -1 ? -1 : 2);
+        items[1] = sw_val_string(msg);
+        return sw_val_tuple(items, 2);
+    }
 
     /* Poll for the exit file with an ADAPTIVE backoff (2ms -> 250ms).
      *
@@ -5129,7 +5486,7 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
         FILE *ef = fopen(exitf, "r");
         if (ef) { fclose(ef); done = 1; break; }
 
-        usleep(delay_us);
+        _sw_nap_us(delay_us);
         waited_us += delay_us;
         if (delay_us < 250000) {
             delay_us *= 2;
@@ -5232,11 +5589,10 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     }
     swbs_unlink(exitf);
 
-    /* Read full output, sanitizing non-printable bytes.
-     * Binary output (gzipped pages, encrypted files, images) poisons
-     * the model's context and causes empty responses.  We keep only
-     * printable ASCII (0x20-0x7E) plus \t \n \r.  If the result is
-     * entirely binary (sanitized length is 0), return a placeholder.
+    /* Read full output, then sanitize it (_sw_sanitize_output): binary
+     * output (gzipped pages, encrypted files, images) poisons the model's
+     * context and causes empty responses, so undecodable bytes are
+     * replaced and mostly-binary output becomes a placeholder.
      * Buffer grows from 64KB on demand — long pages or large shell
      * outputs no longer truncate at the cap. */
     size_t cap = 65536, raw_len = 0;
@@ -5261,23 +5617,10 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     }
     swbs_unlink(outf);
 
-    /* Sanitize: strip non-printable bytes in-place */
     size_t len = 0;
-    char *buf = (char *)malloc(raw_len + 64);
-    if (!buf) { free(raw); return sw_val_nil(); }
-    for (size_t i = 0; i < raw_len; i++) {
-        unsigned char c = (unsigned char)raw[i];
-        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E))
-            buf[len++] = (char)c;
-    }
-    buf[len] = 0;
+    char *buf = _sw_sanitize_output(raw, raw_len, &len);
     free(raw);
-
-    /* If all content was binary, say so */
-    if (len == 0 && raw_len > 0) {
-        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
-        len = strlen(buf);
-    }
+    if (!buf) return sw_val_nil();
 
     /* Return {status, output} tuple */
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
@@ -5330,6 +5673,7 @@ static sw_val_t *_sw_managed_tuple(int code, const char *msg) {
 }
 
 static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_managed_tuple(-1, "error: shell_managed needs a string command");
 #ifdef _WIN32
@@ -5441,21 +5785,10 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
     if (oom) { free(raw); return _sw_managed_tuple(-1, "error: out of memory capturing output"); }
     raw[raw_len] = 0;
 
-    /* Sanitize: keep printable ASCII + \t \n \r (binary poisons the model). */
     size_t len = 0;
-    char *buf = (char *)malloc(raw_len + 64);
-    if (!buf) { free(raw); return _sw_managed_tuple(-1, "error: out of memory"); }
-    for (size_t i = 0; i < raw_len; i++) {
-        unsigned char c = (unsigned char)raw[i];
-        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E))
-            buf[len++] = (char)c;
-    }
-    buf[len] = 0;
+    char *buf = _sw_sanitize_output(raw, raw_len, &len);
     free(raw);
-    if (len == 0 && raw_len > 0) {
-        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
-        len = strlen(buf);
-    }
+    if (!buf) return _sw_managed_tuple(-1, "error: out of memory");
 
     sw_val_t *items[3];
     items[0] = sw_val_int(status);
@@ -5480,6 +5813,7 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
  * (shell tools self-watch inside shell_managed), so stdin has a single
  * reader at any moment. */
 static sw_val_t *_builtin_read_key(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
 #ifdef _WIN32
     (void)a; (void)n;
     return sw_val_nil();
@@ -5517,6 +5851,7 @@ static sw_val_t *_builtin_exec_argv(sw_val_t **a, int n) {
 #else
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_exec_argv, a, n);
     const char *cmd = a[0]->v.str;
 
     /* Collect extra args from the sw list (may be absent or empty). */
@@ -5634,7 +5969,7 @@ static sw_val_t *_builtin_shell_detached(sw_val_t **a, int n) {
         size_t wlen = strlen(cmd) + strlen(exit_path) + 32;
         char *wrapper = (char *)malloc(wlen);
         if (!wrapper) _exit(127);
-        snprintf(wrapper, wlen, "( %s ); echo $? > %s", cmd, exit_path);
+        snprintf(wrapper, wlen, "( %s\n); echo $? > %s", cmd, exit_path);
         execl("/bin/sh", "sh", "-c", wrapper, (char *)NULL);
         _exit(127);                            /* exec failed */
     }
@@ -5704,6 +6039,47 @@ static void _json_putc(char **buf, size_t *cap, size_t *pos, char c) {
     (*buf)[(*pos)++] = c;
 }
 
+/* Quoted, escaped JSON string. Output is always valid UTF-8: each invalid
+ * byte becomes \ufffd (file_read of a Latin-1 file, or a truncated
+ * multi-byte character, used to put raw bytes into LLM request bodies,
+ * which strict providers reject). */
+static void _json_encode_str(const char *str, char **buf, size_t *cap, size_t *pos) {
+    _json_putc(buf, cap, pos, '"');
+    const unsigned char *p = (const unsigned char *)str;
+    size_t n = strlen(str), i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        switch (c) {
+            case '"':  _json_append(buf, cap, pos, "\\\""); i++; continue;
+            case '\\': _json_append(buf, cap, pos, "\\\\"); i++; continue;
+            case '\n': _json_append(buf, cap, pos, "\\n"); i++; continue;
+            case '\r': _json_append(buf, cap, pos, "\\r"); i++; continue;
+            case '\t': _json_append(buf, cap, pos, "\\t"); i++; continue;
+            default: break;
+        }
+        if (c < 0x20 || c == 0x7F) {
+            char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", c);
+            _json_append(buf, cap, pos, esc);
+            i++;
+        } else if (c < 0x80) {
+            _json_putc(buf, cap, pos, (char)c);
+            i++;
+        } else {
+            int len = _sw_utf8_valid_len(p + i, n - i);
+            if (len > 0) {
+                _json_grow(buf, cap, *pos, (size_t)len);
+                memcpy(*buf + *pos, p + i, (size_t)len);
+                *pos += (size_t)len;
+                i += (size_t)len;
+            } else {
+                _json_append(buf, cap, pos, "\\ufffd");
+                i++;
+            }
+        }
+    }
+    _json_putc(buf, cap, pos, '"');
+}
+
 static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) {
     if (!v || v->type == SW_VAL_NIL) {
         _json_append(buf, cap, pos, "null");
@@ -5712,38 +6088,20 @@ static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) 
         snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.i);
         _json_append(buf, cap, pos, tmp);
     } else if (v->type == SW_VAL_FLOAT) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
-        _json_append(buf, cap, pos, tmp);
-    } else if (v->type == SW_VAL_STRING) {
-        _json_append(buf, cap, pos, "\"");
-        /* Escape string contents — buffer grows as needed via _json_putc. */
-        for (const char *p = v->v.str; *p; p++) {
-            switch (*p) {
-                case '"':  _json_append(buf, cap, pos, "\\\""); break;
-                case '\\': _json_append(buf, cap, pos, "\\\\"); break;
-                case '\n': _json_append(buf, cap, pos, "\\n"); break;
-                case '\r': _json_append(buf, cap, pos, "\\r"); break;
-                case '\t': _json_append(buf, cap, pos, "\\t"); break;
-                default:
-                    if ((unsigned char)*p < 0x20) {
-                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
-                        _json_append(buf, cap, pos, esc);
-                    } else {
-                        _json_putc(buf, cap, pos, *p);
-                    }
-            }
+        /* JSON has no NaN/Infinity literals. */
+        if (isnan(v->v.f) || isinf(v->v.f)) { _json_append(buf, cap, pos, "null"); }
+        else {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            _json_append(buf, cap, pos, tmp);
         }
-        _json_append(buf, cap, pos, "\"");
+    } else if (v->type == SW_VAL_STRING) {
+        _json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_ATOM) {
         if (strcmp(v->v.str, "true") == 0) _json_append(buf, cap, pos, "true");
         else if (strcmp(v->v.str, "false") == 0) _json_append(buf, cap, pos, "false");
         else if (strcmp(v->v.str, "nil") == 0) _json_append(buf, cap, pos, "null");
-        else {
-            _json_append(buf, cap, pos, "\"");
-            _json_append(buf, cap, pos, v->v.str);
-            _json_append(buf, cap, pos, "\"");
-        }
+        else _json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_LIST || v->type == SW_VAL_TUPLE) {
         _json_append(buf, cap, pos, "[");
         for (int i = 0; i < v->v.tuple.count; i++) {
@@ -5755,17 +6113,17 @@ static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) 
         _json_append(buf, cap, pos, "{");
         for (int i = 0; i < v->v.map.count; i++) {
             if (i > 0) _json_append(buf, cap, pos, ",");
-            /* Key: always stringify */
-            _json_append(buf, cap, pos, "\"");
+            /* Key: always stringify (and escape — a key holding a quote or
+             * backslash used to produce invalid JSON). */
             if (v->v.map.keys[i]->type == SW_VAL_STRING ||
                 v->v.map.keys[i]->type == SW_VAL_ATOM)
-                _json_append(buf, cap, pos, v->v.map.keys[i]->v.str);
+                _json_encode_str(v->v.map.keys[i]->v.str, buf, cap, pos);
             else {
                 char tmp[64];
-                snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.map.keys[i]->v.i);
+                snprintf(tmp, sizeof(tmp), "\"%lld\"", (long long)v->v.map.keys[i]->v.i);
                 _json_append(buf, cap, pos, tmp);
             }
-            _json_append(buf, cap, pos, "\":");
+            _json_append(buf, cap, pos, ":");
             _json_encode_val(v->v.map.vals[i], buf, cap, pos);
         }
         _json_append(buf, cap, pos, "}");
@@ -5793,6 +6151,13 @@ static sw_val_t *_builtin_json_encode(sw_val_t **a, int n) {
 /* === JSON decode: JSON string → sw_val_t === */
 
 static sw_val_t *_json_parse(const char **pp);
+
+/* Set by the parser on malformed input (unterminated string/array/object,
+ * a bad token, garbage between elements); json_decode then returns nil.
+ * The parser used to be lenient: `{"command":"rm -rf build` decoded to a
+ * complete map, so an LLM tool call cut off mid-argument still ran.
+ * Trailing commas stay accepted. */
+static __thread int g_json_err = 0;
 
 static void _json_skip_ws(const char **pp) {
     while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
@@ -5909,6 +6274,7 @@ static sw_val_t *_json_parse_string(const char **pp) {
         if (len >= cap - 1) { cap *= 2; buf = (char *)realloc(buf, cap); }
     }
     if (**pp == '"') (*pp)++;
+    else g_json_err = 1;                  /* unterminated string */
     buf[len] = 0;
     sw_val_t *r = sw_val_string(buf);
     free(buf);
@@ -5931,14 +6297,16 @@ static sw_val_t *_json_parse_array(const char **pp) {
     _json_skip_ws(pp);
     int cap = 64, cnt = 0;
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
-    while (**pp && **pp != ']' && !g_json_abort) {
+    while (**pp && **pp != ']' && !g_json_abort && !g_json_err) {
         items[cnt++] = _json_parse(pp);
         if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
         _json_skip_ws(pp);
         if (**pp == ',') (*pp)++;
+        else if (**pp != ']') g_json_err = 1;    /* garbage between elements */
         _json_skip_ws(pp);
     }
     if (**pp == ']') (*pp)++;
+    else g_json_err = 1;                          /* unterminated array */
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);
     g_json_depth--;
@@ -5953,23 +6321,26 @@ static sw_val_t *_json_parse_object(const char **pp) {
     int cap = 32, cnt = 0;
     sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
     sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
-    while (**pp && **pp != '}' && !g_json_abort) {
+    while (**pp && **pp != '}' && !g_json_abort && !g_json_err) {
         _json_skip_ws(pp);
-        if (**pp != '"') break;
+        if (**pp != '"') { if (**pp != '}') g_json_err = 1; break; }
         /* Parse key as atom (for dot access) */
         sw_val_t *key_str = _json_parse_string(pp);
         keys[cnt] = sw_val_atom(key_str->v.str);
         _json_skip_ws(pp);
         if (**pp == ':') (*pp)++;
+        else { g_json_err = 1; break; }            /* key without ':' */
         _json_skip_ws(pp);
         vals[cnt] = _json_parse(pp);
         cnt++;
         if (cnt >= cap) { cap *= 2; keys = (sw_val_t **)realloc(keys, sizeof(sw_val_t *) * cap); vals = (sw_val_t **)realloc(vals, sizeof(sw_val_t *) * cap); }
         _json_skip_ws(pp);
         if (**pp == ',') (*pp)++;
+        else if (**pp != '}') g_json_err = 1;    /* garbage between members */
         _json_skip_ws(pp);
     }
     if (**pp == '}') (*pp)++;
+    else g_json_err = 1;                          /* unterminated object */
     sw_val_t *r = sw_val_map_new(keys, vals, cnt);
     free(keys);
     free(vals);
@@ -5992,7 +6363,7 @@ static sw_val_t *_json_parse(const char **pp) {
     while (**pp >= '0' && **pp <= '9') (*pp)++;
     if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
     if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
-    if (*pp == start) { if (**pp) (*pp)++; return sw_val_nil(); } /* fuzz_json: guard NUL before advance on unrecognized token */
+    if (*pp == start) { g_json_err = 1; if (**pp) (*pp)++; return sw_val_nil(); } /* fuzz_json: guard NUL before advance on unrecognized token */
     char tmp[64];
     size_t numlen = *pp - start;
     if (numlen > 63) numlen = 63;
@@ -6005,8 +6376,12 @@ static sw_val_t *_json_parse(const char **pp) {
 static sw_val_t *_builtin_json_decode(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *p = a[0]->v.str;
-    g_json_depth = 0; g_json_abort = 0;   /* reset the per-decode depth guard */
-    return _json_parse(&p);
+    g_json_depth = 0; g_json_abort = 0; g_json_err = 0;   /* per-decode state */
+    sw_val_t *r = _json_parse(&p);
+    _json_skip_ws(&p);
+    if (*p) g_json_err = 1;               /* trailing data after the value */
+    if (g_json_err || g_json_abort) return sw_val_nil();
+    return r;
 }
 
 /* === File I/O extensions === */
@@ -6204,6 +6579,23 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
  *   url default: "https://otonomy-inference-production.up.railway.app/v1/chat/completions"
  * Returns: string (the completion text)
  */
+/* API key for `url` from the environment: LLM_API_KEY (explicit, any URL),
+ * else OPENAI_API_KEY only for api.openai.com, else OTONOMY_API_KEY only for
+ * the Otonomy endpoint. NULL when none applies. */
+static const char *_sw_llm_env_key(const char *url) {
+    const char *k = getenv("LLM_API_KEY");
+    if (k && *k) return k;
+    if (url && strstr(url, "://api.openai.com/")) {
+        k = getenv("OPENAI_API_KEY");
+        if (k && *k) return k;
+    }
+    if (url && strstr(url, "otonomy-inference")) {
+        k = getenv("OTONOMY_API_KEY");
+        if (k && *k) return k;
+    }
+    return NULL;
+}
+
 static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *prompt = a[0]->v.str;
@@ -6241,9 +6633,10 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
         }
     }
 
-    /* Resolve API key from env if not provided */
-    if (!api_key) api_key = getenv("OTONOMY_API_KEY");
-    if (!api_key) api_key = getenv("OPENAI_API_KEY");
+    /* Resolve API key from env if not provided. A provider's key is only
+     * ever sent to THAT provider: OPENAI_API_KEY used to be sent to whatever
+     * URL was in effect — including the vendor default below. */
+    if (!api_key) api_key = _sw_llm_env_key(url);
     if (!api_key) api_key = "ollama";  /* Ollama doesn't need a real key */
 
     /* Escape prompt for JSON */
@@ -6412,7 +6805,9 @@ static sw_val_t *_builtin_parse_gemma_calls(sw_val_t **a, int n) {
         json_buf[json_len] = '\0';
 
         const char *jp = json_buf;
+        g_json_depth = 0; g_json_abort = 0; g_json_err = 0;
         sw_val_t *decoded = _json_parse(&jp);
+        if (g_json_err || g_json_abort) decoded = NULL;   /* malformed call: skip it */
         free(json_buf);
 
         if (decoded && decoded->type == SW_VAL_MAP) {
@@ -7166,28 +7561,34 @@ static void _llm_stream_entry(void *raw) {
         ctx->model, ctx->max_tokens, ctx->temperature, esc);
     free(esc);
 
-    /* Build curl command for SSE streaming */
-    size_t cmd_cap = strlen(body) + strlen(ctx->url) + strlen(ctx->api_key) + 512;
-    char *cmd = (char *)malloc(cmd_cap);
-    /* Write body to temp file for safety */
-    char tmpf[256];
+    /* curl is exec'd with an argv (no shell: the URL and key used to be
+     * pasted into a single-quoted shell string, so a quote in either was a
+     * command injection). The body and the Authorization header go in 0600
+     * temp files (`-H @file` keeps the key out of `ps`), removed only after
+     * curl exits — unlinking right after the spawn raced curl reading them. */
+    char tmpf[256], hdrf[256];
     snprintf(tmpf, sizeof(tmpf), "%s/sw_llm_stream_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
-    FILE *tf = fopen(tmpf, "w");
-    if (tf) { fputs(body, tf); fclose(tf); }
+    snprintf(hdrf, sizeof(hdrf), "%s/sw_llm_stream_%d_%u.hdr", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    int tfd = open(tmpf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (tfd >= 0) { FILE *tf = fdopen(tfd, "w"); if (tf) { fputs(body, tf); fclose(tf); } else close(tfd); }
     free(body);
-
-    snprintf(cmd, cmd_cap,
-        "curl -sS -N --connect-timeout 30 --max-time 300 "
-        "-H 'Content-Type: application/json' "
-        "-H 'Authorization: Bearer %s' "
-        "-d @%s '%s' 2>/dev/null",
-        ctx->api_key, tmpf, ctx->url);
-
-    FILE *fp = sw_popen(cmd, "r");
-    free(cmd);
-    swbs_unlink(tmpf);
+    int hfd = open(hdrf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (hfd >= 0) {
+        FILE *hf = fdopen(hfd, "w");
+        if (hf) { fprintf(hf, "Content-Type: application/json\nAuthorization: Bearer %s\n", ctx->api_key); fclose(hf); }
+        else close(hfd);
+    }
+    char body_arg[300], hdr_arg[300];
+    snprintf(body_arg, sizeof(body_arg), "@%s", tmpf);
+    snprintf(hdr_arg, sizeof(hdr_arg), "@%s", hdrf);
+    char *argv[] = { "curl", "-sS", "-N", "--connect-timeout", "30", "--max-time", "300",
+                     "-H", hdr_arg, "-d", body_arg, ctx->url, NULL };
+    _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
+    FILE *fp = ch.fp;
 
     if (!fp) {
+        swbs_unlink(tmpf);
+        swbs_unlink(hdrf);
         sw_val_t *items[2];
         items[0] = sw_val_atom("llm_done");
         items[1] = sw_val_string("error: failed to start curl");
@@ -7257,7 +7658,9 @@ static void _llm_stream_entry(void *raw) {
         }
     }
 
-    sw_pclose(fp);
+    _sw_popen_pid_close(ch);
+    swbs_unlink(tmpf);
+    swbs_unlink(hdrf);
 
     /* Send completion message */
     {
@@ -7306,10 +7709,10 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
         }
     }
 
-    /* Resolve API key from env if not provided */
+    /* Resolve API key from env if not provided (per-provider; see
+     * _sw_llm_env_key). */
     if (!ctx->api_key) {
-        const char *k = getenv("OTONOMY_API_KEY");
-        if (!k) k = getenv("OPENAI_API_KEY");
+        const char *k = _sw_llm_env_key(ctx->url);
         ctx->api_key = strdup(k ? k : "");
     }
 
@@ -7858,6 +8261,7 @@ static void _sw_rl_done(void) {
 }
 
 static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     const char *prompt = (n >= 1 && a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : NULL;
 
     /* Fall back to canonical line read if not a TTY (piped input, tests). */
@@ -8274,6 +8678,7 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
  * avoid racing with the main input loop on stdin.
  */
 static sw_val_t *_builtin_read_choice(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 2) return sw_val_int(-1);
     const char *header = (a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : "";
     sw_val_t *opts = a[1];
@@ -8371,6 +8776,59 @@ static sw_val_t *_builtin_print_inline(sw_val_t **a, int n) {
         sw_val_print(a[i]);
     }
     fflush(stdout);
+    return sw_val_atom("ok");
+}
+
+/* eprint(args...) → 'ok'
+ * Like print, but to stderr — diagnostics that must not mix into a
+ * program's stdout (machine-readable output, pipes). */
+static sw_val_t *_builtin_eprint(sw_val_t **a, int n) {
+    fflush(stdout);
+    for (int i = 0; i < n; i++) {
+        if (i) fputc(' ', stderr);
+        sw_val_format(stderr, a[i]);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+    return sw_val_atom("ok");
+}
+
+/* stdout_to_stderr() → fd (int) | -1
+ * Point fd 1 at stderr and return a duplicate of the original stdout.
+ * Everything that writes to stdout afterwards — print, streamed tokens,
+ * child processes that inherit fd 1 — lands on stderr, and the caller
+ * keeps the returned fd for its machine-readable result (fd_write).
+ * Idempotent: a second call returns the fd saved by the first. */
+static int _sw_saved_stdout_fd = -1;
+static sw_val_t *_builtin_stdout_to_stderr(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    if (_sw_saved_stdout_fd >= 0) return sw_val_int(_sw_saved_stdout_fd);
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    if (saved < 0) return sw_val_int(-1);
+    if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) { close(saved); return sw_val_int(-1); }
+#ifndef _WIN32
+    fcntl(saved, F_SETFD, FD_CLOEXEC);   /* children must not inherit it */
+#endif
+    _sw_saved_stdout_fd = saved;
+    return sw_val_int(saved);
+}
+
+/* fd_write(fd, string) → 'ok' | 'error'
+ * Write every byte of `string` to an open file descriptor (e.g. the one
+ * stdout_to_stderr returned). Retries short writes and EINTR. */
+static sw_val_t *_builtin_fd_write(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
+        return sw_val_atom("error");
+    int fd = (int)a[0]->v.i;
+    const char *s = a[1]->v.str;
+    size_t len = strlen(s), off = 0;
+    fflush(stdout);
+    while (off < len) {
+        ssize_t w = write(fd, s + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; return sw_val_atom("error"); }
+        off += (size_t)w;
+    }
     return sw_val_atom("ok");
 }
 
@@ -9432,7 +9890,7 @@ static sw_val_t *_builtin_chrome_launch(sw_val_t **a, int n) {
     /* Poll up to 10 seconds for the debug port to come up. */
     for (int i = 0; i < 100; i++) {
         if (system(check) == 0) return sw_val_int(port);
-        usleep(100000);
+        _sw_nap_us(100000);
     }
     return sw_val_nil();
 }

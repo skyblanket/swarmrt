@@ -681,9 +681,17 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
     }
 
     /* Pre-initialize mailbox state.
-     * Each mailbox uses a lock-free LIFO signal stack + private FIFO queue. */
+     * Each mailbox uses a lock-free LIFO signal stack + private FIFO queue.
+     * Every field below starts at zero/NULL, and the slab comes from an
+     * anonymous mmap (zero-filled), so the loop is only needed when the
+     * spinlock initialiser is not all-zero bytes. Skipping it keeps the
+     * untouched slots unfaulted: writing them touched every page of the
+     * slab (~48 MB at the default 100K slots) and cost ~25 ms of startup. */
     sw_process_t *slab = (sw_process_t *)arena->proc_slab;
-    for (uint32_t i = 0; i < max_procs; i++) {
+    sw_spinlock_t lock_init = (sw_spinlock_t)SW_SPINLOCK_INIT;
+    static const unsigned char zero_lock[sizeof(sw_spinlock_t)];
+    int need_init = memcmp(&lock_init, zero_lock, sizeof(lock_init)) != 0;
+    for (uint32_t i = 0; need_init && i < max_procs; i++) {
         sw_mailbox_t *mb = &slab[i].mailbox;
         atomic_store(&mb->sig_head, NULL);
         mb->priv_head = NULL;
@@ -1248,9 +1256,22 @@ static void sched_trace_maybe_start(void) {
     }
 }
 
+static void overflow_rq_push(sw_process_t *proc);
+static void wake_one_idle_scheduler(void);
+
 void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     uint32_t prio = proc->priority;
     if (prio >= SW_PRIO_NUM) prio = SW_PRIO_NORMAL;
+
+    /* Target scheduler is stuck in a blocking builtin: queue the process
+     * where an idle scheduler will find it (see sw_blocking_enter). A
+     * push that races the scheduler ENTERING the section can still land
+     * locally; it runs when the builtin returns, as before. */
+    if (atomic_load_explicit(&rq->blocking, memory_order_seq_cst)) {
+        overflow_rq_push(proc);
+        wake_one_idle_scheduler();
+        return;
+    }
 
     /* NOTE: state must be set by the CALLER before calling this function.
      * Setting state here races with the receiver's final-drain self-resume path
@@ -1369,6 +1390,45 @@ sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
     pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
 
     return proc;
+}
+
+/* Signal one parked scheduler so overflow work is picked up at once (the
+ * idle loop's 0.5ms timed park would find it anyway). */
+static void wake_one_idle_scheduler(void) {
+    if (!g_swarm) return;
+    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
+        sw_scheduler_t *sc = g_swarm->schedulers[i];
+        if (!sc) continue;
+        sw_runq_t *rq = &sc->runq;
+        if (atomic_load_explicit(&rq->idle, memory_order_relaxed) &&
+            !atomic_load_explicit(&rq->blocking, memory_order_relaxed)) {
+            pthread_mutex_lock(&rq->idle_lock);
+            pthread_cond_signal(&rq->idle_cond);
+            pthread_mutex_unlock(&rq->idle_lock);
+            return;
+        }
+    }
+}
+
+void sw_blocking_enter(void) {
+    sw_scheduler_t *sched = tls_scheduler;
+    if (!sched || !tls_current) return;
+    atomic_store_explicit(&sched->runq.blocking, 1, memory_order_seq_cst);
+    /* We are this queue's only consumer (the scheduler loop is suspended
+     * under us), so draining it here is safe. */
+    int moved = 0;
+    sw_process_t *p;
+    while ((p = sw_pick_next(sched)) != NULL) {
+        overflow_rq_push(p);
+        moved++;
+    }
+    if (moved) wake_one_idle_scheduler();
+}
+
+void sw_blocking_exit(void) {
+    sw_scheduler_t *sched = tls_scheduler;
+    if (!sched) return;
+    atomic_store_explicit(&sched->runq.blocking, 0, memory_order_seq_cst);
 }
 
 /*
@@ -1568,6 +1628,9 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             tls_current = NULL;
             _sw_gen = &_sw_gen_fallback;
             sched->current = NULL;
+            /* A blocking section never outlives its process's time slice
+             * (a builtin that parked or panicked inside one). */
+            atomic_store_explicit(&sched->runq.blocking, 0, memory_order_relaxed);
 
             if (proc->state == SW_PROC_EXITING) {
                 /* Process finished or killed — clean up */
@@ -1707,6 +1770,10 @@ static void _sw_install_altstack(void) {
 /* Page size cached at install time — sysconf() is not on the official
  * async-signal-safe list, so the handler must not be the first caller. */
 static long g_crash_page_size = 4096;
+
+/* See the SIGPIPE comment in sw_init: catching (not ignoring) it keeps
+ * children on the default action after exec. */
+static void _sw_sigpipe_noop(int sig) { (void)sig; }
 
 static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
@@ -1908,6 +1975,7 @@ int sw_init(const char *name, uint32_t num_schedulers) {
             atomic_store(&sched->runq.tails[p], &sched->runq.stubs[p]);
         }
         atomic_store(&sched->runq.idle, 0);
+        atomic_store(&sched->runq.blocking, 0);
         pthread_mutex_init(&sched->runq.idle_lock, NULL);
         pthread_cond_init(&sched->runq.idle_cond, NULL);
 
@@ -1943,15 +2011,13 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         }
     }
 
-    /* Startup banner — diagnostics, not program output, so it goes to
-     * stderr. That keeps stdout clean for programs whose output is
-     * piped or captured (e.g. a CLI answering `--version`). Silence it
-     * entirely with SW_QUIET=1 or SW_RUNTIME_QUIET=1. The latter is the
-     * runtime-only knob a headless agent sets in the *built binary's*
-     * environment so the two "[SwarmRT] Arena initialized…" lines never
-     * leak into a captured stream, without having to also be set at
-     * compile time. */
-    if (!getenv("SW_QUIET") && !getenv("SW_RUNTIME_QUIET")) {
+    /* Startup banner — diagnostics, not program output. Opt-in with
+     * SW_VERBOSE=1: a compiled program's stderr belongs to the program
+     * (hello world used to print two "[SwarmRT] ..." lines before its own
+     * output). SW_QUIET / SW_RUNTIME_QUIET still force it off. */
+    const char *verbose = getenv("SW_VERBOSE");
+    if (verbose && verbose[0] && verbose[0] != '0' &&
+        !getenv("SW_QUIET") && !getenv("SW_RUNTIME_QUIET")) {
         fprintf(stderr, "[SwarmRT] Arena initialized: %zu MB mmap, %u proc slots, %u heap blocks\n",
                g_swarm->arena.size / (1024 * 1024),
                g_swarm->arena.proc_capacity,
@@ -1977,6 +2043,21 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         sigaction(SIGBUS,  &crash_sa, NULL);
         sigaction(SIGABRT, &crash_sa, NULL);
         _sw_install_altstack();   /* this thread; schedulers install their own */
+    }
+
+    /* SIGPIPE: a write to a pipe/socket whose reader died (an MCP server
+     * that exited, a closed HTTP client) killed the whole OS process with
+     * status 141. Catch it with a no-op handler so the write returns EPIPE
+     * to the caller instead. Not SIG_IGN: an ignored signal stays ignored
+     * across exec, and every child (`yes | head` in a shell tool) would see
+     * EPIPE errors instead of the default quiet exit; a caught signal is
+     * reset to SIG_DFL on exec. */
+    {
+        struct sigaction pipe_sa;
+        memset(&pipe_sa, 0, sizeof(pipe_sa));
+        pipe_sa.sa_handler = _sw_sigpipe_noop;
+        sigemptyset(&pipe_sa.sa_mask);
+        sigaction(SIGPIPE, &pipe_sa, NULL);
     }
 
     /* Start deadlock watchdog unless SW_DEADLOCK_DETECT=0. */
@@ -3150,6 +3231,23 @@ sw_process_t *sw_spawn_link(void (*func)(void*), void *arg) {
  * MONITORS
  * ============================================================================ */
 
+static void deliver_signal(sw_process_t *target, uint64_t tag,
+                           uint64_t from_pid, uint64_t ref, int reason,
+                           const char *reason_str);
+
+/* Monitor the process a pid VALUE named: `target` is its slab pointer and
+ * `expect_id` the numeric pid captured when the value was made. If that
+ * process is gone and its slot reused, deliver DOWN(noproc) right away
+ * instead of monitoring the slot's new occupant. */
+uint64_t sw_monitor_id(sw_process_t *target, uint64_t expect_id) {
+    sw_process_t *self = tls_current;
+    if (!self) return 0;
+    if (target && target->pid == expect_id) return sw_monitor(target);
+    uint64_t ref = atomic_fetch_add(&g_swarm->next_monitor_ref, 1);
+    deliver_signal(self, SW_TAG_DOWN, expect_id, ref, 0, "noproc");
+    return ref;
+}
+
 uint64_t sw_monitor(sw_process_t *target) {
     sw_process_t *self = tls_current;
     if (!self || !target) return 0;
@@ -3814,6 +3912,173 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         if (timer_ref) sw_cancel_timer(timer_ref);
         if (proc->kill_flag) return NULL;
     }
+}
+
+/*
+ * sw_sleep_ms: park for `ms` without touching the mailbox. A selective receive
+ * on SW_TAG_SLEEP — a tag nothing ever sends — times out after `ms`; any
+ * message that arrives meanwhile wakes us, fails the tag match, and stays
+ * queued. (The old sleep builtins used sw_receive_any and silently discarded
+ * whatever message arrived during the sleep.)
+ */
+void sw_sleep_ms(uint64_t ms) {
+    if (!tls_current) {
+        struct timespec ts = { (time_t)(ms / 1000), (long)((ms % 1000) * 1000000L) };
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        return;
+    }
+    if (ms == 0) { sw_yield(); return; }
+    (void)sw_receive_tagged(SW_TAG_SLEEP, ms);
+}
+
+/*
+ * sw_park_until / sw_wake: park a process on a flag instead of a message.
+ * Same Dekker handshake as the receive paths: we publish `waiting` (seq_cst)
+ * and then re-read the flag (seq_cst); the waker publishes the flag (seq_cst)
+ * and then exchanges `waiting` (seq_cst, in mailbox_wake). At least one side
+ * observes the other, so the wake cannot be lost.
+ */
+void sw_wake(sw_process_t *proc) {
+    if (proc) mailbox_wake(proc);
+}
+
+void sw_park_until(_Atomic int *flag) {
+    sw_process_t *proc = tls_current;
+    if (!proc) {
+        while (!atomic_load_explicit(flag, memory_order_seq_cst)) usleep(200);
+        return;
+    }
+    while (!atomic_load_explicit(flag, memory_order_seq_cst)) {
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(flag, memory_order_seq_cst)) {
+            int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0,
+                                                       memory_order_acq_rel);
+            if (was_waiting) {
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
+                return;
+            }
+            /* A waker already enqueued us — swap so the scheduler dequeues
+             * us through the normal path (no double-enqueue). */
+        }
+        sw_context_swap(proc, &proc->scheduler->sched_proc);
+        atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
+    }
+}
+
+/*
+ * Offload pool: an unbounded FIFO of jobs served by detached worker threads
+ * that are started on demand (when no worker is idle) up to a cap, and exit
+ * after 30s idle. A job is shared by the parked caller and the worker via a
+ * two-count refcount; whoever finishes last frees it.
+ */
+typedef struct sw_offload_job {
+    void (*fn)(void *);
+    void *arg;
+    sw_process_t *waiter;
+    _Atomic int done;
+    _Atomic int refs;
+    struct sw_offload_job *next;
+} sw_offload_job_t;
+
+static pthread_mutex_t g_off_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_off_cond = PTHREAD_COND_INITIALIZER;
+static sw_offload_job_t *g_off_head = NULL, *g_off_tail = NULL;
+static int g_off_threads = 0, g_off_idle = 0, g_off_queued = 0, g_off_max = -1;
+
+static void offload_job_release(sw_offload_job_t *j) {
+    if (atomic_fetch_sub_explicit(&j->refs, 1, memory_order_acq_rel) == 1) free(j);
+}
+
+static void *offload_worker(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&g_off_lock);
+    for (;;) {
+        while (!g_off_head) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 30;
+            g_off_idle++;
+            int rc = pthread_cond_timedwait(&g_off_cond, &g_off_lock, &ts);
+            g_off_idle--;
+            if (rc == ETIMEDOUT && !g_off_head) {
+                g_off_threads--;
+                pthread_mutex_unlock(&g_off_lock);
+                return NULL;
+            }
+        }
+        sw_offload_job_t *j = g_off_head;
+        g_off_head = j->next;
+        if (!g_off_head) g_off_tail = NULL;
+        g_off_queued--;
+        pthread_mutex_unlock(&g_off_lock);
+
+        j->fn(j->arg);
+        sw_process_t *w = j->waiter;
+        atomic_store_explicit(&j->done, 1, memory_order_seq_cst);
+        mailbox_wake(w);
+        offload_job_release(j);
+
+        pthread_mutex_lock(&g_off_lock);
+    }
+}
+
+void sw_offload_run(void (*fn)(void *), void *arg) {
+    sw_process_t *proc = tls_current;
+    if (g_off_max < 0) {
+        const char *e = getenv("SW_OFFLOAD_THREADS");
+        int m = e ? atoi(e) : 256;
+        const char *off = getenv("SW_OFFLOAD");
+        if (off && off[0] == '0') m = 0;
+        g_off_max = m < 0 ? 0 : m;
+    }
+    if (!proc || g_off_max == 0) { fn(arg); return; }
+
+    sw_offload_job_t *j = (sw_offload_job_t *)calloc(1, sizeof(*j));
+    if (!j) { fn(arg); return; }
+    j->fn = fn;
+    j->arg = arg;
+    j->waiter = proc;
+    atomic_store_explicit(&j->refs, 2, memory_order_relaxed);
+
+    pthread_mutex_lock(&g_off_lock);
+    if (g_off_tail) g_off_tail->next = j; else g_off_head = j;
+    g_off_tail = j;
+    g_off_queued++;
+    /* Start a worker unless an idle one is available for EVERY queued job.
+     * (Comparing against idle>0 alone let a burst of callers all signal the
+     * same single idle worker, which then ran their jobs one by one.) */
+    int start = (g_off_queued > g_off_idle && g_off_threads < g_off_max);
+    if (start) g_off_threads++;
+    else pthread_cond_signal(&g_off_cond);
+    pthread_mutex_unlock(&g_off_lock);
+
+    if (start) {
+        pthread_t t;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&attr, 512 * 1024);
+        if (pthread_create(&t, &attr, offload_worker, NULL) != 0) {
+            pthread_mutex_lock(&g_off_lock);
+            g_off_threads--;
+            int none = (g_off_threads == 0);
+            if (none) {
+                /* No worker at all — pull our job back and run it inline. */
+                sw_offload_job_t **pp = &g_off_head, *prev = NULL;
+                while (*pp && *pp != j) { prev = *pp; pp = &(*pp)->next; }
+                if (*pp) { *pp = j->next; if (g_off_tail == j) g_off_tail = prev; g_off_queued--; }
+            }
+            pthread_mutex_unlock(&g_off_lock);
+            pthread_attr_destroy(&attr);
+            if (none) { free(j); fn(arg); return; }
+        } else {
+            pthread_attr_destroy(&attr);
+        }
+    }
+
+    sw_park_until(&j->done);
+    offload_job_release(j);
 }
 
 /*
