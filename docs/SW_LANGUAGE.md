@@ -772,8 +772,16 @@ Tools are pure logic — process primitives degrade to `nil` inside them, and a 
 ### LLM (built-in)
 | | |
 |---|---|
-| `llm_complete(prompt, opts)` | one-shot completion via Otonomy proxy |
-| `llm_stream(prompt, opts)` | streaming variant |
+| `llm_complete(prompt, opts)` → string | one-shot chat completion against an OpenAI-compatible endpoint; `"error: ..."` on failure |
+| `llm_stream(prompt, opts)` → pid | streaming variant: sends `{'llm_token', text}` then `{'llm_done', full_text}` to the caller |
+
+There is no default endpoint. The URL is `opts.url`, else `LLM_URL`, else the
+provider's (`opts.provider`, else `LLM_PROVIDER`): `openai`, `ollama`
+(`$OLLAMA_HOST`, default `http://127.0.0.1:11434`) or `otonomy`. Without one, both
+fail with a message naming these settings. The model is `opts.model`, else
+`LLM_MODEL`, else the provider's default; with none the field is left out. Other
+opts: `api_key`, `max_tokens` (4096), `temperature` (0.7), and for `llm_complete`
+`retries` and `min_chars`.
 
 ### Async helpers (OTP-style)
 | | |
@@ -1005,7 +1013,7 @@ bin/swc test tests/sw/repl/test_repl_builtins_interp.sw
 #   16 tests, 16 passed (8.9ms)
 ```
 
-The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (74 files, 573 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
+The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (78 files, 582 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
 
 Inside your own `.sw` test files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics or errors with a message containing `expected_msg`. The test runner intercepts the panic before it hits `exit(1)` so the suite continues running.
 

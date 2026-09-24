@@ -6574,41 +6574,132 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
 /*
  * llm_complete(prompt)
  * llm_complete(prompt, opts_map)
- *   opts: %{model: "...", api_key: "...", url: "...", max_tokens: 4096, temperature: 0.7}
- *   defaults: model="gpt-4o-mini", reads OTONOMY_API_KEY or OPENAI_API_KEY env
- *   url default: "https://otonomy-inference-production.up.railway.app/v1/chat/completions"
- * Returns: string (the completion text)
+ *   opts: %{url: "...", provider: "...", model: "...", api_key: "...",
+ *           max_tokens: 4096, temperature: 0.7, retries: 0, min_chars: 50}
+ * Returns: string (the completion text), or "error: ..." on failure.
+ *
+ * There is no built-in endpoint: a program says where its prompts go (see
+ * _sw_llm_resolve). Without one, both LLM builtins fail with a message
+ * naming the settings instead of quietly sending the prompt to a vendor.
  */
+
+/* 'host' of an https:// URL equals `want` (case-insensitive), with no
+ * userinfo. Provider keys are only sent where this holds: a substring
+ * match sent OPENAI_API_KEY to "https://evil.example/?://api.openai.com/". */
+static int _sw_url_https_host_is(const char *url, const char *want) {
+    if (!url || strncmp(url, "https://", 8) != 0) return 0;
+    const char *h = url + 8;
+    size_t n = strcspn(h, "/?#");
+    if (memchr(h, '@', n)) return 0;
+    size_t hl = strcspn(h, ":/?#");
+    if (hl != strlen(want)) return 0;
+    for (size_t i = 0; i < hl; i++) {   /* ASCII fold: no <ctype.h> in the codegen prelude */
+        char c = h[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != want[i]) return 0;
+    }
+    return 1;
+}
+
+#define _SW_OTONOMY_HOST "otonomy-inference-production.up.railway.app"
+
 /* API key for `url` from the environment: LLM_API_KEY (explicit, any URL),
- * else OPENAI_API_KEY only for api.openai.com, else OTONOMY_API_KEY only for
- * the Otonomy endpoint. NULL when none applies. */
+ * else OPENAI_API_KEY only for https://api.openai.com, else OTONOMY_API_KEY
+ * only for the Otonomy endpoint. NULL when none applies. */
 static const char *_sw_llm_env_key(const char *url) {
     const char *k = getenv("LLM_API_KEY");
     if (k && *k) return k;
-    if (url && strstr(url, "://api.openai.com/")) {
+    if (_sw_url_https_host_is(url, "api.openai.com")) {
         k = getenv("OPENAI_API_KEY");
         if (k && *k) return k;
     }
-    if (url && strstr(url, "otonomy-inference")) {
+    if (_sw_url_https_host_is(url, _SW_OTONOMY_HOST)) {
         k = getenv("OTONOMY_API_KEY");
         if (k && *k) return k;
     }
     return NULL;
 }
 
+/* Where llm_complete / llm_stream send the prompt, and with which model.
+ *
+ *   url    opts.url > LLM_URL > the provider's URL
+ *   provider  opts.provider > LLM_PROVIDER:
+ *             "openai"  https://api.openai.com/v1/chat/completions
+ *             "ollama"  $OLLAMA_HOST (default http://127.0.0.1:11434)
+ *                       + /v1/chat/completions
+ *             "otonomy" the Otonomy inference proxy
+ *   model  opts.model > LLM_MODEL > the provider's default (openai:
+ *          gpt-4o-mini, otonomy: otonomy-orc) > none (the field is left
+ *          out and the server picks, or says it needs one)
+ *
+ * On success fills url_out/model_out (malloc'd; model may be NULL) and
+ * returns 0. Otherwise writes "error: ..." into err and returns -1. */
+static int _sw_llm_resolve(const char *who, const char *opt_url, const char *opt_provider,
+                           const char *opt_model, char **url_out, char **model_out,
+                           char *err, size_t errsz) {
+    *url_out = NULL; *model_out = NULL;
+    const char *provider = (opt_provider && *opt_provider) ? opt_provider : getenv("LLM_PROVIDER");
+    if (provider && !*provider) provider = NULL;
+    const char *purl = NULL, *pmodel = NULL;
+    char ollama_url[512];
+    if (provider) {
+        if (strcmp(provider, "openai") == 0) {
+            purl = "https://api.openai.com/v1/chat/completions"; pmodel = "gpt-4o-mini";
+        } else if (strcmp(provider, "otonomy") == 0) {
+            purl = "https://" _SW_OTONOMY_HOST "/v1/chat/completions"; pmodel = "otonomy-orc";
+        } else if (strcmp(provider, "ollama") == 0) {
+            /* OLLAMA_HOST is a base ("http://host:11434", or a bare
+             * "host:port" as ollama itself accepts); 0.0.0.0 is a bind
+             * address, so dial loopback instead. */
+            const char *oh = getenv("OLLAMA_HOST");
+            const char *scheme = (oh && strstr(oh, "://")) ? "" : "http://";
+            if (!oh || !*oh || strncmp(oh, "0.0.0.0", 7) == 0) { oh = "127.0.0.1:11434"; scheme = "http://"; }
+            size_t ol = strlen(oh);
+            while (ol > 0 && oh[ol - 1] == '/') ol--;
+            snprintf(ollama_url, sizeof(ollama_url), "%s%.*s/v1/chat/completions", scheme, (int)ol, oh);
+            purl = ollama_url;
+        } else {
+            snprintf(err, errsz, "error: %s: unknown provider '%s' (use openai, ollama or otonomy, "
+                     "or set LLM_URL to any OpenAI-compatible chat-completions URL)", who, provider);
+            return -1;
+        }
+    }
+    const char *url = (opt_url && *opt_url) ? opt_url : getenv("LLM_URL");
+    if (url && !*url) url = NULL;
+    if (!url) url = purl;
+    if (!url) {
+        snprintf(err, errsz, "error: %s: no LLM endpoint configured. Set LLM_URL to an "
+                 "OpenAI-compatible chat-completions URL (e.g. http://127.0.0.1:11434/v1/chat/completions), "
+                 "or LLM_PROVIDER to openai, ollama or otonomy, or pass %%{url: ...} or %%{provider: ...}", who);
+        return -1;
+    }
+    const char *model = (opt_model && *opt_model) ? opt_model : getenv("LLM_MODEL");
+    if (model && !*model) model = NULL;
+    if (!model) model = pmodel;
+    *url_out = strdup(url);
+    *model_out = model ? strdup(model) : NULL;
+    return 0;
+}
+
+/* The "model" member of a request body (with its trailing comma), or ""
+ * to leave it out. The name is JSON-escaped: it comes from the program
+ * or the environment. */
+static char *_sw_llm_model_field(const char *model) {
+    if (!model) return strdup("");
+    sw_val_t *enc = _builtin_json_encode((sw_val_t *[]){ sw_val_string(model) }, 1);
+    const char *e = (enc && enc->type == SW_VAL_STRING) ? enc->v.str : "\"\"";
+    size_t n = strlen(e) + 16;
+    char *out = (char *)malloc(n);
+    snprintf(out, n, "\"model\":%s,", e);
+    return out;
+}
+
 static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *prompt = a[0]->v.str;
 
-    /* Defaults — resolve URL from env: LLM_URL > OLLAMA_HOST > hardcoded */
-    const char *model = "otonomy-orc";
+    const char *opt_model = NULL, *opt_url = NULL, *opt_provider = NULL;
     const char *api_key = NULL;
-    const char *env_url = getenv("LLM_URL");
-    const char *ollama_host = getenv("OLLAMA_HOST");
-    /* Only use OLLAMA_HOST if it looks like a URL (has http), not a bind addr like 0.0.0.0 */
-    const char *url = env_url ? env_url
-                    : (ollama_host && strstr(ollama_host, "http")) ? ollama_host
-                    : "https://otonomy-inference-production.up.railway.app/v1/chat/completions";
     int max_tokens = 4096;
     double temperature = 0.7;
     int retries = 0;
@@ -6620,9 +6711,10 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
         for (int i = 0; i < m->v.map.count; i++) {
             const char *k = m->v.map.keys[i]->v.str;
             sw_val_t *v = m->v.map.vals[i];
-            if (strcmp(k, "model") == 0 && v->type == SW_VAL_STRING) model = v->v.str;
+            if (strcmp(k, "model") == 0 && v->type == SW_VAL_STRING) opt_model = v->v.str;
             else if (strcmp(k, "api_key") == 0 && v->type == SW_VAL_STRING) api_key = v->v.str;
-            else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) url = v->v.str;
+            else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) opt_url = v->v.str;
+            else if (strcmp(k, "provider") == 0 && v->type == SW_VAL_STRING) opt_provider = v->v.str;
             else if (strcmp(k, "max_tokens") == 0 && v->type == SW_VAL_INT) max_tokens = (int)v->v.i;
             else if (strcmp(k, "retries") == 0 && v->type == SW_VAL_INT) retries = (int)v->v.i;
             else if (strcmp(k, "min_chars") == 0 && v->type == SW_VAL_INT) min_chars = (int)v->v.i;
@@ -6633,9 +6725,13 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
         }
     }
 
+    char *url = NULL, *model = NULL, err[512];
+    if (_sw_llm_resolve("llm_complete", opt_url, opt_provider, opt_model, &url, &model,
+                        err, sizeof(err)) != 0)
+        return sw_val_string(err);
+
     /* Resolve API key from env if not provided. A provider's key is only
-     * ever sent to THAT provider: OPENAI_API_KEY used to be sent to whatever
-     * URL was in effect — including the vendor default below. */
+     * ever sent to THAT provider (_sw_llm_env_key). */
     if (!api_key) api_key = _sw_llm_env_key(url);
     if (!api_key) api_key = "ollama";  /* Ollama doesn't need a real key */
 
@@ -6659,10 +6755,15 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     /* Build JSON body */
     size_t body_cap = ep + 512;
     char *body = (char *)malloc(body_cap);
+    char *model_field = _sw_llm_model_field(model);
+    body_cap += strlen(model_field);
+    body = (char *)realloc(body, body_cap);
     snprintf(body, body_cap,
-        "{\"model\":\"%s\",\"max_tokens\":%d,\"temperature\":%.2f,"
+        "{%s\"max_tokens\":%d,\"temperature\":%.2f,"
         "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-        model, max_tokens, temperature, esc_prompt);
+        model_field, max_tokens, temperature, esc_prompt);
+    free(model_field);
+    free(model);
     free(esc_prompt);
 
     /* Build headers */
@@ -6721,6 +6822,7 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     }
 
     free(body);
+    free(url);
     return last_result;
 }
 
@@ -7530,10 +7632,17 @@ typedef struct {
     char *url;
     int max_tokens;
     double temperature;
+    char error[512];   /* set when no endpoint resolved (url == NULL) */
 } _llm_stream_ctx_t;
 
 static void _llm_stream_entry(void *raw) {
     _llm_stream_ctx_t *ctx = (_llm_stream_ctx_t *)raw;
+
+    if (!ctx->url) {
+        sw_val_t *items[2] = { sw_val_atom("llm_done"), sw_val_string(ctx->error) };
+        sw_send_value(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
+        goto cleanup;
+    }
 
     /* Escape prompt for JSON */
     size_t plen = strlen(ctx->prompt);
@@ -7555,10 +7664,14 @@ static void _llm_stream_entry(void *raw) {
     /* Build JSON body */
     size_t body_cap = ep + 512;
     char *body = (char *)malloc(body_cap);
+    char *model_field = _sw_llm_model_field(ctx->model);
+    body_cap += strlen(model_field);
+    body = (char *)realloc(body, body_cap);
     snprintf(body, body_cap,
-        "{\"model\":\"%s\",\"max_tokens\":%d,\"temperature\":%.2f,\"stream\":true,"
+        "{%s\"max_tokens\":%d,\"temperature\":%.2f,\"stream\":true,"
         "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-        ctx->model, ctx->max_tokens, ctx->temperature, esc);
+        model_field, ctx->max_tokens, ctx->temperature, esc);
+    free(model_field);
     free(esc);
 
     /* curl is exec'd with an argv (no shell: the URL and key used to be
@@ -7687,20 +7800,20 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
     _llm_stream_ctx_t *ctx = (_llm_stream_ctx_t *)calloc(1, sizeof(_llm_stream_ctx_t));
     ctx->caller = sw_self();
     ctx->prompt = strdup(a[0]->v.str);
-    ctx->model = strdup("otonomy-orc");
-    ctx->url = strdup("https://otonomy-inference-production.up.railway.app/v1/chat/completions");
     ctx->max_tokens = 4096;
     ctx->temperature = 0.7;
     ctx->api_key = NULL;
 
     /* Parse opts map */
+    const char *opt_model = NULL, *opt_url = NULL, *opt_provider = NULL;
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_MAP) {
         for (int i = 0; i < a[1]->v.map.count; i++) {
             const char *k = a[1]->v.map.keys[i]->v.str;
             sw_val_t *v = a[1]->v.map.vals[i];
-            if (strcmp(k, "model") == 0 && v->type == SW_VAL_STRING) { free(ctx->model); ctx->model = strdup(v->v.str); }
-            else if (strcmp(k, "api_key") == 0 && v->type == SW_VAL_STRING) { ctx->api_key = strdup(v->v.str); }
-            else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) { free(ctx->url); ctx->url = strdup(v->v.str); }
+            if (strcmp(k, "model") == 0 && v->type == SW_VAL_STRING) opt_model = v->v.str;
+            else if (strcmp(k, "api_key") == 0 && v->type == SW_VAL_STRING) { free(ctx->api_key); ctx->api_key = strdup(v->v.str); }
+            else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) opt_url = v->v.str;
+            else if (strcmp(k, "provider") == 0 && v->type == SW_VAL_STRING) opt_provider = v->v.str;
             else if (strcmp(k, "max_tokens") == 0 && v->type == SW_VAL_INT) ctx->max_tokens = (int)v->v.i;
             else if (strcmp(k, "temperature") == 0) {
                 if (v->type == SW_VAL_FLOAT) ctx->temperature = v->v.f;
@@ -7709,10 +7822,17 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
         }
     }
 
+    /* No endpoint → the worker still starts and reports the reason as its
+     * {'llm_done', "error: ..."}, the same way every other failure arrives. */
+    if (_sw_llm_resolve("llm_stream", opt_url, opt_provider, opt_model, &ctx->url, &ctx->model,
+                        ctx->error, sizeof(ctx->error)) != 0) {
+        ctx->url = NULL;
+    }
+
     /* Resolve API key from env if not provided (per-provider; see
      * _sw_llm_env_key). */
     if (!ctx->api_key) {
-        const char *k = _sw_llm_env_key(ctx->url);
+        const char *k = ctx->url ? _sw_llm_env_key(ctx->url) : NULL;
         ctx->api_key = strdup(k ? k : "");
     }
 
