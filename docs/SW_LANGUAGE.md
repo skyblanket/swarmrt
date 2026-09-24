@@ -519,6 +519,9 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 |---|---|
 | `print(...)` | stdout, trailing newline |
 | `print_inline(...)` | stdout, no newline |
+| `eprint(...)` | stderr, trailing newline — diagnostics that must stay out of stdout |
+| `stdout_to_stderr()` → fd | point stdout at stderr from now on (print, streamed tokens) and return the original stdout's fd; idempotent. For CLIs whose stdout carries one machine-readable result |
+| `fd_write(fd, s)` → `'ok'` \| `'error'` | write a string to a file descriptor, e.g. the one `stdout_to_stderr()` returned |
 | `read_line(prompt?)` | stdin, returns string or `nil` on EOF |
 | `read_char()` | single keypress (raw mode) |
 | `read_choice(header, options)` | arrow-key picker → int index, -1 on cancel |

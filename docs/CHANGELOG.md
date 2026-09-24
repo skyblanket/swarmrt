@@ -4,6 +4,18 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — stderr and a clean stdout for CLIs
+
+**feat(lang): `eprint`, `stdout_to_stderr`, `fd_write`.** `sw` had no way to write to
+stderr, so a CLI could not keep diagnostics out of its output, and a headless agent's
+`--json` line arrived mixed into the tool transcript and streamed tokens (C-level writes
+included). `eprint(...)` prints to stderr. `stdout_to_stderr()` points fd 1 at stderr and
+returns the original stdout's fd (idempotent, close-on-exec); `fd_write(fd, s)` writes the
+result there. Both paths (compiled and interpreter). Unblocks: swarm-code's
+`-p --json | jq`. Gate: `tests/sw/test_stdio_routing.sw`.
+
+---
+
 ## 2026-09-24 — parallel subagent streams
 
 **fix(runtime): subagent-mode `http_post_stream` runs on the offload pool.** The

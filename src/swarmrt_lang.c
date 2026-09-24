@@ -4275,6 +4275,39 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         free(items);
         return r;
     }
+    if (strcmp(fname, "stdout_to_stderr") == 0) {
+        static int saved_fd = -1;
+        if (saved_fd < 0) {
+            fflush(stdout);
+            int fd = dup(STDOUT_FILENO);
+            if (fd >= 0 && dup2(STDERR_FILENO, STDOUT_FILENO) >= 0) saved_fd = fd;
+            else if (fd >= 0) close(fd);
+        }
+        return sw_val_int(saved_fd);
+    }
+    if (strcmp(fname, "fd_write") == 0) {
+        if (nargs < 2 || args[0]->type != SW_VAL_INT || args[1]->type != SW_VAL_STRING)
+            return sw_val_atom("error");
+        const char *s = args[1]->v.str;
+        size_t len = strlen(s), off = 0;
+        fflush(stdout);
+        while (off < len) {
+            ssize_t w = write((int)args[0]->v.i, s + off, len - off);
+            if (w < 0) { if (errno == EINTR) continue; return sw_val_atom("error"); }
+            off += (size_t)w;
+        }
+        return sw_val_atom("ok");
+    }
+    if (strcmp(fname, "eprint") == 0) {
+        fflush(stdout);
+        for (int i = 0; i < nargs; i++) {
+            if (i) fputc(' ', stderr);
+            sw_val_format(stderr, args[i]);
+        }
+        fputc('\n', stderr);
+        fflush(stderr);
+        return sw_val_atom("ok");
+    }
     if (strcmp(fname, "print_above") == 0) {
         /* No raw line editor under the interpreter — behaves as print. */
         for (int i = 0; i < nargs; i++) {
@@ -6628,7 +6661,7 @@ static const char *k_interp_builtins[] = {
     "file_mkdir","file_read","file_read_bytes","file_write","file_write_bytes",
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
-    "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above",
+    "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above","eprint","stdout_to_stderr","fd_write",
     "pid_kill_group","random_int","read_key","reduce","rl_history_append","rl_history_load",
     "shell","shell_detached","shell_managed","shell_sandboxed","sleep",
     "stdin_pending_push","stdin_take_pending","string_replace",

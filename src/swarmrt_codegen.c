@@ -367,6 +367,9 @@ static int is_builtin(const char *name) {
            strcmp(name, "read_line") == 0 ||
            strcmp(name, "read_key") == 0 ||
            strcmp(name, "print_inline") == 0 ||
+           strcmp(name, "eprint") == 0 ||
+           strcmp(name, "stdout_to_stderr") == 0 ||
+           strcmp(name, "fd_write") == 0 ||
            strcmp(name, "sys_exit") == 0 ||
            strcmp(name, "pid_alive") == 0 ||
            /* Phase 17: LLM streaming */
@@ -1960,7 +1963,7 @@ static void emit_binop(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
  * leisure — missing one means the suggestion is less specific, not
  * that the compile breaks. */
 static const char *_common_builtins[] = {
-    "print", "print_inline", "length", "hd", "tl", "elem", "abs",
+    "print", "print_inline", "eprint", "stdout_to_stderr", "fd_write", "length", "hd", "tl", "elem", "abs",
     "to_string", "format", "panic", "expect", "error", "typeof",
     "map", "pmap", "reduce", "filter", "list_append",
     "map_get", "map_put", "map_new", "map_keys", "map_values",
@@ -2456,6 +2459,9 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "read_line") == 0 ||
              strcmp(fname, "read_key") == 0 ||
              strcmp(fname, "print_inline") == 0 ||
+             strcmp(fname, "eprint") == 0 ||
+             strcmp(fname, "stdout_to_stderr") == 0 ||
+             strcmp(fname, "fd_write") == 0 ||
              strcmp(fname, "sys_exit") == 0 ||
              strcmp(fname, "pid_alive") == 0 ||
              /* Phase 17: LLM streaming */

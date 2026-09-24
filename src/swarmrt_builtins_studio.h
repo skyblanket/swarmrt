@@ -8576,6 +8576,59 @@ static sw_val_t *_builtin_print_inline(sw_val_t **a, int n) {
     return sw_val_atom("ok");
 }
 
+/* eprint(args...) → 'ok'
+ * Like print, but to stderr — diagnostics that must not mix into a
+ * program's stdout (machine-readable output, pipes). */
+static sw_val_t *_builtin_eprint(sw_val_t **a, int n) {
+    fflush(stdout);
+    for (int i = 0; i < n; i++) {
+        if (i) fputc(' ', stderr);
+        sw_val_format(stderr, a[i]);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+    return sw_val_atom("ok");
+}
+
+/* stdout_to_stderr() → fd (int) | -1
+ * Point fd 1 at stderr and return a duplicate of the original stdout.
+ * Everything that writes to stdout afterwards — print, streamed tokens,
+ * child processes that inherit fd 1 — lands on stderr, and the caller
+ * keeps the returned fd for its machine-readable result (fd_write).
+ * Idempotent: a second call returns the fd saved by the first. */
+static int _sw_saved_stdout_fd = -1;
+static sw_val_t *_builtin_stdout_to_stderr(sw_val_t **a, int n) {
+    (void)a; (void)n;
+    if (_sw_saved_stdout_fd >= 0) return sw_val_int(_sw_saved_stdout_fd);
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    if (saved < 0) return sw_val_int(-1);
+    if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) { close(saved); return sw_val_int(-1); }
+#ifndef _WIN32
+    fcntl(saved, F_SETFD, FD_CLOEXEC);   /* children must not inherit it */
+#endif
+    _sw_saved_stdout_fd = saved;
+    return sw_val_int(saved);
+}
+
+/* fd_write(fd, string) → 'ok' | 'error'
+ * Write every byte of `string` to an open file descriptor (e.g. the one
+ * stdout_to_stderr returned). Retries short writes and EINTR. */
+static sw_val_t *_builtin_fd_write(sw_val_t **a, int n) {
+    if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
+        return sw_val_atom("error");
+    int fd = (int)a[0]->v.i;
+    const char *s = a[1]->v.str;
+    size_t len = strlen(s), off = 0;
+    fflush(stdout);
+    while (off < len) {
+        ssize_t w = write(fd, s + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; return sw_val_atom("error"); }
+        off += (size_t)w;
+    }
+    return sw_val_atom("ok");
+}
+
 /* print_above(args...) → 'ok'
  * Print like print(), but cooperate with an active raw-mode read_line:
  * wipe the input line, print the text above it, then redraw the input
