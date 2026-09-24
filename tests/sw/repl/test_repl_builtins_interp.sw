@@ -15,6 +15,8 @@
 
 module Test_repl_builtins_interp
 
+import Audio
+
 fun test_string_sub() {
     assert_eq(string_sub("hello", 0, 3), "hel")
     assert_eq(string_sub("hello", 1, 3), "ell")

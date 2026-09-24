@@ -175,6 +175,29 @@ if [ -d "$WD_DIR" ]; then
             echo "${GREEN}OK${RESET}           $name ${DIM}— no spurious deadlock warning${RESET}"
         fi
     done
+    # The other direction: a real deadlock (nothing can wake the process)
+    # must still be reported.
+    for sw in "$WD_DIR"/deadlock/*.sw; do
+        [ -e "$sw" ] || continue
+        wd_files=$((wd_files + 1))
+        name="$(basename "$sw" .sw)"
+        bin="$BUILD_DIR/wd_dl_$name"
+        elog="$BUILD_DIR/wd_dl_$name.err"
+        if ! "$SWC" build "$sw" -o "$bin" >"$BUILD_DIR/wd_dl_$name.build" 2>&1; then
+            wd_failed=$((wd_failed + 1))
+            echo "${RED}COMPILE FAIL${RESET} $name"
+            sed 's/^/    /' "$BUILD_DIR/wd_dl_$name.build"
+            continue
+        fi
+        SW_QUIET=1 SW_DEADLOCK_MS=250 perl -e 'alarm 2; exec @ARGV or die' \
+            "$bin" >"$BUILD_DIR/wd_dl_$name.out" 2>"$elog"
+        if grep -q "possible deadlock" "$elog"; then
+            echo "${GREEN}OK${RESET}           $name ${DIM}— real deadlock reported${RESET}"
+        else
+            wd_failed=$((wd_failed + 1))
+            echo "${RED}WATCHDOG FAIL${RESET} $name — deadlock NOT reported"
+        fi
+    done
     echo ""
 fi
 

@@ -1,5 +1,8 @@
 module TestLLM
 
+# Manual check against a live endpoint (not part of make test-sw). Needs an
+# endpoint, e.g. LLM_PROVIDER=otonomy OTONOMY_API_KEY=... or LLM_URL=...
+
 fun main() {
     print("=== LLM Client Test ===")
     print("")

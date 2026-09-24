@@ -60,4 +60,16 @@ int sw_pdf_extract_structured(const uint8_t *data, size_t len, int page_idx,
 /* Free structured blocks */
 void sw_pdf_blocks_free(sw_pdf_text_block_t *blocks, int count);
 
+/* The sw builtins (the Pdf battery), shared by compiled programs and the
+ * interpreter. Each takes a path; nil when the file is missing, over 100MB
+ * or not a readable PDF.
+ *   pdf_text(path)  → string (every page; a second argument is ignored)
+ *   pdf_pages(path) → int
+ *   pdf_meta(path)  → map of the present keys among title, author,
+ *                     subject, creator, creation_date */
+struct sw_val;
+struct sw_val *sw_pdf_builtin_text(struct sw_val **a, int n);
+struct sw_val *sw_pdf_builtin_pages(struct sw_val **a, int n);
+struct sw_val *sw_pdf_builtin_meta(struct sw_val **a, int n);
+
 #endif /* SWARMRT_PDF_H */

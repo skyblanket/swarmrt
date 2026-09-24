@@ -34,7 +34,8 @@
 #include "swarmrt_ets.h"
 #include "swarmrt_varena.h"  /* per-process value arena (GC v1) */
 #include "swarmrt_node.h"    /* sw_send_dispatch: structure-preserving send */
-#include "swarmrt_audio.h"   /* G.711 / PCM16 / resample for REPL+test parity */
+#define SW_AUDIO_BASE64_ONLY   /* the codecs are the Audio battery: swarmrt_battery_interp.c */
+#include "swarmrt_audio.h"   /* base64 helpers */
 #include "swarmrt_otp.h"     /* sw_supervisor_start + child spec (interp supervise) */
 
 /* ed25519_verify lives in swarmrt_builtins_studio.h for the compiled path, but
@@ -5075,35 +5076,12 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return _sw_lang_ed25519_verify(args, nargs);
     }
 
-    /* === Audio codecs (base64 in/out, fully binary-safe) ======== */
-    if (strcmp(fname, "audio_ulaw_to_pcm16") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-        size_t inlen = 0; uint8_t *ulaw = _sw_audio_b64_decode(args[0]->v.str, &inlen);
-        if (!ulaw) return sw_val_nil();
-        size_t pcmlen = 0; uint8_t *pcm = _sw_ulaw_to_pcm16(ulaw, inlen, &pcmlen);
-        free(ulaw); if (!pcm) return sw_val_nil();
-        char *b64 = _sw_audio_b64_encode(pcm, pcmlen); free(pcm);
-        if (!b64) return sw_val_nil();
-        sw_val_t *r = sw_val_string(b64); free(b64); return r;
-    }
-    if (strcmp(fname, "audio_pcm16_to_ulaw") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-        size_t inlen = 0; uint8_t *pcm = _sw_audio_b64_decode(args[0]->v.str, &inlen);
-        if (!pcm) return sw_val_nil();
-        size_t ulen = 0; uint8_t *ulaw = _sw_pcm16_to_ulaw(pcm, inlen, &ulen);
-        free(pcm); if (!ulaw) return sw_val_nil();
-        char *b64 = _sw_audio_b64_encode(ulaw, ulen); free(ulaw);
-        if (!b64) return sw_val_nil();
-        sw_val_t *r = sw_val_string(b64); free(b64); return r;
-    }
-    if (strcmp(fname, "audio_resample") == 0 && nargs >= 3 &&
-        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
-        size_t inlen = 0; uint8_t *pcm = _sw_audio_b64_decode(args[0]->v.str, &inlen);
-        if (!pcm) return sw_val_nil();
-        size_t outlen = 0;
-        uint8_t *out = _sw_pcm16_resample(pcm, inlen, (int)args[1]->v.i, (int)args[2]->v.i, &outlen);
-        free(pcm); if (!out) return sw_val_nil();
-        char *b64 = _sw_audio_b64_encode(out, outlen); free(out);
-        if (!b64) return sw_val_nil();
-        sw_val_t *r = sw_val_string(b64); free(b64); return r;
+    /* === Batteries (Audio codecs): run by the hook the swc binary installs
+     * (swarmrt_battery_interp.c). This file is linked into every compiled
+     * program, which must not carry battery code it didn't import. */
+    if (sw_interp_battery_call && sw_battery_of(fname)) {
+        sw_val_t *r = sw_interp_battery_call(fname, args, nargs);
+        if (r) return r;
     }
 
     /* === SW_VAL_BYTES builtins (NUL-safe; parity with codegen path) === */
@@ -5249,28 +5227,6 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         double base = (args[0]->type == SW_VAL_INT) ? (double)args[0]->v.i : args[0]->v.f;
         double ex   = (args[1]->type == SW_VAL_INT) ? (double)args[1]->v.i : args[1]->v.f;
         return sw_val_float(pow(base, ex));
-    }
-
-    /* === Bytes-native audio codec twins (NUL-safe; parity) ====== */
-    if (strcmp(fname, "audio_ulaw_to_pcm16_b") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
-        size_t pcmlen = 0;
-        uint8_t *pcm = _sw_ulaw_to_pcm16(args[0]->v.bytes.data, args[0]->v.bytes.len, &pcmlen);
-        if (!pcm) return sw_val_nil();
-        sw_val_t *r = sw_val_bytes(pcm, pcmlen); free(pcm); return r;
-    }
-    if (strcmp(fname, "audio_pcm16_to_ulaw_b") == 0 && nargs >= 1 && args[0]->type == SW_VAL_BYTES) {
-        size_t ulen = 0;
-        uint8_t *ulaw = _sw_pcm16_to_ulaw(args[0]->v.bytes.data, args[0]->v.bytes.len, &ulen);
-        if (!ulaw) return sw_val_nil();
-        sw_val_t *r = sw_val_bytes(ulaw, ulen); free(ulaw); return r;
-    }
-    if (strcmp(fname, "audio_resample_b") == 0 && nargs >= 3 &&
-        args[0]->type == SW_VAL_BYTES && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
-        size_t outlen = 0;
-        uint8_t *out = _sw_pcm16_resample(args[0]->v.bytes.data, args[0]->v.bytes.len,
-                                          (int)args[1]->v.i, (int)args[2]->v.i, &outlen);
-        if (!out) return sw_val_nil();
-        sw_val_t *r = sw_val_bytes(out, outlen); free(out); return r;
     }
 
     /* === Process-scheduler primitives — WIRED to native scheduler =====
@@ -7239,6 +7195,7 @@ typedef struct {
     int nmods;
     const char *path;      /* file of the module being checked */
     int errors;
+    node_t *mod;           /* the module being checked */
 } rs_ctx_t;
 
 static void rs_add(rs_scope_t *s, const char *name) {
@@ -7396,11 +7353,76 @@ static void rs_report(rs_ctx_t *c, rs_scope_t *s, const char *name, int line) {
 
 static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s);
 
+/* ------------------------------------------------------------------
+ * Batteries — builtins that are not part of the core.
+ *
+ * PDF parsing, launching Chrome and the G.711 audio codecs are compiled
+ * into a program only when it imports the matching module (lib/Pdf.sw,
+ * lib/Chrome.sw, lib/Audio.sw), so a program that doesn't use them
+ * doesn't carry them: a smaller binary, and one less parser of
+ * untrusted input in every agent. A module calls a battery's builtins
+ * only if it imports that battery itself (or is it), which keeps "what
+ * can this code do" answerable from its imports. The same rule holds on
+ * every path — swc build, run and test all go through sw_resolve_module.
+ * Codegen emits `#define SW_BATTERY_<X> 1` for each imported battery and
+ * swarmrt_builtins_studio.h compiles the code under that macro.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    const char *module;
+    const char *macro;
+    const char *builtins[8];
+} sw_battery_t;
+
+static const sw_battery_t g_batteries[] = {
+    { "Pdf",    "SW_BATTERY_PDF",    { "pdf_text", "pdf_pages", "pdf_meta", NULL } },
+    { "Chrome", "SW_BATTERY_CHROME", { "chrome_launch", NULL } },
+    { "Audio",  "SW_BATTERY_AUDIO",  { "audio_ulaw_to_pcm16", "audio_pcm16_to_ulaw", "audio_resample",
+                                       "audio_ulaw_to_pcm16_b", "audio_pcm16_to_ulaw_b",
+                                       "audio_resample_b", NULL } },
+};
+#define SW_NBATTERIES ((int)(sizeof(g_batteries) / sizeof(g_batteries[0])))
+
+int sw_battery_count(void) { return SW_NBATTERIES; }
+const char *sw_battery_module_at(int i) { return (i >= 0 && i < SW_NBATTERIES) ? g_batteries[i].module : NULL; }
+const char *sw_battery_macro_at(int i)  { return (i >= 0 && i < SW_NBATTERIES) ? g_batteries[i].macro : NULL; }
+
+sw_val_t *(*sw_interp_battery_call)(const char *fname, sw_val_t **args, int nargs) = NULL;
+
+const char *sw_battery_of(const char *builtin) {
+    if (!builtin) return NULL;
+    for (int b = 0; b < SW_NBATTERIES; b++)
+        for (int i = 0; g_batteries[b].builtins[i]; i++)
+            if (strcmp(builtin, g_batteries[b].builtins[i]) == 0) return g_batteries[b].module;
+    return NULL;
+}
+
+/* Does module `m` import (or define) the battery module `name`? */
+int sw_module_has_battery(void *m_ast, const char *name) {
+    node_t *m = (node_t *)m_ast;
+    if (!m || m->type != N_MODULE || !name) return 0;
+    if (strcmp(m->v.mod.name, name) == 0) return 1;
+    for (int i = 0; i < m->v.mod.nimports; i++)
+        if (strcmp(m->v.mod.imports[i], name) == 0) return 1;
+    return 0;
+}
+
 static void rs_check_callee(rs_ctx_t *c, node_t *f, rs_scope_t *s) {
     /* A plain-name callee is resolved by the backends (builtin, module
      * function, or closure variable); only a computed callee is an
-     * expression to check. */
-    if (f && f->type != N_IDENT) rs_check(c, f, s);
+     * expression to check — except that a battery builtin needs its
+     * import (see g_batteries). */
+    if (f && f->type == N_IDENT) {
+        const char *name = f->v.sval;
+        const char *bat = sw_battery_of(name);
+        if (bat && !rs_has(s, name) && c->mod && !sw_module_has_battery(c->mod, bat)) {
+            c->errors++;
+            fprintf(stderr, "swc: %s:%d: %s() is in the %s battery, which this module doesn't "
+                    "import — add `import %s` to module %s\n",
+                    c->path ? c->path : "?", f->line, name, bat, bat, c->mod->v.mod.name);
+        }
+        return;
+    }
+    if (f) rs_check(c, f, s);
 }
 
 static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
@@ -7490,7 +7512,7 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
 int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path) {
     node_t *mod = (node_t *)mod_ast;
     if (!mod || mod->type != N_MODULE) return 0;
-    rs_ctx_t c = { (node_t **)mods, nmods, path, 0 };
+    rs_ctx_t c = { (node_t **)mods, nmods, path, 0, mod };
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
         node_t *fn = mod->v.mod.funs[i];
         rs_scope_t top = { NULL, 0, 0, NULL };
