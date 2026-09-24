@@ -693,6 +693,9 @@ sw_process_t *sw_spawn_link(void (*func)(void*), void *arg);
 
 /* Monitors */
 uint64_t sw_monitor(sw_process_t *target);
+/* sw_monitor for a pid value (ptr + captured numeric id): DOWN(noproc) at
+ * once if that process is gone, even if its slot was reused. */
+uint64_t sw_monitor_id(sw_process_t *target, uint64_t expect_id);
 int sw_demonitor(uint64_t ref);
 
 /* Process flags */

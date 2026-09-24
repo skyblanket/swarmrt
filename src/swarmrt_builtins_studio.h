@@ -85,8 +85,8 @@ static void _sw_nap_us(unsigned us) {
 /* === Registry === */
 
 static sw_val_t *_builtin_register(sw_val_t **a, int n) {
-    if (n < 2 || !a[0]->v.str || !a[1]->v.pid) return sw_val_atom("error");
-    return sw_val_atom(sw_register(a[0]->v.str, a[1]->v.pid) == 0 ? "ok" : "error");
+    if (n < 2 || !a[0]->v.str || !sw_pid_of(a[1])) return sw_val_atom("error");
+    return sw_val_atom(sw_register(a[0]->v.str, sw_pid_of(a[1])) == 0 ? "ok" : "error");
 }
 
 static sw_val_t *_builtin_whereis(sw_val_t **a, int n) {
@@ -97,12 +97,16 @@ static sw_val_t *_builtin_whereis(sw_val_t **a, int n) {
 
 static sw_val_t *_builtin_monitor(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_PID) return sw_val_nil();
-    return sw_val_int((int64_t)sw_monitor(a[0]->v.pid));
+    /* A stale pid (process gone, slot reused) gets an immediate
+     * {'DOWN', ref, 'process', pid, "noproc"} instead of a monitor on
+     * whatever process now occupies the slot. */
+    return sw_val_int((int64_t)sw_monitor_id(a[0]->v.pidv.ptr, a[0]->v.pidv.id));
 }
 
 static sw_val_t *_builtin_link(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_PID) return sw_val_atom("error");
-    sw_link(a[0]->v.pid);
+    if (!sw_pid_of(a[0])) return sw_val_atom("error");   /* noproc */
+    sw_link(sw_pid_of(a[0]));
     return sw_val_atom("ok");
 }
 
@@ -159,7 +163,7 @@ static uint32_t _vets_hash_val(sw_val_t *v) {
              * different arena-copied sw_val_t landed in different buckets yet
              * compared equal, so a pid-keyed put never found the prior entry
              * and the table accumulated duplicates + mislooked-up. */
-            uint64_t k = v->v.pid ? v->v.pid->pid : 0;
+            uint64_t k = v->v.pidv.id;
             for (int i = 0; i < 8; i++) { h ^= (k & 0xff); h *= 1099511628211ULL; k >>= 8; }
             break;
         }
@@ -193,7 +197,7 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
                 if (!_vets_key_eq(a->v.tuple.items[i], b->v.tuple.items[i])) return 0;
             return 1;
         case SW_VAL_PID: /* compare by numeric pid id (see sw_val_equal) */
-            return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
+            return a->v.pidv.id == b->v.pidv.id;
         default: return a == b;
     }
 }
@@ -4543,7 +4547,8 @@ static sw_val_t *_builtin_expect(sw_val_t **a, int n) {
  * the missing pieces here: unlink, demonitor, exit_proc, trap_exit. */
 static sw_val_t *_builtin_unlink(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_PID) return sw_val_atom("error");
-    return sw_val_atom(sw_unlink(a[0]->v.pid) == 0 ? "ok" : "error");
+    if (!sw_pid_of(a[0])) return sw_val_atom("ok");
+    return sw_val_atom(sw_unlink(sw_pid_of(a[0])) == 0 ? "ok" : "error");
 }
 
 static sw_val_t *_builtin_demonitor(sw_val_t **a, int n) {
@@ -4559,7 +4564,9 @@ static sw_val_t *_builtin_exit_proc(sw_val_t **a, int n) {
         else if (strcmp(a[1]->v.str, "killed") == 0) reason = 2;
         else reason = 3;
     }
-    sw_process_kill(a[0]->v.pid, reason);
+    /* exit_proc on a process that is gone is a no-op — it must not kill
+     * an unrelated process that reused the slot. */
+    if (sw_pid_of(a[0])) sw_process_kill(sw_pid_of(a[0]), reason);
     return sw_val_atom("ok");
 }
 
@@ -5131,27 +5138,75 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
  * opts is currently a placeholder for future knobs (allow_net,
  * extra_read_paths, cpu_seconds…). Pass nil for the default policy.
  */
+#ifndef _WIN32
+/* Run argv (execvp, no outer shell) with stdout AND stderr on one pipe; read
+ * everything; return {exit_code, output} or nil if it could not start. */
+static sw_val_t *_sw_run_argv_merged(char *const argv[]) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return sw_val_nil();
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return sw_val_nil(); }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
+        setpgid(0, 0);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    size_t cap = 65536, got = 0;
+    char *buf = (char *)malloc(cap);
+    for (;;) {
+        if (!buf) break;
+        if (got + 4096 + 1 > cap) {
+            char *nb = (char *)realloc(buf, cap * 2);
+            if (!nb) break;
+            buf = nb; cap *= 2;
+        }
+        ssize_t r = read(pipefd[0], buf + got, cap - got - 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(pipefd[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!buf) return sw_val_nil();
+    buf[got] = '\0';
+    sw_val_t *items[2];
+    items[0] = sw_val_int(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    items[1] = sw_val_string(buf);
+    free(buf);
+    return sw_val_tuple(items, 2);
+}
+#endif
+
+/* shell_sandboxed(cmd) → {exit_code, output} | nil — run `cmd` with /bin/sh
+ * inside the platform sandbox (sandbox-exec on macOS, firejail on Linux; nil
+ * if unavailable — never a silent unsandboxed fallback). The sandbox tool is
+ * exec'd directly with `cmd` as ONE argv element, so only the sandboxed
+ * shell ever interprets it. (It used to be pasted into an outer `sh -c '...'`
+ * unescaped: a `'` in cmd broke out and ran the rest UNSANDBOXED.) */
 static sw_val_t *_builtin_shell_sandboxed(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
-    const char *cmd = a[0]->v.str;
-    (void)n; /* opts arg reserved for future knobs */
+    SW_OFFLOAD_BUILTIN(_builtin_shell_sandboxed, a, n);
+    char *cmd = a[0]->v.str;
 
 #ifdef __APPLE__
-    /* Write a minimal sandbox-exec profile. Restrictive by default:
-     * - no network
-     * - read-only outside /tmp + /private/tmp + standard system dirs
-     * - no writes outside /tmp + /private/tmp
-     */
-    char profile_path[256];
-    snprintf(profile_path, sizeof(profile_path), "%s/sw_sandbox_%d_%u.sb",
-             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
-    FILE *pf = fopen(profile_path, "w");
-    if (!pf) return sw_val_nil();
     /* Permissive-but-network-blocked profile. macOS dyld + libc need
      * a surprising amount of access to even load `sh`, so a strict
      * "deny default" profile aborts with SIGABRT before the user's
      * command runs. Instead we "allow default" then selectively
      * deny network + writes outside /tmp. Future opts can tighten. */
+    char profile_path[256];
+    snprintf(profile_path, sizeof(profile_path), "%s/sw_sandbox_%d_%u.sb",
+             sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    FILE *pf = fopen(profile_path, "w");
+    if (!pf) return sw_val_nil();
     fprintf(pf,
         "(version 1)\n"
         "(allow default)\n"
@@ -5162,57 +5217,17 @@ static sw_val_t *_builtin_shell_sandboxed(sw_val_t **a, int n) {
         "(allow file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
     );
     fclose(pf);
-
-    /* Capture output via popen — easier than the tmp-file dance of shell(). */
-    size_t cmdlen = strlen(cmd) + strlen(profile_path) + 256;
-    char *full = (char *)malloc(cmdlen);
-    snprintf(full, cmdlen, "sandbox-exec -f %s /bin/sh -c %c%s%c 2>&1",
-             profile_path, '\'', cmd, '\'');
-    FILE *fp = popen(full, "r");
-    free(full);
-    if (!fp) { swbs_unlink(profile_path); return sw_val_nil(); }
-    /* sw processes have small per-process stacks; allocate the read
-     * buffer on the heap instead of using a 64 KB stack array. */
-    size_t out_cap = 65536;
-    char *outbuf = (char *)malloc(out_cap);
-    if (!outbuf) { pclose(fp); swbs_unlink(profile_path); return sw_val_nil(); }
-    size_t got = fread(outbuf, 1, out_cap - 1, fp);
-    outbuf[got] = '\0';
-    int status = pclose(fp);
+    char *argv[] = { "sandbox-exec", "-f", profile_path, "/bin/sh", "-c", cmd, NULL };
+    sw_val_t *r = _sw_run_argv_merged(argv);
     swbs_unlink(profile_path);
-
-    sw_val_t *items[2];
-    items[0] = sw_val_int(WEXITSTATUS(status));
-    items[1] = sw_val_string(outbuf);
-    free(outbuf);
-    return sw_val_tuple(items, 2);
+    return r;
 #elif !defined(_WIN32)
-    /* Linux — try firejail. If absent, return nil (don't silently
-     * fall back to un-sandboxed). */
-    if (system("command -v firejail >/dev/null 2>&1") != 0) {
-        return sw_val_nil();
-    }
-    size_t cmdlen = strlen(cmd) + 256;
-    char *full = (char *)malloc(cmdlen);
-    snprintf(full, cmdlen,
-        "firejail --quiet --net=none --private-tmp -- /bin/sh -c %c%s%c 2>&1",
-        '\'', cmd, '\'');
-    FILE *fp = popen(full, "r");
-    free(full);
-    if (!fp) return sw_val_nil();
-    size_t out_cap = 65536;
-    char *outbuf = (char *)malloc(out_cap);
-    if (!outbuf) { pclose(fp); return sw_val_nil(); }
-    size_t got = fread(outbuf, 1, out_cap - 1, fp);
-    outbuf[got] = '\0';
-    int status = pclose(fp);
-    sw_val_t *items[2];
-    items[0] = sw_val_int(WEXITSTATUS(status));
-    items[1] = sw_val_string(outbuf);
-    free(outbuf);
-    return sw_val_tuple(items, 2);
+    if (system("command -v firejail >/dev/null 2>&1") != 0) return sw_val_nil();
+    char *argv[] = { "firejail", "--quiet", "--net=none", "--private-tmp", "--",
+                     "/bin/sh", "-c", cmd, NULL };
+    return _sw_run_argv_merged(argv);
 #else
-    (void)cmd;
+    (void)cmd; (void)n;
     return sw_val_nil();
 #endif
 }
@@ -6345,6 +6360,23 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
  *   url default: "https://otonomy-inference-production.up.railway.app/v1/chat/completions"
  * Returns: string (the completion text)
  */
+/* API key for `url` from the environment: LLM_API_KEY (explicit, any URL),
+ * else OPENAI_API_KEY only for api.openai.com, else OTONOMY_API_KEY only for
+ * the Otonomy endpoint. NULL when none applies. */
+static const char *_sw_llm_env_key(const char *url) {
+    const char *k = getenv("LLM_API_KEY");
+    if (k && *k) return k;
+    if (url && strstr(url, "://api.openai.com/")) {
+        k = getenv("OPENAI_API_KEY");
+        if (k && *k) return k;
+    }
+    if (url && strstr(url, "otonomy-inference")) {
+        k = getenv("OTONOMY_API_KEY");
+        if (k && *k) return k;
+    }
+    return NULL;
+}
+
 static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *prompt = a[0]->v.str;
@@ -6382,9 +6414,10 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
         }
     }
 
-    /* Resolve API key from env if not provided */
-    if (!api_key) api_key = getenv("OTONOMY_API_KEY");
-    if (!api_key) api_key = getenv("OPENAI_API_KEY");
+    /* Resolve API key from env if not provided. A provider's key is only
+     * ever sent to THAT provider: OPENAI_API_KEY used to be sent to whatever
+     * URL was in effect — including the vendor default below. */
+    if (!api_key) api_key = _sw_llm_env_key(url);
     if (!api_key) api_key = "ollama";  /* Ollama doesn't need a real key */
 
     /* Escape prompt for JSON */
@@ -7307,28 +7340,34 @@ static void _llm_stream_entry(void *raw) {
         ctx->model, ctx->max_tokens, ctx->temperature, esc);
     free(esc);
 
-    /* Build curl command for SSE streaming */
-    size_t cmd_cap = strlen(body) + strlen(ctx->url) + strlen(ctx->api_key) + 512;
-    char *cmd = (char *)malloc(cmd_cap);
-    /* Write body to temp file for safety */
-    char tmpf[256];
+    /* curl is exec'd with an argv (no shell: the URL and key used to be
+     * pasted into a single-quoted shell string, so a quote in either was a
+     * command injection). The body and the Authorization header go in 0600
+     * temp files (`-H @file` keeps the key out of `ps`), removed only after
+     * curl exits — unlinking right after the spawn raced curl reading them. */
+    char tmpf[256], hdrf[256];
     snprintf(tmpf, sizeof(tmpf), "%s/sw_llm_stream_%d_%u.json", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
-    FILE *tf = fopen(tmpf, "w");
-    if (tf) { fputs(body, tf); fclose(tf); }
+    snprintf(hdrf, sizeof(hdrf), "%s/sw_llm_stream_%d_%u.hdr", sw_tmpdir(), sw_getpid_os(), sw_random_u32());
+    int tfd = open(tmpf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (tfd >= 0) { FILE *tf = fdopen(tfd, "w"); if (tf) { fputs(body, tf); fclose(tf); } else close(tfd); }
     free(body);
-
-    snprintf(cmd, cmd_cap,
-        "curl -sS -N --connect-timeout 30 --max-time 300 "
-        "-H 'Content-Type: application/json' "
-        "-H 'Authorization: Bearer %s' "
-        "-d @%s '%s' 2>/dev/null",
-        ctx->api_key, tmpf, ctx->url);
-
-    FILE *fp = sw_popen(cmd, "r");
-    free(cmd);
-    swbs_unlink(tmpf);
+    int hfd = open(hdrf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (hfd >= 0) {
+        FILE *hf = fdopen(hfd, "w");
+        if (hf) { fprintf(hf, "Content-Type: application/json\nAuthorization: Bearer %s\n", ctx->api_key); fclose(hf); }
+        else close(hfd);
+    }
+    char body_arg[300], hdr_arg[300];
+    snprintf(body_arg, sizeof(body_arg), "@%s", tmpf);
+    snprintf(hdr_arg, sizeof(hdr_arg), "@%s", hdrf);
+    char *argv[] = { "curl", "-sS", "-N", "--connect-timeout", "30", "--max-time", "300",
+                     "-H", hdr_arg, "-d", body_arg, ctx->url, NULL };
+    _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
+    FILE *fp = ch.fp;
 
     if (!fp) {
+        swbs_unlink(tmpf);
+        swbs_unlink(hdrf);
         sw_val_t *items[2];
         items[0] = sw_val_atom("llm_done");
         items[1] = sw_val_string("error: failed to start curl");
@@ -7398,7 +7437,9 @@ static void _llm_stream_entry(void *raw) {
         }
     }
 
-    sw_pclose(fp);
+    _sw_popen_pid_close(ch);
+    swbs_unlink(tmpf);
+    swbs_unlink(hdrf);
 
     /* Send completion message */
     {
@@ -7447,10 +7488,10 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
         }
     }
 
-    /* Resolve API key from env if not provided */
+    /* Resolve API key from env if not provided (per-provider; see
+     * _sw_llm_env_key). */
     if (!ctx->api_key) {
-        const char *k = getenv("OTONOMY_API_KEY");
-        if (!k) k = getenv("OPENAI_API_KEY");
+        const char *k = _sw_llm_env_key(ctx->url);
         ctx->api_key = strdup(k ? k : "");
     }
 

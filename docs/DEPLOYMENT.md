@@ -64,6 +64,10 @@ noted. **Every one is optional**; the defaults are the product defaults.
 |----------|---------|---------|
 | `SW_SHUTDOWN_GRACE_MS` | `5000` | Graceful-shutdown drain deadline in ms (clamped to `[0, 3600000]`). See **Graceful shutdown** below. |
 | `SW_NO_SIGNAL_SHUTDOWN` | off | If set, the runtime does NOT install SIGTERM/SIGINT handlers (for embedders that own signal disposition). |
+| `SW_NODE_BIND` | `127.0.0.1` | Address the distribution listener binds (`node_start`). Set `0.0.0.0` (with `SW_NODE_COOKIE`) for multi-host clusters. |
+| `SW_NODE_COOKIE` | unset | Shared secret; every distribution frame carries a SHA-256 MAC and frames that fail it are dropped. Use the same value on every node. |
+| `SW_OFFLOAD_THREADS` | `256` | Max worker threads for blocking builtins (HTTP client, `exec_argv`, `shell_sandboxed`). `SW_OFFLOAD=0` runs them inline on the scheduler thread (old behavior). |
+| `LLM_URL` / `LLM_API_KEY` | unset | Endpoint and key for `llm_complete` / `llm_stream`. Provider keys (`OPENAI_API_KEY`, `OTONOMY_API_KEY`) are only sent to their own provider's URL. |
 | `SW_LOG_JSON` | off | If `1`, every abnormal process exit emits one JSON line on stderr: `{"ev":"proc_crash","pid":N,"reason":R[,"msg"][,"name"],"ts":MS}`. The human-readable panic trace remains the default. |
 | `SW_VERBOSE` | off | `1` prints the startup banner (off by default). |
 | `SW_QUIET` / `SW_RUNTIME_QUIET` | off | Suppress the startup banner (even with `SW_VERBOSE`) and operational stderr notices. |

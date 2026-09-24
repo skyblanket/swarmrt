@@ -90,6 +90,10 @@ typedef struct {
     char to_name[SW_REG_NAME_MAX]; /* Registry name (if to_pid == 0) */
     uint64_t tag;
     uint32_t payload_len;
+    /* SHA-256(SW_NODE_COOKIE || this header with mac zeroed || payload) when
+     * the node has a cookie; all zero otherwise. Frames whose MAC does not
+     * verify are dropped. */
+    uint8_t mac[32];
     /* payload bytes follow */
 } sw_remote_msg_t;
 

@@ -4,6 +4,38 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — security: sandbox escape, key leak, pid reuse, open distribution
+
+**fix(security): `shell_sandboxed` could be escaped with a quote.** The command was pasted
+unescaped into an outer `sh -c '...'` around the sandbox tool, so `x'; cmd; '` ran `cmd`
+outside the sandbox. The sandbox tool is now exec'd with the command as one argv element
+(and the call runs on the offload pool, reads all output, merges stderr).
+
+**fix(security): LLM builtins leaked keys and were injectable.** `llm_complete` /
+`llm_stream` fell back to sending `OPENAI_API_KEY` to whatever URL was in effect, the
+vendor default included. Keys are now per-provider (`LLM_API_KEY` explicit;
+`OPENAI_API_KEY` only to api.openai.com; `OTONOMY_API_KEY` only to the Otonomy endpoint).
+`llm_stream` built a single-quoted shell string from the URL and key (injectable) and
+unlinked its body file right after spawning curl (racing curl reading it); it now execs
+curl with an argv, passes the Authorization header via a 0600 file (`-H @file`, out of
+`ps`), and cleans up after curl exits.
+
+**fix(runtime): pids survive slot reuse.** A pid value held only the slab pointer, so once
+a dead process's slot was reused, its stale pid compared equal to the new occupant,
+`send` delivered to it, `exit_proc` killed it and `monitor` watched it. Pid values now
+capture the numeric id; a stale pid is dead (`send`/`exit_proc` no-op, `monitor` → DOWN
+`"noproc"`, `link` → `'error'`). Gate: `tests/sw/test_pid_reuse.sw` (fails on the old
+build on all four counts).
+
+**fix(security): distribution was open to the network.** `node_start` listened on 0.0.0.0
+with no authentication and delivered the wire's `tag` verbatim, letting a peer make the
+receiver reinterpret a payload as an EXIT/DOWN/CALL struct. It now binds 127.0.0.1 unless
+`SW_NODE_BIND` is set, authenticates frames with an optional `SW_NODE_COOKIE` (SHA-256
+MAC), delivers only value messages (other tags arrive as `SW_TAG_REMOTE_MSG`), and
+NUL-terminates wire name fields before use.
+
+---
+
 ## 2026-09-24 — linear list code, sharing-preserving copies, interpreter TCO
 
 **perf(values): list operations are O(1) where the idioms need them.** `tl()` and `[h | t]`

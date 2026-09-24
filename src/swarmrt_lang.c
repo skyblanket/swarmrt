@@ -126,6 +126,7 @@ __attribute__((weak)) void sw_send_tagged(sw_process_t *to, uint64_t tag, void *
 __attribute__((weak)) void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload, struct sw_value_arena *region) { (void)to; (void)tag; (void)payload; (void)region; }
 __attribute__((weak)) sw_process_t *sw_self(void) { return NULL; }
 __attribute__((weak)) void sw_sleep_ms(uint64_t ms) { usleep((useconds_t)(ms * 1000)); }
+__attribute__((weak)) uint64_t sw_monitor_id(sw_process_t *t, uint64_t id) { (void)t; (void)id; return 0; }
 /* Returns the current process's value arena, or NULL (interpreter / pre-fiber).
  * Strong impl in swarmrt_native.c reads tls_current->varena; this weak stub
  * keeps swc linkable without the runtime and makes the interpreter use calloc. */
@@ -2305,8 +2306,14 @@ sw_val_t *sw_val_bytes(const uint8_t *data, size_t len) {
 }
 
 sw_val_t *sw_val_pid(sw_process_t *p) {
+    return sw_val_pid_id(p, p ? p->pid : 0);
+}
+
+sw_val_t *sw_val_pid_id(sw_process_t *p, uint64_t id) {
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
-    v->type = SW_VAL_PID; v->v.pid = p;
+    v->type = SW_VAL_PID;
+    v->v.pidv.ptr = p;
+    v->v.pidv.id = id;
     return v;
 }
 
@@ -2671,7 +2678,7 @@ static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
     case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
     case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
     case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
-    case SW_VAL_PID:    return sw_val_pid(v->v.pid);
+    case SW_VAL_PID:    return sw_val_pid_id(v->v.pidv.ptr, v->v.pidv.id);
     case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
     case SW_VAL_TUPLE:
     case SW_VAL_LIST: {
@@ -2951,7 +2958,7 @@ int sw_val_equal(sw_val_t *a, sw_val_t *b) {
          * slab slot today, but comparing the id keeps them equal even if
          * one side carries a freshly-resolved pointer. NULL pids (id 0)
          * only equal other NULL pids. */
-        return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
+        return a->v.pidv.id == b->v.pidv.id;
     case SW_VAL_REMOTE_PID:
         return a->v.rpid.id == b->v.rpid.id &&
                ((a->v.rpid.node == b->v.rpid.node) ||
@@ -2981,7 +2988,7 @@ void sw_val_format(FILE *f, sw_val_t *v) {
     case SW_VAL_FLOAT: fprintf(f, "%.17g", v->v.f); break;
     case SW_VAL_STRING: fprintf(f, "%s", v->v.str); break;
     case SW_VAL_ATOM: fprintf(f, ":%s", v->v.str); break;
-    case SW_VAL_PID: fprintf(f, "<pid:%llu>", (unsigned long long)(v->v.pid ? v->v.pid->pid : 0)); break;
+    case SW_VAL_PID: fprintf(f, "<pid:%llu>", (unsigned long long)v->v.pidv.id); break;
     case SW_VAL_REMOTE_PID:
         fprintf(f, "<rpid:%s:%llu>",
                 v->v.rpid.node ? v->v.rpid.node : "?",
@@ -3277,7 +3284,7 @@ static sw_val_t *recv_msg_to_val(sw_msg_t *m) {
         sw_val_t *reason = sig->reason_str ? sw_val_string(sig->reason_str)
                                            : sw_val_int((int64_t)sig->reason);
         sw_val_t *items[3] = { sw_val_atom("EXIT"),
-                               sw_val_pid(sw_find_by_pid_any(sig->pid)),
+                               sw_val_pid_id(sw_find_by_pid_any(sig->pid), sig->pid),
                                reason };
         return sw_val_tuple(items, 3);
     }
@@ -3288,7 +3295,7 @@ static sw_val_t *recv_msg_to_val(sw_msg_t *m) {
         sw_val_t *items[5] = { sw_val_atom("DOWN"),
                                sw_val_int((int64_t)sig->ref),
                                sw_val_atom("process"),
-                               sw_val_pid(sw_find_by_pid_any(sig->pid)),
+                               sw_val_pid_id(sw_find_by_pid_any(sig->pid), sig->pid),
                                reason };
         return sw_val_tuple(items, 5);
     }
@@ -3779,7 +3786,7 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
             return a->v.bytes.len == b->v.bytes.len &&
                    memcmp(a->v.bytes.data, b->v.bytes.data, a->v.bytes.len) == 0;
         case SW_VAL_PID:    /* compare by numeric pid id, see sw_val_equal */
-            return (a->v.pid ? a->v.pid->pid : 0) == (b->v.pid ? b->v.pid->pid : 0);
+            return a->v.pidv.id == b->v.pidv.id;
         default:            return a == b;
     }
 }
@@ -5201,12 +5208,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     /* link/unlink/trap_exit/exit_proc — {'EXIT',from,reason} delivery */
     if (strcmp(fname, "link") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
-        sw_link(args[0]->v.pid);
+        if (!sw_pid_of(args[0])) return sw_val_atom("error");   /* noproc */
+        sw_link(sw_pid_of(args[0]));
         return sw_val_atom("ok");
     }
     if (strcmp(fname, "unlink") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_atom("error");
-        return sw_val_atom(sw_unlink(args[0]->v.pid) == 0 ? "ok" : "error");
+        if (!sw_pid_of(args[0])) return sw_val_atom("ok");
+        return sw_val_atom(sw_unlink(sw_pid_of(args[0])) == 0 ? "ok" : "error");
     }
     if (strcmp(fname, "trap_exit") == 0) {
         if (nargs < 1 || !args[0]) return sw_val_atom("error");
@@ -5224,14 +5233,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             else if (strcmp(args[1]->v.str, "killed") == 0) reason = 2;
             else reason = 3;
         }
-        sw_process_kill(args[0]->v.pid, reason);
+        if (sw_pid_of(args[0])) sw_process_kill(sw_pid_of(args[0]), reason);   /* gone: no-op */
         return sw_val_atom("ok");
     }
 
     /* monitor/demonitor — same machinery spawn_monitor already uses */
     if (strcmp(fname, "monitor") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_PID) return sw_val_nil();
-        return sw_val_int((int64_t)sw_monitor(args[0]->v.pid));
+        return sw_val_int((int64_t)sw_monitor_id(args[0]->v.pidv.ptr, args[0]->v.pidv.id));
     }
     if (strcmp(fname, "demonitor") == 0) {
         if (nargs < 1 || args[0]->type != SW_VAL_INT) return sw_val_atom("error");
@@ -5244,7 +5253,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             (args[0]->type != SW_VAL_STRING && args[0]->type != SW_VAL_ATOM) ||
             args[1]->type != SW_VAL_PID)
             return sw_val_atom("error");
-        return sw_val_atom(sw_register(args[0]->v.str, args[1]->v.pid) == 0 ? "ok" : "error");
+        if (!sw_pid_of(args[1])) return sw_val_atom("error");
+        return sw_val_atom(sw_register(args[0]->v.str, sw_pid_of(args[1])) == 0 ? "ok" : "error");
     }
     if (strcmp(fname, "whereis") == 0) {
         if (nargs < 1 || !args[0]->v.str ||

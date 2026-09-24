@@ -53,6 +53,12 @@ struct sw_val {
         double f;
         char *str;                   /* string or atom text (owned) */
         sw_process_t *pid;
+        /* SW_VAL_PID: `ptr` aliases `pid` (same offset); `id` is the
+         * process's numeric pid captured when the value was made. Slab
+         * slots are reused, so the pointer alone could come to denote a
+         * DIFFERENT process — sends, kills, links, monitors and equality go
+         * through the id (see sw_pid_of). */
+        struct { sw_process_t *ptr; uint64_t id; } pidv;
         struct {
             sw_val_t **items;
             int count;
@@ -200,6 +206,15 @@ sw_val_t *sw_val_atom(const char *s);
  * owned block (data may be NULL iff len==0). NUL-safe — never uses strlen. */
 sw_val_t *sw_val_bytes(const uint8_t *data, size_t len);
 sw_val_t *sw_val_pid(sw_process_t *p);
+/* Pid value for a process known by numeric id (e.g. a dead one named in a
+ * DOWN/EXIT signal): keeps that id even if the slot has been reused. */
+sw_val_t *sw_val_pid_id(sw_process_t *p, uint64_t id);
+/* The live process a pid value denotes, or NULL if that process has exited
+ * and its slot was reused (or the value is not a pid). */
+static inline sw_process_t *sw_pid_of(sw_val_t *v) {
+    if (!v || v->type != SW_VAL_PID || !v->v.pidv.ptr) return NULL;
+    return v->v.pidv.ptr->pid == v->v.pidv.id ? v->v.pidv.ptr : NULL;
+}
 sw_val_t *sw_val_remote_pid(const char *node, uint64_t id);
 sw_val_t *sw_val_tuple(sw_val_t **items, int count);
 sw_val_t *sw_val_list(sw_val_t **items, int count);

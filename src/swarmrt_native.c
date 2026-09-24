@@ -3148,6 +3148,23 @@ sw_process_t *sw_spawn_link(void (*func)(void*), void *arg) {
  * MONITORS
  * ============================================================================ */
 
+static void deliver_signal(sw_process_t *target, uint64_t tag,
+                           uint64_t from_pid, uint64_t ref, int reason,
+                           const char *reason_str);
+
+/* Monitor the process a pid VALUE named: `target` is its slab pointer and
+ * `expect_id` the numeric pid captured when the value was made. If that
+ * process is gone and its slot reused, deliver DOWN(noproc) right away
+ * instead of monitoring the slot's new occupant. */
+uint64_t sw_monitor_id(sw_process_t *target, uint64_t expect_id) {
+    sw_process_t *self = tls_current;
+    if (!self) return 0;
+    if (target && target->pid == expect_id) return sw_monitor(target);
+    uint64_t ref = atomic_fetch_add(&g_swarm->next_monitor_ref, 1);
+    deliver_signal(self, SW_TAG_DOWN, expect_id, ref, 0, "noproc");
+    return ref;
+}
+
 uint64_t sw_monitor(sw_process_t *target) {
     sw_process_t *self = tls_current;
     if (!self || !target) return 0;

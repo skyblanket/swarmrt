@@ -2753,7 +2753,7 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     /* Deliver the source as a SW_VAL_PID (resolved from the slab,
      * dead-or-alive) so `{'EXIT', from, _} -> from == some_pid` works.
      * Previously this was sw_val_int(pid), which never == a spawn() pid. */
-    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_pid(sw_find_by_pid_any(_sig->pid)), _reason };\n");
+    fprintf(f, "            sw_val_t *_items[3] = { sw_val_atom(\"EXIT\"), sw_val_pid_id(sw_find_by_pid_any(_sig->pid), _sig->pid), _reason };\n");
     fprintf(f, "            %s = sw_val_tuple(_items, 3);\n", msg);
     fprintf(f, "          } else if (%s->tag == SW_TAG_DOWN && %s->payload) {\n", cur, cur);
     fprintf(f, "            sw_signal_t *_sig = (sw_signal_t *)%s->payload;\n", cur);
@@ -2764,7 +2764,7 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
      * resolved from the slab (dead-or-alive) so the idiomatic supervisor
      * pattern `dpid == child_pid` matches. ref stays an int (monitor()
      * returns an int ref). Previously PID was sw_val_int → always !=. */
-    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_pid(sw_find_by_pid_any(_sig->pid)), _reason };\n");
+    fprintf(f, "            sw_val_t *_items[5] = { sw_val_atom(\"DOWN\"), sw_val_int((int64_t)_sig->ref), sw_val_atom(\"process\"), sw_val_pid_id(sw_find_by_pid_any(_sig->pid), _sig->pid), _reason };\n");
     fprintf(f, "            %s = sw_val_tuple(_items, 5);\n", msg);
     fprintf(f, "          } else {\n");
     fprintf(f, "            %s = %s->payload ? (sw_val_t *)%s->payload : sw_val_nil();\n",

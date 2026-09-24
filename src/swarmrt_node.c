@@ -25,6 +25,53 @@
 #include <arpa/inet.h>
 #include "swarmrt_node.h"
 #include "swarmrt_lang.h"
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#define SW_SHA256_CTX CC_SHA256_CTX
+#define SW_SHA256_Init CC_SHA256_Init
+#define SW_SHA256_Update(c, d, n) CC_SHA256_Update((c), (d), (CC_LONG)(n))
+#define SW_SHA256_Final CC_SHA256_Final
+#else
+#include <openssl/evp.h>
+#endif
+
+/* === Frame authentication ===
+ * With SW_NODE_COOKIE set (same value on every node of the cluster), each
+ * frame carries SHA-256(cookie || header-with-zero-mac || payload) and
+ * frames that fail verification are dropped before anything else looks at
+ * them. Without a cookie the node accepts any frame — which is why the
+ * listener binds 127.0.0.1 unless SW_NODE_BIND says otherwise. (Integrity
+ * and peer authentication only: frames are not encrypted and not
+ * replay-protected — use a private network or a tunnel across hosts.) */
+static const char *node_cookie(void) {
+    const char *c = getenv("SW_NODE_COOKIE");
+    return (c && *c) ? c : NULL;
+}
+
+static void frame_mac(const char *cookie, const sw_remote_msg_t *hdr,
+                      const void *payload, uint32_t plen, uint8_t out[32]) {
+    sw_remote_msg_t h = *hdr;
+    memset(h.mac, 0, sizeof(h.mac));
+#ifdef __APPLE__
+    SW_SHA256_CTX ctx;
+    SW_SHA256_Init(&ctx);
+    SW_SHA256_Update(&ctx, cookie, strlen(cookie));
+    SW_SHA256_Update(&ctx, &h, sizeof(h));
+    if (plen && payload) SW_SHA256_Update(&ctx, payload, plen);
+    SW_SHA256_Final(out, &ctx);
+#else
+    memset(out, 0, 32);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return;              /* all-zero MAC: fails verification (closed) */
+    unsigned int olen = 0;
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(ctx, cookie, strlen(cookie)) == 1 &&
+        EVP_DigestUpdate(ctx, &h, sizeof(h)) == 1 &&
+        (!plen || !payload || EVP_DigestUpdate(ctx, payload, plen) == 1))
+        EVP_DigestFinal_ex(ctx, out, &olen);
+    EVP_MD_CTX_free(ctx);
+#endif
+}
 
 /* === Global State === */
 
@@ -170,7 +217,7 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
          * over TCP when used in `send()`. */
         marsh_grow(buf, cap, *pos + 1 + 8);
         (*buf)[(*pos)++] = SW_MARSHAL_PID;
-        uint64_t pid = v->v.pid ? v->v.pid->pid : 0;
+        uint64_t pid = v->v.pidv.id;   /* id captured at creation (slots are reused) */
         memcpy(*buf + *pos, &pid, 8); *pos += 8;
         return 0;
     }
@@ -345,7 +392,11 @@ void sw_send_dispatch(sw_val_t *target, sw_val_t *msg) {
         /* GC v1: deep-copy the value to the global heap so it survives the
          * sender's arena being freed on exit (compiled send shares pointers
          * cross-process — see [[swarmrt-gc-design]]). */
-        sw_send_value(target->v.pid, SW_TAG_NONE, msg);
+        /* A pid whose process exited and whose slot was reused denotes
+         * nothing: sending to it is a no-op (Erlang semantics), NOT a
+         * delivery to whichever process now occupies the slot. */
+        sw_process_t *to = sw_pid_of(target);
+        if (to) sw_send_value(to, SW_TAG_NONE, msg);
     } else if (target->type == SW_VAL_REMOTE_PID && target->v.rpid.node) {
         uint8_t *buf = NULL;
         uint32_t blen = 0;
@@ -458,6 +509,9 @@ static int send_remote_msg(sw_port_t *conn, sw_remote_msg_t *hdr,
 
     /* Send header */
     hdr->payload_len = payload_len;
+    memset(hdr->mac, 0, sizeof(hdr->mac));
+    const char *cookie = node_cookie();
+    if (cookie) frame_mac(cookie, hdr, payload, payload_len, hdr->mac);
     if (sw_tcp_send(conn, hdr, sizeof(sw_remote_msg_t)) < 0) return -1;
 
     /* Send payload */
@@ -473,6 +527,30 @@ static void handle_remote_data(uint8_t *data, uint32_t len, sw_port_t *conn) {
     if (len < sizeof(sw_remote_msg_t)) return;
 
     sw_remote_msg_t *hdr = (sw_remote_msg_t *)data;
+    /* The name fields come off the wire: force termination before any
+     * strcmp/strncpy reads them (a full 64-byte field over-read into the
+     * neighbouring header bytes). */
+    hdr->from_node[SW_NODE_NAME_MAX - 1] = '\0';
+    hdr->to_node[SW_NODE_NAME_MAX - 1] = '\0';
+    hdr->to_name[SW_REG_NAME_MAX - 1] = '\0';
+
+    /* Authenticate before anything else — including peer registration. */
+    const char *cookie = node_cookie();
+    if (cookie) {
+        uint32_t avail = len - (uint32_t)sizeof(sw_remote_msg_t);
+        uint32_t mlen = hdr->payload_len <= avail ? hdr->payload_len : avail;
+        uint8_t want[32];
+        frame_mac(cookie, hdr, data + sizeof(sw_remote_msg_t), mlen, want);
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; i++) diff |= (uint8_t)(want[i] ^ hdr->mac[i]);
+        if (diff || mlen != hdr->payload_len) {
+            static _Atomic int warned = 0;
+            if (!atomic_exchange(&warned, 1))
+                fprintf(stderr, "swarmrt: dropping distribution frame with a bad or missing "
+                                "SW_NODE_COOKIE MAC (further drops are silent)\n");
+            return;
+        }
+    }
 
     /* Auto-register the sender as a peer if this is the first time
      * we've seen it on this connection — happens when alpha connects
@@ -554,9 +632,15 @@ static void handle_remote_data(uint8_t *data, uint32_t len, sw_port_t *conn) {
         /* GC v1: sw_unmarshal builds the value in the dist handler's arena;
          * deep-copy to the global heap so it survives that process's teardown
          * (and so the receiver doesn't alias the dist handler's arena). */
-        sw_send_value(target, hdr->tag, msg);
+        /* Only plain value messages cross the wire. Runtime tags (EXIT,
+         * DOWN, CALL, CAST, timers, ports, ...) make the receiver
+         * reinterpret the payload as an internal struct, so a peer that
+         * picked one would get a wild pointer dereferenced; they are
+         * delivered as SW_TAG_REMOTE_MSG values instead. */
+        uint64_t tag = hdr->tag == SW_TAG_NONE ? SW_TAG_NONE : SW_TAG_REMOTE_MSG;
+        sw_send_value(target, tag, msg);
     } else if (target) {
-        sw_send_tagged(target, hdr->tag, NULL);
+        sw_send_tagged(target, SW_TAG_REMOTE_MSG, NULL);
     } else {
         if (payload) free(payload);
     }
@@ -653,7 +737,11 @@ int sw_node_start(const char *name, uint16_t port) {
     memset(&g_node, 0, sizeof(g_node));
     strncpy(g_node.name, name, SW_NODE_NAME_MAX - 1);
     g_node.port = port;
-    strcpy(g_node.host, "0.0.0.0");
+    /* Loopback unless SW_NODE_BIND widens it: with no cookie any peer that
+     * can connect may message any process. */
+    const char *bind_addr = getenv("SW_NODE_BIND");
+    if (!bind_addr || !*bind_addr) bind_addr = "127.0.0.1";
+    snprintf(g_node.host, sizeof(g_node.host), "%s", bind_addr);
 
     /* Start distribution handler process */
     g_dist_proc = sw_spawn(dist_handler, NULL);
@@ -665,7 +753,10 @@ int sw_node_start(const char *name, uint16_t port) {
     /* Start TCP listener owned by dist handler */
     /* We need to listen from the dist_handler context. For simplicity,
      * listen from here and transfer ownership. */
-    g_node.listener = sw_tcp_listen("0.0.0.0", port);
+    if (strcmp(bind_addr, "127.0.0.1") != 0 && !node_cookie())
+        fprintf(stderr, "swarmrt: distribution listening on %s:%u WITHOUT SW_NODE_COOKIE — "
+                        "any host that can connect can message every process\n", bind_addr, port);
+    g_node.listener = sw_tcp_listen(bind_addr, port);
     if (!g_node.listener) return -1;
 
     sw_port_controlling_process(g_node.listener, g_dist_proc);
