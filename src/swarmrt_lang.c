@@ -3447,6 +3447,65 @@ static void interp_json_putc(char **buf, size_t *cap, size_t *pos, char c) {
     (*buf)[(*pos)++] = c;
 }
 
+/* Length of the valid UTF-8 sequence at p (2-4 bytes), 0 if invalid:
+ * overlongs, surrogates and > U+10FFFF are invalid. */
+static int interp_utf8_valid_len(const unsigned char *p, size_t avail) {
+    unsigned char c = p[0];
+    int n; uint32_t cp;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; cp = c & 0x07; }
+    else return 0;
+    if ((size_t)n > avail) return 0;
+    for (int i = 1; i < n; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    if ((n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000)) return 0;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+    if (cp > 0x10FFFF) return 0;
+    return n;
+}
+
+/* Same as the compiled _json_encode_str: escaped, always valid UTF-8
+ * (each invalid byte becomes \ufffd). */
+static void interp_json_encode_str(const char *str, char **buf, size_t *cap, size_t *pos) {
+    interp_json_putc(buf, cap, pos, '"');
+    const unsigned char *p = (const unsigned char *)str;
+    size_t n = strlen(str), i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        switch (c) {
+            case '"':  interp_json_append(buf, cap, pos, "\\\""); i++; continue;
+            case '\\': interp_json_append(buf, cap, pos, "\\\\"); i++; continue;
+            case '\n': interp_json_append(buf, cap, pos, "\\n"); i++; continue;
+            case '\r': interp_json_append(buf, cap, pos, "\\r"); i++; continue;
+            case '\t': interp_json_append(buf, cap, pos, "\\t"); i++; continue;
+            default: break;
+        }
+        if (c < 0x20 || c == 0x7F) {
+            char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", c);
+            interp_json_append(buf, cap, pos, esc);
+            i++;
+        } else if (c < 0x80) {
+            interp_json_putc(buf, cap, pos, (char)c);
+            i++;
+        } else {
+            int len = interp_utf8_valid_len(p + i, n - i);
+            if (len > 0) {
+                interp_json_grow(buf, cap, *pos, (size_t)len);
+                memcpy(*buf + *pos, p + i, (size_t)len);
+                *pos += (size_t)len;
+                i += (size_t)len;
+            } else {
+                interp_json_append(buf, cap, pos, "\\ufffd");
+                i++;
+            }
+        }
+    }
+    interp_json_putc(buf, cap, pos, '"');
+}
+
 static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) {
     if (!v || v->type == SW_VAL_NIL) {
         interp_json_append(buf, cap, pos, "null");
@@ -3455,37 +3514,19 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
         snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.i);
         interp_json_append(buf, cap, pos, tmp);
     } else if (v->type == SW_VAL_FLOAT) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
-        interp_json_append(buf, cap, pos, tmp);
-    } else if (v->type == SW_VAL_STRING) {
-        interp_json_append(buf, cap, pos, "\"");
-        for (const char *p = v->v.str; *p; p++) {
-            switch (*p) {
-                case '"':  interp_json_append(buf, cap, pos, "\\\""); break;
-                case '\\': interp_json_append(buf, cap, pos, "\\\\"); break;
-                case '\n': interp_json_append(buf, cap, pos, "\\n"); break;
-                case '\r': interp_json_append(buf, cap, pos, "\\r"); break;
-                case '\t': interp_json_append(buf, cap, pos, "\\t"); break;
-                default:
-                    if ((unsigned char)*p < 0x20) {
-                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
-                        interp_json_append(buf, cap, pos, esc);
-                    } else {
-                        interp_json_putc(buf, cap, pos, *p);
-                    }
-            }
+        if (isnan(v->v.f) || isinf(v->v.f)) { interp_json_append(buf, cap, pos, "null"); }
+        else {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            interp_json_append(buf, cap, pos, tmp);
         }
-        interp_json_append(buf, cap, pos, "\"");
+    } else if (v->type == SW_VAL_STRING) {
+        interp_json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_ATOM) {
         if (strcmp(v->v.str, "true") == 0) interp_json_append(buf, cap, pos, "true");
         else if (strcmp(v->v.str, "false") == 0) interp_json_append(buf, cap, pos, "false");
         else if (strcmp(v->v.str, "nil") == 0) interp_json_append(buf, cap, pos, "null");
-        else {
-            interp_json_append(buf, cap, pos, "\"");
-            interp_json_append(buf, cap, pos, v->v.str);
-            interp_json_append(buf, cap, pos, "\"");
-        }
+        else interp_json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_LIST || v->type == SW_VAL_TUPLE) {
         interp_json_append(buf, cap, pos, "[");
         for (int i = 0; i < v->v.tuple.count; i++) {
@@ -3497,16 +3538,15 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
         interp_json_append(buf, cap, pos, "{");
         for (int i = 0; i < v->v.map.count; i++) {
             if (i > 0) interp_json_append(buf, cap, pos, ",");
-            interp_json_append(buf, cap, pos, "\"");
             if (v->v.map.keys[i]->type == SW_VAL_STRING ||
                 v->v.map.keys[i]->type == SW_VAL_ATOM)
-                interp_json_append(buf, cap, pos, v->v.map.keys[i]->v.str);
+                interp_json_encode_str(v->v.map.keys[i]->v.str, buf, cap, pos);
             else {
                 char tmp[64];
-                snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.map.keys[i]->v.i);
+                snprintf(tmp, sizeof(tmp), "\"%lld\"", (long long)v->v.map.keys[i]->v.i);
                 interp_json_append(buf, cap, pos, tmp);
             }
-            interp_json_append(buf, cap, pos, "\":");
+            interp_json_append(buf, cap, pos, ":");
             interp_json_encode_val(v->v.map.vals[i], buf, cap, pos);
         }
         interp_json_append(buf, cap, pos, "}");
@@ -4600,7 +4640,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             size_t wlen = strlen(cmd) + strlen(exit_path) + 32;
             char *wrapper = (char *)malloc(wlen);
             if (!wrapper) _exit(127);
-            snprintf(wrapper, wlen, "( %s ); echo $? > %s", cmd, exit_path);
+            snprintf(wrapper, wlen, "( %s\n); echo $? > %s", cmd, exit_path);
             execl("/bin/sh", "sh", "-c", wrapper, (char *)NULL);
             _exit(127);
         }
@@ -7001,11 +7041,19 @@ static int _jd_utf8(unsigned int cp, char *buf) {
     return 4;
 }
 
+/* Malformed input flag (unterminated string/array/object, bad token,
+ * garbage between elements, trailing data) — json_decode returns nil, the
+ * same contract as the compiled decoder. */
+static __thread int g_jd_err = 0;
+
 static sw_val_t *_jd_parse_string(const char **pp) {
     (*pp)++;
-    char buf[8192];
+    /* Growable: a fixed 8KB buffer used to cut long strings silently. */
+    size_t cap = 4096;
+    char *buf = (char *)malloc(cap);
     int len = 0;
-    while (**pp && **pp != '"' && len < (int)sizeof(buf) - 5) {
+    while (**pp && **pp != '"') {
+        if ((size_t)len + 8 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
         if (**pp == '\\') {
             (*pp)++;
             /* A backslash as the last byte before the NUL: stop. Otherwise
@@ -7054,12 +7102,15 @@ static sw_val_t *_jd_parse_string(const char **pp) {
         } else { buf[len++] = **pp; (*pp)++; }
     }
     if (**pp == '"') (*pp)++;
+    else g_jd_err = 1;                    /* unterminated string */
     buf[len] = 0;
-    return sw_val_string(buf);
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
 }
 
 static sw_val_t *_jd_parse(const char **pp) {
-    if (g_jd_depth >= SW_JD_MAX_DEPTH) return sw_val_nil();  /* too deep */
+    if (g_jd_depth >= SW_JD_MAX_DEPTH) { g_jd_err = 1; return sw_val_nil(); }  /* too deep */
     g_jd_depth++;
     sw_val_t *r = _jd_parse_inner(pp);
     g_jd_depth--;
@@ -7070,34 +7121,55 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
     _jd_skip_ws(pp);
     if (**pp == '"') return _jd_parse_string(pp);
     if (**pp == '[') {
+        /* Growable (it stopped at 256 elements, silently). */
         (*pp)++; _jd_skip_ws(pp);
-        sw_val_t *items[256]; int cnt = 0;
-        while (**pp && **pp != ']' && cnt < 256) {
+        int cap = 64, cnt = 0;
+        sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        while (**pp && **pp != ']' && !g_jd_err) {
+            if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
             items[cnt++] = _jd_parse(pp);
             _jd_skip_ws(pp);
             if (**pp == ',') (*pp)++;
+            else if (**pp != ']') g_jd_err = 1;
             _jd_skip_ws(pp);
         }
         if (**pp == ']') (*pp)++;
-        return sw_val_list(items, cnt);
+        else g_jd_err = 1;
+        sw_val_t *r = sw_val_list(items, cnt);
+        free(items);
+        return r;
     }
     if (**pp == '{') {
+        /* Growable (it stopped at 128 keys, silently). */
         (*pp)++; _jd_skip_ws(pp);
-        sw_val_t *keys[128], *vals[128]; int cnt = 0;
-        while (**pp && **pp != '}' && cnt < 128) {
+        int cap = 32, cnt = 0;
+        sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
+        while (**pp && **pp != '}' && !g_jd_err) {
             _jd_skip_ws(pp);
-            if (**pp != '"') break;
+            if (**pp != '"') { if (**pp != '}') g_jd_err = 1; break; }
+            if (cnt >= cap) {
+                cap *= 2;
+                keys = (sw_val_t **)realloc(keys, sizeof(sw_val_t *) * cap);
+                vals = (sw_val_t **)realloc(vals, sizeof(sw_val_t *) * cap);
+            }
             sw_val_t *k = _jd_parse_string(pp);
             keys[cnt] = sw_val_atom(k->v.str);
             _jd_skip_ws(pp);
             if (**pp == ':') (*pp)++;
+            else { g_jd_err = 1; break; }
             vals[cnt] = _jd_parse(pp);
             cnt++;
             _jd_skip_ws(pp);
             if (**pp == ',') (*pp)++;
+            else if (**pp != '}') g_jd_err = 1;
+            _jd_skip_ws(pp);
         }
         if (**pp == '}') (*pp)++;
-        return sw_val_map_new(keys, vals, cnt);
+        else g_jd_err = 1;
+        sw_val_t *r = sw_val_map_new(keys, vals, cnt);
+        free(keys); free(vals);
+        return r;
     }
     if (**pp == 't' && strncmp(*pp, "true", 4) == 0)  { *pp += 4; return sw_val_atom("true"); }
     if (**pp == 'f' && strncmp(*pp, "false", 5) == 0) { *pp += 5; return sw_val_atom("false"); }
@@ -7115,6 +7187,7 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
          * at end-of-input (e.g. `{"a":` then EOF) stepping past `\0` is a
          * heap-buffer-overflow (found by fuzz-json). The enclosing array/
          * object loops gate on `**pp`, so leaving pp at the NUL ends them. */
+        g_jd_err = 1;
         if (**pp != '\0') (*pp)++;
         return sw_val_nil();
     }
@@ -7128,8 +7201,11 @@ static sw_val_t *_jd_parse_inner(const char **pp) {
 sw_val_t *sw_lang_json_decode(const char *s) {
     if (!s) return sw_val_nil();
     const char *p = s;
-    g_jd_depth = 0;   /* reset the per-decode depth guard */
-    return _jd_parse(&p);
+    g_jd_depth = 0; g_jd_err = 0;   /* per-decode state */
+    sw_val_t *r = _jd_parse(&p);
+    _jd_skip_ws(&p);
+    if (*p) g_jd_err = 1;           /* trailing data after the value */
+    return g_jd_err ? sw_val_nil() : r;
 }
 
 /* =========================================================================

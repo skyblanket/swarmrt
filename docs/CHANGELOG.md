@@ -4,6 +4,41 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — runtime fixes from the swarm-code review
+
+**fix(sched): blocking builtins no longer strand the processes queued behind them.**
+`read_line`/`read_key`/`read_choice`, `shell_managed`, TTY `http_post_stream`,
+`subprocess_recv_line` and `db_*` run inside a blocking section: the scheduler's queue
+moves to the overflow queue idle schedulers steal from, and new wake-ups for it go
+there. swarm-code's interactive session hung forever whenever the agent shared a
+scheduler with the line reader. Gate: `tests/sw/test_blocking_section.sw`.
+
+**fix(runtime): SIGPIPE no longer kills the process.** A write to a pipe whose reader
+died (an MCP server that exited) terminated the binary with status 141. A no-op
+handler turns it into EPIPE; children still get the default action after exec.
+
+**fix(shell): output keeps UTF-8.** `shell`/`shell_managed` stripped everything outside
+printable ASCII (`echo café` → `caf`). Valid UTF-8 is kept, invalid bytes become
+U+FFFD, ANSI sequences are removed whole. The shell wrappers end the command with a
+newline, so a trailing `# comment`, heredoc or `&` no longer breaks them, and a
+command `/bin/sh` cannot start fails at once instead of after the 120s poll.
+
+**fix(json): `json_decode` rejects malformed input; `json_encode` always emits valid
+JSON.** A truncated `{"command":"rm -rf build` decoded to a complete map, so a tool
+call cut off mid-argument still ran; unterminated strings/arrays/objects, bad tokens
+and trailing data now return nil (trailing commas stay accepted). The interpreter's
+decoder no longer truncates strings at 8KB, arrays at 256 or objects at 128. The
+encoder replaces invalid UTF-8 with `\ufffd`, escapes map keys and atoms, and writes
+NaN/Infinity as null — on both paths.
+
+**fix(sse): the stream parser drops nothing.** Lines over 16KB (a whole tool call in one
+frame), content deltas over 8KB, `"key": "value"` with a space after the colon, and
+tool calls without an `index` (they merged into one) are all handled; a
+reasoning-only reply is an answer, not a failure to retry four times; curl no longer
+retries on top of the caller's retries (12 POSTs per failed turn → 4).
+
+---
+
 ## 2026-09-24 — stderr and a clean stdout for CLIs
 
 **feat(lang): `eprint`, `stdout_to_stderr`, `fd_write`.** `sw` had no way to write to

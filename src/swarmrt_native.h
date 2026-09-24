@@ -436,6 +436,12 @@ typedef struct {
     _Atomic int idle;
     pthread_mutex_t idle_lock;
     pthread_cond_t idle_cond;
+
+    /* Non-zero while this scheduler's thread is inside a blocking builtin
+     * (sw_blocking_enter): producers divert wake-ups to the global overflow
+     * queue, which idle schedulers steal from, instead of stranding them
+     * behind the blocked thread. */
+    _Atomic int blocking;
 } sw_runq_t;
 
 /* === Scheduler (per OS thread) === */
@@ -738,6 +744,15 @@ void sw_offload_run(void (*fn)(void *), void *arg);
  * flag (seq_cst) and then calls sw_wake(proc). The mailbox is untouched:
  * messages arriving meanwhile wake us, we re-check, and they stay queued. */
 void sw_park_until(_Atomic int *flag);
+/* Bracket a builtin that blocks its OS thread without parking (terminal
+ * input, a synchronous subprocess wait). While inside, processes queued on
+ * this scheduler move to the shared overflow queue and new wake-ups for it
+ * go there too, so idle schedulers run them — there is no general work
+ * stealing, and a process whose home scheduler sat in read_line starved
+ * even with every other scheduler idle. No-ops off a scheduler thread.
+ * The builtin must not park or yield inside the section. */
+void sw_blocking_enter(void);
+void sw_blocking_exit(void);
 /* Wake a parked process (spurious wakes are harmless: every wait re-checks). */
 void sw_wake(sw_process_t *proc);
 /* Park the calling process for `ms` milliseconds WITHOUT consuming any

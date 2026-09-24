@@ -39,12 +39,13 @@ like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
 subagent-mode `http_post_stream` run on the runtime's offload pool (see "Recently
 cleared"), and so does `llm_complete`, whose request goes through `http_post` (200
 completions against a 500ms mock endpoint, 64 in flight, finish in 2.1s on 4
-cores). Still inline on the scheduler thread: TTY-mode `http_post_stream` and
-`http_post` while the interactive line editor owns the terminal (their ESC watcher
-reads the TTY), `shell()`'s initial `system()` launch and `db_*` (SQLite). A long
-call there blocks every other process queued on the same scheduler.
+cores). Still on the calling scheduler's thread: `read_line`/`read_key`/`read_choice`,
+`shell_managed`, TTY-mode `http_post_stream`, `subprocess_recv_line` and `db_*`.
+Those run inside a blocking section, so the processes queued behind them move to
+idle schedulers (see "Recently cleared"); what they cost is one OS thread each for
+the duration. With every scheduler thread inside one, nothing else runs.
 
-**Workaround:** `SW_SCHEDULERS>=2`, or move the call into its own process.
+**Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
 ### Maps are association arrays
 
@@ -93,6 +94,25 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### Processes starved behind a blocked scheduler thread (cleared 2026-09-24)
+
+There is no general work stealing, so a process queued on a scheduler whose thread
+sat in a blocking builtin waited for that builtin to return, even with every other
+scheduler idle. swarm-code's interactive session hung forever this way whenever its
+agent process shared a scheduler with the line reader (starting an MCP server
+changed the placement). Blocking builtins now run inside `sw_blocking_enter`/
+`sw_blocking_exit`: the scheduler's queue moves to the shared overflow queue that idle
+schedulers steal from, and wake-ups aimed at it go there until the builtin returns.
+Gate: `tests/sw/test_blocking_section.sw` (16 workers behind a 3s blocker: 3066ms
+before, ~1ms after).
+
+### Shell output lost every non-ASCII character (cleared 2026-09-24)
+
+`shell`/`shell_managed` kept only printable ASCII, so `echo café` returned `caf` and
+CJK file names vanished from grep/glob results. Valid UTF-8 is kept; invalid bytes
+become U+FFFD; ANSI escape sequences are removed whole.
+
 
 ### Bare `receive` differed between paths (cleared)
 

@@ -1256,9 +1256,22 @@ static void sched_trace_maybe_start(void) {
     }
 }
 
+static void overflow_rq_push(sw_process_t *proc);
+static void wake_one_idle_scheduler(void);
+
 void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     uint32_t prio = proc->priority;
     if (prio >= SW_PRIO_NUM) prio = SW_PRIO_NORMAL;
+
+    /* Target scheduler is stuck in a blocking builtin: queue the process
+     * where an idle scheduler will find it (see sw_blocking_enter). A
+     * push that races the scheduler ENTERING the section can still land
+     * locally; it runs when the builtin returns, as before. */
+    if (atomic_load_explicit(&rq->blocking, memory_order_seq_cst)) {
+        overflow_rq_push(proc);
+        wake_one_idle_scheduler();
+        return;
+    }
 
     /* NOTE: state must be set by the CALLER before calling this function.
      * Setting state here races with the receiver's final-drain self-resume path
@@ -1377,6 +1390,45 @@ sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
     pthread_mutex_unlock(&g_swarm->overflow_rq.lock);
 
     return proc;
+}
+
+/* Signal one parked scheduler so overflow work is picked up at once (the
+ * idle loop's 0.5ms timed park would find it anyway). */
+static void wake_one_idle_scheduler(void) {
+    if (!g_swarm) return;
+    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
+        sw_scheduler_t *sc = g_swarm->schedulers[i];
+        if (!sc) continue;
+        sw_runq_t *rq = &sc->runq;
+        if (atomic_load_explicit(&rq->idle, memory_order_relaxed) &&
+            !atomic_load_explicit(&rq->blocking, memory_order_relaxed)) {
+            pthread_mutex_lock(&rq->idle_lock);
+            pthread_cond_signal(&rq->idle_cond);
+            pthread_mutex_unlock(&rq->idle_lock);
+            return;
+        }
+    }
+}
+
+void sw_blocking_enter(void) {
+    sw_scheduler_t *sched = tls_scheduler;
+    if (!sched || !tls_current) return;
+    atomic_store_explicit(&sched->runq.blocking, 1, memory_order_seq_cst);
+    /* We are this queue's only consumer (the scheduler loop is suspended
+     * under us), so draining it here is safe. */
+    int moved = 0;
+    sw_process_t *p;
+    while ((p = sw_pick_next(sched)) != NULL) {
+        overflow_rq_push(p);
+        moved++;
+    }
+    if (moved) wake_one_idle_scheduler();
+}
+
+void sw_blocking_exit(void) {
+    sw_scheduler_t *sched = tls_scheduler;
+    if (!sched) return;
+    atomic_store_explicit(&sched->runq.blocking, 0, memory_order_seq_cst);
 }
 
 /*
@@ -1576,6 +1628,9 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             tls_current = NULL;
             _sw_gen = &_sw_gen_fallback;
             sched->current = NULL;
+            /* A blocking section never outlives its process's time slice
+             * (a builtin that parked or panicked inside one). */
+            atomic_store_explicit(&sched->runq.blocking, 0, memory_order_relaxed);
 
             if (proc->state == SW_PROC_EXITING) {
                 /* Process finished or killed — clean up */
@@ -1715,6 +1770,10 @@ static void _sw_install_altstack(void) {
 /* Page size cached at install time — sysconf() is not on the official
  * async-signal-safe list, so the handler must not be the first caller. */
 static long g_crash_page_size = 4096;
+
+/* See the SIGPIPE comment in sw_init: catching (not ignoring) it keeps
+ * children on the default action after exec. */
+static void _sw_sigpipe_noop(int sig) { (void)sig; }
 
 static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
@@ -1916,6 +1975,7 @@ int sw_init(const char *name, uint32_t num_schedulers) {
             atomic_store(&sched->runq.tails[p], &sched->runq.stubs[p]);
         }
         atomic_store(&sched->runq.idle, 0);
+        atomic_store(&sched->runq.blocking, 0);
         pthread_mutex_init(&sched->runq.idle_lock, NULL);
         pthread_cond_init(&sched->runq.idle_cond, NULL);
 
@@ -1983,6 +2043,21 @@ int sw_init(const char *name, uint32_t num_schedulers) {
         sigaction(SIGBUS,  &crash_sa, NULL);
         sigaction(SIGABRT, &crash_sa, NULL);
         _sw_install_altstack();   /* this thread; schedulers install their own */
+    }
+
+    /* SIGPIPE: a write to a pipe/socket whose reader died (an MCP server
+     * that exited, a closed HTTP client) killed the whole OS process with
+     * status 141. Catch it with a no-op handler so the write returns EPIPE
+     * to the caller instead. Not SIG_IGN: an ignored signal stays ignored
+     * across exec, and every child (`yes | head` in a shell tool) would see
+     * EPIPE errors instead of the default quiet exit; a caught signal is
+     * reset to SIG_DFL on exec. */
+    {
+        struct sigaction pipe_sa;
+        memset(&pipe_sa, 0, sizeof(pipe_sa));
+        pipe_sa.sa_handler = _sw_sigpipe_noop;
+        sigemptyset(&pipe_sa.sa_mask);
+        sigaction(SIGPIPE, &pipe_sa, NULL);
     }
 
     /* Start deadlock watchdog unless SW_DEADLOCK_DETECT=0. */

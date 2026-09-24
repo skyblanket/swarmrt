@@ -1247,6 +1247,15 @@ static sw_val_t *_sw_offload_builtin(sw_val_t *(*fn)(sw_val_t **, int),
 
 /* First statement of a blocking builtin: re-dispatches the call through the
  * offload pool unless we are already running on the worker. */
+/* SW_BLOCKING_SCOPE(): the rest of this builtin blocks its OS thread
+ * without parking (terminal input, a synchronous wait on a child), so let
+ * idle schedulers take over the processes queued behind it
+ * (sw_blocking_enter). Ends automatically at every return. */
+static inline void _sw_blocking_scope_end(int *unused) { (void)unused; sw_blocking_exit(); }
+#define SW_BLOCKING_SCOPE() \
+    int _sw_blocking_scope __attribute__((cleanup(_sw_blocking_scope_end), unused)) = \
+        (sw_blocking_enter(), 0)
+
 #define SW_OFFLOAD_BUILTIN(fn, a, n) \
     do { if (_sw_offl_depth == 0) return _sw_offload_builtin((fn), (a), (n)); } while (0)
 
@@ -1595,6 +1604,7 @@ static sw_val_t *_builtin_subprocess_send_line(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_subprocess_recv_line(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_nil();
     int slot = (int)a[0]->v.i;
     if (slot < 0 || slot >= _SW_SUBPROC_MAX || !_sw_subprocs[slot].active) return sw_val_nil();
@@ -2318,13 +2328,53 @@ static const char *_sw_json_str_end(const char *p) {
     return NULL;
 }
 
+/* Find `"key"` followed by optional whitespace, ':', optional whitespace
+ * and a string value; return a pointer just past the value's opening
+ * quote, or NULL. Servers differ on spacing — Python's json.dumps emits
+ * `"content": "hi"` — and an exact `"key":"` match silently dropped every
+ * chunk from them. `end` (may be NULL) bounds the search. */
+static const char *_sw_json_key_str(const char *json, const char *key, const char *end) {
+    size_t klen = strlen(key);
+    for (const char *p = strstr(json, key); p && (!end || p < end); p = strstr(p + 1, key)) {
+        if (p == json || p[-1] != '"' || p[klen] != '"') continue;
+        const char *q = p + klen + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q != ':') continue;
+        q++;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q != '"') return NULL;   /* key present, value not a string (null, number) */
+        if (end && q >= end) return NULL;
+        return q + 1;
+    }
+    return NULL;
+}
+
+/* Same for a numeric value: pointer to its first digit/sign, or NULL. */
+static const char *_sw_json_key_num(const char *json, const char *key, const char *end) {
+    size_t klen = strlen(key);
+    for (const char *p = strstr(json, key); p && (!end || p < end); p = strstr(p + 1, key)) {
+        if (p == json || p[-1] != '"' || p[klen] != '"') continue;
+        const char *q = p + klen + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q != ':') continue;
+        q++;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == '-' || (*q >= '0' && *q <= '9')) return (end && q >= end) ? NULL : q;
+        return NULL;
+    }
+    return NULL;
+}
+
 /* Parse the `tool_calls` array out of one SSE `data:` JSON line and
  * fold each fragment into the per-index accumulator set. */
 static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_count) {
-    const char *arr = strstr(json, "\"tool_calls\":");
+    const char *arr = strstr(json, "\"tool_calls\"");
     if (!arr) return;
-    arr += 13;
-    while (*arr == ' ') arr++;
+    arr += 12;
+    while (*arr == ' ' || *arr == '\t') arr++;
+    if (*arr != ':') return;
+    arr++;
+    while (*arr == ' ' || *arr == '\t') arr++;
     if (*arr != '[') return;            /* e.g. "tool_calls":null */
     const char *arr_end = _sw_match_bracket(arr);
     const char *q = arr + 1;
@@ -2333,17 +2383,35 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
         const char *obj_end = _sw_match_bracket(q);
         if (!obj_end) break;
 
+        /* Fragments are keyed by `index`. Some servers omit it: then a
+         * fragment carrying a NEW id starts a new call, and one without an
+         * id continues the last call (defaulting everything to 0 merged
+         * two calls' arguments into one). */
         int idx = 0;
-        const char *ip = strstr(q, "\"index\":");
-        if (ip && ip < obj_end) idx = (int)strtol(ip + 8, NULL, 10);
+        const char *ip = _sw_json_key_num(q, "index", obj_end);
+        if (ip) {
+            idx = (int)strtol(ip, NULL, 10);
+        } else {
+            const char *idv = _sw_json_key_str(q, "id", obj_end);
+            if (idv) {
+                const char *ide = _sw_json_str_end(idv);
+                size_t il = ide ? (size_t)(ide - idv) : 0;
+                idx = *tc_count;
+                for (int k = 0; k < *tc_count; k++) {
+                    if (tcs[k].used && strlen(tcs[k].id) == il && strncmp(tcs[k].id, idv, il) == 0) { idx = k; break; }
+                }
+            } else {
+                idx = (*tc_count > 0) ? *tc_count - 1 : 0;
+            }
+        }
         if (idx < 0 || idx >= SW_MAX_TOOL_CALLS) { q = obj_end + 1; continue; }
         _sw_toolcall_t *tc = &tcs[idx];
         tc->used = 1;
         if (idx + 1 > *tc_count) *tc_count = idx + 1;
 
-        const char *idp = strstr(q, "\"id\":\"");
-        if (idp && idp < obj_end && tc->id[0] == '\0') {
-            const char *s = idp + 6;
+        const char *idp = _sw_json_key_str(q, "id", obj_end);
+        if (idp && tc->id[0] == '\0') {
+            const char *s = idp;
             const char *e = _sw_json_str_end(s);
             if (e && e < obj_end) {
                 size_t l = (size_t)(e - s);
@@ -2351,9 +2419,9 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
                 memcpy(tc->id, s, l); tc->id[l] = '\0';
             }
         }
-        const char *np = strstr(q, "\"name\":\"");
-        if (np && np < obj_end && tc->name[0] == '\0') {
-            const char *s = np + 8;
+        const char *np = _sw_json_key_str(q, "name", obj_end);
+        if (np && tc->name[0] == '\0') {
+            const char *s = np;
             const char *e = _sw_json_str_end(s);
             if (e && e < obj_end) {
                 size_t l = (size_t)(e - s);
@@ -2361,9 +2429,9 @@ static void _sw_parse_tc_deltas(const char *json, _sw_toolcall_t *tcs, int *tc_c
                 memcpy(tc->name, s, l); tc->name[l] = '\0';
             }
         }
-        const char *ap = strstr(q, "\"arguments\":\"");
-        if (ap && ap < obj_end) {
-            const char *s = ap + 13;
+        const char *ap = _sw_json_key_str(q, "arguments", obj_end);
+        if (ap) {
+            const char *s = ap;
             const char *e = _sw_json_str_end(s);
             if (e && e <= obj_end) {
                 size_t l = (size_t)(e - s);
@@ -2471,6 +2539,7 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             return _sw_hps_err("http_post_stream: subagent target process is gone");
         subagent_name = a[4]->v.str;
     }
+    SW_BLOCKING_SCOPE();   /* TTY mode: spinner + ESC watcher on this thread */
     _stream_out_t so;
     _stream_out_init(&so, subagent_target, subagent_name);
 
@@ -2530,10 +2599,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * --keepalive-time 30: send TCP keepalives so flaky long-distance
      *   routes (api.z.ai, sushi, anything overseas) don't silently drop
      *   an idle stream during long reasoning chains.
-     * --retry 2 --retry-delay 1 --retry-connrefused --retry-all-errors:
-     *   curl auto-retries connection failures BEFORE any data arrives;
-     *   does NOT restart an already-streaming response (so safe for
-     *   streaming). Catches transient SSL/connect timeouts (curl 28/35).
+     * No curl-level --retry: the sw caller already retries transient
+     *   failures (status 0 / 5xx / 429) with backoff, and curl's own retries
+     *   (which also fire on 429/5xx) multiplied them: 12 POSTs per failed
+     *   turn, 40s on a 429 with Retry-After: 4.
      * --max-time 1800: hard ceiling at 30 min — long reasoning is fine
      *   but eventually we want to surface a failure rather than hang.
      * NOTE (F3c): we deliberately DO NOT pass curl --speed-limit/--speed-time
@@ -2562,12 +2631,6 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
     argv[argc++] = "1800";
     argv[argc++] = "--keepalive-time";
     argv[argc++] = "30";
-    argv[argc++] = "--retry";
-    argv[argc++] = "2";
-    argv[argc++] = "--retry-delay";
-    argv[argc++] = "1";
-    argv[argc++] = "--retry-connrefused";
-    argv[argc++] = "--retry-all-errors";
     /* (F3c) No --speed-limit/--speed-time: the prefill-aware first-byte and
      * inter-byte stall guards are enforced in the select loop below so a
      * silent prefill is never mistaken for a dead stream. */
@@ -2677,12 +2740,13 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * buffer and split lines ourselves — fgets() would block and prevent
      * spinner ticking during dead air. Heap-allocated (see SW_HPS_*). */
     char *line = (char *)malloc(SW_HPS_LINE_CAP);
-    size_t line_len = 0;
+    size_t line_len = 0, line_cap = SW_HPS_LINE_CAP;
     char *readbuf = (char *)malloc(SW_HPS_READ_CAP);
     /* Per-delta token scratch for content + reasoning. Hoisted out of
      * the loop and onto the heap to keep the stack frame small. */
-    char *tok = (char *)malloc(SW_HPS_TOK_CAP);
-    char *rtok = (char *)malloc(SW_HPS_TOK_CAP);
+    size_t tok_cap = SW_HPS_TOK_CAP;
+    char *tok = (char *)malloc(tok_cap);
+    char *rtok = (char *)malloc(tok_cap);
     int done = 0;
     const int spinner_tick_ms = 80;
 
@@ -2851,11 +2915,29 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
 
         for (ssize_t ri = 0; ri < rn && !done; ri++) {
             char ch = readbuf[ri];
-            if (line_len < SW_HPS_LINE_CAP - 1) line[line_len++] = ch;
+            /* The line buffer grows: a whole tool call in one frame
+             * (Ollama-style) can be far past 16KB, and a capped line lost it
+             * silently. 256MB bounds a runaway server. */
+            if (line_len + 1 >= line_cap && line_cap < ((size_t)256 << 20)) {
+                char *nl = (char *)realloc(line, line_cap * 2);
+                if (nl) { line = nl; line_cap *= 2; }
+            }
+            if (line_len + 1 < line_cap) line[line_len++] = ch;
             if (ch != '\n') continue;
             line[line_len] = '\0';
             size_t this_line_len = line_len;
             line_len = 0;
+            /* Decoded deltas are never longer than their line (escapes only
+             * shrink; \uXXXX is 6 bytes in, at most 4 out): size the token
+             * scratch to the line so a long delta isn't cut at 8KB. */
+            if (this_line_len + 8 > tok_cap) {
+                size_t nc = tok_cap;
+                while (this_line_len + 8 > nc) nc *= 2;
+                char *nt = (char *)realloc(tok, nc);
+                char *nr = nt ? (char *)realloc(rtok, nc) : NULL;
+                if (nt) tok = nt;
+                if (nr) { rtok = nr; tok_cap = nc; }
+            }
 
             /* SSE field parse. The WHATWG spec makes the space after the
              * colon OPTIONAL: "data: {...}" and "data:{...}" are both legal,
@@ -2893,16 +2975,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
              * that includes a `usage` object. Final chunk usually
              * does; intermediate chunks usually don't. */
             {
-                const char *u = strstr(json, "\"prompt_tokens\":");
-                if (u) { prompt_tokens = strtoll(u + 16, NULL, 10); }
-                u = strstr(json, "\"completion_tokens\":");
-                if (u) { completion_tokens = strtoll(u + 20, NULL, 10); }
-                u = strstr(json, "\"total_tokens\":");
-                if (u) { total_tokens = strtoll(u + 15, NULL, 10); }
+                const char *u = _sw_json_key_num(json, "prompt_tokens", NULL);
+                if (u) { prompt_tokens = strtoll(u, NULL, 10); }
+                u = _sw_json_key_num(json, "completion_tokens", NULL);
+                if (u) { completion_tokens = strtoll(u, NULL, 10); }
+                u = _sw_json_key_num(json, "total_tokens", NULL);
+                if (u) { total_tokens = strtoll(u, NULL, 10); }
                 /* finish_reason — capture on the last chunk that has one */
-                const char *fr = strstr(json, "\"finish_reason\":\"");
+                const char *fr = _sw_json_key_str(json, "finish_reason", NULL);
                 if (fr) {
-                    fr += 17;
                     size_t k = 0;
                     while (*fr && *fr != '"' && k < sizeof(finish_reason) - 1) {
                         finish_reason[k++] = *fr++;
@@ -2916,11 +2997,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
              * or neither. The `"reasoning_content":"` prefix can't false-
              * match `"content":"` because of the underscore boundary. */
             {
-                const char *rp = strstr(json, "\"reasoning_content\":\"");
+                const char *rp = _sw_json_key_str(json, "reasoning_content", NULL);
                 if (rp) {
-                    rp += 21;
                     size_t rtok_len = 0;
-                    while (*rp && *rp != '"' && rtok_len < SW_HPS_TOK_CAP - 4) {
+                    while (*rp && *rp != '"' && rtok_len < tok_cap - 4) {
                         if (*rp == '\\' && *(rp + 1)) {
                             char esc = *(rp + 1);
                             switch (esc) {
@@ -2998,16 +3078,15 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
             /* Native function-calling channel: reassemble fragmented
              * tool_calls. Runs BEFORE the content `continue` below — a
              * tool-call-only delta usually carries no `content` field. */
-            if (tcs && strstr(json, "\"tool_calls\":")) {
+            if (tcs && strstr(json, "\"tool_calls\"")) {
                 _sw_parse_tc_deltas(json, tcs, &tc_count);
             }
 
-            const char *p = strstr(json, "\"content\":\"");
+            const char *p = _sw_json_key_str(json, "content", NULL);
             if (!p) continue;
-            p += 11;
 
             size_t tok_len = 0;
-            while (*p && *p != '"' && tok_len < SW_HPS_TOK_CAP - 4) {
+            while (*p && *p != '"' && tok_len < tok_cap - 4) {
                 if (*p == '\\' && *(p + 1)) {
                     char esc = *(p + 1);
                     switch (esc) {
@@ -3319,8 +3398,10 @@ static sw_val_t *_builtin_http_post_stream(sw_val_t **a, int n) {
      * previous response was incomplete. */
     /* Snapshot whether the stream produced anything real BEFORE we append
      * any truncation marker (the marker would otherwise mask an empty turn).
-     * "Real" = streamed content OR at least one reassembled tool call. */
-    int produced_output = (buf_len > 0) || (tc_count > 0);
+     * "Real" = streamed content, a reassembled tool call, or reasoning: a
+     * reasoning-only reply is the model's answer (the agent tells the user
+     * it reasoned but said nothing), not a transport failure to retry. */
+    int produced_output = (buf_len > 0) || (tc_count > 0) || (reason_len > 0);
 
     const char *trunc_marker = NULL;
     if (interrupted) {
@@ -4700,6 +4781,7 @@ static sw_val_t *_sw_db_row_to_map(sqlite3_stmt *stmt) {
 }
 
 static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
     int slot = (int)a[0]->v.i;
@@ -4733,6 +4815,7 @@ static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_list(NULL, 0);
     int slot = (int)a[0]->v.i;
@@ -5252,6 +5335,87 @@ static sw_val_t *_builtin_shell_sandboxed(sw_val_t **a, int n) {
 #endif
 }
 
+/* Make command output safe to hand to a model: valid UTF-8 is kept (it used
+ * to be stripped to printable ASCII, so `echo café` came back as "caf" and
+ * every CJK file name vanished), each run of invalid bytes becomes one
+ * U+FFFD, ANSI escape sequences are removed whole, and other control bytes
+ * are dropped (\t \n \r kept). Output that is mostly undecodable is
+ * binary: the caller gets a "[binary output — N bytes, not text]"
+ * placeholder instead. Returns a malloc'd NUL-terminated string. */
+static int _sw_utf8_valid_len(const unsigned char *p, size_t avail) {
+    unsigned char c = p[0];
+    int n; uint32_t cp;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; cp = c & 0x07; }
+    else return 0;
+    if ((size_t)n > avail) return 0;
+    for (int i = 1; i < n; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    if ((n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000)) return 0;  /* overlong */
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0;                          /* surrogate */
+    if (cp > 0x10FFFF) return 0;
+    return n;
+}
+
+static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_len) {
+    /* Worst case every byte starts an invalid run: 3 bytes of U+FFFD each. */
+    char *buf = (char *)malloc(raw_len * 3 + 64);
+    if (!buf) return NULL;
+    const unsigned char *u = (const unsigned char *)raw;
+    size_t len = 0, bad = 0, i = 0;
+    int in_bad_run = 0;
+    while (i < raw_len) {
+        unsigned char c = u[i];
+        if (c == 0x1B) {                         /* ANSI escape: skip it whole */
+            i++;
+            if (i < raw_len && u[i] == '[') {    /* CSI ... final byte 0x40-0x7E */
+                i++;
+                while (i < raw_len && !(u[i] >= 0x40 && u[i] <= 0x7E)) i++;
+                if (i < raw_len) i++;
+            } else if (i < raw_len && u[i] == ']') {   /* OSC ... BEL or ESC \ */
+                i++;
+                while (i < raw_len && u[i] != 0x07 && !(u[i] == 0x1B && i + 1 < raw_len && u[i + 1] == '\\')) i++;
+                if (i < raw_len) i += (u[i] == 0x07) ? 1 : 2;
+            } else if (i < raw_len) {
+                i++;
+            }
+            in_bad_run = 0;
+            continue;
+        }
+        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E)) {
+            buf[len++] = (char)c; i++; in_bad_run = 0; continue;
+        }
+        if (c >= 0x80) {
+            int n = _sw_utf8_valid_len(u + i, raw_len - i);
+            if (n > 0) {
+                memcpy(buf + len, u + i, (size_t)n);
+                len += (size_t)n; i += (size_t)n; in_bad_run = 0;
+                continue;
+            }
+            bad++;
+            if (!in_bad_run) {                   /* one U+FFFD per invalid run */
+                buf[len++] = (char)0xEF; buf[len++] = (char)0xBF; buf[len++] = (char)0xBD;
+                in_bad_run = 1;
+            }
+            i++;
+            continue;
+        }
+        bad++;                                   /* other C0 control / DEL: drop */
+        i++;
+    }
+    buf[len] = 0;
+    /* Mostly undecodable (or nothing decodable at all) means binary. */
+    if (raw_len > 0 && (len == 0 || (raw_len >= 32 && bad * 10 > raw_len * 3))) {
+        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
+        len = strlen(buf);
+    }
+    *out_len = len;
+    return buf;
+}
+
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
@@ -5270,10 +5434,28 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     size_t wrapcap = cmdlen + 1024;
     char *wrapped = (char *)malloc(wrapcap);
     if (!wrapped) return sw_val_nil();
+    /* The newline (not "; ") ends cmd: a trailing `# comment` or heredoc
+     * terminator used to swallow the rest of the wrapper, and a trailing
+     * `&` made "& ;" a syntax error. */
     snprintf(wrapped, wrapcap,
-        "{ %s ; echo $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
-    system(wrapped);
+        "{ %s\necho $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
+    int launch = system(wrapped);
     free(wrapped);
+    /* The launching sh backgrounds the group and exits 0. Anything else
+     * means the command never started (a parse error, or E2BIG for a huge
+     * command line) — the exit file will never appear, so fail now instead
+     * of polling for the full timeout. */
+    if (launch != 0) {
+        swbs_unlink(outf);
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "error: /bin/sh could not start the command (%s)",
+                 launch == -1 ? "fork/exec failed" : "syntax error or argument list too long");
+        sw_val_t *items[2];
+        items[0] = sw_val_int(launch == -1 ? -1 : 2);
+        items[1] = sw_val_string(msg);
+        return sw_val_tuple(items, 2);
+    }
 
     /* Poll for the exit file with an ADAPTIVE backoff (2ms -> 250ms).
      *
@@ -5407,11 +5589,10 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     }
     swbs_unlink(exitf);
 
-    /* Read full output, sanitizing non-printable bytes.
-     * Binary output (gzipped pages, encrypted files, images) poisons
-     * the model's context and causes empty responses.  We keep only
-     * printable ASCII (0x20-0x7E) plus \t \n \r.  If the result is
-     * entirely binary (sanitized length is 0), return a placeholder.
+    /* Read full output, then sanitize it (_sw_sanitize_output): binary
+     * output (gzipped pages, encrypted files, images) poisons the model's
+     * context and causes empty responses, so undecodable bytes are
+     * replaced and mostly-binary output becomes a placeholder.
      * Buffer grows from 64KB on demand — long pages or large shell
      * outputs no longer truncate at the cap. */
     size_t cap = 65536, raw_len = 0;
@@ -5436,23 +5617,10 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     }
     swbs_unlink(outf);
 
-    /* Sanitize: strip non-printable bytes in-place */
     size_t len = 0;
-    char *buf = (char *)malloc(raw_len + 64);
-    if (!buf) { free(raw); return sw_val_nil(); }
-    for (size_t i = 0; i < raw_len; i++) {
-        unsigned char c = (unsigned char)raw[i];
-        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E))
-            buf[len++] = (char)c;
-    }
-    buf[len] = 0;
+    char *buf = _sw_sanitize_output(raw, raw_len, &len);
     free(raw);
-
-    /* If all content was binary, say so */
-    if (len == 0 && raw_len > 0) {
-        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
-        len = strlen(buf);
-    }
+    if (!buf) return sw_val_nil();
 
     /* Return {status, output} tuple */
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * 2);
@@ -5505,6 +5673,7 @@ static sw_val_t *_sw_managed_tuple(int code, const char *msg) {
 }
 
 static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_managed_tuple(-1, "error: shell_managed needs a string command");
 #ifdef _WIN32
@@ -5616,21 +5785,10 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
     if (oom) { free(raw); return _sw_managed_tuple(-1, "error: out of memory capturing output"); }
     raw[raw_len] = 0;
 
-    /* Sanitize: keep printable ASCII + \t \n \r (binary poisons the model). */
     size_t len = 0;
-    char *buf = (char *)malloc(raw_len + 64);
-    if (!buf) { free(raw); return _sw_managed_tuple(-1, "error: out of memory"); }
-    for (size_t i = 0; i < raw_len; i++) {
-        unsigned char c = (unsigned char)raw[i];
-        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0x7E))
-            buf[len++] = (char)c;
-    }
-    buf[len] = 0;
+    char *buf = _sw_sanitize_output(raw, raw_len, &len);
     free(raw);
-    if (len == 0 && raw_len > 0) {
-        snprintf(buf, 63, "[binary output — %zu bytes, not text]", raw_len);
-        len = strlen(buf);
-    }
+    if (!buf) return _sw_managed_tuple(-1, "error: out of memory");
 
     sw_val_t *items[3];
     items[0] = sw_val_int(status);
@@ -5655,6 +5813,7 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
  * (shell tools self-watch inside shell_managed), so stdin has a single
  * reader at any moment. */
 static sw_val_t *_builtin_read_key(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
 #ifdef _WIN32
     (void)a; (void)n;
     return sw_val_nil();
@@ -5810,7 +5969,7 @@ static sw_val_t *_builtin_shell_detached(sw_val_t **a, int n) {
         size_t wlen = strlen(cmd) + strlen(exit_path) + 32;
         char *wrapper = (char *)malloc(wlen);
         if (!wrapper) _exit(127);
-        snprintf(wrapper, wlen, "( %s ); echo $? > %s", cmd, exit_path);
+        snprintf(wrapper, wlen, "( %s\n); echo $? > %s", cmd, exit_path);
         execl("/bin/sh", "sh", "-c", wrapper, (char *)NULL);
         _exit(127);                            /* exec failed */
     }
@@ -5880,6 +6039,47 @@ static void _json_putc(char **buf, size_t *cap, size_t *pos, char c) {
     (*buf)[(*pos)++] = c;
 }
 
+/* Quoted, escaped JSON string. Output is always valid UTF-8: each invalid
+ * byte becomes \ufffd (file_read of a Latin-1 file, or a truncated
+ * multi-byte character, used to put raw bytes into LLM request bodies,
+ * which strict providers reject). */
+static void _json_encode_str(const char *str, char **buf, size_t *cap, size_t *pos) {
+    _json_putc(buf, cap, pos, '"');
+    const unsigned char *p = (const unsigned char *)str;
+    size_t n = strlen(str), i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        switch (c) {
+            case '"':  _json_append(buf, cap, pos, "\\\""); i++; continue;
+            case '\\': _json_append(buf, cap, pos, "\\\\"); i++; continue;
+            case '\n': _json_append(buf, cap, pos, "\\n"); i++; continue;
+            case '\r': _json_append(buf, cap, pos, "\\r"); i++; continue;
+            case '\t': _json_append(buf, cap, pos, "\\t"); i++; continue;
+            default: break;
+        }
+        if (c < 0x20 || c == 0x7F) {
+            char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", c);
+            _json_append(buf, cap, pos, esc);
+            i++;
+        } else if (c < 0x80) {
+            _json_putc(buf, cap, pos, (char)c);
+            i++;
+        } else {
+            int len = _sw_utf8_valid_len(p + i, n - i);
+            if (len > 0) {
+                _json_grow(buf, cap, *pos, (size_t)len);
+                memcpy(*buf + *pos, p + i, (size_t)len);
+                *pos += (size_t)len;
+                i += (size_t)len;
+            } else {
+                _json_append(buf, cap, pos, "\\ufffd");
+                i++;
+            }
+        }
+    }
+    _json_putc(buf, cap, pos, '"');
+}
+
 static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) {
     if (!v || v->type == SW_VAL_NIL) {
         _json_append(buf, cap, pos, "null");
@@ -5888,38 +6088,20 @@ static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) 
         snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.i);
         _json_append(buf, cap, pos, tmp);
     } else if (v->type == SW_VAL_FLOAT) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
-        _json_append(buf, cap, pos, tmp);
-    } else if (v->type == SW_VAL_STRING) {
-        _json_append(buf, cap, pos, "\"");
-        /* Escape string contents — buffer grows as needed via _json_putc. */
-        for (const char *p = v->v.str; *p; p++) {
-            switch (*p) {
-                case '"':  _json_append(buf, cap, pos, "\\\""); break;
-                case '\\': _json_append(buf, cap, pos, "\\\\"); break;
-                case '\n': _json_append(buf, cap, pos, "\\n"); break;
-                case '\r': _json_append(buf, cap, pos, "\\r"); break;
-                case '\t': _json_append(buf, cap, pos, "\\t"); break;
-                default:
-                    if ((unsigned char)*p < 0x20) {
-                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
-                        _json_append(buf, cap, pos, esc);
-                    } else {
-                        _json_putc(buf, cap, pos, *p);
-                    }
-            }
+        /* JSON has no NaN/Infinity literals. */
+        if (isnan(v->v.f) || isinf(v->v.f)) { _json_append(buf, cap, pos, "null"); }
+        else {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            _json_append(buf, cap, pos, tmp);
         }
-        _json_append(buf, cap, pos, "\"");
+    } else if (v->type == SW_VAL_STRING) {
+        _json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_ATOM) {
         if (strcmp(v->v.str, "true") == 0) _json_append(buf, cap, pos, "true");
         else if (strcmp(v->v.str, "false") == 0) _json_append(buf, cap, pos, "false");
         else if (strcmp(v->v.str, "nil") == 0) _json_append(buf, cap, pos, "null");
-        else {
-            _json_append(buf, cap, pos, "\"");
-            _json_append(buf, cap, pos, v->v.str);
-            _json_append(buf, cap, pos, "\"");
-        }
+        else _json_encode_str(v->v.str, buf, cap, pos);
     } else if (v->type == SW_VAL_LIST || v->type == SW_VAL_TUPLE) {
         _json_append(buf, cap, pos, "[");
         for (int i = 0; i < v->v.tuple.count; i++) {
@@ -5931,17 +6113,17 @@ static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) 
         _json_append(buf, cap, pos, "{");
         for (int i = 0; i < v->v.map.count; i++) {
             if (i > 0) _json_append(buf, cap, pos, ",");
-            /* Key: always stringify */
-            _json_append(buf, cap, pos, "\"");
+            /* Key: always stringify (and escape — a key holding a quote or
+             * backslash used to produce invalid JSON). */
             if (v->v.map.keys[i]->type == SW_VAL_STRING ||
                 v->v.map.keys[i]->type == SW_VAL_ATOM)
-                _json_append(buf, cap, pos, v->v.map.keys[i]->v.str);
+                _json_encode_str(v->v.map.keys[i]->v.str, buf, cap, pos);
             else {
                 char tmp[64];
-                snprintf(tmp, sizeof(tmp), "%lld", (long long)v->v.map.keys[i]->v.i);
+                snprintf(tmp, sizeof(tmp), "\"%lld\"", (long long)v->v.map.keys[i]->v.i);
                 _json_append(buf, cap, pos, tmp);
             }
-            _json_append(buf, cap, pos, "\":");
+            _json_append(buf, cap, pos, ":");
             _json_encode_val(v->v.map.vals[i], buf, cap, pos);
         }
         _json_append(buf, cap, pos, "}");
@@ -5969,6 +6151,13 @@ static sw_val_t *_builtin_json_encode(sw_val_t **a, int n) {
 /* === JSON decode: JSON string → sw_val_t === */
 
 static sw_val_t *_json_parse(const char **pp);
+
+/* Set by the parser on malformed input (unterminated string/array/object,
+ * a bad token, garbage between elements); json_decode then returns nil.
+ * The parser used to be lenient: `{"command":"rm -rf build` decoded to a
+ * complete map, so an LLM tool call cut off mid-argument still ran.
+ * Trailing commas stay accepted. */
+static __thread int g_json_err = 0;
 
 static void _json_skip_ws(const char **pp) {
     while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
@@ -6085,6 +6274,7 @@ static sw_val_t *_json_parse_string(const char **pp) {
         if (len >= cap - 1) { cap *= 2; buf = (char *)realloc(buf, cap); }
     }
     if (**pp == '"') (*pp)++;
+    else g_json_err = 1;                  /* unterminated string */
     buf[len] = 0;
     sw_val_t *r = sw_val_string(buf);
     free(buf);
@@ -6107,14 +6297,16 @@ static sw_val_t *_json_parse_array(const char **pp) {
     _json_skip_ws(pp);
     int cap = 64, cnt = 0;
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
-    while (**pp && **pp != ']' && !g_json_abort) {
+    while (**pp && **pp != ']' && !g_json_abort && !g_json_err) {
         items[cnt++] = _json_parse(pp);
         if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
         _json_skip_ws(pp);
         if (**pp == ',') (*pp)++;
+        else if (**pp != ']') g_json_err = 1;    /* garbage between elements */
         _json_skip_ws(pp);
     }
     if (**pp == ']') (*pp)++;
+    else g_json_err = 1;                          /* unterminated array */
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);
     g_json_depth--;
@@ -6129,23 +6321,26 @@ static sw_val_t *_json_parse_object(const char **pp) {
     int cap = 32, cnt = 0;
     sw_val_t **keys = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
     sw_val_t **vals = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
-    while (**pp && **pp != '}' && !g_json_abort) {
+    while (**pp && **pp != '}' && !g_json_abort && !g_json_err) {
         _json_skip_ws(pp);
-        if (**pp != '"') break;
+        if (**pp != '"') { if (**pp != '}') g_json_err = 1; break; }
         /* Parse key as atom (for dot access) */
         sw_val_t *key_str = _json_parse_string(pp);
         keys[cnt] = sw_val_atom(key_str->v.str);
         _json_skip_ws(pp);
         if (**pp == ':') (*pp)++;
+        else { g_json_err = 1; break; }            /* key without ':' */
         _json_skip_ws(pp);
         vals[cnt] = _json_parse(pp);
         cnt++;
         if (cnt >= cap) { cap *= 2; keys = (sw_val_t **)realloc(keys, sizeof(sw_val_t *) * cap); vals = (sw_val_t **)realloc(vals, sizeof(sw_val_t *) * cap); }
         _json_skip_ws(pp);
         if (**pp == ',') (*pp)++;
+        else if (**pp != '}') g_json_err = 1;    /* garbage between members */
         _json_skip_ws(pp);
     }
     if (**pp == '}') (*pp)++;
+    else g_json_err = 1;                          /* unterminated object */
     sw_val_t *r = sw_val_map_new(keys, vals, cnt);
     free(keys);
     free(vals);
@@ -6168,7 +6363,7 @@ static sw_val_t *_json_parse(const char **pp) {
     while (**pp >= '0' && **pp <= '9') (*pp)++;
     if (**pp == '.') { is_float = 1; (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
     if (**pp == 'e' || **pp == 'E') { is_float = 1; (*pp)++; if (**pp == '+' || **pp == '-') (*pp)++; while (**pp >= '0' && **pp <= '9') (*pp)++; }
-    if (*pp == start) { if (**pp) (*pp)++; return sw_val_nil(); } /* fuzz_json: guard NUL before advance on unrecognized token */
+    if (*pp == start) { g_json_err = 1; if (**pp) (*pp)++; return sw_val_nil(); } /* fuzz_json: guard NUL before advance on unrecognized token */
     char tmp[64];
     size_t numlen = *pp - start;
     if (numlen > 63) numlen = 63;
@@ -6181,8 +6376,12 @@ static sw_val_t *_json_parse(const char **pp) {
 static sw_val_t *_builtin_json_decode(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
     const char *p = a[0]->v.str;
-    g_json_depth = 0; g_json_abort = 0;   /* reset the per-decode depth guard */
-    return _json_parse(&p);
+    g_json_depth = 0; g_json_abort = 0; g_json_err = 0;   /* per-decode state */
+    sw_val_t *r = _json_parse(&p);
+    _json_skip_ws(&p);
+    if (*p) g_json_err = 1;               /* trailing data after the value */
+    if (g_json_err || g_json_abort) return sw_val_nil();
+    return r;
 }
 
 /* === File I/O extensions === */
@@ -6606,7 +6805,9 @@ static sw_val_t *_builtin_parse_gemma_calls(sw_val_t **a, int n) {
         json_buf[json_len] = '\0';
 
         const char *jp = json_buf;
+        g_json_depth = 0; g_json_abort = 0; g_json_err = 0;
         sw_val_t *decoded = _json_parse(&jp);
+        if (g_json_err || g_json_abort) decoded = NULL;   /* malformed call: skip it */
         free(json_buf);
 
         if (decoded && decoded->type == SW_VAL_MAP) {
@@ -8060,6 +8261,7 @@ static void _sw_rl_done(void) {
 }
 
 static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     const char *prompt = (n >= 1 && a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : NULL;
 
     /* Fall back to canonical line read if not a TTY (piped input, tests). */
@@ -8476,6 +8678,7 @@ static sw_val_t *_builtin_read_line(sw_val_t **a, int n) {
  * avoid racing with the main input loop on stdin.
  */
 static sw_val_t *_builtin_read_choice(sw_val_t **a, int n) {
+    SW_BLOCKING_SCOPE();
     if (n < 2) return sw_val_int(-1);
     const char *header = (a[0] && a[0]->type == SW_VAL_STRING) ? a[0]->v.str : "";
     sw_val_t *opts = a[1];
