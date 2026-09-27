@@ -83,6 +83,35 @@ build and run of programs that import dependency modules, conflicts, bad refs,
 unreachable remotes, missing git, and name/URL/ref injection attempts (a canary file
 must never appear). It runs in CI on Linux and macOS. Reference:
 [docs/PACKAGES.md](PACKAGES.md).
+## 2026-09-27 — durable agent state
+
+**feat(lang): `checkpoint` / `restore` / `checkpoint_delete` keep agent state across
+OS-process restarts.** When the OS process died, every process's state went with it.
+`checkpoint(key, value)` now writes any sw value to one SQLite table in `SW_STATE_DB`
+(default `./.swarm/state.db`) as a single atomic `INSERT OR REPLACE` (WAL,
+`synchronous=FULL`) and returns `'ok'` or `{'error', reason}`; `restore(key)` returns
+it after a restart, or `nil`. Values use the distribution layer's type-preserving
+encoding (`sw_marshal`) behind a versioned header, so atoms, tuples, maps and binary
+bytes come back exactly; JSON would have turned them into strings and lists. Pids and
+funs are rejected with `{'error', 'not_serializable'}` instead of being stored as nil,
+since a pid means nothing to the next OS process. Encodings that would truncate a
+tuple, map or atom are rejected too. The calls run inside a blocking section, so the
+other processes on that scheduler keep running during disk I/O. The interpreter and
+compiled binaries share one implementation (`sw_durable_*` in `swarmrt_node.c`). The
+tool-registry lint requires the `db` capability for all three.
+
+**feat(lib): `lib/Durable.sw`.** `Durable.loop(key, init, step)` restores the saved
+state, calls `step` until it returns `{'done', result}`, checkpoints after every
+`{'next', state}` and clears the key when done. `load` / `save` / `clear` are the
+pieces for a hand-written loop, such as a supervised worker that loads its state on
+start.
+
+Gates: `tests/sw/test_durable.sw` (36). It round-trips every value type and checks
+the rejections. A child SIGKILLs itself partway through a step, and the re-run
+resumes from the last checkpoint with no step lost or repeated. `Durable.loop` is
+killed and resumed the same way. A `dyn_supervisor` child that panics comes back with
+its checkpointed count. `tests/sw/conform/t19_durable.sw` checks interpreter =
+compiled; `run_conform.sh` now gives each program its own empty `SW_STATE_DB`.
 
 ## 2026-09-24 — batteries out of core
 

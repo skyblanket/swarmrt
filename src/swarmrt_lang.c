@@ -4799,6 +4799,15 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
 #endif
     }
 
+    /* === Durable state (shared impl in swarmrt_node.c — same db, same
+     * encoding, same results as compiled) ======================== */
+    if (strcmp(fname, "checkpoint") == 0)
+        return sw_durable_checkpoint(nargs >= 1 ? args[0] : NULL, nargs >= 2 ? args[1] : NULL);
+    if (strcmp(fname, "restore") == 0)
+        return sw_durable_restore(nargs >= 1 ? args[0] : NULL);
+    if (strcmp(fname, "checkpoint_delete") == 0)
+        return sw_durable_delete(nargs >= 1 ? args[0] : NULL);
+
     /* === SQLite ================================================ */
     if (strcmp(fname, "db_open") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
         int slot = -1;
@@ -6778,7 +6787,7 @@ static const char *k_interp_builtins[] = {
     "audio_resample_b","audio_ulaw_to_pcm16","audio_ulaw_to_pcm16_b",
     "base64_decode","base64_encode","byte","byte_at","byte_size","byte_slice",
     "bytes_concat","bytes_from_base64","bytes_from_ints","bytes_to_base64",
-    "bytes_to_string","codepoint_at","db_close","db_exec","db_open","db_query",
+    "bytes_to_string","checkpoint","checkpoint_delete","codepoint_at","db_close","db_exec","db_open","db_query",
     "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_drop","ets_get",
     "ets_list","ets_new","ets_put","ets_take","ets_update","ets_update_counter",
     "exec_argv","expect","file_append","file_delete","file_exists","file_list",
@@ -6786,7 +6795,7 @@ static const char *k_interp_builtins[] = {
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above","eprint","stdout_to_stderr","fd_write",
-    "pid_kill_group","random_int","read_key","reduce","rl_history_append","rl_history_load",
+    "pid_kill_group","random_int","read_key","reduce","restore","rl_history_append","rl_history_load",
     "shell","shell_detached","shell_managed","shell_sandboxed","sleep",
     "stdin_pending_push","stdin_take_pending","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
@@ -6804,6 +6813,8 @@ int interp_is_known_builtin(const char *name) {
 static const char *lint_required_cap(const char *name) {
     if (strncmp(name, "file_", 5) == 0) return "file";
     if (strncmp(name, "db_", 3) == 0)   return "db";
+    if (strcmp(name, "checkpoint") == 0 || strcmp(name, "restore") == 0 ||
+        strcmp(name, "checkpoint_delete") == 0) return "db";   /* the state db */
     if (strcmp(name, "shell") == 0 || strcmp(name, "shell_sandboxed") == 0 ||
         strcmp(name, "shell_managed") == 0 ||
         strcmp(name, "shell_detached") == 0 ||

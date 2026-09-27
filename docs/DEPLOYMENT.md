@@ -66,6 +66,7 @@ noted. **Every one is optional**; the defaults are the product defaults.
 | `SW_NO_SIGNAL_SHUTDOWN` | off | If set, the runtime does NOT install SIGTERM/SIGINT handlers (for embedders that own signal disposition). |
 | `SW_NODE_BIND` | `127.0.0.1` | Address the distribution listener binds (`node_start`). Set `0.0.0.0` (with `SW_NODE_COOKIE`) for multi-host clusters. |
 | `SW_NODE_COOKIE` | unset | Shared secret; every distribution frame carries a SHA-256 MAC and frames that fail it are dropped. Use the same value on every node. |
+| `SW_STATE_DB` | `./.swarm/state.db` | SQLite file behind `checkpoint` / `restore` / `checkpoint_delete` (durable agent state). Relative paths resolve against the working directory; missing parent directories are created. Point it at a persistent volume in containers. |
 | `SW_OFFLOAD_THREADS` | `256` | Max worker threads for blocking builtins (HTTP client, `exec_argv`, `shell_sandboxed`). `SW_OFFLOAD=0` runs them inline on the scheduler thread (old behavior). |
 | `LLM_URL` / `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` | unset | Endpoint (or provider: `openai`, `ollama`, `otonomy`), model and key for `llm_complete` / `llm_stream`. There is no default endpoint: with neither `LLM_URL` nor a provider, both fail with a message saying so. Provider keys (`OPENAI_API_KEY`, `OTONOMY_API_KEY`) are only sent to their own provider's https host. |
 | `SWARMRT_HOME` | the parent of `swc`'s directory | Install root `swc` reads headers (`src/`), `libswarmrt.a` (`bin/`), the stdlib (`lib/`) and templates from. Set it only for a relocated install. |
@@ -129,7 +130,9 @@ Because a SwarmRT program is one native binary that boots in well under 10 ms,
 the recovery model is **restart, not in-place patch**:
 
 1. Flush durable state to **SQLite** (see below) — this happens continuously if
-   your program persists as it goes.
+   your program persists as it goes. `checkpoint(key, value)` /
+   `restore(key)` (or `lib/Durable.sw`'s `Durable.loop`) do this for any sw
+   value in one call each.
 2. Receive SIGTERM → graceful drain (above) → exit.
 3. An **external supervisor** (systemd, a container orchestrator, or a parent
    process) restarts the binary.
@@ -174,7 +177,12 @@ you can run the health server alongside your own work in the same node.
 ## Backup & disaster recovery
 
 - **SQLite is the durable store.** Everything you need to survive a restart must
-  be written via the `db_*` builtins. Writes are per-statement autocommit;
+  be written via `checkpoint` (whole sw values, keyed, into `SW_STATE_DB`) or
+  the `db_*` builtins (your own schema). A `checkpoint` that returned `'ok'` is
+  committed (WAL, `synchronous=FULL`). The state db is an ordinary SQLite file
+  with one table, `checkpoints(key, value, updated_at)`; back it up like any
+  other. Its value encoding is native byte order, so restore on a machine of the
+  same endianness (every supported target is little-endian). Writes are per-statement autocommit;
   graceful shutdown lets in-flight writers finish. Back up the SQLite file(s)
   with normal SQLite backup practice (`.backup`, WAL-aware copy, or filesystem
   snapshot of a quiesced instance).

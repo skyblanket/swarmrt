@@ -811,6 +811,66 @@ Tools are pure logic — process primitives degrade to `nil` inside them, and a 
 | `db_query(h, sql, [args])` | `?` parameters; returns list of `%{col: value}` row maps |
 | `db_close(h)` | `'ok'` |
 
+### Durable state
+Agent state that survives the OS process dying (crash, redeploy, restart under
+a supervisor). Values go to one SQLite table in `$SW_STATE_DB` (default
+`./.swarm/state.db`, directory created) using the same type-preserving
+encoding as distribution, so atoms stay atoms, tuples stay tuples and bytes
+stay binary-clean. Same database, same encoding and same results on both
+execution paths.
+
+| | |
+|---|---|
+| `checkpoint(key, value)` | `'ok'` or `{'error', reason}`. `key` is a string. One atomic write (WAL, `synchronous=FULL`): once it returns `'ok'` the value survives a crash. Replaces any earlier value for `key` |
+| `restore(key)` | the last checkpointed value, or `nil` if none (also `nil` for an unreadable db or a corrupt entry, with a note on stderr) |
+| `checkpoint_delete(key)` | `'ok'` (also when `key` was not set) or `{'error', reason}` |
+
+Rejections (nothing is written): pids and funs, anywhere in the value, are
+`{'error', 'not_serializable'}` — a pid means nothing in the next OS process,
+so store a registered name instead. A non-string key is `{'error', 'bad_key'}`;
+a tuple, map or atom too large for the encoding is `{'error', 'too_large'}`,
+nesting more than ~250 levels deep is `{'error', 'too_deep'}`, and a SQLite
+failure is `{'error', message_string}`. Checkpointing `nil` stores `nil`, which
+`restore` cannot tell from "nothing saved" — use `checkpoint_delete`. These
+calls do disk I/O; other processes on the same scheduler keep running.
+
+`import Durable` wraps the pattern: `Durable.loop(key, init, step)` restores
+the saved state (or starts from `init`), calls `step(state)`, checkpoints after
+every `{'next', new_state}`, and on `{'done', result}` clears the key and
+returns `result`. `Durable.load(key, init)`, `Durable.save(key, state)`
+(panics if the checkpoint fails) and `Durable.clear(key)` are the pieces.
+A crash inside a step re-runs that step from the previous checkpoint, so keep
+step side effects idempotent.
+
+```sw
+module Demo
+import Durable
+
+fun step(n) {
+    if (n < 3) { {'next', n + 1} } else { {'done', n * 100} }
+}
+
+fun main() {
+    print(Durable.loop("demo:counter", 0, fun(n) { step(n) }))   # prints 300
+}
+```
+
+A supervised worker picks up where its crashed predecessor stopped by
+loading its state on start:
+
+```sw
+import Durable
+
+fun worker() { worker_loop(Durable.load("worker:count", 0)) }
+
+fun worker_loop(n) {
+    receive {
+        'inc' -> Durable.save("worker:count", n + 1) ; worker_loop(n + 1)
+        'boom' -> panic("boom")    # the restarted worker resumes at n
+    }
+}
+```
+
 ### Sandboxed shell
 | | |
 |---|---|
