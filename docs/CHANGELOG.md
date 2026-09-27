@@ -4,6 +4,16 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-27 — maps: O(1) adds and hashed lookups
+
+**perf(maps): building a map one key at a time is linear.** `map_put` copied and
+scanned the whole map on every call (20,000 keys: 3,639 ms). A compiled map now lives
+in a shared, growable store with a hash index; a put that adds a key extends the store
+in place when the map owns its edge (the list-store technique), so older map values
+never see the new slot. 20,000 keys: 25 ms; 100,000: 137 ms. Values stay immutable:
+two maps branched from one base, replaced keys and atom/string key equivalence are
+pinned by `tests/sw/test_map_store.sw` (15).
+
 ## 2026-09-27 — `swc new`, and swc works from PATH and from a release archive
 
 **feat(swc): `swc new <name>` creates an agent project.** From `templates/agent`: one

@@ -47,12 +47,6 @@ the duration. With every scheduler thread inside one, nothing else runs.
 
 **Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
-### Maps are association arrays
-
-`map_get` / `map_put` are O(n) in the number of keys (`map_put` copies the map), so
-building a 20K-key map one key at a time is quadratic (~7s). Fine for the small maps
-agents pass around (JSON objects, options); for large keyed state use ETS.
-
 ### The HTTP server never frees a connection's port struct
 
 Closing a connection closes its socket (the per-connection fd leak is fixed), but the
@@ -94,6 +88,14 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### Building a map one key at a time was quadratic (cleared 2026-09-27)
+
+`map_put` copied the whole map and scanned it for the key, so 20,000 puts took 3.6s.
+Compiled maps now share a growable store with a hash index over string, atom and int
+keys: adding a key is amortised O(1) and `map_get` is a hash probe (20,000 keys: 25ms;
+100,000: 137ms). Replacing an existing key still copies the map (other values keep the
+old one). The interpreter keeps plain arrays. Gate: `tests/sw/test_map_store.sw`.
 
 ### Processes starved behind a blocked scheduler thread (cleared 2026-09-24)
 

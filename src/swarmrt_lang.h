@@ -83,6 +83,11 @@ struct sw_val {
             sw_val_t **vals;
             int count;
             int cap;
+            /* Arena-backed only: the growable store keys/vals live in, with a
+             * hash index (NULL = a plain exact-size map). Lets map_put add a
+             * key in O(1) when the map owns the store's edge, and map_get
+             * find one without a scan — see sw_val_map_put. */
+            struct sw_map_store *store;
         } map;
         struct {
             char *node;          /* node name string, owned */
