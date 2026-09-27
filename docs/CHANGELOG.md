@@ -4,6 +4,29 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-27 — `swc new`, and swc works from PATH and from a release archive
+
+**feat(swc): `swc new <name>` creates an agent project.** From `templates/agent`: one
+agent that can call a tool (`agent.sw`, `tools.sw`), a fan-out over `tasks.txt` with
+`Std.task_stream` (8 in flight, 30 s deadline each, `main.sw`), a Makefile, and offline
+tests against an in-process mock model, including an agent that crashes and one that
+hangs (`agent_test.sw`, about 3 s). `make test` needs no network and no API key.
+
+**fix(swc): swc found its headers, runtime library and stdlib relative to `argv[0]`.**
+Run as `swc` from `PATH`, that is just a name, so every build outside the checkout
+failed (`swarmrt_native.h: No such file`, `cannot resolve import 'Std'`). swc now uses
+its real path (`/proc/self/exe`, `_NSGetExecutablePath`, else a `PATH` search);
+`SWARMRT_HOME` overrides the install root.
+
+**fix(release): the archive could not build a program.** It shipped `swc` at the top
+level with three headers and no `lib/`, while swc looks for `<root>/src`, `<root>/bin`
+and `<root>/lib`. Archives now use that layout (`bin/`, `src/`, `lib/`, `templates/`),
+built by `scripts/install_layout.sh`. `scripts/install_smoke.sh` (`make test-install`,
+Linux and macOS CI, and the release job before upload) runs `swc new`, the new
+project's tests and a stdlib import from outside the repo.
+
+---
+
 ## 2026-09-24 — batteries out of core
 
 **change(lang): PDF, Chrome and the audio codecs are batteries you import.**

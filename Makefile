@@ -236,6 +236,12 @@ test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
 
+# The install path end to end: swc on PATH from an install laid out like a
+# release archive, `swc new`, and the new project's own tests.
+.PHONY: test-install
+test-install: swc libswarmrt
+	@bash scripts/install_smoke.sh
+
 # Security regression: the curl-backed HTTP builtins must not pass
 # caller-supplied URLs / headers through a shell. Builds the injection
 # probe and fails if any shell payload executes (canary file appears).
@@ -713,7 +719,7 @@ libswarmrt: core-objs
 swc: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
-		$(SRC_DIR)/swarmrt_battery_interp.c \
+		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c \
 		-o $(BIN_DIR)/swc $(LDFLAGS)
 
 # Example: compile a .sw file

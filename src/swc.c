@@ -36,6 +36,7 @@
 #include "swarmrt_codegen.h"
 #include "swarmrt_repl.h"
 #include "swarmrt_test.h"
+#include "swarmrt_new.h"
 #include "swarmrt_native.h"
 #include "swarmrt_io.h"
 #include <pthread.h>
@@ -49,6 +50,7 @@ static void usage(void) {
         "  emit     Output generated C to stdout\n"
         "  repl     Start interactive REPL\n"
         "  test     Run test_* functions in .sw files\n"
+        "  new      Create a project: swc new <name> [--template agent]\n"
         "  version  Print the swc/runtime version (also --version, -v)\n\n"
         "Options:\n"
         "  -o <name>          Output binary name (default: module name)\n"
@@ -350,6 +352,9 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
+    /* Every install-relative lookup below starts from argv[0]; make it the
+     * real path even when swc was found on PATH. */
+    argv[0] = (char *)sw_swc_self_path(argv[0]);
     sw_interp_batteries_install();   /* battery builtins for run/test/REPL */
 
     const char *cmd = argv[1];
@@ -369,6 +374,9 @@ int main(int argc, char **argv) {
     }
 
     /* REPL — no input files needed */
+    if (strcmp(cmd, "new") == 0)
+        return sw_new_main(argc, argv, argv[0]);
+
     if (strcmp(cmd, "repl") == 0)
         return sw_repl_start();
 

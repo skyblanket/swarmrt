@@ -97,6 +97,9 @@ jobs:
       - name: Run the sw test suite
         run: make test-sw
 
+      - name: Install smoke (swc on PATH, swc new, project tests, from outside the repo)
+        run: bash scripts/install_smoke.sh
+
       - name: Phase test suite (C-side runtime tests)
         # Was not in CI before round 7 — codex review caught that
         # multiple phase tests were failing locally while CI stayed
@@ -326,6 +329,9 @@ jobs:
 
       - name: sw test suite + interp/compiled conformance
         run: make test-sw
+
+      - name: Install smoke (swc on PATH, swc new, project tests)
+        run: bash scripts/install_smoke.sh
 
       - name: Docs + examples still compile
         run: bash scripts/check_sw_docs.sh

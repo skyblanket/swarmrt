@@ -67,15 +67,16 @@ jobs:
         run: |
           set -e
           PKG="swarmrt-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "dist/$PKG/include"
-          cp bin/swc "dist/$PKG/"
-          cp bin/libswarmrt.a "dist/$PKG/"
-          # Public headers an embedder links against.
-          cp src/swarmrt_native.h src/swarmrt_lang.h src/swarmrt_varena.h "dist/$PKG/include/" 2>/dev/null || true
-          cp VERSION README.md LICENSE "dist/$PKG/" 2>/dev/null || true
-          if [[ "${{ matrix.target }}" == linux-* ]]; then strip "dist/$PKG/swc" || true; fi
+          # bin/ src/ lib/ templates/: swc finds headers, libswarmrt.a, the
+          # stdlib and templates relative to its own binary. The old flat
+          # archive (swc at the top, three headers) could not build a program.
+          bash scripts/install_layout.sh "dist/$PKG"
+          if [[ "${{ matrix.target }}" == linux-* ]]; then strip "dist/$PKG/bin/swc" || true; fi
           tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
           ls -lh "dist/$PKG.tar.gz"
+
+      - name: Smoke — the packaged install, from outside the checkout
+        run: bash scripts/install_smoke.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -136,8 +137,10 @@ jobs:
             | `swarmrt-*-linux-x86_64.tar.gz` | Linux x86_64 |
             | `swarmrt-*-linux-arm64.tar.gz` | Linux ARM64 |
 
-            Each archive contains `swc`, `libswarmrt.a`, the public headers,
-            `README.md`, and `LICENSE`. See `docs/DEPLOYMENT.md` for operating a
+            Each archive contains `bin/swc`, `bin/libswarmrt.a`, the runtime
+            headers (`src/`), the stdlib (`lib/`), the project templates
+            (`templates/`), `README.md` and `LICENSE`. Put `bin/` on your PATH
+            and run `swc new myagent`. See `docs/DEPLOYMENT.md` for operating a
             compiled binary in production and `docs/CHANGELOG.md` for changes.
 
             Verify downloads against `checksums.txt`.
