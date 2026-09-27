@@ -45,6 +45,12 @@ for sw in "$CONFORM_DIR"/t*.sw; do
     bin="$BUILD_DIR/$name"
     total=$((total + 1))
 
+    # Durable-state builtins (checkpoint/restore) write $SW_STATE_DB: give
+    # each program a private db, emptied before each path so both start
+    # from the same (empty) state.
+    export SW_STATE_DB="$BUILD_DIR/$name.state.db"
+    rm -f "$SW_STATE_DB" "$SW_STATE_DB-wal" "$SW_STATE_DB-shm"
+
     # Path 1: interpreter
     SW_QUIET=1 "$SWC" run "$sw" > "$BUILD_DIR/$name.interp.out" 2>"$BUILD_DIR/$name.interp.err"
     interp_rc=$?
@@ -56,6 +62,7 @@ for sw in "$CONFORM_DIR"/t*.sw; do
         sed 's/^/    /' "$BUILD_DIR/$name.cc.log" | head -15
         continue
     fi
+    rm -f "$SW_STATE_DB" "$SW_STATE_DB-wal" "$SW_STATE_DB-shm"
     SW_QUIET=1 "$bin" > "$BUILD_DIR/$name.comp.out" 2>"$BUILD_DIR/$name.comp.err"
     comp_rc=$?
 

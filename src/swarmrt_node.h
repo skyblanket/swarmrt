@@ -128,4 +128,16 @@ int sw_node_peers(char names[][SW_NODE_NAME_MAX], int max);
 /* Check if a node is connected */
 int sw_node_is_connected(const char *name);
 
+/* === Durable state (checkpoint / restore) ===
+ * Persist a value under a string key in the SQLite state db ($SW_STATE_DB,
+ * default ./.swarm/state.db) so it survives an OS-process restart. Backs the
+ * checkpoint / restore / checkpoint_delete builtins on both execution paths.
+ * checkpoint → 'ok' | {'error', reason}; restore → value | nil (missing,
+ * unreadable or corrupt); delete → 'ok' | {'error', reason}. Blocking calls:
+ * they bracket their disk I/O with sw_blocking_enter/exit. Lives next to
+ * sw_marshal, whose encoding it stores. */
+sw_val_t *sw_durable_checkpoint(sw_val_t *key, sw_val_t *value);
+sw_val_t *sw_durable_restore(sw_val_t *key);
+sw_val_t *sw_durable_delete(sw_val_t *key);
+
 #endif /* SWARMRT_NODE_H */

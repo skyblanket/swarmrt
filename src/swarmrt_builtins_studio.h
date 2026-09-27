@@ -4848,6 +4848,28 @@ static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
     return r;
 }
 
+/* ============================================================
+ * Durable state — checkpoint a value to SQLite, restore it after restart
+ * ============================================================
+ *
+ *   checkpoint(key, value)  → 'ok' | {'error', reason}
+ *   restore(key)            → value | nil
+ *   checkpoint_delete(key)  → 'ok' | {'error', reason}
+ *
+ * Shared with the interpreter: the implementation (storage, encoding,
+ * blocking section) is sw_durable_* in swarmrt_node.c. */
+static sw_val_t *_builtin_checkpoint(sw_val_t **a, int n) {
+    return sw_durable_checkpoint(n >= 1 ? a[0] : NULL, n >= 2 ? a[1] : NULL);
+}
+
+static sw_val_t *_builtin_restore(sw_val_t **a, int n) {
+    return sw_durable_restore(n >= 1 ? a[0] : NULL);
+}
+
+static sw_val_t *_builtin_checkpoint_delete(sw_val_t **a, int n) {
+    return sw_durable_delete(n >= 1 ? a[0] : NULL);
+}
+
 /* ================================================================
  * Phase 13: Agent Stdlib Batteries
  *

@@ -331,6 +331,7 @@ The [`lib/`](lib/) directory ships modules that auto-resolve via `import` — no
 | `Prompt` | `{{var}}` template engine — render from a string or a file |
 | `Cron` | Wake scheduler — `Cron.every(ms, fn)` / `Cron.at("14:00", fn)` |
 | `Telemetry` | Event hub with stdout / file / JSONL sinks |
+| `Durable` | State that survives restarts — `Durable.loop(key, init, step)` restores, steps and checkpoints to SQLite (`SW_STATE_DB`) |
 
 ---
 
