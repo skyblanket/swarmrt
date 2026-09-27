@@ -67,7 +67,7 @@ noted. **Every one is optional**; the defaults are the product defaults.
 | `SW_NODE_BIND` | `127.0.0.1` | Address the distribution listener binds (`node_start`). Set `0.0.0.0` (with `SW_NODE_COOKIE`) for multi-host clusters. |
 | `SW_NODE_COOKIE` | unset | Shared secret; every distribution frame carries a SHA-256 MAC and frames that fail it are dropped. Use the same value on every node. |
 | `SW_OFFLOAD_THREADS` | `256` | Max worker threads for blocking builtins (HTTP client, `exec_argv`, `shell_sandboxed`). `SW_OFFLOAD=0` runs them inline on the scheduler thread (old behavior). |
-| `LLM_URL` / `LLM_API_KEY` | unset | Endpoint and key for `llm_complete` / `llm_stream`. Provider keys (`OPENAI_API_KEY`, `OTONOMY_API_KEY`) are only sent to their own provider's URL. |
+| `LLM_URL` / `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` | unset | Endpoint (or provider: `openai`, `ollama`, `otonomy`), model and key for `llm_complete` / `llm_stream`. There is no default endpoint: with neither `LLM_URL` nor a provider, both fail with a message saying so. Provider keys (`OPENAI_API_KEY`, `OTONOMY_API_KEY`) are only sent to their own provider's https host. |
 | `SW_LOG_JSON` | off | If `1`, every abnormal process exit emits one JSON line on stderr: `{"ev":"proc_crash","pid":N,"reason":R[,"msg"][,"name"],"ts":MS}`. The human-readable panic trace remains the default. |
 | `SW_VERBOSE` | off | `1` prints the startup banner (off by default). |
 | `SW_QUIET` / `SW_RUNTIME_QUIET` | off | Suppress the startup banner (even with `SW_VERBOSE`) and operational stderr notices. |
@@ -75,7 +75,7 @@ noted. **Every one is optional**; the defaults are the product defaults.
 | `SW_SCHED_TRACE` | off | Scheduler stall/interleave tracing (`1`/`2`) for diagnosing wedges. |
 
 > Provider/credential vars used by builtins (not runtime config): `OPENAI_API_KEY`,
-> `OTONOMY_API_KEY`, `LLM_URL`, `OLLAMA_HOST`. `SW_FAIL_ALLOC_AT` is a test-only
+> `OTONOMY_API_KEY`, `OLLAMA_HOST` (the `ollama` provider's base URL). `SW_FAIL_ALLOC_AT` is a test-only
 > fault-injection hook (compiled only under `-DSW_ALLOC_FAULT`).
 
 ---

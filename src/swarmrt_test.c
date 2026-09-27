@@ -64,7 +64,7 @@ int sw_test_run_file(const char *path) {
         void *mods[1] = { ast };
         int unresolved = sw_resolve_module(ast, mods, 1, path);
         if (unresolved) {
-            fprintf(stderr, "test: %d undefined name%s in '%s'\n",
+            fprintf(stderr, "test: %d name error%s in '%s'\n",
                     unresolved, unresolved == 1 ? "" : "s", path);
             return 1;
         }

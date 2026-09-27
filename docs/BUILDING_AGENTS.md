@@ -336,10 +336,12 @@ Like all process primitives, these run only in compiled binaries (`swc build`). 
 
 ## Tools that need a browser
 
-Use `chrome_launch` + the WebSocket client. No Playwright, no Node sidecar:
+Use the `Chrome` battery + the WebSocket client. No Playwright, no Node sidecar:
 
 ```sw
-port = chrome_launch()    # finds Chromium, spawns headed Chrome with CDP
+import Chrome
+
+port = Chrome.launch()    # finds Chromium, spawns headless Chrome with CDP
 # Connect via CDP, navigate, screenshot — full pipeline in
 # examples/http_echo.sw + swarm-code's browser.sw
 ```

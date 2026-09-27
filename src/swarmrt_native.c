@@ -336,6 +336,10 @@ static pthread_cond_t   g_watchdog_cond = PTHREAD_COND_INITIALIZER;
  * the I/O subsystem whether any live port could still wake a process. */
 int sw_io_active_port_count(void);
 
+/* Processes parked in sw_offload_run waiting for their job (defined with
+ * the offload pool below): the worker thread will wake them. */
+static _Atomic int g_off_parked;
+
 /*
  * watchdog_thread_fn — wakes periodically and checks for total deadlock.
  *
@@ -346,7 +350,12 @@ int sw_io_active_port_count(void);
  *   4. Has an empty mailbox: sig_head == NULL AND priv_head == NULL.
  *
  * If every live non-scheduler process meets (3)+(4) we warn once per
- * interval.  We do NOT warn on an empty swarm (live_count == 0).
+ * interval — unless something can still wake one: a live I/O port, a
+ * pending timer (every `receive ... after` and `sleep` is one) or an
+ * offload job in flight (http_*, llm_complete, exec_argv). Counting those
+ * as deadlocks warned on every slow HTTP call and every timed receive —
+ * the very fix the warning recommends. We do NOT warn on an empty swarm
+ * (live_count == 0).
  *
  * All reads are best-effort — we hold no locks.  A false positive is
  * possible if a message is in flight at the exact moment we scan; that
@@ -430,7 +439,15 @@ static void *watchdog_thread_fn(void *arg) {
          * That is not a deadlock — a live port can still wake them. */
         int active_ports = sw_io_active_port_count();
 
+        int wake_pending = 0;
         if (live_count > 0 && stuck_count == live_count && active_ports == 0) {
+            pthread_mutex_lock(&sw->timers.lock);
+            wake_pending = sw->timers.head != NULL;
+            pthread_mutex_unlock(&sw->timers.lock);
+            if (atomic_load_explicit(&g_off_parked, memory_order_acquire) > 0) wake_pending = 1;
+        }
+
+        if (live_count > 0 && stuck_count == live_count && active_ports == 0 && !wake_pending) {
             fprintf(stderr,
                 "[swarmrt] WARNING: all %d process%s blocked in `receive`"
                 " with an empty mailbox for >%lums — possible deadlock.\n"
@@ -4077,7 +4094,9 @@ void sw_offload_run(void (*fn)(void *), void *arg) {
         }
     }
 
+    atomic_fetch_add_explicit(&g_off_parked, 1, memory_order_acq_rel);
     sw_park_until(&j->done);
+    atomic_fetch_sub_explicit(&g_off_parked, 1, memory_order_acq_rel);
     offload_job_release(j);
 }
 

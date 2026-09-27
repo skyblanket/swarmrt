@@ -3242,3 +3242,71 @@ void sw_pdf_blocks_free(sw_pdf_text_block_t *blocks, int count) {
         free(blocks[i].text);
     free(blocks);
 }
+
+/* ============================================================
+ * sw builtins (the Pdf battery) — see swarmrt_pdf.h
+ * ============================================================ */
+#include "swarmrt_lang.h"
+
+/* The whole file, or NULL when it is missing, empty, over 100MB or short. */
+static uint8_t *pdf_read_file(sw_val_t **a, int n, long *out_sz) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING || !a[0]->v.str) return NULL;
+    FILE *fp = fopen(a[0]->v.str, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100 * 1024 * 1024) { fclose(fp); return NULL; }
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    if (!buf) { fclose(fp); return NULL; }
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (got != (size_t)sz) { free(buf); return NULL; }
+    *out_sz = sz;
+    return buf;
+}
+
+sw_val_t *sw_pdf_builtin_text(sw_val_t **a, int n) {
+    long sz = 0;
+    uint8_t *buf = pdf_read_file(a, n, &sz);
+    if (!buf) return sw_val_nil();
+    char *text = NULL;
+    size_t text_len = 0;
+    int rc = sw_pdf_extract_text(buf, (size_t)sz, &text, &text_len);
+    free(buf);
+    if (rc != SW_PDF_OK || !text) { free(text); return sw_val_nil(); }
+    sw_val_t *r = sw_val_string(text);
+    free(text);
+    return r;
+}
+
+sw_val_t *sw_pdf_builtin_pages(sw_val_t **a, int n) {
+    long sz = 0;
+    uint8_t *buf = pdf_read_file(a, n, &sz);
+    if (!buf) return sw_val_nil();
+    int count = 0;
+    int rc = sw_pdf_page_count(buf, (size_t)sz, &count);
+    free(buf);
+    if (rc != SW_PDF_OK) return sw_val_nil();
+    return sw_val_int(count);
+}
+
+sw_val_t *sw_pdf_builtin_meta(sw_val_t **a, int n) {
+    long sz = 0;
+    uint8_t *buf = pdf_read_file(a, n, &sz);
+    if (!buf) return sw_val_nil();
+    sw_pdf_meta_t meta;
+    int rc = sw_pdf_metadata(buf, (size_t)sz, &meta);
+    free(buf);
+    if (rc != SW_PDF_OK) return sw_val_nil();
+    sw_val_t *keys[5], *vals[5];
+    int mc = 0;
+    if (meta.title)         { keys[mc] = sw_val_string("title");         vals[mc] = sw_val_string(meta.title);         mc++; }
+    if (meta.author)        { keys[mc] = sw_val_string("author");        vals[mc] = sw_val_string(meta.author);        mc++; }
+    if (meta.subject)       { keys[mc] = sw_val_string("subject");       vals[mc] = sw_val_string(meta.subject);       mc++; }
+    if (meta.creator)       { keys[mc] = sw_val_string("creator");       vals[mc] = sw_val_string(meta.creator);       mc++; }
+    if (meta.creation_date) { keys[mc] = sw_val_string("creation_date"); vals[mc] = sw_val_string(meta.creation_date); mc++; }
+    sw_pdf_meta_free(&meta);
+    if (mc == 0) return sw_val_map_new(NULL, NULL, 0);
+    return sw_val_map_new(keys, vals, mc);
+}

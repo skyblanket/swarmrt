@@ -40,6 +40,8 @@
 
 module Voice
 
+import Audio   # the G.711 codecs (a battery; see lib/Audio.sw)
+
 export [
     # OpenAI Realtime
     realtime_connect, realtime_poll,

@@ -43,9 +43,11 @@ to contain what it documents.
   frames (SHA-256 MAC per frame; frames are not encrypted or replay-protected,
   so run clusters on a private network or through a tunnel). A remote peer can
   only deliver plain value messages — never runtime-internal signals.
-- **LLM builtins** send a provider key only to that provider: `LLM_API_KEY` to
-  any URL, `OPENAI_API_KEY` only to `api.openai.com`, `OTONOMY_API_KEY` only to
-  the Otonomy endpoint.
+- **LLM builtins** have no default endpoint: a prompt goes only where the
+  program or its environment points it (`opts.url`, `LLM_URL` or a provider).
+  They send a provider key only to that provider: `LLM_API_KEY` to any URL,
+  `OPENAI_API_KEY` only to `https://api.openai.com`, `OTONOMY_API_KEY` only to
+  the Otonomy endpoint (matched on the parsed host, not a substring).
 - **`shell_sandboxed`** execs the sandbox tool directly; the command string is
   interpreted only by the shell *inside* the sandbox.
 - **The HTTP server** (`http_listen`) binds all interfaces (it is meant to be

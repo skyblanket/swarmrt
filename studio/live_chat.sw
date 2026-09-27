@@ -67,6 +67,7 @@ fun handle_send(ws, history, msg) {
     user_input = extract_message(value)
     if (string_length(user_input) > 0) {
         new_history = list_append(history, {'user', user_input})
+        # Endpoint from the environment: LLM_URL or LLM_PROVIDER (+ LLM_MODEL).
         stream_pid = llm_stream(user_input, %{})
         chat_stream(ws, new_history, stream_pid, "")
     } else {

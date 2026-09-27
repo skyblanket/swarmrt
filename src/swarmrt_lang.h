@@ -256,6 +256,22 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor);
  * mod_ast). Returns the number of errors printed to stderr. */
 int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path);
 
+/* Batteries (see g_batteries in swarmrt_lang.c): builtins compiled into a
+ * program only when it imports their module. sw_battery_of returns the
+ * module name ("Pdf", "Chrome", "Audio") for a battery builtin, else NULL. */
+int         sw_battery_count(void);
+const char *sw_battery_module_at(int i);
+const char *sw_battery_macro_at(int i);
+const char *sw_battery_of(const char *builtin);
+int         sw_module_has_battery(void *mod_ast, const char *name);
+
+/* Interpreter side of the batteries: NULL in compiled programs; the swc
+ * binary installs it (sw_interp_batteries_install, swarmrt_battery_interp.c)
+ * so `swc run` / `swc test` / the REPL can run battery builtins. Returns NULL
+ * for a call it doesn't handle. */
+extern sw_val_t *(*sw_interp_battery_call)(const char *fname, sw_val_t **args, int nargs);
+void sw_interp_batteries_install(void);
+
 /* GC v1: type-safe value-send choke point — deep-copies the payload to the
  * global heap, then enqueues via sw_send_tagged. Route every sw_val_t* send
  * through this (struct sends keep using sw_send_tagged directly). */

@@ -4,6 +4,63 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-24 — batteries out of core
+
+**change(lang): PDF, Chrome and the audio codecs are batteries you import.**
+`pdf_text`/`pdf_pages`/`pdf_meta` need `import Pdf`, `chrome_launch` needs
+`import Chrome`, and the `audio_*` codecs need `import Audio` (new `lib/Pdf.sw`,
+`lib/Chrome.sw`, `lib/Audio.sw`, each with a small module API). Every binary used to
+carry all three: the hand-written PDF parser (~3.2K lines of C over untrusted input),
+the browser launcher and the codecs. Now codegen defines `SW_BATTERY_<X>` only for
+the batteries a program imports, the builtins header compiles each under its macro,
+and `swarmrt_pdf.o` is linked only when referenced. A hello-world binary goes from
+1,669,728 to 1,441,768 bytes with no battery symbols left. A module calls a battery's
+builtins only if it imports that battery itself, checked by the shared resolver on
+`swc build`, `swc run` and `swc test` alike, with the import to add in the error.
+`lib/Voice.sw` imports `Audio`. **Migration:** add the import to each module that
+calls these builtins.
+
+**fix(run): `swc run` loads imports transitively and checks each module like `swc
+build`.** It merged only the root file's direct imports, so a local module that
+imported another failed under `swc run` but built fine. The interpreter also gains
+`pdf_*` (shared with the compiled path through `swarmrt_pdf.c`); the interpreter's
+codecs move to `swarmrt_battery_interp.c`, linked into `swc` only. The resolver's
+summary now says "name errors" rather than "undefined names".
+
+Gates: `tests/sw/test_batteries.sw` (7, including a check that a program that doesn't
+import Chrome has no launcher symbol), `tests/sw/compile_fail/battery_without_import.sw`
+(build and run), `tests/sw/conform/t18_batteries.sw` (interpreter = compiled). The PDF
+engine had no test before this.
+
+## 2026-09-24 — LLM builtins need an endpoint; deadlock watchdog false positives
+
+**change(llm): `llm_complete` / `llm_stream` have no default endpoint.** Without
+`opts.url`, `LLM_URL` or a provider (`opts.provider` / `LLM_PROVIDER`: `openai`,
+`ollama`, `otonomy`) they used to send the prompt to a hosted vendor proxy. Now
+`llm_complete` returns `"error: llm_complete: no LLM endpoint configured. Set LLM_URL
+..."` and `llm_stream` delivers the same as its `{'llm_done', ...}`; the first such
+failure is also printed to stderr, since a program that doesn't check the result would
+otherwise just score it as a wrong answer. The model comes from
+`opts.model`, `LLM_MODEL` or the provider's default, and is left out of the request
+otherwise (it was `otonomy-orc` for every endpoint). `llm_stream` now honours `LLM_URL`
+(it ignored it). `OLLAMA_HOST` is the `ollama` provider's base URL, `/v1/chat/completions`
+appended. **Migration:** set `LLM_URL` (or `LLM_PROVIDER=otonomy` for the old default).
+
+**fix(security): provider keys matched their host by substring.** `OPENAI_API_KEY` went
+to any URL containing `://api.openai.com/`, such as
+`https://evil.example/?://api.openai.com/`; the host is now parsed (https only, no
+userinfo). Model names are JSON-escaped in the request body. Gate:
+`tests/sw/test_llm_endpoint.sw` (12 cases). An explicit URL wins over an unknown
+provider, and `OLLAMA_HOST=0.0.0.0:PORT` dials loopback on that port.
+
+**fix(watchdog): no "possible deadlock" warning while something can still wake a
+process.** A lone process in `receive ... after` (the fix the warning itself
+recommends), in `sleep`, or parked on an offloaded `http_*` / `llm_complete` /
+`exec_argv` call was reported as deadlocked every interval; any LLM call longer than
+5s printed it. The watchdog now stays silent while a timer is pending or an offload
+job is in flight, and still reports a bare `receive` nothing can answer. Gates:
+`tests/sw/watchdog/{timed_receive,slow_offload}.sw`, `watchdog/deadlock/bare_receive.sw`.
+
 ## 2026-09-24 — runtime fixes from the swarm-code review
 
 **fix(sched): blocking builtins no longer strand the processes queued behind them.**
