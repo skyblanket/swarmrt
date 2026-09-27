@@ -36,6 +36,43 @@ Linux and macOS CI, and the release job before upload) runs `swc new`, the new
 project's tests and a stdlib import from outside the repo.
 
 ---
+## 2026-09-27 — packages: swc add / install
+
+**feat(swc): a package manager — `swarm.json`, `swarm.lock`, `swc add` / `install` /
+`update` / `remove`.** A project lists dependencies in `swarm.json` at its root, each
+`{"git": "<url>", "ref": "<tag|branch|sha>"}` or `{"path": "<dir>"}`. `swc add <name>
+<git-url>[@ref]` (or `--path <dir>`) records one, fetches it into
+`.swarm/deps/<name>/` and pins the resolved commit in `swarm.lock`. `swc install`
+(alias `swc deps`) checks out exactly the locked commits, even after the remote's
+branch moves or a tag is re-pointed, and checks that `HEAD` is the locked sha. `swc
+update` re-resolves every ref. `swc remove` drops a dependency and its checkout. A
+dependency with its own `swarm.json` brings its dependencies too, flat (one version
+per name). Two different refs for one name are an error that names both requesters.
+A failed `add` / `remove` puts `swarm.json` back. git runs through fork+execvp with an
+argv vector, never a shell string. Names must match `[a-z0-9_-]+`. URLs that start
+with `-` or use `<transport>::` helpers (`ext::`, `fd::`) are refused, and so are refs
+that aren't `[A-Za-z0-9._/+-]` or that start with `-`. The error messages name the
+actual problem: missing git, fetch failure, bad ref, a locked commit gone from the
+remote, sha mismatch.
+
+**change(swc): imports resolve from installed packages.** `import Foo` now looks next
+to the input file, then in every `<project>/.swarm/deps/<pkg>/` and its `src/`, then in
+`lib/`. The project is the nearest ancestor with a `swarm.json`. A package's own
+imports resolve inside that package first. A module that two packages both provide is
+an "ambiguous" error, and install warns when a package shadows a `lib/` module. `swc
+build` and `swc run` now share one resolver (`resolve_import` / `load_imports` in
+`swc.c`) instead of two copies of the lookup loop. The resolver also stops re-loading
+a file whose `module` line doesn't match the import name, which used to load it again
+for every importer up to the 64-module cap. Files outside a project resolve exactly as
+before.
+
+Gates: `make test-pkg` (`tests/pkg/run_pkg_tests.sh`, 67 checks, offline: the
+"remotes" are local bare git repos). It covers add/install/update/remove, the lock
+pinning shas across a moved branch and a force-moved tag, transitive and path deps,
+build and run of programs that import dependency modules, conflicts, bad refs,
+unreachable remotes, missing git, and name/URL/ref injection attempts (a canary file
+must never appear). It runs in CI on Linux and macOS. Reference:
+[docs/PACKAGES.md](PACKAGES.md).
 
 ## 2026-09-24 — batteries out of core
 

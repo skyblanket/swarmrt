@@ -318,6 +318,9 @@ swc emit  <file.sw>               Print generated C to stdout
 swc repl                          Interactive REPL (no file needed)
 swc test [<file.sw>|<dir>]        Run test_* functions in .sw files
 swc lsp                           Language Server (LSP 3.17 over stdio)
+swc add <name> <git-url>[@ref]    Add a dependency to swarm.json (or: add <name> --path <dir>)
+swc install                       Fetch the deps at the commits pinned in swarm.lock (alias: deps)
+swc update | swc remove <name>    Re-resolve every ref / drop a dependency
 swc version                       Print the version (also --version, -v)
 
 Options for build/emit
@@ -331,7 +334,7 @@ Options for build/emit
                      need `zig` or a matching cross-gcc in PATH.
 ```
 
-Imports are auto-resolved from `src/` next to the file you're compiling — no manifest, no lockfile.
+Imports are auto-resolved from the directory of the file you're compiling, then from the project's installed packages, then from the bundled `lib/`. Packages are git repos (or local dirs) listed in a `swarm.json` manifest and pinned to exact commits in `swarm.lock` — see [docs/PACKAGES.md](docs/PACKAGES.md).
 
 ### REPL
 

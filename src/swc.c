@@ -39,7 +39,12 @@
 #include "swarmrt_new.h"
 #include "swarmrt_native.h"
 #include "swarmrt_io.h"
+#include "swc_pkg.h"
 #include <pthread.h>
+#include <limits.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 static void usage(void) {
     fprintf(stderr,
@@ -51,6 +56,10 @@ static void usage(void) {
         "  repl     Start interactive REPL\n"
         "  test     Run test_* functions in .sw files\n"
         "  new      Create a project: swc new <name> [--template agent]\n"
+        "  add      Add a dependency: add <name> <git-url>[@ref] | add <name> --path <dir>\n"
+        "  install  Install the deps in swarm.json at the swarm.lock commits (alias: deps)\n"
+        "  update   Re-resolve every dependency's ref and rewrite swarm.lock\n"
+        "  remove   Remove a dependency: remove <name>\n"
         "  version  Print the swc/runtime version (also --version, -v)\n\n"
         "Options:\n"
         "  -o <name>          Output binary name (default: module name)\n"
@@ -147,6 +156,165 @@ static void merge_module_funs(node_t *dst, node_t *src, int qualify) {
     }
 }
 
+/* dirname() into a caller buffer ("." when there is no separator). */
+static void path_dirname(const char *path, char *out, size_t outsz) {
+    char *tmp = strdup(path);
+    if (!tmp) { snprintf(out, outsz, "."); return; }
+#ifdef _WIN32
+    char *sep = strrchr(tmp, '/');
+    char *bsep = strrchr(tmp, '\\');
+    if (bsep > sep) sep = bsep;
+    if (sep) *sep = '\0'; else tmp[0] = '.', tmp[1] = '\0';
+    snprintf(out, outsz, "%s", tmp);
+#else
+    snprintf(out, outsz, "%s", dirname(tmp));
+#endif
+    free(tmp);
+}
+
+/* Where `import Foo` is looked for. Shared by `swc build`/`emit` and
+ * `swc run` so both paths resolve every import identically. */
+typedef struct {
+    char   input_dir[PATH_MAX];      /* dir of the primary input file */
+    char   lib_dir[PATH_MAX];        /* <swarmrt>/lib — bundled stdlib */
+    int    has_project;              /* a swarm.json was found upward */
+    char   project_root[PATH_MAX];
+    char **dep_dirs;                 /* <root>/.swarm/deps/<name>, sorted */
+    int    ndeps;
+} import_ctx_t;
+
+static void import_ctx_init(import_ctx_t *c, const char *input_path, const char *lib_dir) {
+    memset(c, 0, sizeof(*c));
+    path_dirname(input_path, c->input_dir, sizeof(c->input_dir));
+    snprintf(c->lib_dir, sizeof(c->lib_dir), "%s", lib_dir);
+    c->has_project = swc_pkg_find_root(c->input_dir, c->project_root, sizeof(c->project_root));
+    if (c->has_project)
+        c->ndeps = swc_pkg_dep_dirs(c->project_root, &c->dep_dirs);
+}
+
+static void import_ctx_free(import_ctx_t *c) {
+    for (int i = 0; i < c->ndeps; i++) free(c->dep_dirs[i]);
+    free(c->dep_dirs);
+    c->dep_dirs = NULL; c->ndeps = 0;
+}
+
+/* Probe <dir>/<Name>.sw then <dir>/<name>.sw, silently (a miss on one
+ * candidate is expected; only a total miss is reported). */
+static char *probe_module(const char *dir, const char *name, const char *lower,
+                          char *out, size_t outsz) {
+    snprintf(out, outsz, "%s/%s.sw", dir, name);
+    char *src = read_file_quiet(out);
+    if (src) return src;
+    snprintf(out, outsz, "%s/%s.sw", dir, lower);
+    return read_file_quiet(out);
+}
+
+/* A dependency package's modules live in its root or its src/. */
+static char *probe_package(const char *pkg, const char *name, const char *lower,
+                           char *out, size_t outsz) {
+    char *src = probe_module(pkg, name, lower, out, outsz);
+    if (src) return src;
+    char sub[PATH_MAX + 8];
+    snprintf(sub, sizeof(sub), "%s/src", pkg);
+    return probe_module(sub, name, lower, out, outsz);
+}
+
+/* Find and read the source of `import <name>` written in the module at
+ * `importer`. Lookup order:
+ *   1. the importer's own package (root, then src/) when the importer is a
+ *      dependency's module; otherwise the primary input file's directory
+ *   2. every installed dependency: <project>/.swarm/deps/<pkg>/ and its src/
+ *      (a module provided by two packages is an error, not a silent pick)
+ *   3. <swarmrt>/lib/  (bundled stdlib)
+ * Each directory is tried as <Name>.sw, then <name>.sw. Returns the malloc'd
+ * source (its path in `out`), or NULL after printing why. */
+static char *resolve_import(const import_ctx_t *c, const char *importer, const char *name,
+                            char *out, size_t outsz) {
+    char lower[128];
+    snprintf(lower, sizeof(lower), "%s", name);
+    for (int i = 0; lower[i]; i++)
+        if (lower[i] >= 'A' && lower[i] <= 'Z') lower[i] += 32;
+
+    int own = -1;
+    for (int i = 0; i < c->ndeps && importer; i++) {
+        size_t n = strlen(c->dep_dirs[i]);
+        if (strncmp(importer, c->dep_dirs[i], n) == 0 && importer[n] == '/') { own = i; break; }
+    }
+    char *src = own >= 0 ? probe_package(c->dep_dirs[own], name, lower, out, outsz)
+                         : probe_module(c->input_dir, name, lower, out, outsz);
+    if (src) return src;
+
+    for (int i = 0; i < c->ndeps; i++) {
+        if (i == own) continue;
+        char path[PATH_MAX + 256];
+        char *s = probe_package(c->dep_dirs[i], name, lower, path, sizeof(path));
+        if (!s) continue;
+        if (src) {
+            fprintf(stderr, "swc: import '%s' is ambiguous: both %s and %s provide it\n",
+                    name, out, path);
+            free(s); free(src);
+            return NULL;
+        }
+        src = s;
+        snprintf(out, outsz, "%s", path);
+    }
+    if (src) return src;
+
+    src = probe_module(c->lib_dir, name, lower, out, outsz);
+    if (src) return src;
+    if (c->has_project)
+        fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/, %s/%s/*/ and %s/)"
+                        " — if it comes from a dependency, run `swc install`\n",
+                name, own >= 0 ? c->dep_dirs[own] : c->input_dir,
+                c->project_root, SWC_PKG_DEPS_DIR, c->lib_dir);
+    else
+        fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
+                name, c->input_dir, c->lib_dir);
+    return NULL;
+}
+
+/* Load imports transitively: the imports of every module in mods[]
+ * (including the ones loaded here), each module once by name, appended to
+ * mods/paths (paths added here are strdup'd). With `build`, register each
+ * source with codegen for diagnostics and say what was auto-imported. */
+static void load_imports(void **mods, const char **paths, int *nmods, int max,
+                         const import_ctx_t *c, int build) {
+    for (int a = 0; a < *nmods; a++) {
+        node_t *m = (node_t *)mods[a];
+        for (int im = 0; im < m->v.mod.nimports; im++) {
+            const char *imp_name = m->v.mod.imports[im];
+            int loaded = 0;
+            for (int e = 0; e < *nmods; e++)
+                if (strcmp(get_mod_name(mods[e]), imp_name) == 0) { loaded = 1; break; }
+            if (loaded) continue;
+
+            char imp_path[PATH_MAX + 256];
+            char *imp_source = resolve_import(c, paths[a], imp_name, imp_path, sizeof(imp_path));
+            if (!imp_source) continue;
+            /* The file found is already loaded (its module line names some
+             * other module): don't load it again for every importer. */
+            int dup = 0;
+            for (int e = 0; e < *nmods; e++)
+                if (paths[e] && strcmp(paths[e], imp_path) == 0) { dup = 1; break; }
+            if (dup) { free(imp_source); continue; }
+            void *imp_ast = sw_lang_parse(imp_source);
+            free(imp_source);
+            if (!imp_ast) {
+                fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
+                continue;
+            }
+            if (*nmods < max) {
+                paths[*nmods] = strdup(imp_path);
+                mods[(*nmods)++] = imp_ast;
+                if (build) {
+                    sw_codegen_register_source(get_mod_name(imp_ast), imp_path);
+                    fprintf(stderr, "swc: auto-imported %s from %s\n", imp_name, imp_path);
+                }
+            }
+        }
+    }
+}
+
 /* Bootstrap context handed to the spawned root process. Mirrors the
  * compiled entrypoint's _main_entry/_sw_done_* machinery (codegen
  * emit_entry_and_main): the root process calls main() inside a live
@@ -189,66 +357,24 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
     node_t *root = (node_t *)main_ast;
 
     /* swc-binary dir → <root>/lib fallback for stdlib imports. */
-    char swc_dir[256] = ".";
     char swarmrt_lib[512] = "./lib";
     {
-        char *sp = strdup(argv0);
-        if (sp) {
-            char *dir = dirname(sp);
-            snprintf(swc_dir, sizeof(swc_dir), "%s", dir);
-            free(sp);
-        }
+        char swc_dir[256];
+        path_dirname(argv0, swc_dir, sizeof(swc_dir));
         snprintf(swarmrt_lib, sizeof(swarmrt_lib), "%s/../lib", swc_dir);
-    }
-    char input_dir[256] = ".";
-    {
-        char *tmp = strdup(path);
-        if (tmp) { snprintf(input_dir, sizeof(input_dir), "%s", dirname(tmp)); free(tmp); }
     }
 
     /* Load imports the way the build path does: transitively (an imported
      * module's own imports too), same lookup order, each module once. */
     void *mods[64];
-    char *mod_paths[64];
+    const char *mod_paths[64];
     int nmods = 0;
     mods[nmods] = root; mod_paths[nmods++] = strdup(path);
-    for (int a = 0; a < nmods; a++) {
-        node_t *m = (node_t *)mods[a];
-        for (int im = 0; im < m->v.mod.nimports; im++) {
-            const char *imp_name = m->v.mod.imports[im];
-            int loaded = 0;
-            for (int e = 0; e < nmods; e++)
-                if (strcmp(((node_t *)mods[e])->v.mod.name, imp_name) == 0) { loaded = 1; break; }
-            if (loaded) continue;
-
-            char lower[128];
-            snprintf(lower, sizeof(lower), "%s", imp_name);
-            for (int c = 0; lower[c]; c++)
-                if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
-
-            char imp_path[512];
-            char *imp_source = NULL;
-            const char *roots[2] = { input_dir, swarmrt_lib };
-            for (int r = 0; r < 2 && !imp_source; r++) {
-                snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
-                imp_source = read_file_quiet(imp_path);
-                if (imp_source) break;
-                snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
-                imp_source = read_file_quiet(imp_path);
-            }
-            if (!imp_source) {
-                fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
-                        imp_name, input_dir, swarmrt_lib);
-                continue;
-            }
-            void *imp_ast = sw_lang_parse(imp_source);
-            free(imp_source);
-            if (!imp_ast) {
-                fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
-                continue;
-            }
-            if (nmods < 64) { mods[nmods] = imp_ast; mod_paths[nmods++] = strdup(imp_path); }
-        }
+    {
+        import_ctx_t ictx;
+        import_ctx_init(&ictx, path, swarmrt_lib);
+        load_imports(mods, mod_paths, &nmods, 64, &ictx, 0);
+        import_ctx_free(&ictx);
     }
 
     /* Same static name check as `swc build` — each module against the whole
@@ -257,7 +383,7 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
         int unresolved = 0;
         for (int a = 0; a < nmods; a++)
             unresolved += sw_resolve_module(mods[a], mods, nmods, mod_paths[a]);
-        for (int a = 0; a < nmods; a++) free(mod_paths[a]);
+        for (int a = 0; a < nmods; a++) free((char *)mod_paths[a]);
         if (unresolved) {
             fprintf(stderr, "swc: %d name error%s — not running\n",
                     unresolved, unresolved == 1 ? "" : "s");
@@ -411,6 +537,14 @@ int main(int argc, char **argv) {
         return run_file(argv[2], argv[0], argc, argv);
     }
 
+    /* Package manager — swarm.json / swarm.lock / .swarm/deps (swc_pkg.c). */
+    if (swc_pkg_is_command(cmd)) {
+        char swc_dir[256], lib_dir[512];
+        path_dirname(argv[0], swc_dir, sizeof(swc_dir));
+        snprintf(lib_dir, sizeof(lib_dir), "%s/../lib", swc_dir);
+        return swc_pkg_main(argc, argv, lib_dir);
+    }
+
     if (argc < 3) { usage(); return 1; }
     const char *inputs[64];
     int ninputs = 0;
@@ -491,83 +625,13 @@ int main(int argc, char **argv) {
         snprintf(swarmrt_lib, sizeof(swarmrt_lib), "%s/../lib", swc_dir_early);
     }
 
-    /* Resolve imports: for each parsed AST, find import declarations and
-     * auto-load the corresponding .sw files. Lookup order:
-     *   1. <input_dir>/<Name>.sw  (capitalised — matches `import Foo`)
-     *   2. <input_dir>/<name>.sw  (lowercase — legacy `main.sw` style)
-     *   3. <swarmrt_root>/lib/<Name>.sw   (stdlib path)
-     *   4. <swarmrt_root>/lib/<name>.sw   (stdlib path, lowercase)
-     */
+    /* Resolve imports transitively for every parsed AST — see
+     * resolve_import for the lookup order (input dir, installed deps, lib/). */
     {
-        char input_dir[256];
-        char *tmp = strdup(inputs[0]);
-#ifdef _WIN32
-        /* Manual dirname: find last separator */
-        char *sep = strrchr(tmp, '/');
-        char *bsep = strrchr(tmp, '\\');
-        if (bsep > sep) sep = bsep;
-        if (sep) *sep = '\0'; else tmp[0] = '.', tmp[1] = '\0';
-        strncpy(input_dir, tmp, sizeof(input_dir) - 1);
-#else
-        char *dir = dirname(tmp);
-        strncpy(input_dir, dir, sizeof(input_dir) - 1);
-#endif
-        free(tmp);
-
-        for (int a = 0; a < nasts; a++) {
-            node_t *mod = (node_t *)asts[a];
-            for (int im = 0; im < mod->v.mod.nimports; im++) {
-                const char *imp_name = mod->v.mod.imports[im];
-                /* Check if already loaded */
-                int found = 0;
-                for (int e = 0; e < nasts; e++) {
-                    if (strcmp(get_mod_name(asts[e]), imp_name) == 0) { found = 1; break; }
-                }
-                if (found) continue;
-
-                /* Lowercase variant computed once. */
-                char lower[128];
-                strncpy(lower, imp_name, sizeof(lower) - 1);
-                for (int c = 0; lower[c]; c++)
-                    if (lower[c] >= 'A' && lower[c] <= 'Z') lower[c] += 32;
-
-                /* Search in order: input_dir CamelCase → input_dir lower
-                 *   → stdlib CamelCase → stdlib lower */
-                char imp_path[512];
-                char *imp_source = NULL;
-                const char *roots[2] = { input_dir, swarmrt_lib };
-                /* Probe candidate paths SILENTLY — a miss on any individual
-                 * candidate is expected (we try CamelCase + lowercase across
-                 * input_dir + stdlib). Only a *total* failure (all four
-                 * candidates missed) is a genuine error, reported below.
-                 * read_file (noisy) would otherwise spam "cannot open
-                 * './Std.sw'" on every SUCCESSFUL stdlib import. */
-                for (int r = 0; r < 2 && !imp_source; r++) {
-                    snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], imp_name);
-                    imp_source = read_file_quiet(imp_path);
-                    if (imp_source) break;
-                    snprintf(imp_path, sizeof(imp_path), "%s/%s.sw", roots[r], lower);
-                    imp_source = read_file_quiet(imp_path);
-                }
-                if (!imp_source) {
-                    fprintf(stderr, "swc: cannot resolve import '%s' (looked in %s/ and %s/)\n",
-                            imp_name, input_dir, swarmrt_lib);
-                    continue;
-                }
-                void *imp_ast = sw_lang_parse(imp_source);
-                free(imp_source);
-                if (!imp_ast) {
-                    fprintf(stderr, "swc: parse failed for import '%s'\n", imp_name);
-                    continue;
-                }
-                if (nasts < 64) {
-                    ast_paths[nasts] = strdup(imp_path);
-                    asts[nasts++] = imp_ast;
-                    sw_codegen_register_source(get_mod_name(imp_ast), imp_path);
-                    fprintf(stderr, "swc: auto-imported %s from %s\n", imp_name, imp_path);
-                }
-            }
-        }
+        import_ctx_t ictx;
+        import_ctx_init(&ictx, inputs[0], swarmrt_lib);
+        load_imports(asts, ast_paths, &nasts, 64, &ictx, 1);
+        import_ctx_free(&ictx);
     }
 
     const char *mod_name = get_mod_name(asts[main_idx]);

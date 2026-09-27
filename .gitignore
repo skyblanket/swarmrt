@@ -40,3 +40,4 @@ tests/sw/.build/
 tests/stress/.build/
 tests/soak/.build/
 .claude/worktrees/
+.swarm/

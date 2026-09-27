@@ -54,7 +54,7 @@ import Tools
 import UI
 ```
 
-Module names are CamelCase by convention. `swc` resolves imports by looking for `src/<Name>.sw` (case preserved) and falling back to `src/<name>.sw` (lowercase) — so `Main` lives at `src/main.sw` per legacy convention.
+Module names are CamelCase by convention. `swc` resolves `import Foo` by looking for `Foo.sw` (case preserved) and falling back to `foo.sw` (lowercase) — first next to the file you build or run, then in the project's installed packages (see below), then in the bundled `lib/`.
 
 Imports are top-level only and resolved transitively at build time. There's no namespace per module — calling an imported function uses `ModuleName.func(...)` syntax:
 
@@ -67,6 +67,28 @@ result = LLM.chat(messages, opts)
 ```sw
 export [init, navigate, click, screenshot, close]
 ```
+
+### Packages
+
+A project with a `swarm.json` at its root can depend on other people's
+modules. `swc add <name> <git-url>[@ref]` (or `swc add <name> --path <dir>`)
+records the dependency, fetches it into `.swarm/deps/<name>/`, and pins the
+exact commit in `swarm.lock`. `swc install` reproduces that checkout anywhere.
+An installed package's modules (in its root or its `src/`) are then importable
+like local ones, on `swc build` and `swc run` alike:
+
+```
+$ swc add strutil https://github.com/acme/sw-strutil@v0.1.0
+$ cat main.sw
+module Main
+import Strutil
+...
+```
+
+A package's own imports resolve inside that package first, then across the
+project's dependencies. A local file next to your program wins over a package;
+a package wins over `lib/` (install warns when one shadows a `lib/` module).
+Full reference: [PACKAGES.md](PACKAGES.md).
 
 ### Batteries: builtins you import
 

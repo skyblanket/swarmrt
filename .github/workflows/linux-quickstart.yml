@@ -99,6 +99,8 @@ jobs:
 
       - name: Install smoke (swc on PATH, swc new, project tests, from outside the repo)
         run: bash scripts/install_smoke.sh
+      - name: Package manager (swc add / install, swarm.lock; offline git remotes)
+        run: make test-pkg
 
       - name: Phase test suite (C-side runtime tests)
         # Was not in CI before round 7 — codex review caught that
@@ -332,6 +334,8 @@ jobs:
 
       - name: Install smoke (swc on PATH, swc new, project tests)
         run: bash scripts/install_smoke.sh
+      - name: Package manager (swc add / install, swarm.lock; offline git remotes)
+        run: make test-pkg
 
       - name: Docs + examples still compile
         run: bash scripts/check_sw_docs.sh
