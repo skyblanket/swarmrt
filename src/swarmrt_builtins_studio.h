@@ -9560,6 +9560,9 @@ static void _sw_wsc_reader_entry(void *raw) {
     _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)raw;
     int handle = ra->handle;
     free(ra);
+    /* Claim the read path before the first recv: wsc_set_handler may still
+     * be returning from sw_spawn, and wsc_recv rejects every other caller. */
+    if (handle >= 0 && handle < _SW_WSC_MAX) _sw_wsc[handle].reader_proc = sw_self();
 
     for (;;) {
         if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) break;
@@ -9621,13 +9624,21 @@ static sw_val_t *_builtin_wsc_set_handler(sw_val_t **a, int n) {
     _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)malloc(sizeof(*ra));
     if (!ra) return sw_val_atom("error");
     ra->handle = handle;
-    sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
-    if (!rp) { free(ra); return sw_val_atom("error"); }
-    /* Record handler + reader BEFORE returning so the wsc_recv guard can
-     * tell the reader's own loop from a stray user wsc_recv. */
+    /* Record the handler BEFORE the spawn publishes it: the reader may run
+     * on another scheduler before sw_spawn returns, and it used to find no
+     * handler, exit, and leave the handle unread for good (a frame sent to
+     * it was never delivered — test_voice_bridge_async lost a leg ~1 run
+     * in 5 under load). The reader records reader_proc itself. */
     _sw_wsc[handle].handler = a[1]->v.pid;
-    _sw_wsc[handle].reader_proc = rp;
     _sw_wsc[handle].reader_running = 1;
+    sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
+    if (!rp) {
+        free(ra);
+        _sw_wsc[handle].handler = NULL;
+        _sw_wsc[handle].reader_running = 0;
+        return sw_val_atom("error");
+    }
+    _sw_wsc[handle].reader_proc = rp;
     return sw_val_atom("ok");
 }
 

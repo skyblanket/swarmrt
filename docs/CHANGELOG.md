@@ -4,6 +4,16 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-27 — wsc_set_handler could drop a connection
+
+**fix(ws): an async WebSocket client could stop delivering frames for good.**
+`wsc_set_handler` spawned the reader process before recording the handler. When the
+reader ran first on another scheduler it found no handler, exited, and the handle was
+never read again: every later frame on it was lost. Under CPU load
+`test_voice_bridge_async` lost one of its two legs in 13 of 30 runs. The handler is now
+recorded before the spawn, and the reader claims the read path itself; 0 of 30 under
+the same load.
+
 ## 2026-09-27 — maps: O(1) adds and hashed lookups
 
 **perf(maps): building a map one key at a time is linear.** `map_put` copied and
