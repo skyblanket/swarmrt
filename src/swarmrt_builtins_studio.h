@@ -7323,7 +7323,10 @@ static sw_val_t *_builtin_ws_request_headers(sw_val_t **a, int n) {
 static sw_val_t *_builtin_ws_request_path(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT)
         return sw_val_string("");
-    return sw_val_string(sw_ws_request_path((int)a[0]->v.i));
+    char *p = sw_ws_request_path_dup((int)a[0]->v.i);
+    sw_val_t *r = sw_val_string(p ? p : "");
+    free(p);
+    return r;
 }
 
 /* live_js() → string containing client-side LiveView JavaScript */

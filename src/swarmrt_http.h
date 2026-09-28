@@ -181,7 +181,7 @@ int sw_ws_set_handler(int conn_id, sw_process_t *handler);
 sw_val_t *sw_ws_request_headers(int conn_id);
 
 /* Request path+query from a WS connection's UPGRADE request (""=unknown). */
-const char *sw_ws_request_path(int conn_id);
+char *sw_ws_request_path_dup(int conn_id);   /* malloc'd; caller frees */
 
 /* Get embedded LiveView JavaScript */
 const char *sw_liveview_js(void);

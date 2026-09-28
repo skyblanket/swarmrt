@@ -1328,13 +1328,17 @@ sw_val_t *sw_ws_request_headers(int conn_id) {
     return m;
 }
 
-/* Request path+query from the UPGRADE request, for a live WS conn.
- * Returns "" if unknown. */
-const char *sw_ws_request_path(int conn_id) {
-    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return "";
+/* Request path+query from the UPGRADE request, for a live WS conn, as a
+ * malloc'd copy the caller frees ("" if unknown). Copied under the lock:
+ * it used to return c->req_path itself, which a close on the bridge could
+ * free before the caller had copied it. */
+char *sw_ws_request_path_dup(int conn_id) {
+    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return strdup("");
+    pthread_mutex_lock(&g_http_lock);
     sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active || !c->req_path) return "";
-    return c->req_path;
+    char *p = strdup((c->active && c->req_path) ? c->req_path : "");
+    pthread_mutex_unlock(&g_http_lock);
+    return p;
 }
 
 const char *sw_liveview_js(void) {

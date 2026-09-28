@@ -154,6 +154,10 @@ Gates: `tests/sw/test_http_bind.sw` (9), `tests/sw/test_ws_origin.sw` (10),
 `tests/sw/test_http_port_free.sw` (3; 700 connections over hang-up, server-close and
 `ws_close` paths). All three fail on the previous code.
 
+**fix(ws): `ws_request_path` read a string a close could free.** It returned the
+connection's path pointer without the lock and the caller copied it afterwards; it is
+now copied under the lock, as `ws_request_headers` already was.
+
 ## 2026-09-24 — batteries out of core
 
 **change(lang): PDF, Chrome and the audio codecs are batteries you import.**
