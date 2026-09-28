@@ -47,6 +47,8 @@ noted. **Every one is optional**; the defaults are the product defaults.
 | `SW_MAX_PROCS` | build default | Max concurrent process slots (arena sizing). Accepted range `[16, SWARM_MAX_PROCESSES]`. |
 | `SW_HTTP_MAX_REQUEST` | `33554432` (32 MB) | Max bytes buffered per HTTP connection before a 413 / connection close. WebSocket frames are separately capped at 16 MB. |
 | `SW_HTTP_IDLE_TIMEOUT_MS` | `30000` | Close an HTTP connection with no inbound bytes for this long (slow-loris defense) and free its slot. `0` disables. |
+| `SW_HTTP_BIND` | `127.0.0.1` | Address `http_listen` binds when the call passes no `bind` option. Set `0.0.0.0` to serve other hosts (containers, a load balancer, a public WebSocket endpoint). IPv4 literal or `localhost`; a malformed value makes `http_listen` return `'error'` instead of binding every interface. |
+| `SW_WS_ORIGINS` | unset | Comma-separated extra `Origin`s allowed to open a WebSocket to an `http_listen` server (e.g. `https://app.example.com`), on top of same-origin, loopback, and the call's `ws_origins` option. `*` allows any. Upgrades carrying any other `Origin` get `403`; upgrades with no `Origin` (non-browser clients) are always accepted. |
 | `SW_HTTP_WS_IDLE_TIMEOUT_MS` | `0` (never) | Idle timeout for **established** WebSocket connections. Off by default — a quiet LiveView/agent session is legitimate. Inbound client pings count as activity. |
 
 ### Scheduling & runtime
@@ -171,6 +173,10 @@ fun main() {
 
 `Health.start(port)` is the non-blocking variant (spawns, returns the pid) so
 you can run the health server alongside your own work in the same node.
+
+Like every `http_listen` server, the health endpoint binds `127.0.0.1` by
+default. An orchestrator probing over the pod/host network (Kubernetes,
+a load balancer on another host) needs `SW_HTTP_BIND=0.0.0.0`.
 
 ---
 

@@ -103,7 +103,7 @@ static uint64_t http_now_ms(void) {
 
 /* === Connection Management === */
 
-static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
+static int conn_alloc(sw_port_t *port, sw_http_bridge_t *bridge) {
     pthread_mutex_lock(&g_http_lock);
     for (int i = 0; i < SW_HTTP_MAX_CONNS; i++) {
         if (!g_http_conns[i].active) {
@@ -111,7 +111,11 @@ static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
             c->id = i;
             c->port = port;
             c->mode = SW_HTTP_MODE_HTTP;
-            c->handler = handler;
+            c->handler = bridge->handler;
+            c->bridge = bridge;
+            c->busy = 0;
+            c->closed = 0;
+            c->drop = 0;
             c->active = 1;
             c->buf = (uint8_t *)malloc(4096);
             c->buf_len = 0;
@@ -120,7 +124,7 @@ static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
             c->content_length = 0;
             c->body_pending = 0;
             c->keep_alive = 1; /* HTTP/1.1 default */
-            c->req_headers = NULL;
+            c->req_hdr = NULL;
             c->req_path = NULL;
             /* Idle-timeout bookkeeping: stamp the accept, and record the
              * OWNING bridge (conn_alloc runs on the bridge fiber that got
@@ -135,16 +139,12 @@ static int conn_alloc(sw_port_t *port, sw_process_t *handler) {
     return -1;
 }
 
-static void conn_free(int cid) {
-    if (cid < 0 || cid >= SW_HTTP_MAX_CONNS) return;
-    pthread_mutex_lock(&g_http_lock);
-    sw_http_conn_t *c = &g_http_conns[cid];
+/* Release a slot's buffers and mark it free. Caller holds g_http_lock and
+ * has already detached (and will close) c->port. */
+static void conn_clear_locked(sw_http_conn_t *c) {
     if (c->buf) { free(c->buf); c->buf = NULL; }
     if (c->frag_buf) { free(c->frag_buf); c->frag_buf = NULL; }
-    /* req_headers is a managed sw_val_t; drop our reference and let the GC
-     * reclaim it (it may also be referenced by a delivered message that the
-     * handler still holds). req_path is a plain heap string we own. */
-    c->req_headers = NULL;
+    if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
     if (c->req_path) { free(c->req_path); c->req_path = NULL; }
     c->frag_len = 0;
     c->frag_cap = 0;
@@ -155,15 +155,96 @@ static void conn_free(int cid) {
     c->port = NULL;
     c->handler = NULL;
     c->owner = NULL;
-    pthread_mutex_unlock(&g_http_lock);
+    c->bridge = NULL;
+    c->busy = 0;
+    c->closed = 0;
+    c->drop = 0;
 }
 
-static int conn_find_by_port(sw_port_t *port) {
-    for (int i = 0; i < SW_HTTP_MAX_CONNS; i++) {
-        if (g_http_conns[i].active && g_http_conns[i].port == port)
-            return i;
+/* Close connection `cid` and free its slot, exactly once. The port is
+ * detached under g_http_lock, so of two racing closers (the bridge's idle
+ * sweep vs. the handler's ws_close, say) only the one that still finds
+ * `expect` attached closes it; expect == NULL takes whatever the slot
+ * holds. The port goes to sw_port_close_free: nothing keeps the pointer
+ * afterwards, and the IO thread frees the struct once no batch or pin can
+ * reach it. If the owning bridge is mid-pass on this conn (busy), its
+ * buffers are left for the bridge to free when the pass ends. */
+static void conn_close(int cid, sw_port_t *expect) {
+    if (cid < 0 || cid >= SW_HTTP_MAX_CONNS) return;
+    pthread_mutex_lock(&g_http_lock);
+    sw_http_conn_t *c = &g_http_conns[cid];
+    if (!c->active || !c->port || (expect && c->port != expect)) {
+        pthread_mutex_unlock(&g_http_lock);
+        return;
     }
-    return -1;
+    sw_port_t *port = c->port;
+    c->port = NULL;
+    if (c->busy) c->closed = 1;
+    else         conn_clear_locked(c);
+    pthread_mutex_unlock(&g_http_lock);
+    sw_port_close_free(port);
+}
+
+/* Pin a live conn's port (see sw_port_ref) under g_http_lock so a close on
+ * another thread can't free it while the caller writes to it. NULL = no
+ * live conn / already closed. Pair with sw_port_unref. */
+static sw_port_t *conn_pin(int cid) {
+    if (cid < 0 || cid >= SW_HTTP_MAX_CONNS) return NULL;
+    pthread_mutex_lock(&g_http_lock);
+    sw_http_conn_t *c = &g_http_conns[cid];
+    sw_port_t *port = c->active ? c->port : NULL;
+    if (port) sw_port_ref(port);
+    pthread_mutex_unlock(&g_http_lock);
+    return port;
+}
+
+/* Bridge-side lookups match only the calling bridge's own connections. A
+ * port event can be stale (queued before its port was closed and freed),
+ * and a freed struct's address can come back as a new connection's port;
+ * that new connection's ACCEPT is queued behind the stale event in the
+ * same mailbox, so within one bridge the stale event finds nothing — but
+ * with two listeners it could match the OTHER bridge's new connection. */
+static int conn_find_by_port(sw_port_t *port) {
+    int cid = -1;
+    sw_process_t *self = sw_self();
+    pthread_mutex_lock(&g_http_lock);
+    for (int i = 0; i < SW_HTTP_MAX_CONNS; i++) {
+        if (g_http_conns[i].active && g_http_conns[i].port == port &&
+            g_http_conns[i].owner == self) {
+            cid = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_http_lock);
+    return cid;
+}
+
+/* Bridge side of a DATA event: find the conn for `port`, pin the port and
+ * mark the conn busy for the duration of the pass (see conn_close). */
+static int conn_begin_pass(sw_port_t *port) {
+    int cid = -1;
+    sw_process_t *self = sw_self();
+    pthread_mutex_lock(&g_http_lock);
+    for (int i = 0; i < SW_HTTP_MAX_CONNS; i++) {
+        sw_http_conn_t *c = &g_http_conns[i];
+        if (c->active && c->port == port && c->owner == self) {
+            c->busy = 1;
+            sw_port_ref(port);
+            cid = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_http_lock);
+    return cid;
+}
+
+static void conn_end_pass(int cid, sw_port_t *port) {
+    pthread_mutex_lock(&g_http_lock);
+    sw_http_conn_t *c = &g_http_conns[cid];
+    c->busy = 0;
+    if (c->closed) conn_clear_locked(c);   /* closed during the pass */
+    pthread_mutex_unlock(&g_http_lock);
+    sw_port_unref(port);
 }
 
 /* === Base64 Encode (for SHA-1 digest → WebSocket accept key) === */
@@ -188,7 +269,7 @@ static void base64_encode(const uint8_t *in, int len, char *out) {
 
 static const char *WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-static void ws_do_handshake(int cid) {
+static void ws_do_handshake(int cid, sw_port_t *port) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     /* SHA-1(key + magic GUID) */
@@ -210,7 +291,7 @@ static void ws_do_handshake(int cid) {
         "Sec-WebSocket-Accept: %s\r\n"
         "\r\n", accept);
 
-    sw_tcp_send(c->port, response, rlen);
+    sw_tcp_send(port, response, rlen);
 }
 
 /* === WebSocket Frame Parsing (client → server, masked) === */
@@ -224,7 +305,7 @@ static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint
     sw_http_conn_t *c = &g_http_conns[cid];
     if (opcode == 0x2) {
         char *b64 = _sw_audio_b64_encode(payload, (size_t)len);
-        if (!b64) { c->active = 0; return; }
+        if (!b64) { c->drop = 1; return; }
         sw_val_t *items[3];
         items[0] = sw_val_atom("ws_binary");
         items[1] = sw_val_int(cid);
@@ -234,7 +315,7 @@ static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint
     } else {
         /* text */
         char *text = (char *)malloc((size_t)len + 1);
-        if (!text) { c->active = 0; return; }
+        if (!text) { c->drop = 1; return; }
         /* len==0 (empty reassembled/text frame) → payload may be NULL, and
          * memcpy with a NULL src is UB even for 0 bytes. Skip the no-op copy. */
         if (len > 0) memcpy(text, payload, (size_t)len);
@@ -248,7 +329,10 @@ static void ws_deliver_message(int cid, int opcode, const uint8_t *payload, uint
     }
 }
 
-static void ws_try_parse(int cid) {
+/* `port` is the conn's (pinned) port, for pong / close-echo writes; NULL
+ * from the fuzz harness. A connection the parser gives up on gets c->drop,
+ * and the bridge closes it once the pass ends. */
+static void ws_try_parse(int cid, sw_port_t *port) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     while (c->buf_len >= 2) {
@@ -276,7 +360,7 @@ static void ws_try_parse(int cid) {
         /* Reject oversized payloads (16MB max) */
         if (payload_len > 16 * 1024 * 1024) {
             /* Close connection — payload too large */
-            c->active = 0;
+            c->drop = 1;
             return;
         }
 
@@ -301,7 +385,7 @@ static void ws_try_parse(int cid) {
                 /* Continuation — must be part of an in-progress message. */
                 if (c->frag_opcode == 0) {
                     /* Stray continuation; drop the connection defensively. */
-                    c->active = 0; return;
+                    c->drop = 1; return;
                 }
                 eff_opcode = c->frag_opcode;
             }
@@ -311,12 +395,12 @@ static void ws_try_parse(int cid) {
                 /* Append this frame's payload to the reassembly buffer. */
                 if (opcode != 0x0 && c->frag_opcode == 0) c->frag_opcode = opcode;
                 uint32_t need = c->frag_len + (uint32_t)payload_len;
-                if (need > 16 * 1024 * 1024) { c->active = 0; return; }
+                if (need > 16 * 1024 * 1024) { c->drop = 1; return; }
                 if (need > c->frag_cap) {
                     uint32_t ncap = c->frag_cap ? c->frag_cap : 4096;
                     while (ncap < need) ncap *= 2;
                     uint8_t *nb = (uint8_t *)realloc(c->frag_buf, ncap);
-                    if (!nb) { c->active = 0; return; }
+                    if (!nb) { c->drop = 1; return; }
                     c->frag_buf = nb; c->frag_cap = ncap;
                 }
                 /* Guard the zero-length case: an empty fragment (FIN=0,
@@ -348,7 +432,7 @@ static void ws_try_parse(int cid) {
 
             /* Echo close frame back */
             uint8_t close_frame[2] = {0x88, 0x00};
-            sw_tcp_send(c->port, close_frame, 2);
+            sw_tcp_send(port, close_frame, 2);
 
         } else if (opcode == 0x9) {
             /* Ping → Pong */
@@ -356,9 +440,9 @@ static void ws_try_parse(int cid) {
                 uint8_t pong[2];
                 pong[0] = 0x8A;
                 pong[1] = (uint8_t)payload_len;
-                sw_tcp_send(c->port, pong, 2);
+                sw_tcp_send(port, pong, 2);
                 if (payload_len > 0)
-                    sw_tcp_send(c->port, payload, (uint32_t)payload_len);
+                    sw_tcp_send(port, payload, (uint32_t)payload_len);
             }
         }
         /* opcode 0xA (pong) — ignore */
@@ -452,7 +536,73 @@ static sw_val_t *http_parse_headers(const char *hdr_start, const char *hdr_end) 
     return map;
 }
 
-static void http_try_parse(int cid) {
+/* === WebSocket Origin check (see the policy note in swarmrt_http.h) === */
+
+/* Does comma list `list` allow `origin`? Entries are trimmed; "*" allows
+ * anything; otherwise a case-insensitive exact match, ignoring one trailing
+ * '/' on either side ("https://a.example/" == "https://a.example"). */
+static int ws_origin_listed(const char *list, const char *origin) {
+    if (!list || !*list) return 0;
+    size_t olen = strlen(origin);
+    if (olen && origin[olen - 1] == '/') olen--;
+    const char *p = list;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        const char *e = p;
+        while (*e && *e != ',') e++;
+        const char *t = e;
+        while (t > p && (t[-1] == ' ' || t[-1] == '\t')) t--;
+        size_t n = (size_t)(t - p);
+        if (n && p[n - 1] == '/') n--;
+        if (n == 1 && p[0] == '*') return 1;
+        if (n && n == olen && strncasecmp(p, origin, n) == 0) return 1;
+        p = e;
+    }
+    return 0;
+}
+
+static int ws_origin_allowed(const sw_http_bridge_t *b, const char *origin,
+                             const char *host) {
+    if (ws_origin_listed(b ? b->ws_origins : NULL, origin)) return 1;
+    if (ws_origin_listed(getenv("SW_WS_ORIGINS"), origin)) return 1;
+
+    /* scheme "://" authority [path]. Anything else ("null" from a sandboxed
+     * iframe or file://) only passes via the allowlist above. */
+    const char *auth = strstr(origin, "://");
+    if (!auth) return 0;
+    auth += 3;
+    size_t alen = strcspn(auth, "/?#");
+
+    /* Hostname = authority minus port; "[::1]:8080" keeps its brackets. */
+    size_t hlen = alen;
+    if (auth[0] == '[') {
+        const char *rb = memchr(auth, ']', alen);
+        if (rb) hlen = (size_t)(rb - auth) + 1;
+    } else {
+        const char *colon = memchr(auth, ':', alen);
+        if (colon) hlen = (size_t)(colon - auth);
+    }
+    if ((hlen == 9 && strncasecmp(auth, "localhost", 9) == 0) ||
+        (hlen == 9 && strncmp(auth, "127.0.0.1", 9) == 0) ||
+        (hlen == 5 && strncmp(auth, "[::1]", 5) == 0))
+        return 1;
+
+    /* Same-origin: the page was served by this very host:port. */
+    return host && strlen(host) == alen && strncasecmp(auth, host, alen) == 0;
+}
+
+/* Header MAP for a saved raw header block (c->req_hdr: header lines, each
+ * CRLF-terminated, NUL after the last), in the CALLING process's heap. NULL
+ * → empty map. */
+static sw_val_t *http_hdr_map(const char *raw) {
+    if (!raw) return sw_val_map_new(NULL, NULL, 0);
+    size_t n = strlen(raw);
+    return http_parse_headers(raw, n >= 2 ? raw + n - 2 : raw);
+}
+
+/* `port` is the conn's (pinned) port, for the WS handshake write; NULL
+ * from the fuzz harness. */
+static void http_try_parse(int cid, sw_port_t *port) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     /* If we're waiting for body bytes, check if we have enough */
@@ -479,6 +629,10 @@ static void http_try_parse(int cid) {
     int has_content_length = 0;
     int is_chunked = 0;
     int keep_alive = (strstr(version, "1.1") != NULL) ? 1 : 0; /* HTTP/1.1 default */
+    /* For the WS Origin check. An over-long value is kept truncated, which
+     * can only fail to match (i.e. fails closed). */
+    char origin[512] = {0}, host[256] = {0};
+    int has_origin = 0;
 
     char *hdr = (char *)c->buf;
     char *hdr_end = (char *)end;
@@ -525,6 +679,20 @@ static void http_try_parse(int cid) {
                 is_chunked = 1;
             }
         }
+        if (strncasecmp(line, "Origin:", 7) == 0 ||
+            strncasecmp(line, "Host:", 5) == 0) {
+            int is_origin = (line[0] == 'O' || line[0] == 'o');
+            char *val = line + (is_origin ? 7 : 5);
+            char *dst = is_origin ? origin : host;
+            size_t cap = is_origin ? sizeof(origin) : sizeof(host);
+            while (*val == ' ' || *val == '\t') val++;
+            size_t vlen = (size_t)(line_end - val);
+            while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
+            if (vlen >= cap) vlen = cap - 1;
+            memcpy(dst, val, vlen);
+            dst[vlen] = '\0';
+            if (is_origin) has_origin = 1;
+        }
         if (strncasecmp(line, "Connection:", 11) == 0) {
             char *val = line + 11;
             while (*val == ' ' || *val == '\t') val++;
@@ -538,7 +706,7 @@ static void http_try_parse(int cid) {
     /* Reject oversized declared bodies up front with a 413 instead of
      * buffering toward the conn_on_data cap: strtoul gave the client a
      * free uint32-range Content-Length, i.e. a request to buffer ~4GB.
-     * keep_alive=0 makes sw_http_respond close + conn_free the slot. */
+     * keep_alive=0 makes sw_http_respond close + free the slot. */
     if (has_content_length && content_length > http_max_request()) {
         fprintf(stderr,
             "swarmrt_http: rejecting %s %s — Content-Length %u exceeds "
@@ -549,16 +717,22 @@ static void http_try_parse(int cid) {
         return;
     }
 
-    /* Build the request-header MAP now, while c->buf is still intact (the
+    /* Save the raw header block now, while c->buf is still intact (the
      * consume/memmove below mutates it). `line` after the request line is
      * the first header; hdr_end is the start of the terminating CRLF CRLF.
      * Stash on the conn so it survives a buffered POST body and is reachable
-     * for a WS upgrade. Replaces any stale map from a prior keep-alive
+     * for a WS upgrade; the MAP is built from it when it is delivered (see
+     * http_hdr_map). Replaces any stale block from a prior keep-alive
      * request on this connection. */
     {
         char *hdr1 = strchr(hdr, '\n');
         if (hdr1) hdr1++;
-        c->req_headers = http_parse_headers(hdr1, hdr_end);
+        if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
+        if (hdr1 && hdr1 <= hdr_end) {
+            size_t n = (size_t)(hdr_end - hdr1) + 2;   /* keep the last CRLF */
+            c->req_hdr = (char *)malloc(n + 1);
+            if (c->req_hdr) { memcpy(c->req_hdr, hdr1, n); c->req_hdr[n] = '\0'; }
+        }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         c->req_path = strdup(path);
     }
@@ -598,14 +772,32 @@ static void http_try_parse(int cid) {
     if (is_upgrade && ws_key[0]) {
         /* WebSocket upgrade. The upgrade request's headers (Origin,
          * Authorization, the Telnyx signature headers, etc.) and its
-         * path+query are retained on the connection (c->req_headers /
+         * path+query are retained on the connection (c->req_hdr /
          * c->req_path, set above) for the whole WS lifetime, queryable by
          * the handler via ws_request_headers(conn) / ws_request_path(conn).
          * The {'ws_connect', conn, path} message keeps its original 3-tuple
          * shape so existing handlers (studio LiveView, swarm-live) keep
          * working untouched. */
+        /* Cross-site WebSocket hijacking guard: a browser page on any other
+         * site can open a WS to us (the same-origin policy does not apply
+         * to WS) and the browser attaches this host's cookies. Refuse
+         * unless the Origin is ours, loopback, or allowlisted. */
+        if (has_origin && !ws_origin_allowed(c->bridge, origin, host)) {
+            static _Atomic uint32_t g_ws_origin_rejects;
+            uint32_t d = atomic_fetch_add_explicit(&g_ws_origin_rejects, 1,
+                                                   memory_order_relaxed);
+            if ((d & 0x3F) == 0) {
+                fprintf(stderr,
+                    "swarmrt_http: refusing WebSocket upgrade on %s from "
+                    "Origin %s (not same-origin, loopback, or in ws_origins / "
+                    "SW_WS_ORIGINS); %u refused so far\n", path, origin, d + 1);
+            }
+            c->keep_alive = 0;
+            sw_http_respond(cid, 403, NULL, "Forbidden: WebSocket Origin not allowed");
+            return;
+        }
         strncpy(c->ws_key, ws_key, sizeof(c->ws_key) - 1);
-        ws_do_handshake(cid);
+        ws_do_handshake(cid, port);
         c->mode = SW_HTTP_MODE_WS;
 
         /* Send {'ws_connect', conn, path} to handler */
@@ -647,13 +839,12 @@ static void http_try_parse(int cid) {
         items[1] = sw_val_int(cid);
         items[2] = sw_val_atom(method);
         items[3] = sw_val_string(path);
-        /* headers: the real request-header MAP (lowercased keys), built
-         * above into c->req_headers. Hand it off by reference and drop our
-         * pointer — the delivered message keeps it alive. */
-        items[4] = c->req_headers ? c->req_headers : sw_val_map_new(NULL, NULL, 0);
+        /* headers: the real request-header MAP (lowercased keys), from the
+         * block saved above. */
+        items[4] = http_hdr_map(c->req_hdr);
         items[5] = sw_val_string(body_str);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
-        c->req_headers = NULL;
+        if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         if (body_buf) free(body_buf);
     }
@@ -689,12 +880,12 @@ deliver_body:
         items[1] = sw_val_int(cid);
         items[2] = sw_val_atom(method);
         items[3] = sw_val_string(path);
-        /* headers MAP captured when the header block first arrived (before
-         * the body was buffered). Hand off by reference, then drop. */
-        items[4] = c->req_headers ? c->req_headers : sw_val_map_new(NULL, NULL, 0);
+        /* headers MAP from the block saved when the header block first
+         * arrived (before the body was buffered). */
+        items[4] = http_hdr_map(c->req_hdr);
         items[5] = sw_val_string(body_buf);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
-        c->req_headers = NULL;
+        if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         free(body_buf);
     }
@@ -702,7 +893,9 @@ deliver_body:
 
 /* === Connection Data Handler === */
 
-static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
+/* Runs on the owning bridge between conn_begin_pass / conn_end_pass, with
+ * `port` pinned. */
+static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     /* Idle timeout: any inbound bytes count as activity (incl. WS pings —
@@ -713,7 +906,7 @@ static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
      * without bound (headers that never terminate, a body the client keeps
      * streaming, WS bytes piling up behind a stalled parse). 64-bit sum so
      * buf_len+len can't wrap. Close + free the slot — same defensive shape
-     * as the WS oversize rejection, but conn_free'd so the slot and buffer
+     * as the WS oversize rejection, and conn_close'd so the slot and buffer
      * are actually reclaimed. Rate-limited stderr keeps the drop LOUD. */
     if ((uint64_t)c->buf_len + (uint64_t)len + 1 > (uint64_t)http_max_request()) {
         static _Atomic uint32_t g_http_oversize_drops;
@@ -726,8 +919,7 @@ static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
                 "dropped so far\n",
                 cid, http_max_request(), d + 1);
         }
-        if (c->port) sw_port_close(c->port);
-        conn_free(cid);
+        conn_close(cid, port);
         return;
     }
 
@@ -745,18 +937,22 @@ static void conn_on_data(int cid, uint8_t *data, uint32_t len) {
     c->buf[c->buf_len] = '\0'; /* keep the scan buffer C-string safe */
 
     if (c->mode == SW_HTTP_MODE_HTTP) {
-        http_try_parse(cid);
+        http_try_parse(cid, port);
         /* After upgrade, parse any remaining data as WS */
-        if (c->mode == SW_HTTP_MODE_WS && c->buf_len > 0)
-            ws_try_parse(cid);
+        if (c->mode == SW_HTTP_MODE_WS && c->buf_len > 0 && !c->closed)
+            ws_try_parse(cid, port);
     } else {
-        ws_try_parse(cid);
+        ws_try_parse(cid, port);
     }
+    /* The frame parser gave up on this connection (oversize / malformed /
+     * OOM). It used to just clear c->active, which leaked the socket and
+     * the slot's buffers. */
+    if (c->drop) conn_close(cid, port);
 }
 
 /* === Connection Close Handler === */
 
-static void conn_on_close(int cid) {
+static void conn_on_close(int cid, sw_port_t *port) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     if (c->mode == SW_HTTP_MODE_WS && c->handler) {
@@ -767,18 +963,17 @@ static void conn_on_close(int cid) {
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 2));
     }
 
-    conn_free(cid);
+    conn_close(cid, port);
 }
 
 /* === Idle sweep (slow-loris defense) ===
  *
  * Close every connection THIS bridge owns that has had no inbound bytes for
  * its timeout (HTTP vs established-WS timeouts differ — see the header).
- * Two-pass: collect victims under g_http_lock (conn_free re-locks it, so
- * closing inline would self-deadlock), then close outside the lock. The
- * close+free shape mirrors the oversize-drop path in conn_on_data; a
- * concurrent handler-side ws_close is tolerated the same way it is there
- * (conn_free NULLs what it frees; sweeping is per-owner so the data path
+ * Two-pass: collect victims under g_http_lock (conn_close re-locks it, so
+ * closing inline would self-deadlock), then close outside the lock. A
+ * concurrent handler-side ws_close is harmless: conn_close only acts if the
+ * victim's port is still attached (sweeping is per-owner, so the data path
  * for a conn never races its own sweep — both run on the bridge fiber). */
 static void http_sweep_idle(void) {
     uint64_t http_to = http_idle_timeout_ms();
@@ -795,7 +990,7 @@ static void http_sweep_idle(void) {
     pthread_mutex_lock(&g_http_lock);
     for (int i = 0; i < SW_HTTP_MAX_CONNS; i++) {
         sw_http_conn_t *c = &g_http_conns[i];
-        if (!c->active || c->owner != self) continue;
+        if (!c->active || !c->port || c->owner != self) continue;
         uint64_t to = (c->mode == SW_HTTP_MODE_WS) ? ws_to : http_to;
         if (!to) continue;                       /* exempt (e.g. WS default) */
         uint64_t idle = now - c->last_activity_ms;
@@ -822,8 +1017,7 @@ static void http_sweep_idle(void) {
                 victim_cid[k], (unsigned long long)victim_idle[k],
                 (unsigned long long)http_to, (unsigned long long)ws_to, d + 1);
         }
-        if (victim_port[k]) sw_port_close(victim_port[k]);
-        conn_free(victim_cid[k]);
+        conn_close(victim_cid[k], victim_port[k]);
     }
 }
 
@@ -849,7 +1043,18 @@ static void http_bridge_entry(void *arg) {
     }
     uint64_t last_sweep = http_now_ms();
 
+    /* The bridge is a C loop, so it never reaches the turn checkpoint that
+     * reclaims a compiled sw loop's garbage: every header map, message tuple
+     * and string it built stayed in its heap for good (~1.7 KB per request,
+     * ~33 MB per 20k requests). Nothing it builds outlives the event that
+     * built it (sends deep-copy; a conn keeps raw bytes, never values), so
+     * rewind the heap to this floor before each event. */
+    sw_value_arena_t *heap = sw_self_varena();
+    sw_varena_mark_t floor = {0};
+    if (heap) floor = sw_varena_mark(heap);
+
     while (1) {
+        if (heap) sw_varena_reset_to(heap, floor);
         uint64_t tag;
         void *raw = sw_receive_any(tick ? tick : (uint64_t)-1, &tag);
         if (tick) {
@@ -863,18 +1068,19 @@ static void http_bridge_entry(void *arg) {
 
         if (tag == SW_TAG_PORT_ACCEPT) {
             sw_port_accept_t *acc = (sw_port_accept_t *)raw;
-            int cid = conn_alloc(acc->conn, bridge->handler);
+            int cid = conn_alloc(acc->conn, bridge);
             if (cid < 0) {
                 /* Table full — close the connection */
-                sw_port_close(acc->conn);
+                sw_port_close_free(acc->conn);
             }
             free(acc);
 
         } else if (tag == SW_TAG_PORT_DATA) {
             sw_port_data_t *data = (sw_port_data_t *)raw;
-            int cid = conn_find_by_port(data->port);
+            int cid = conn_begin_pass(data->port);
             if (cid >= 0) {
-                conn_on_data(cid, data->data, data->len);
+                conn_on_data(cid, data->port, data->data, data->len);
+                conn_end_pass(cid, data->port);
             }
             free(data->data);
             free(data);
@@ -884,16 +1090,14 @@ static void http_bridge_entry(void *arg) {
             int cid = conn_find_by_port(evt->port);
             if (cid >= 0) {
                 /* Peer hung up (the IO thread saw EOF/error and only
-                 * deregistered the fd). Close our end too — conn_free alone
-                 * used to leave the socket open, leaking one fd per
+                 * deregistered the fd). Close our end too — freeing the slot
+                 * alone used to leave the socket open, leaking one fd per
                  * connection until accept() hit EMFILE (~1000 requests on a
-                 * default ulimit). sw_port_close queues one more CLOSED
-                 * event; it finds no conn and is ignored. (The port struct
-                 * itself is still never freed: another thread may hold it
-                 * in an in-flight event, see KNOWN_ISSUES.) */
-                sw_port_t *port = evt->port;
-                conn_on_close(cid);
-                sw_port_close(port);
+                 * default ulimit). conn_close hands the port to
+                 * sw_port_close_free, which also reclaims the struct. A
+                 * CLOSED event for a port we already closed finds no conn
+                 * and is ignored (pointer compare only, never a deref). */
+                conn_on_close(cid, evt->port);
             }
             free(evt);
         }
@@ -903,15 +1107,36 @@ static void http_bridge_entry(void *arg) {
 /* === Public API === */
 
 sw_process_t *sw_http_listen(uint16_t port, sw_process_t *handler) {
+    return sw_http_listen_opts(port, handler, NULL);
+}
+
+sw_process_t *sw_http_listen_opts(uint16_t port, sw_process_t *handler,
+                                  const sw_http_opts_t *opts) {
+    /* Loopback unless the caller or SW_HTTP_BIND widens it (same shape as
+     * SW_NODE_BIND for distribution): a dev server, an agent's control
+     * socket or a LiveView page must not be reachable from the network
+     * just because it was started. "localhost" is taken as 127.0.0.1;
+     * anything else must be an IPv4 literal — sw_tcp_listen refuses a
+     * garbage address rather than falling back to every interface. */
+    const char *bind_addr = (opts && opts->bind && *opts->bind) ? opts->bind
+                                                                : getenv("SW_HTTP_BIND");
+    if (!bind_addr || !*bind_addr || strcasecmp(bind_addr, "localhost") == 0)
+        bind_addr = "127.0.0.1";
+
     /* Create TCP listener (owned by caller initially) */
-    sw_port_t *listener = sw_tcp_listen(NULL, port);
-    if (!listener) return NULL;
+    sw_port_t *listener = sw_tcp_listen(bind_addr, port);
+    if (!listener) {
+        fprintf(stderr, "swarmrt_http: cannot listen on %s:%u\n", bind_addr, port);
+        return NULL;
+    }
 
     /* Allocate bridge state */
     sw_http_bridge_t *bridge = (sw_http_bridge_t *)calloc(1, sizeof(sw_http_bridge_t));
     bridge->listener = listener;
     bridge->handler = handler;
     bridge->port = port;
+    if (opts && opts->ws_origins && *opts->ws_origins)
+        bridge->ws_origins = strdup(opts->ws_origins);
 
     /* Spawn bridge process */
     sw_process_t *bp = sw_spawn(http_bridge_entry, bridge);
@@ -923,9 +1148,9 @@ sw_process_t *sw_http_listen(uint16_t port, sw_process_t *handler) {
 }
 
 int sw_http_respond(int conn_id, int status, const char *headers, const char *body) {
-    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return -1;
+    sw_port_t *port = conn_pin(conn_id);
+    if (!port) return -1;
     sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active || !c->port) return -1;
 
     const char *status_text;
     switch (status) {
@@ -934,6 +1159,7 @@ int sw_http_respond(int conn_id, int status, const char *headers, const char *bo
     case 302: status_text = "Found"; break;
     case 304: status_text = "Not Modified"; break;
     case 400: status_text = "Bad Request"; break;
+    case 403: status_text = "Forbidden"; break;
     case 404: status_text = "Not Found"; break;
     case 413: status_text = "Payload Too Large"; break;
     case 500: status_text = "Internal Server Error"; break;
@@ -954,27 +1180,25 @@ int sw_http_respond(int conn_id, int status, const char *headers, const char *bo
         status, status_text, body_len, conn_hdr,
         headers ? headers : "");
 
-    sw_tcp_send(c->port, head, hlen);
+    sw_tcp_send(port, head, hlen);
     if (body_len > 0)
-        sw_tcp_send(c->port, body, body_len);
+        sw_tcp_send(port, body, body_len);
 
     /* Close connection if not keep-alive */
-    if (!c->keep_alive) {
-        if (c->port) sw_port_close(c->port);
-        conn_free(conn_id);
-    }
-
+    if (!c->keep_alive) conn_close(conn_id, port);
+    sw_port_unref(port);
     return 0;
 }
 
 int sw_http_respond_raw(int conn_id, int status, const char *headers, const void *data, uint32_t data_len) {
-    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return -1;
+    sw_port_t *port = conn_pin(conn_id);
+    if (!port) return -1;
     sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active || !c->port) return -1;
 
     const char *status_text;
     switch (status) {
     case 200: status_text = "OK"; break;
+    case 403: status_text = "Forbidden"; break;
     case 404: status_text = "Not Found"; break;
     case 413: status_text = "Payload Too Large"; break;
     default:  status_text = "OK"; break;
@@ -991,21 +1215,19 @@ int sw_http_respond_raw(int conn_id, int status, const char *headers, const void
         status, status_text, data_len, conn_hdr,
         headers ? headers : "");
 
-    sw_tcp_send(c->port, head, hlen);
+    sw_tcp_send(port, head, hlen);
     if (data_len > 0 && data)
-        sw_tcp_send(c->port, data, data_len);
+        sw_tcp_send(port, data, data_len);
 
-    if (!c->keep_alive) {
-        if (c->port) sw_port_close(c->port);
-        conn_free(conn_id);
-    }
+    if (!c->keep_alive) conn_close(conn_id, port);
+    sw_port_unref(port);
     return 0;
 }
 
 int sw_ws_send_text(int conn_id, const char *data, uint32_t len) {
-    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return -1;
-    sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active || c->mode != SW_HTTP_MODE_WS || !c->port) return -1;
+    sw_port_t *port = conn_pin(conn_id);
+    if (!port) return -1;
+    if (g_http_conns[conn_id].mode != SW_HTTP_MODE_WS) { sw_port_unref(port); return -1; }
 
     /* Build WebSocket frame header (server → client, no mask) */
     uint8_t hdr[10];
@@ -1027,15 +1249,16 @@ int sw_ws_send_text(int conn_id, const char *data, uint32_t len) {
         hdr_len = 10;
     }
 
-    sw_tcp_send(c->port, hdr, hdr_len);
-    sw_tcp_send(c->port, data, len);
+    sw_tcp_send(port, hdr, hdr_len);
+    sw_tcp_send(port, data, len);
+    sw_port_unref(port);
     return 0;
 }
 
 int sw_ws_send_binary(int conn_id, const char *data, uint32_t len) {
-    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return -1;
-    sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active || c->mode != SW_HTTP_MODE_WS || !c->port) return -1;
+    sw_port_t *port = conn_pin(conn_id);
+    if (!port) return -1;
+    if (g_http_conns[conn_id].mode != SW_HTTP_MODE_WS) { sw_port_unref(port); return -1; }
 
     /* WebSocket frame header (server → client, no mask), opcode 0x2. */
     uint8_t hdr[10];
@@ -1057,23 +1280,23 @@ int sw_ws_send_binary(int conn_id, const char *data, uint32_t len) {
         hdr_len = 10;
     }
 
-    sw_tcp_send(c->port, hdr, hdr_len);
-    sw_tcp_send(c->port, data, len);
+    sw_tcp_send(port, hdr, hdr_len);
+    sw_tcp_send(port, data, len);
+    sw_port_unref(port);
     return 0;
 }
 
 int sw_ws_close(int conn_id) {
-    if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS) return -1;
-    sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active) return -1;
+    sw_port_t *port = conn_pin(conn_id);
+    if (!port) return -1;
 
-    if (c->mode == SW_HTTP_MODE_WS && c->port) {
+    if (g_http_conns[conn_id].mode == SW_HTTP_MODE_WS) {
         uint8_t close_frame[2] = {0x88, 0x00};
-        sw_tcp_send(c->port, close_frame, 2);
+        sw_tcp_send(port, close_frame, 2);
     }
 
-    if (c->port) sw_port_close(c->port);
-    conn_free(conn_id);
+    conn_close(conn_id, port);
+    sw_port_unref(port);
     return 0;
 }
 
@@ -1092,10 +1315,17 @@ int sw_ws_set_handler(int conn_id, sw_process_t *handler) {
 sw_val_t *sw_ws_request_headers(int conn_id) {
     if (conn_id < 0 || conn_id >= SW_HTTP_MAX_CONNS)
         return sw_val_map_new(NULL, NULL, 0);
+    /* Copy the raw block under the lock (a close on the bridge may free it)
+     * and build the map here, in the caller's own heap. It used to hand out
+     * a map living in the bridge's heap — shared across processes, and it
+     * pinned the bridge's heap forever (see http_bridge_entry). */
+    pthread_mutex_lock(&g_http_lock);
     sw_http_conn_t *c = &g_http_conns[conn_id];
-    if (!c->active || !c->req_headers)
-        return sw_val_map_new(NULL, NULL, 0);
-    return c->req_headers;
+    char *raw = (c->active && c->req_hdr) ? strdup(c->req_hdr) : NULL;
+    pthread_mutex_unlock(&g_http_lock);
+    sw_val_t *m = http_hdr_map(raw);
+    free(raw);
+    return m;
 }
 
 /* Request path+query from the UPGRADE request, for a live WS conn.
@@ -1157,7 +1387,7 @@ void sw_ws_fuzz_frames(const uint8_t *data, uint32_t len) {
     c->buf_len = len;
     c->buf_cap = len + 1;
 
-    ws_try_parse(0);
+    ws_try_parse(0, NULL);
 
     free(c->buf);
     free(c->frag_buf);

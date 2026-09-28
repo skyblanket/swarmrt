@@ -67,6 +67,12 @@ static volatile int g_io_running = 0;
 static sw_port_t *g_ports = NULL;           /* Global port list */
 static pthread_mutex_t g_ports_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint32_t g_next_port_id = 1;
+static _Atomic int64_t g_ports_live;       /* allocated sw_port_t structs */
+
+/* Ports handed to sw_port_close_free, waiting for the IO thread to free
+ * them between event batches (io_reap_retired). */
+static sw_port_t *g_retired = NULL;
+static pthread_mutex_t g_retired_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Wake pipe for signaling the IO thread */
 #ifdef _WIN32
@@ -112,6 +118,7 @@ static sw_port_t *port_alloc(sw_fd_t fd, sw_port_type_t type, sw_process_t *owne
     p->state = SW_PORT_OPEN;
     p->owner = owner;
     p->id = atomic_fetch_add(&g_next_port_id, 1);
+    atomic_fetch_add_explicit(&g_ports_live, 1, memory_order_relaxed);
 
     if (type == SW_PORT_TCP_CONN) {
         p->recv_buf = (uint8_t *)malloc(SW_IO_RECV_BUF);
@@ -151,6 +158,39 @@ static void port_free(sw_port_t *port) {
     }
     port->state = SW_PORT_CLOSED;
     free(port);
+    atomic_fetch_sub_explicit(&g_ports_live, 1, memory_order_relaxed);
+}
+
+/* Free the ports sw_port_close_free retired. Runs on the IO thread at the
+ * top of each loop iteration, i.e. strictly between event batches: every
+ * retired port was deregistered before it was retired, so no batch fetched
+ * from here on can name it, and the batch that might have is finished. A
+ * port someone still pins (refs > 0) goes back on the list for the next
+ * pass (at most one poll timeout, 100ms, later). */
+static void io_reap_retired(void) {
+    pthread_mutex_lock(&g_retired_lock);
+    sw_port_t *p = g_retired;
+    g_retired = NULL;
+    pthread_mutex_unlock(&g_retired_lock);
+
+    sw_port_t *keep = NULL, *keep_tail = NULL;
+    while (p) {
+        sw_port_t *next = p->retire_next;
+        if (atomic_load_explicit(&p->refs, memory_order_acquire) == 0) {
+            port_free(p);
+        } else {
+            p->retire_next = NULL;
+            if (keep_tail) keep_tail->retire_next = p; else keep = p;
+            keep_tail = p;
+        }
+        p = next;
+    }
+    if (keep) {
+        pthread_mutex_lock(&g_retired_lock);
+        keep_tail->retire_next = g_retired;
+        g_retired = keep;
+        pthread_mutex_unlock(&g_retired_lock);
+    }
 }
 
 /* === Event registration (platform-specific) === */
@@ -219,17 +259,23 @@ static void handle_accept(sw_port_t *listener) {
     set_nonblocking(fd);
     set_nodelay(fd);
 
-    sw_port_t *conn = port_alloc(fd, SW_PORT_TCP_CONN, listener->owner);
+    /* owner is handed over by sw_port_controlling_process on another thread
+     * (http_listen transfers its listener to the bridge after creating it). */
+    sw_process_t *owner = __atomic_load_n(&listener->owner, __ATOMIC_ACQUIRE);
+    sw_port_t *conn = port_alloc(fd, SW_PORT_TCP_CONN, owner);
     ev_register_read(fd, conn);
 
     sw_port_accept_t *msg = (sw_port_accept_t *)malloc(sizeof(sw_port_accept_t));
     msg->listener = listener;
     msg->conn = conn;
-    sw_send_tagged(listener->owner, SW_TAG_PORT_ACCEPT, msg);
+    sw_send_tagged(owner, SW_TAG_PORT_ACCEPT, msg);
 }
 
 static void handle_read(sw_port_t *port) {
-    if (port->state != SW_PORT_OPEN || !port->owner) return;
+    /* Acquire: a port closed (and maybe retired) on another thread while it
+     * sat in this batch reads as not-OPEN here and is left alone. */
+    if (__atomic_load_n(&port->state, __ATOMIC_ACQUIRE) != SW_PORT_OPEN ||
+        !port->owner) return;
 
 #ifdef _WIN32
     int n = recv(port->fd, (char *)port->recv_buf, port->recv_buf_size, 0);
@@ -254,7 +300,7 @@ static void handle_read(sw_port_t *port) {
 #endif
     )) {
         ev_deregister(port->fd);
-        port->state = SW_PORT_CLOSING;
+        __atomic_store_n(&port->state, SW_PORT_CLOSING, __ATOMIC_RELEASE);
 
         sw_port_event_t *msg = (sw_port_event_t *)malloc(sizeof(sw_port_event_t));
         msg->port = port;
@@ -276,6 +322,7 @@ static void *io_loop(void *arg) {
     /* ---- kqueue ---- */
     struct kevent events[SW_IO_MAX_EVENTS];
     while (g_io_running) {
+        io_reap_retired();
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
         int n = kevent(g_kq, NULL, 0, events, SW_IO_MAX_EVENTS, &ts);
         for (int i = 0; i < n; i++) {
@@ -304,6 +351,7 @@ static void *io_loop(void *arg) {
     sw_port_t *pollports[SW_IO_MAX_EVENTS];
 
     while (g_io_running) {
+        io_reap_retired();
         int nfds = 0;
 
         /* Always poll the wake socket */
@@ -363,6 +411,7 @@ static void *io_loop(void *arg) {
     /* ---- epoll ---- */
     struct epoll_event events[SW_IO_MAX_EVENTS];
     while (g_io_running) {
+        io_reap_retired();
         int n = epoll_wait(g_kq, events, SW_IO_MAX_EVENTS, 100); /* 100ms */
         for (int i = 0; i < n; i++) {
             sw_port_t *port = (sw_port_t *)events[i].data.ptr;
@@ -488,10 +537,22 @@ void sw_io_shutdown(void) {
         if (p->fd != SW_INVALID_FD) close_fd(p->fd);
         if (p->recv_buf) free(p->recv_buf);
         free(p);
+        atomic_fetch_sub_explicit(&g_ports_live, 1, memory_order_relaxed);
         p = next;
     }
     g_ports = NULL;
     pthread_mutex_unlock(&g_ports_lock);
+    /* IO thread is joined: nothing can be mid-batch, so free retired ports
+     * whatever their pins say. */
+    pthread_mutex_lock(&g_retired_lock);
+    p = g_retired;
+    g_retired = NULL;
+    pthread_mutex_unlock(&g_retired_lock);
+    while (p) {
+        sw_port_t *next = p->retire_next;
+        port_free(p);
+        p = next;
+    }
 
 #ifdef _WIN32
     if (g_wake_pipe[0] != INVALID_SOCKET) closesocket(g_wake_pipe[0]);
@@ -534,7 +595,13 @@ sw_port_t *sw_tcp_listen(const char *addr, uint16_t port) {
     sin.sin_family = AF_INET;
     sin.sin_port = htons(port);
     if (addr && addr[0]) {
-        inet_pton(AF_INET, addr, &sin.sin_addr);
+        /* A malformed address used to leave sin_addr zeroed, i.e. silently
+         * bind every interface — the opposite of what a bind setting asks
+         * for. Refuse instead. */
+        if (inet_pton(AF_INET, addr, &sin.sin_addr) != 1) {
+            close_fd(fd);
+            return NULL;
+        }
     } else {
         sin.sin_addr.s_addr = htonl(INADDR_ANY);
     }
@@ -586,7 +653,8 @@ sw_port_t *sw_tcp_connect(const char *addr, uint16_t port) {
 }
 
 int sw_tcp_send(sw_port_t *port, const void *data, uint32_t len) {
-    if (!port || port->state != SW_PORT_OPEN || port->type != SW_PORT_TCP_CONN)
+    if (!port || __atomic_load_n(&port->state, __ATOMIC_ACQUIRE) != SW_PORT_OPEN ||
+        port->type != SW_PORT_TCP_CONN)
         return -1;
 
 #ifdef _WIN32
@@ -612,7 +680,7 @@ void sw_port_close(sw_port_t *port) {
     if (!port || port->state == SW_PORT_CLOSED) return;
 
     ev_deregister(port->fd);
-    port->state = SW_PORT_CLOSING;
+    __atomic_store_n(&port->state, SW_PORT_CLOSING, __ATOMIC_RELEASE);
     close_fd(port->fd);
     port->fd = SW_INVALID_FD;
 
@@ -626,11 +694,47 @@ void sw_port_close(sw_port_t *port) {
     port_remove(port);
     if (port->recv_buf) free(port->recv_buf);
     port->recv_buf = NULL;
-    port->state = SW_PORT_CLOSED;
+    __atomic_store_n(&port->state, SW_PORT_CLOSED, __ATOMIC_RELEASE);
+}
+
+void sw_port_close_free(sw_port_t *port) {
+    if (!port) return;
+    ev_deregister(port->fd);
+    __atomic_store_n(&port->state, SW_PORT_CLOSING, __ATOMIC_RELEASE);
+    /* shutdown, not close: the peer gets its FIN now, but the fd NUMBER stays
+     * ours until the reaper closes it, so a read the IO thread already has in
+     * flight on it can't land on a freshly accepted socket reusing the
+     * number. (sw_port_close closes here and has that race.) */
+    if (port->fd != SW_INVALID_FD) {
+#ifdef _WIN32
+        shutdown(port->fd, SD_BOTH);
+#else
+        shutdown(port->fd, SHUT_RDWR);
+#endif
+    }
+    port_remove(port);
+
+    pthread_mutex_lock(&g_retired_lock);
+    port->retire_next = g_retired;
+    g_retired = port;
+    pthread_mutex_unlock(&g_retired_lock);
+    io_wake();   /* reap (and close the fd) promptly, not on the poll timeout */
+}
+
+void sw_port_ref(sw_port_t *port) {
+    if (port) atomic_fetch_add_explicit(&port->refs, 1, memory_order_relaxed);
+}
+
+void sw_port_unref(sw_port_t *port) {
+    if (port) atomic_fetch_sub_explicit(&port->refs, 1, memory_order_release);
+}
+
+int64_t sw_io_ports_live(void) {
+    return atomic_load_explicit(&g_ports_live, memory_order_relaxed);
 }
 
 void sw_port_controlling_process(sw_port_t *port, sw_process_t *new_owner) {
-    if (port) port->owner = new_owner;
+    if (port) __atomic_store_n(&port->owner, new_owner, __ATOMIC_RELEASE);
 }
 
 void sw_io_cleanup_owner(sw_process_t *proc) {
