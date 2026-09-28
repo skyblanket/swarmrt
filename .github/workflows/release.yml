@@ -76,7 +76,13 @@ jobs:
           ls -lh "dist/$PKG.tar.gz"
 
       - name: Smoke — the packaged install, from outside the checkout
-        run: bash scripts/install_smoke.sh
+        run: |
+          set -e
+          # Test the archive itself (after strip), not a fresh layout.
+          PKG="swarmrt-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          x="$(mktemp -d)"
+          tar -C "$x" -xzf "dist/$PKG.tar.gz"
+          bash scripts/install_smoke.sh "$x/$PKG"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -126,8 +132,8 @@ jobs:
             Download the archive for your platform, extract, and put `swc` on PATH:
             ```bash
             tar xzf swarmrt-*-<platform>.tar.gz
-            ./swarmrt-*/swc --version
-            ./swarmrt-*/swc build yourprogram.sw -o yourprogram
+            ./swarmrt-*/bin/swc --version
+            ./swarmrt-*/bin/swc build yourprogram.sw -o yourprogram
             ```
 
             ### Platforms

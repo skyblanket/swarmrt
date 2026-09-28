@@ -3,12 +3,20 @@
 # out like a release archive: swc on PATH, `swc new`, the project's offline
 # tests, and a build that imports the stdlib. Catches install-relative
 # lookups that only work from inside the checkout.
+#   install_smoke.sh            lay out an install from this checkout
+#   install_smoke.sh <root>     test an existing install (an extracted archive)
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-bash "$here/scripts/install_layout.sh" "$tmp/swarmrt"
-export PATH="$tmp/swarmrt/bin:$PATH"
+if [ -n "${1:-}" ]; then
+    root="$(cd "$1" && pwd)"
+else
+    root="$tmp/swarmrt"
+    bash "$here/scripts/install_layout.sh" "$root"
+fi
+test -x "$root/bin/swc" || { echo "install smoke: no bin/swc under $root"; exit 1; }
+export PATH="$root/bin:$PATH"
 cd "$tmp"
 swc --version
 swc new demo

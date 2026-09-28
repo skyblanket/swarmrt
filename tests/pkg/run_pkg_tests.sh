@@ -153,7 +153,7 @@ fun main() {
     print(Local.value())
 }
 EOF
-cd "$APP"
+cd "$APP" || { echo "error: cannot cd to $APP" >&2; exit 2; }
 
 lock_sha() { # lock_sha <dep> — the sha pinned in swarm.lock (one entry per line)
     grep "^    \"$1\": " "$APP/swarm.lock" | sed -n 's/.*"sha": "\([0-9a-f]*\)".*/\1/p'
@@ -271,14 +271,14 @@ fun nothing() {
     0
 }
 EOF
-cd "$APP/sub"
+cd "$APP/sub" || { echo "error: cannot cd to $APP/sub" >&2; exit 2; }
 out="$("$SWC" add localpkg --path ../../localpkg 2>&1)"
 if [ $? -eq 0 ]; then ok "swc add --path (from a subdirectory)"; else bad "swc add --path (from a subdirectory)" "$out"; fi
 if grep -q "warning: dependency 'localpkg' provides Std.sw, which shadows" <<<"$out"; then
     ok "shadowing a lib/ module warns"
 else bad "shadowing a lib/ module warns" "$out"; fi
 rm -f "$WORK/localpkg/Std.sw"
-cd "$APP"
+cd "$APP" || { echo "error: cannot cd to $APP" >&2; exit 2; }
 
 # A module provided by two packages is ambiguous, not a silent pick.
 mkdir -p "$WORK/dup_a" "$WORK/dup_b"
@@ -296,6 +296,47 @@ else bad "module in two packages is ambiguous (swc run)" "$out"; fi
 "$SWC" remove dup_a >/dev/null 2>&1
 "$SWC" remove dup_b >/dev/null 2>&1
 rm -f "$APP/use_dup.sw"
+
+# A package's own import that another loaded module shadows by name is a
+# conflict, not a silent call into the wrong module.
+mkdir -p "$WORK/shadow/src"
+printf 'module Util
+
+fun who() {
+    "pkg"
+}
+' > "$WORK/shadow/src/Util.sw"
+printf 'module Shadow
+
+import Util
+
+fun who() {
+    Util.who()
+}
+' > "$WORK/shadow/src/Shadow.sw"
+printf 'module Util
+
+fun who() {
+    "app"
+}
+' > "$APP/Util.sw"
+printf 'module Main
+
+import Util
+import Shadow
+
+fun main() {
+    print(Shadow.who())
+}
+' > "$APP/use_shadow.sw"
+"$SWC" add shadow --path ../shadow >/dev/null 2>&1
+for mode in build run; do
+    if [ "$mode" = build ]; then out="$("$SWC" build use_shadow.sw -o "$WORK/prog" 2>&1)"; else out="$("$SWC" run use_shadow.sw 2>&1)"; fi
+    if [ $? -ne 0 ] && grep -q "module 'Util' is provided by both" <<<"$out"; then ok "package-internal module shadowed by a project module is a conflict (swc $mode)"
+    else bad "package-internal module shadowed by a project module is a conflict (swc $mode)" "$out"; fi
+done
+"$SWC" remove shadow >/dev/null 2>&1
+rm -f "$APP/Util.sw" "$APP/use_shadow.sw"
 check "path dep is a symlink to the package" test -L .swarm/deps/localpkg
 check "lock records the path dep" grep -q '"localpkg": {"path": ' swarm.lock
 build_run sub/other.sw "42" "path dep, project root found from a subdirectory"

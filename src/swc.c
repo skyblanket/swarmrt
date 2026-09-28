@@ -273,20 +273,59 @@ static char *resolve_import(const import_ctx_t *c, const char *importer, const c
     return NULL;
 }
 
+/* Is `importer` a module inside an installed dependency? */
+static int importer_in_dep(const import_ctx_t *c, const char *importer) {
+    if (!importer) return 0;
+    for (int i = 0; i < c->ndeps; i++) {
+        size_t n = strlen(c->dep_dirs[i]);
+        if (strncmp(importer, c->dep_dirs[i], n) == 0 && importer[n] == '/') return 1;
+    }
+    return 0;
+}
+
+static int same_file(const char *a, const char *b) {
+    char ra[PATH_MAX], rb[PATH_MAX];
+    if (realpath(a, ra) && realpath(b, rb)) return strcmp(ra, rb) == 0;
+    return strcmp(a, b) == 0;
+}
+
 /* Load imports transitively: the imports of every module in mods[]
  * (including the ones loaded here), each module once by name, appended to
  * mods/paths (paths added here are strdup'd). With `build`, register each
- * source with codegen for diagnostics and say what was auto-imported. */
-static void load_imports(void **mods, const char **paths, int *nmods, int max,
-                         const import_ctx_t *c, int build) {
+ * source with codegen for diagnostics and say what was auto-imported.
+ * Returns the number of conflicts: module names are global, so a package
+ * whose own import resolves to a different file than the module already
+ * loaded under that name can't be built (it would silently call the other
+ * module otherwise). */
+static int load_imports(void **mods, const char **paths, int *nmods, int max,
+                        const import_ctx_t *c, int build) {
+    int conflicts = 0;
     for (int a = 0; a < *nmods; a++) {
         node_t *m = (node_t *)mods[a];
         for (int im = 0; im < m->v.mod.nimports; im++) {
             const char *imp_name = m->v.mod.imports[im];
-            int loaded = 0;
+            int loaded = -1;
             for (int e = 0; e < *nmods; e++)
-                if (strcmp(get_mod_name(mods[e]), imp_name) == 0) { loaded = 1; break; }
-            if (loaded) continue;
+                if (strcmp(get_mod_name(mods[e]), imp_name) == 0) { loaded = e; break; }
+            if (loaded >= 0) {
+                /* A package's own imports resolve inside the package first:
+                 * check that the name really is the same file. */
+                if (importer_in_dep(c, paths[a]) && paths[loaded]) {
+                    char want[PATH_MAX + 256];
+                    char *s = resolve_import(c, paths[a], imp_name, want, sizeof(want));
+                    if (s) {
+                        free(s);
+                        if (!same_file(want, paths[loaded])) {
+                            fprintf(stderr, "swc: module '%s' is provided by both %s and %s "
+                                            "(imported from %s); module names are global, "
+                                            "so rename one\n",
+                                    imp_name, paths[loaded], want, paths[a]);
+                            conflicts++;
+                        }
+                    }
+                }
+                continue;
+            }
 
             char imp_path[PATH_MAX + 256];
             char *imp_source = resolve_import(c, paths[a], imp_name, imp_path, sizeof(imp_path));
@@ -313,6 +352,7 @@ static void load_imports(void **mods, const char **paths, int *nmods, int max,
             }
         }
     }
+    return conflicts;
 }
 
 /* Bootstrap context handed to the spawned root process. Mirrors the
@@ -373,8 +413,9 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
     {
         import_ctx_t ictx;
         import_ctx_init(&ictx, path, swarmrt_lib);
-        load_imports(mods, mod_paths, &nmods, 64, &ictx, 0);
+        int conflicts = load_imports(mods, mod_paths, &nmods, 64, &ictx, 0);
         import_ctx_free(&ictx);
+        if (conflicts) return 1;
     }
 
     /* Same static name check as `swc build` — each module against the whole
@@ -630,8 +671,9 @@ int main(int argc, char **argv) {
     {
         import_ctx_t ictx;
         import_ctx_init(&ictx, inputs[0], swarmrt_lib);
-        load_imports(asts, ast_paths, &nasts, 64, &ictx, 1);
+        int conflicts = load_imports(asts, ast_paths, &nasts, 64, &ictx, 1);
         import_ctx_free(&ictx);
+        if (conflicts) return 1;
     }
 
     const char *mod_name = get_mod_name(asts[main_idx]);

@@ -22,7 +22,7 @@ in a shared, growable store with a hash index; a put that adds a key extends the
 in place when the map owns its edge (the list-store technique), so older map values
 never see the new slot. 20,000 keys: 25 ms; 100,000: 137 ms. Values stay immutable:
 two maps branched from one base, replaced keys and atom/string key equivalence are
-pinned by `tests/sw/test_map_store.sw` (15).
+pinned by `tests/sw/test_map_store.sw` (14).
 
 ## 2026-09-27 — `swc new`, and swc works from PATH and from a release archive
 
