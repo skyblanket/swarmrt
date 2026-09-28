@@ -2855,6 +2855,7 @@ sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {
     v->v.map.cap = count > 4 ? count : 4;
     v->v.map.keys = val_alloc(sizeof(sw_val_t*) * v->v.map.cap);
     v->v.map.vals = val_alloc(sizeof(sw_val_t*) * v->v.map.cap);
+    v->v.map.store = NULL;
     if (count > 0 && keys && vals) {
         memcpy(v->v.map.keys, keys, sizeof(sw_val_t*) * count);
         memcpy(v->v.map.vals, vals, sizeof(sw_val_t*) * count);
@@ -2862,23 +2863,135 @@ sw_val_t *sw_val_map_new(sw_val_t **keys, sw_val_t **vals, int count) {
     return v;
 }
 
-sw_val_t *sw_val_map_get(sw_val_t *map, sw_val_t *key) {
-    if (!map || map->type != SW_VAL_MAP) return sw_val_nil();
-    /* First pass: exact value-equal match. */
-    for (int i = 0; i < map->v.map.count; i++)
-        if (sw_val_equal(map->v.map.keys[i], key)) return map->v.map.vals[i];
-    /* Second pass: treat atom and string with the same text as
-     * equivalent for lookup. JSON decode produces string keys; sw
-     * map literals (`%{name: ...}`) produce atom keys; users expect
-     * `map_get(json_decode(...), 'msg')` to work. */
+/* === Map backing stores ===
+ * The same idea as list stores: slots [0, hi) of keys/vals are claimed, and
+ * every map header sharing the store covers a prefix [0, count). A header
+ * may add a key in place only when count == hi, so the new slot is outside
+ * every other header's range and no existing map can observe it. Keys are
+ * therefore unique across [0, hi), and the hash index (slot -> entry + 1)
+ * serves every header: an entry e belongs to a header iff e < count.
+ * Only string, atom and int keys are indexed; strings and atoms hash by
+ * their text so the atom/string equivalence of map_get still works. A store
+ * that gets any other key drops its index and falls back to a scan.
+ * Stores live in the arena; single writer, as for lists (sends and copies
+ * build fresh store-less maps through sw_val_map_new). */
+typedef struct sw_map_store {
+    int cap, hi;
+    int *index;        /* icap slots, 0 = empty; NULL = no index */
+    int icap;          /* power of two, >= 2 * cap */
+} sw_map_store_t;
+
+#define SW_MAP_INDEX_MIN 16    /* smaller maps: a scan is as fast */
+
+static int map_key_indexable(sw_val_t *k) {
+    return k && (k->type == SW_VAL_STRING || k->type == SW_VAL_ATOM || k->type == SW_VAL_INT) &&
+           (k->type == SW_VAL_INT || k->v.str);
+}
+
+static uint64_t map_key_hash(sw_val_t *k) {
+    uint64_t h = 1469598103934665603ULL;
+    if (k->type == SW_VAL_INT) {
+        uint64_t x = (uint64_t)k->v.i;
+        for (int i = 0; i < 8; i++) { h ^= (x >> (i * 8)) & 0xff; h *= 1099511628211ULL; }
+        return h ^ 0x9e3779b97f4a7c15ULL;
+    }
+    for (const unsigned char *p = (const unsigned char *)k->v.str; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+    return h;
+}
+
+static void map_index_insert(sw_map_store_t *st, sw_val_t *k, int e) {
+    unsigned mask = (unsigned)st->icap - 1;
+    unsigned i = (unsigned)map_key_hash(k) & mask;
+    while (st->index[i]) i = (i + 1) & mask;
+    st->index[i] = e + 1;
+}
+
+/* Entry of `key` in header `m` (-1 if absent). `alt` gets the lowest entry
+ * whose key is the other of atom/string with the same text (map_get's
+ * second pass), or -1. */
+static int map_find(sw_val_t *m, sw_val_t *key, int *alt) {
+    int n = m->v.map.count;
+    *alt = -1;
+    sw_map_store_t *st = m->v.map.store;
+    if (st && st->index && map_key_indexable(key)) {
+        unsigned mask = (unsigned)st->icap - 1;
+        for (unsigned i = (unsigned)map_key_hash(key) & mask; st->index[i]; i = (i + 1) & mask) {
+            int e = st->index[i] - 1;
+            if (e >= n) continue;
+            sw_val_t *k = m->v.map.keys[e];
+            if (sw_val_equal(k, key)) return e;
+            if (key->type != SW_VAL_INT && k->type != key->type && k->type != SW_VAL_INT &&
+                strcmp(k->v.str, key->v.str) == 0 && (*alt < 0 || e < *alt)) *alt = e;
+        }
+        return -1;
+    }
+    for (int i = 0; i < n; i++)
+        if (sw_val_equal(m->v.map.keys[i], key)) return i;
     if (key && (key->type == SW_VAL_ATOM || key->type == SW_VAL_STRING) && key->v.str) {
         sw_val_type_t alt_type = (key->type == SW_VAL_ATOM) ? SW_VAL_STRING : SW_VAL_ATOM;
-        for (int i = 0; i < map->v.map.count; i++) {
-            sw_val_t *k = map->v.map.keys[i];
-            if (k && k->type == alt_type && k->v.str && strcmp(k->v.str, key->v.str) == 0)
-                return map->v.map.vals[i];
+        for (int i = 0; i < n; i++) {
+            sw_val_t *k = m->v.map.keys[i];
+            if (k && k->type == alt_type && k->v.str && strcmp(k->v.str, key->v.str) == 0) { *alt = i; break; }
         }
     }
+    return -1;
+}
+
+static sw_val_t *map_header(sw_map_store_t *st, sw_val_t **keys, sw_val_t **vals, int count) {
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_MAP;
+    v->v.map.keys = keys;
+    v->v.map.vals = vals;
+    v->v.map.count = count;
+    v->v.map.cap = st->cap;
+    v->v.map.store = st;
+    return v;
+}
+
+/* Fresh store holding `m`'s entries (value of entry `replace` swapped for
+ * `val`, when >= 0) plus, when `add` is set, key -> val appended; room to
+ * keep growing. */
+static sw_val_t *map_grow(sw_val_t *m, sw_val_t *key, sw_val_t *val, int replace, int add) {
+    int n = m->v.map.count, need = n + (add ? 1 : 0);
+    int cap = need * 2;
+    if (cap < 8) cap = 8;
+    sw_map_store_t *st = val_alloc(sizeof(*st));
+    sw_val_t **ks = val_alloc(sizeof(sw_val_t *) * (size_t)cap);
+    sw_val_t **vs = val_alloc(sizeof(sw_val_t *) * (size_t)cap);
+    if (n) {
+        memcpy(ks, m->v.map.keys, sizeof(sw_val_t *) * (size_t)n);
+        memcpy(vs, m->v.map.vals, sizeof(sw_val_t *) * (size_t)n);
+    }
+    if (replace >= 0) vs[replace] = val;
+    if (add) { ks[n] = key; vs[n] = val; }
+    st->cap = cap;
+    st->hi = need;
+    st->index = NULL;
+    st->icap = 0;
+    if (cap >= SW_MAP_INDEX_MIN) {
+        int ok = 1;
+        for (int i = 0; i < need && ok; i++) ok = map_key_indexable(ks[i]);
+        if (ok) {
+            int icap = 16;
+            while (icap < cap * 2) icap <<= 1;
+            st->index = val_alloc(sizeof(int) * (size_t)icap);
+            memset(st->index, 0, sizeof(int) * (size_t)icap);
+            st->icap = icap;
+            for (int i = 0; i < need; i++) map_index_insert(st, ks[i], i);
+        }
+    }
+    return map_header(st, ks, vs, need);
+}
+
+sw_val_t *sw_val_map_get(sw_val_t *map, sw_val_t *key) {
+    if (!map || map->type != SW_VAL_MAP) return sw_val_nil();
+    /* Exact value-equal match; failing that, an atom and a string with the
+     * same text are equivalent for lookup. JSON decode produces string keys;
+     * sw map literals (`%{name: ...}`) produce atom keys; users expect
+     * `map_get(json_decode(...), 'msg')` to work. */
+    int alt, e = map_find(map, key, &alt);
+    if (e >= 0) return map->v.map.vals[e];
+    if (alt >= 0) return map->v.map.vals[alt];
     return sw_val_nil();
 }
 
@@ -2886,21 +2999,36 @@ sw_val_t *sw_val_map_put(sw_val_t *map, sw_val_t *key, sw_val_t *val) {
     if (!map || map->type != SW_VAL_MAP) {
         return sw_val_map_new(&key, &val, 1);
     }
-    for (int i = 0; i < map->v.map.count; i++) {
-        if (sw_val_equal(map->v.map.keys[i], key)) {
+    int alt, e = map_find(map, key, &alt);
+    if (!list_arena_backed()) {
+        if (e >= 0) {
             sw_val_t *nm = sw_val_map_new(map->v.map.keys, map->v.map.vals, map->v.map.count);
-            nm->v.map.vals[i] = val;
+            nm->v.map.vals[e] = val;
             return nm;
         }
+        int n = map->v.map.count;
+        sw_val_t **ks = malloc(sizeof(sw_val_t*) * (n+1));
+        sw_val_t **vs = malloc(sizeof(sw_val_t*) * (n+1));
+        if (n > 0) { memcpy(ks, map->v.map.keys, sizeof(sw_val_t*)*n); memcpy(vs, map->v.map.vals, sizeof(sw_val_t*)*n); }
+        ks[n] = key; vs[n] = val;
+        sw_val_t *nm = sw_val_map_new(ks, vs, n+1);
+        free(ks); free(vs);
+        return nm;
     }
+    if (e >= 0) return map_grow(map, NULL, val, e, 0);    /* replace: others still see the old value */
+    sw_map_store_t *st = map->v.map.store;
     int n = map->v.map.count;
-    sw_val_t **ks = malloc(sizeof(sw_val_t*) * (n+1));
-    sw_val_t **vs = malloc(sizeof(sw_val_t*) * (n+1));
-    if (n > 0) { memcpy(ks, map->v.map.keys, sizeof(sw_val_t*)*n); memcpy(vs, map->v.map.vals, sizeof(sw_val_t*)*n); }
-    ks[n] = key; vs[n] = val;
-    sw_val_t *nm = sw_val_map_new(ks, vs, n+1);
-    free(ks); free(vs);
-    return nm;
+    if (st && n == st->hi && n < st->cap) {
+        map->v.map.keys[n] = key;
+        map->v.map.vals[n] = val;
+        st->hi++;
+        if (st->index) {
+            if (map_key_indexable(key)) map_index_insert(st, key, n);
+            else st->index = NULL;                         /* a key it can't hash: scan from now on */
+        }
+        return map_header(st, map->v.map.keys, map->v.map.vals, n + 1);
+    }
+    return map_grow(map, key, val, -1, 1);
 }
 
 void sw_val_free(sw_val_t *v) {
@@ -4670,6 +4798,15 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_atom("false");
 #endif
     }
+
+    /* === Durable state (shared impl in swarmrt_node.c — same db, same
+     * encoding, same results as compiled) ======================== */
+    if (strcmp(fname, "checkpoint") == 0)
+        return sw_durable_checkpoint(nargs >= 1 ? args[0] : NULL, nargs >= 2 ? args[1] : NULL);
+    if (strcmp(fname, "restore") == 0)
+        return sw_durable_restore(nargs >= 1 ? args[0] : NULL);
+    if (strcmp(fname, "checkpoint_delete") == 0)
+        return sw_durable_delete(nargs >= 1 ? args[0] : NULL);
 
     /* === SQLite ================================================ */
     if (strcmp(fname, "db_open") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
@@ -6650,7 +6787,7 @@ static const char *k_interp_builtins[] = {
     "audio_resample_b","audio_ulaw_to_pcm16","audio_ulaw_to_pcm16_b",
     "base64_decode","base64_encode","byte","byte_at","byte_size","byte_slice",
     "bytes_concat","bytes_from_base64","bytes_from_ints","bytes_to_base64",
-    "bytes_to_string","codepoint_at","db_close","db_exec","db_open","db_query",
+    "bytes_to_string","checkpoint","checkpoint_delete","codepoint_at","db_close","db_exec","db_open","db_query",
     "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_drop","ets_get",
     "ets_list","ets_new","ets_put","ets_take","ets_update","ets_update_counter",
     "exec_argv","expect","file_append","file_delete","file_exists","file_list",
@@ -6658,7 +6795,7 @@ static const char *k_interp_builtins[] = {
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
     "math_round","math_sin","math_sqrt","ord","os_args","panic","print_above","eprint","stdout_to_stderr","fd_write",
-    "pid_kill_group","random_int","read_key","reduce","rl_history_append","rl_history_load",
+    "pid_kill_group","random_int","read_key","reduce","restore","rl_history_append","rl_history_load",
     "shell","shell_detached","shell_managed","shell_sandboxed","sleep",
     "stdin_pending_push","stdin_take_pending","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
@@ -6676,6 +6813,8 @@ int interp_is_known_builtin(const char *name) {
 static const char *lint_required_cap(const char *name) {
     if (strncmp(name, "file_", 5) == 0) return "file";
     if (strncmp(name, "db_", 3) == 0)   return "db";
+    if (strcmp(name, "checkpoint") == 0 || strcmp(name, "restore") == 0 ||
+        strcmp(name, "checkpoint_delete") == 0) return "db";   /* the state db */
     if (strcmp(name, "shell") == 0 || strcmp(name, "shell_sandboxed") == 0 ||
         strcmp(name, "shell_managed") == 0 ||
         strcmp(name, "shell_detached") == 0 ||

@@ -937,3 +937,239 @@ int sw_node_is_connected(const char *name) {
     pthread_mutex_unlock(&g_dist_lock);
     return connected;
 }
+
+/* === Durable state: checkpoint / restore ================================
+ *
+ * checkpoint(key, value) persists one sw value under a string key in a
+ * SQLite database; restore(key) reads it back after the OS process died and
+ * came back (a redeploy, a crash, a supervisor restart). The value is stored
+ * in the type-preserving encoding the distribution layer uses (marsh_val
+ * above), so atoms stay atoms, tuples stay tuples and bytes stay
+ * binary-clean — JSON would lose all three.
+ *
+ * Database: $SW_STATE_DB, default ./.swarm/state.db (parent directories are
+ * created). One table:
+ *
+ *   checkpoints(key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER)
+ *
+ * Every write is one INSERT OR REPLACE — atomic, so a crash leaves the
+ * previous or the new value, never a torn one. WAL journal with
+ * synchronous=FULL: a checkpoint that returned 'ok' survives a process
+ * crash and a power loss. updated_at is unix milliseconds.
+ *
+ * Blob layout: "SWD" + version byte (1) + marshalled value. The marshal
+ * format uses native byte order, so a state file moves between machines of
+ * the same endianness only (every current target is little-endian).
+ *
+ * Values that mean nothing in a later OS process are rejected rather than
+ * silently stored as nil: pids and remote pids (the process is gone after a
+ * restart — store a registered name instead) and funs. Shapes the wire
+ * format cannot carry losslessly are rejected too (tuples, maps and atoms
+ * whose u16 count/length would truncate; nesting past the unmarshal depth
+ * cap). One connection per OS process, serialized by g_durable_lock. */
+
+#include <sqlite3.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+
+#define SW_DURABLE_MAGIC   "SWD"
+#define SW_DURABLE_VERSION 1
+
+static pthread_mutex_t g_durable_lock = PTHREAD_MUTEX_INITIALIZER;
+static sqlite3 *g_durable_db = NULL;
+
+static sw_val_t *durable_err(sw_val_t *reason) {
+    sw_val_t *items[2] = { sw_val_atom("error"), reason };
+    return sw_val_tuple(items, 2);
+}
+
+/* NULL if `v` can be checkpointed, else the rejection reason (an atom name). */
+static const char *durable_check(sw_val_t *v, int depth) {
+    if (depth >= SW_UNMARSH_MAX_DEPTH - 1) return "too_deep";
+    if (!v) return NULL;
+    switch (v->type) {
+    case SW_VAL_NIL: case SW_VAL_INT: case SW_VAL_FLOAT:
+    case SW_VAL_STRING: case SW_VAL_BYTES:
+        return NULL;
+    case SW_VAL_ATOM:
+        return strlen(v->v.str) > 0xFFFF ? "too_large" : NULL;
+    case SW_VAL_TUPLE:
+    case SW_VAL_LIST:
+        if (v->type == SW_VAL_TUPLE && v->v.tuple.count > 0xFFFF) return "too_large";
+        if (v->v.tuple.count > 100000) return "too_large";   /* unmarshal breadth cap */
+        for (int i = 0; i < v->v.tuple.count; i++) {
+            const char *r = durable_check(v->v.tuple.items[i], depth + 1);
+            if (r) return r;
+        }
+        return NULL;
+    case SW_VAL_MAP:
+        if (v->v.map.count > 0xFFFF) return "too_large";
+        for (int i = 0; i < v->v.map.count; i++) {
+            const char *r = durable_check(v->v.map.keys[i], depth + 1);
+            if (!r) r = durable_check(v->v.map.vals[i], depth + 1);
+            if (r) return r;
+        }
+        return NULL;
+    default:   /* PID, REMOTE_PID, FUN */
+        return "not_serializable";
+    }
+}
+
+/* mkdir -p for the directory part of `path`. Failures surface at open. */
+static void durable_mkdirs(const char *path) {
+    char buf[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(buf)) return;
+    memcpy(buf, path, n + 1);
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash == buf) return;
+    *slash = '\0';
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        mkdir(buf, 0755);
+        *p = '/';
+    }
+    mkdir(buf, 0755);
+}
+
+/* Open (once) the state database. Caller holds g_durable_lock. On failure
+ * returns NULL with *err set to a malloc'd message; the next call retries. */
+static sqlite3 *durable_db(char **err) {
+    if (g_durable_db) return g_durable_db;
+    const char *path = getenv("SW_STATE_DB");
+    if (!path || !*path) path = "./.swarm/state.db";
+    durable_mkdirs(path);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                        SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        *err = strdup(db ? sqlite3_errmsg(db) : "cannot open state db");
+        if (db) sqlite3_close(db);
+        return NULL;
+    }
+    /* Another OS process (the restarted instance, a sibling agent) may hold
+     * the write lock briefly: wait for it instead of failing SQLITE_BUSY. */
+    sqlite3_busy_timeout(db, 5000);
+    char *e = NULL;
+    if (sqlite3_exec(db,
+            "PRAGMA journal_mode=WAL;"
+            "PRAGMA synchronous=FULL;"
+            "CREATE TABLE IF NOT EXISTS checkpoints("
+            "key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER);",
+            NULL, NULL, &e) != SQLITE_OK) {
+        *err = strdup(e ? e : sqlite3_errmsg(db));
+        if (e) sqlite3_free(e);
+        sqlite3_close(db);
+        return NULL;
+    }
+    g_durable_db = db;
+    return db;
+}
+
+/* Run one keyed statement (bind 1 = key, then optional blob + timestamp).
+ * On a ROW result, *out gets a malloc'd copy of column 0. Returns a malloc'd
+ * error message or NULL. Brackets the disk I/O (and a possible busy wait on
+ * another OS process's lock) with sw_blocking_enter so this scheduler's
+ * queued processes move to idle schedulers meanwhile. */
+static char *durable_run(const char *sql, const char *key,
+                         const uint8_t *blob, size_t blen,
+                         uint8_t **out, int *out_len) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t now_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    char *err = NULL;
+    sw_blocking_enter();
+    pthread_mutex_lock(&g_durable_lock);
+    sqlite3 *db = durable_db(&err);
+    if (db) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+            err = strdup(sqlite3_errmsg(db));
+        } else {
+            sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+            if (blob) {
+                sqlite3_bind_blob(st, 2, blob, (int)blen, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(st, 3, now_ms);
+            }
+            int rc = sqlite3_step(st);
+            if (rc == SQLITE_ROW && out) {
+                int n = sqlite3_column_bytes(st, 0);
+                const void *p = sqlite3_column_blob(st, 0);
+                if (p && n > 0) {
+                    *out = (uint8_t *)malloc((size_t)n);
+                    memcpy(*out, p, (size_t)n);
+                    *out_len = n;
+                }
+            } else if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+                err = strdup(sqlite3_errmsg(db));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    pthread_mutex_unlock(&g_durable_lock);
+    sw_blocking_exit();
+    return err;
+}
+
+static sw_val_t *durable_result(char *err) {
+    if (!err) return sw_val_atom("ok");
+    sw_val_t *r = durable_err(sw_val_string(err));
+    free(err);
+    return r;
+}
+
+sw_val_t *sw_durable_checkpoint(sw_val_t *key, sw_val_t *value) {
+    if (!key || key->type != SW_VAL_STRING) return durable_err(sw_val_atom("bad_key"));
+    const char *bad = durable_check(value, 0);
+    if (bad) return durable_err(sw_val_atom(bad));
+    uint8_t *body = NULL; uint32_t blen = 0;
+    if (sw_marshal(value, &body, &blen) < 0 || blen > 0x7FFFFFFBu) {
+        free(body);
+        return durable_err(sw_val_atom("too_large"));
+    }
+    size_t tot = 4 + (size_t)blen;
+    uint8_t *blob = (uint8_t *)malloc(tot);
+    memcpy(blob, SW_DURABLE_MAGIC, 3);
+    blob[3] = SW_DURABLE_VERSION;
+    if (blen) memcpy(blob + 4, body, blen);
+    free(body);
+    char *err = durable_run(
+        "INSERT OR REPLACE INTO checkpoints(key, value, updated_at) VALUES(?, ?, ?)",
+        key->v.str, blob, tot, NULL, NULL);
+    free(blob);
+    return durable_result(err);
+}
+
+sw_val_t *sw_durable_restore(sw_val_t *key) {
+    if (!key || key->type != SW_VAL_STRING) return sw_val_nil();
+    uint8_t *blob = NULL; int blen = 0;
+    /* restore has no error channel: an unreadable db reads as "nothing saved". */
+    free(durable_run("SELECT value FROM checkpoints WHERE key = ?",
+                     key->v.str, NULL, 0, &blob, &blen));
+    if (!blob) return sw_val_nil();
+    sw_val_t *r = sw_val_nil();
+    if (blen >= 4 && memcmp(blob, SW_DURABLE_MAGIC, 3) == 0 &&
+        blob[3] == SW_DURABLE_VERSION) {
+        /* Decode directly (not via sw_unmarshal) so a truncated blob or one
+         * with trailing garbage is caught: the decoder must consume it
+         * exactly. */
+        uint32_t pos = 0, len = (uint32_t)blen - 4;
+        g_unmarsh_depth = 0;
+        tls_unmarshal_default_node = NULL;
+        sw_val_t *v = unmarsh_val(blob + 4, len, &pos);
+        if (pos == len) r = v;
+        else fprintf(stderr, "swarmrt: restore(\"%s\"): corrupt checkpoint ignored\n",
+                     key->v.str);
+    } else {
+        fprintf(stderr, "swarmrt: restore(\"%s\"): unknown checkpoint format ignored\n",
+                key->v.str);
+    }
+    free(blob);
+    return r;
+}
+
+sw_val_t *sw_durable_delete(sw_val_t *key) {
+    if (!key || key->type != SW_VAL_STRING) return durable_err(sw_val_atom("bad_key"));
+    return durable_result(durable_run("DELETE FROM checkpoints WHERE key = ?",
+                                      key->v.str, NULL, 0, NULL, NULL));
+}

@@ -260,6 +260,9 @@ static int is_builtin(const char *name) {
            strcmp(name, "subprocess_close") == 0 ||
            strcmp(name, "db_open") == 0 || strcmp(name, "db_close") == 0 ||
            strcmp(name, "db_exec") == 0 || strcmp(name, "db_query") == 0 ||
+           /* Durable state */
+           strcmp(name, "checkpoint") == 0 || strcmp(name, "restore") == 0 ||
+           strcmp(name, "checkpoint_delete") == 0 ||
            strcmp(name, "typeof") == 0 ||
            /* Phase 13: Agent stdlib */
            strcmp(name, "http_get") == 0 || strcmp(name, "shell") == 0 ||
@@ -2015,6 +2018,7 @@ static const char *_common_builtins[] = {
     "shell_detached", "pid_kill_group",
     "stdin_pending_push", "stdin_take_pending", "rl_history_load", "rl_history_append",
     "random_int", "supervise", "swarm_stats",
+    "checkpoint", "restore", "checkpoint_delete",
     "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
     "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
     NULL
@@ -2367,6 +2371,8 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "subprocess_close") == 0 ||
              strcmp(fname, "db_open") == 0 || strcmp(fname, "db_close") == 0 ||
              strcmp(fname, "db_exec") == 0 || strcmp(fname, "db_query") == 0 ||
+             strcmp(fname, "checkpoint") == 0 || strcmp(fname, "restore") == 0 ||
+             strcmp(fname, "checkpoint_delete") == 0 ||
              strcmp(fname, "typeof") == 0 ||
              /* Phase 13: Agent stdlib */
              strcmp(fname, "http_get") == 0 || strcmp(fname, "shell") == 0 ||

@@ -7,6 +7,8 @@ build_ios/
 *.gen.c
 .DS_Store
 .swarmrt/
+# Default durable-state db (checkpoint/restore; override with SW_STATE_DB).
+.swarm/
 .conductor/
 dist/
 CMakeCache.txt
@@ -39,3 +41,4 @@ tests/sw/.build/
 
 tests/stress/.build/
 tests/soak/.build/
+.claude/worktrees/

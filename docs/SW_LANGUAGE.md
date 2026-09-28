@@ -54,7 +54,7 @@ import Tools
 import UI
 ```
 
-Module names are CamelCase by convention. `swc` resolves imports by looking for `src/<Name>.sw` (case preserved) and falling back to `src/<name>.sw` (lowercase) — so `Main` lives at `src/main.sw` per legacy convention.
+Module names are CamelCase by convention. `swc` resolves `import Foo` by looking for `Foo.sw` (case preserved) and falling back to `foo.sw` (lowercase) — first next to the file you build or run, then in the project's installed packages (see below), then in the bundled `lib/`.
 
 Imports are top-level only and resolved transitively at build time. There's no namespace per module — calling an imported function uses `ModuleName.func(...)` syntax:
 
@@ -67,6 +67,28 @@ result = LLM.chat(messages, opts)
 ```sw
 export [init, navigate, click, screenshot, close]
 ```
+
+### Packages
+
+A project with a `swarm.json` at its root can depend on other people's
+modules. `swc add <name> <git-url>[@ref]` (or `swc add <name> --path <dir>`)
+records the dependency, fetches it into `.swarm/deps/<name>/`, and pins the
+exact commit in `swarm.lock`. `swc install` reproduces that checkout anywhere.
+An installed package's modules (in its root or its `src/`) are then importable
+like local ones, on `swc build` and `swc run` alike:
+
+```
+$ swc add strutil https://github.com/acme/sw-strutil@v0.1.0
+$ cat main.sw
+module Main
+import Strutil
+...
+```
+
+A package's own imports resolve inside that package first, then across the
+project's dependencies. A local file next to your program wins over a package;
+a package wins over `lib/` (install warns when one shadows a `lib/` module).
+Full reference: [PACKAGES.md](PACKAGES.md).
 
 ### Batteries: builtins you import
 
@@ -718,7 +740,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `http_request(url, opts)` | **status-aware** request → `%{status: int, body: string, headers: %{lowercased keys}}` on a completed transport (incl. 4xx/5xx — the status is surfaced, not hidden), or `{'error, reason}` if the request never completed. `opts` is a map: `method` (default `"GET"`), `headers` (a `%{name=>value}` MAP **or** a list of `{name, value}` tuples), `body` (string). Unlike `http_post`/`http_get` (body-or-nil, status hidden) it lets a caller tell a 200 from a 4xx/5xx with a body. `http_post`/`http_get` are unchanged |
 | `http_post_stream(url, headers, body, [pid, name])` | streams to stdout incrementally; reasoning channel; ESC interrupt. Returns a **tagged** result: `{'ok, openai_json}` on success, `{'error, reason}` on curl-failure / non-2xx / empty-or-unparseable stream. Parses both `data: {...}` and `data:{...}` SSE framing |
 | **HTTP/WS server**: `http_listen`, `http_respond`, `ws_send`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `live_js` |
-| `http_listen(port)` delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
+| `http_listen(port)` / `http_listen(port, opts)` → `'ok'`/`'error'`; delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. **Binds `127.0.0.1`** unless `opts` has `bind: "0.0.0.0"` (or another IPv4 address) or `SW_HTTP_BIND` is set; the option wins. A WS upgrade whose `Origin` is not same-origin (Origin authority = `Host`), loopback, or listed in `opts.ws_origins` (list of strings) / `SW_WS_ORIGINS` gets `403`; an upgrade with no `Origin` (non-browser client) is accepted. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
 | **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_connect_tls(wss_url)` → handle (TLS `wss://`), `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_set_handler(h, pid)` (deliver frames to a process as messages), `wsc_close(h)` |
 
 ### Browser
@@ -788,6 +810,66 @@ Tools are pure logic — process primitives degrade to `nil` inside them, and a 
 | `db_exec(h, sql, [args])` | 3-arg form: prepares + **binds** `?` params + steps. Always bind user data this way — never string-interpolate into SQL |
 | `db_query(h, sql, [args])` | `?` parameters; returns list of `%{col: value}` row maps |
 | `db_close(h)` | `'ok'` |
+
+### Durable state
+Agent state that survives the OS process dying (crash, redeploy, restart under
+a supervisor). Values go to one SQLite table in `$SW_STATE_DB` (default
+`./.swarm/state.db`, directory created) using the same type-preserving
+encoding as distribution, so atoms stay atoms, tuples stay tuples and bytes
+stay binary-clean. Same database, same encoding and same results on both
+execution paths.
+
+| | |
+|---|---|
+| `checkpoint(key, value)` | `'ok'` or `{'error', reason}`. `key` is a string. One atomic write (WAL, `synchronous=FULL`): once it returns `'ok'` the value survives a crash. Replaces any earlier value for `key` |
+| `restore(key)` | the last checkpointed value, or `nil` if none (also `nil` for an unreadable db or a corrupt entry, with a note on stderr) |
+| `checkpoint_delete(key)` | `'ok'` (also when `key` was not set) or `{'error', reason}` |
+
+Rejections (nothing is written): pids and funs, anywhere in the value, are
+`{'error', 'not_serializable'}` — a pid means nothing in the next OS process,
+so store a registered name instead. A non-string key is `{'error', 'bad_key'}`;
+a tuple, map or atom too large for the encoding is `{'error', 'too_large'}`,
+nesting more than ~250 levels deep is `{'error', 'too_deep'}`, and a SQLite
+failure is `{'error', message_string}`. Checkpointing `nil` stores `nil`, which
+`restore` cannot tell from "nothing saved" — use `checkpoint_delete`. These
+calls do disk I/O; other processes on the same scheduler keep running.
+
+`import Durable` wraps the pattern: `Durable.loop(key, init, step)` restores
+the saved state (or starts from `init`), calls `step(state)`, checkpoints after
+every `{'next', new_state}`, and on `{'done', result}` clears the key and
+returns `result`. `Durable.load(key, init)`, `Durable.save(key, state)`
+(panics if the checkpoint fails) and `Durable.clear(key)` are the pieces.
+A crash inside a step re-runs that step from the previous checkpoint, so keep
+step side effects idempotent.
+
+```sw
+module Demo
+import Durable
+
+fun step(n) {
+    if (n < 3) { {'next', n + 1} } else { {'done', n * 100} }
+}
+
+fun main() {
+    print(Durable.loop("demo:counter", 0, fun(n) { step(n) }))   # prints 300
+}
+```
+
+A supervised worker picks up where its crashed predecessor stopped by
+loading its state on start:
+
+```sw
+import Durable
+
+fun worker() { worker_loop(Durable.load("worker:count", 0)) }
+
+fun worker_loop(n) {
+    receive {
+        'inc' -> Durable.save("worker:count", n + 1) ; worker_loop(n + 1)
+        'boom' -> panic("boom")    # the restarted worker resumes at n
+    }
+}
+```
 
 ### Sandboxed shell
 | | |
@@ -1048,7 +1130,7 @@ bin/swc test tests/sw/repl/test_repl_builtins_interp.sw
 #   16 tests, 16 passed (8.9ms)
 ```
 
-The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (80 files, 595 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
+The broader test suite (`make test-sw`) compiles and runs every `tests/sw/test_*.sw` file (85 files, 667 assertions at the time of writing) plus the interpreter and conformance suites. The C-side phase regression tests (75 tests across phases 2–10) run via `make test-phase{2..10}` or `make test-full` — they are separate from `swc test`.
 
 Inside your own `.sw` test files, use `assert_raises(fn, expected_msg)` to assert that a zero-arg lambda panics or errors with a message containing `expected_msg`. The test runner intercepts the panic before it hits `exit(1)` so the suite continues running.
 

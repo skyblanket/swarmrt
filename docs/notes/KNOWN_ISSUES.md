@@ -47,18 +47,6 @@ the duration. With every scheduler thread inside one, nothing else runs.
 
 **Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
-### Maps are association arrays
-
-`map_get` / `map_put` are O(n) in the number of keys (`map_put` copies the map), so
-building a 20K-key map one key at a time is quadratic (~7s). Fine for the small maps
-agents pass around (JSON objects, options); for large keyed state use ETS.
-
-### The HTTP server never frees a connection's port struct
-
-Closing a connection closes its socket (the per-connection fd leak is fixed), but the
-~64-byte `sw_port_t` is not freed: the IO thread may still hold it in an event batch
-fetched before the close, so freeing it safely needs an event refcount. About 64 MB
-per million connections over a process lifetime.
 
 ### Compiled mutual tail recursion is not TCO'd — but overflow is a recoverable panic
 
@@ -94,6 +82,41 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### Building a map one key at a time was quadratic (cleared 2026-09-27)
+
+`map_put` copied the whole map and scanned it for the key, so 20,000 puts took 3.6s.
+Compiled maps now share a growable store with a hash index over string, atom and int
+keys: adding a key is amortised O(1) and `map_get` is a hash probe (20,000 keys: 25ms;
+100,000: 137ms). Replacing an existing key still copies the map (other values keep the
+old one). The interpreter keeps plain arrays. Gate: `tests/sw/test_map_store.sw`.
+
+### The HTTP server leaked memory per connection and per request (cleared 2026-09-27)
+
+A closed connection's `sw_port_t` was never freed, because the IO thread may still
+hold it in an event batch fetched before the close. Closed HTTP ports now go to
+`sw_port_close_free`: the socket is shut down at once and the IO thread frees the fd
+and struct between event batches, once no `sw_port_ref` pin is held. Separately, the
+bridge process (a C loop, so no turn checkpoint) never released the header maps and
+message tuples it built, about 1.7 KB per request; it now rewinds its heap before
+each event, and connections keep raw header bytes rather than values in that heap.
+Over 20,000 `Connection: close` requests RSS grew 39 MB with the port fix alone and
+under 1 MB with both (the old code did not survive the run, see below);
+`swarm_stats()` gains `io_ports` (live port structs), flat across the churn. The same
+work fixes two bugs the old close path had under churn: a handler-side `ws_close`
+or `Connection: close` response freed the connection's buffers while the bridge was
+parsing them (double free / SIGSEGV), and closing the fd on the caller's thread let
+an in-flight read on the IO thread land on a newly accepted socket that reused the
+number. Gate: `tests/sw/test_http_port_free.sw`.
+
+### `http_listen` bound every interface; WebSocket upgrades ignored Origin (cleared 2026-09-27)
+
+`http_listen(port)` now binds `127.0.0.1`; `http_listen(port, %{bind: "0.0.0.0"})` or
+`SW_HTTP_BIND` widens it, and a malformed address is an `'error'` instead of a silent
+bind to every interface. A WebSocket upgrade with an `Origin` that is not loopback,
+same-origin or allowlisted (`ws_origins` option, `SW_WS_ORIGINS`) gets `403`;
+upgrades without `Origin` (non-browser clients) are unchanged. Gates:
+`tests/sw/test_http_bind.sw`, `tests/sw/test_ws_origin.sw`.
 
 ### Processes starved behind a blocked scheduler thread (cleared 2026-09-24)
 

@@ -1,17 +1,60 @@
-<img src="docs/assets/banner.gif" alt="swarmrt — erlang's soul, compiled. A BEAM-shaped runtime in C. Up to 100,000 processes. MIT." width="100%"/>
+<img src="docs/assets/banner.gif" alt="swarmrt: a BEAM-shaped runtime in C for AI agents. MIT." width="100%"/>
 
 # SwarmRT
 
 [![CI](https://github.com/skyblanket/swarmrt/actions/workflows/linux-quickstart.yml/badge.svg)](https://github.com/skyblanket/swarmrt/actions/workflows/linux-quickstart.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-C81E0F.svg)](LICENSE)
 
-**A from-scratch BEAM-shaped runtime for the AI-agent era — written in C, compiled ahead of time, no VM, no GC pauses.**
+**Agents hang, loop and crash. SwarmRT gives each one its own supervised process, in one small binary: no VM, no virtualenv, no cluster to run.**
 
 https://github.com/skyblanket/swarmrt/raw/main/docs/assets/swarmrt-film.mp4
 
-> **60 seconds, sound on** — the whole pitch: 99,990 processes alive on a laptop, crashed workers respawned by supervisors, sub-250 ns context switches. Every number measured, receipts in the repo.
+Each agent is a process with its own memory, a supervisor that restarts it and a deadline that ends it. A crash stays in its process. The runtime is written in C and compiles your program ahead of time to a native binary that starts in about 12 ms. The language on top, `sw`, is small enough that models write it correctly from the docs alone ([eval](eval/)).
 
-In plain terms: Erlang's superpower — hundreds of thousands of cheap, crash-isolated processes passing messages, with supervisors that restart the ones that die — but compiled straight to a single native binary. No VM to install, no garbage-collector pauses, boots in milliseconds. The language on top (`sw`) is shaped so an LLM writes it correctly on the first try, because the point is running swarms of AI agents, each one its own process.
+## Five minutes
+
+```bash
+make swc libswarmrt && export PATH="$PWD/bin:$PATH"    # or put a release archive's bin/ on PATH
+swc new myagent && cd myagent
+make test                                             # offline: a local server plays the model
+LLM_PROVIDER=ollama LLM_MODEL=qwen2.5 make run        # or LLM_URL=... LLM_API_KEY=...
+```
+
+You get one agent that can call a tool, a fan-out over `tasks.txt` (8 in flight, 30 s deadline each), and tests that include an agent that crashes and one that hangs. Nothing is sent anywhere until you set `LLM_URL` or `LLM_PROVIDER`.
+
+## An eval runner in 15 lines
+
+```sw
+module EvalRun
+import Std
+
+fun grade(task) {
+    out = llm_complete(task.prompt, %{model: "qwen2.5-coder:7b"})
+    if (string_contains(out, task.expect)) { 'pass' } else { 'fail' }
+}
+
+fun main() {
+    tasks = json_decode(file_read("tasks.json"))
+    results = Std.task_stream(tasks, fn(t) { grade(t) },
+                              %{max_concurrency: 64, timeout_ms: 30000})
+    passed = length(filter(results, fn(r) { r == {'ok', 'pass'} }))
+    failed = length(filter(results, fn(r) { r == {'ok', 'fail'} }))
+    print(f"pass {passed} fail {failed} error {length(tasks) - passed - failed}")
+}
+```
+
+Against a local mock with 500 ms latency, 200 prompts run in 2.1 s on 4 cores: four waves of 64, so the runtime adds about 0.1 s to the network wait. With one grader made to panic and another to hang forever, the same run prints `pass 100 fail 98 error 2` and finishes at its deadline. One bad grader costs one cell, not the run.
+
+## Why a runtime, not a framework
+
+- **Isolation by default.** One process per agent, preempted by reduction count like the BEAM, so a busy loop can't starve the others.
+- **Supervisors, links, monitors.** The OTP model: one-for-one, one-for-all, rest-for-one.
+- **Deadlines and bounded fan-out.** `Std.task_stream` returns `{'ok', v}` or `{'error', reason}` per item and never hangs on a stuck one.
+- **Local-first.** No default cloud endpoint. PDF, browser and audio code is compiled in only when a module imports it ([batteries](docs/SW_LANGUAGE.md)).
+- **One binary.** No VM, no interpreter to install; the release archive is the compiler, the runtime library and the stdlib.
+- **Model-friendly code.** Undefined names are rejected before anything runs, on the compiled and interpreted paths alike.
+
+## The language
 
 ```sw
 module Counter
@@ -275,6 +318,9 @@ swc emit  <file.sw>               Print generated C to stdout
 swc repl                          Interactive REPL (no file needed)
 swc test [<file.sw>|<dir>]        Run test_* functions in .sw files
 swc lsp                           Language Server (LSP 3.17 over stdio)
+swc add <name> <git-url>[@ref]    Add a dependency to swarm.json (or: add <name> --path <dir>)
+swc install                       Fetch the deps at the commits pinned in swarm.lock (alias: deps)
+swc update | swc remove <name>    Re-resolve every ref / drop a dependency
 swc version                       Print the version (also --version, -v)
 
 Options for build/emit
@@ -288,7 +334,7 @@ Options for build/emit
                      need `zig` or a matching cross-gcc in PATH.
 ```
 
-Imports are auto-resolved from `src/` next to the file you're compiling — no manifest, no lockfile.
+Imports are auto-resolved from the directory of the file you're compiling, then from the project's installed packages, then from the bundled `lib/`. Packages are git repos (or local dirs) listed in a `swarm.json` manifest and pinned to exact commits in `swarm.lock` — see [docs/PACKAGES.md](docs/PACKAGES.md).
 
 ### REPL
 
@@ -331,6 +377,7 @@ The [`lib/`](lib/) directory ships modules that auto-resolve via `import` — no
 | `Prompt` | `{{var}}` template engine — render from a string or a file |
 | `Cron` | Wake scheduler — `Cron.every(ms, fn)` / `Cron.at("14:00", fn)` |
 | `Telemetry` | Event hub with stdout / file / JSONL sinks |
+| `Durable` | State that survives restarts — `Durable.loop(key, init, step)` restores, steps and checkpoints to SQLite (`SW_STATE_DB`) |
 
 ---
 
@@ -370,7 +417,7 @@ make test-full       # the comprehensive gate: core + OTP + phases 2-10 + search
 - **Compiled** — each `test_*.sw` is compiled with `swc build` and the resulting binary is run.
 - **Interpreter** — `tests/sw/repl/test_*.sw` files are run via `swc test` (tree-walking interpreter). Guards against the REPL/codegen builtin drift that the May 2026 marathon closed.
 
-Together the suite reports `all sw tests passed — 80 files, 595 assertions`, and `make test-sw` then runs the **dual-path conformance gate**: every program in `tests/sw/conform/` executes under BOTH `swc run` (interpreter) and `swc build` (compiled) and must produce byte-identical stdout and exit codes — the structural guard against the two paths drifting apart.
+Together the suite reports `all sw tests passed — 85 files, 667 assertions`, and `make test-sw` then runs the **dual-path conformance gate**: every program in `tests/sw/conform/` executes under BOTH `swc run` (interpreter) and `swc build` (compiled) and must produce byte-identical stdout and exit codes — the structural guard against the two paths drifting apart.
 
 Add a `test_<topic>.sw` file in either directory and it'll be picked up automatically.
 
@@ -447,7 +494,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)
 - `bash scripts/check_sw_docs.sh` — **doc-compile tripwire**: every complete ```sw block in the docs and every runnable `examples/*.sw` must still compile with this `swc`
-- `make test-sw` — **80 files, 595 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
+- `make test-sw` — **85 files, 667 assertions** (`.sw` language: compiled + interpreter + `swc run` paths) **plus the dual-path conformance gate** (`tests/sw/conform/` — interpreter and compiled output must be byte-identical per program)
 - `make test-phase$p` for `p` in **2 through 10** — C-side runtime tests: GenServer/Supervisor (phase 2), ETS (phase 3), Agent/App/DynSup (phase 4), StateMachine/ProcessGroup (phase 5), TCP (phase 6), hot reload (phase 7), GC scaffolding (phase 8), distribution (phase 9), language frontend (phase 10); the **deadlock watchdog** runs automatically in every test (active by default in the runtime)
 - `make stress` — high-process-count race guard (multi-scheduler + single-scheduler spawn storm); every run must complete
 - `make gc-stress` — GC v1 copy-on-escape correctness: the value-arena stress harness compiled with ASAN + `-DSW_ARENA_POISON`; a missed deep-copy on any send/spawn/ETS boundary surfaces as a use-after-free or a `0xDE`-garbage content assert

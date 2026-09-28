@@ -1,0 +1,3 @@
+What is the capital of France?
+count the words in: the quick brown fox jumps
+Name a prime number greater than 10.

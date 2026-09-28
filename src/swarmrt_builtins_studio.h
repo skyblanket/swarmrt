@@ -4311,6 +4311,9 @@ static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
     keys[c] = sw_val_atom("mailbox_dropped"); vals[c] = sw_val_int((int64_t)sw_mailbox_dropped()); c++;
     keys[c] = sw_val_atom("msgsize_dropped"); vals[c] = sw_val_int((int64_t)sw_msgsize_dropped()); c++;
     keys[c] = sw_val_atom("overflow_queue");  vals[c] = sw_val_int(overflow); c++;
+    /* io_ports: live sw_port_t structs (sockets incl. closed-but-not-yet-
+     * reclaimed ones). Flat under steady HTTP churn; a climb is a leak. */
+    keys[c] = sw_val_atom("io_ports");        vals[c] = sw_val_int(sw_io_ports_live()); c++;
     /* draining: 1 once graceful shutdown has begun — a readiness probe
      * (/readyz) fails on this so a load balancer stops routing here. */
     keys[c] = sw_val_atom("draining");        vals[c] = sw_val_atom(sw_is_draining() ? "true" : "false"); c++;
@@ -4846,6 +4849,28 @@ static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_list(rows, nrows);
     free(rows);
     return r;
+}
+
+/* ============================================================
+ * Durable state — checkpoint a value to SQLite, restore it after restart
+ * ============================================================
+ *
+ *   checkpoint(key, value)  → 'ok' | {'error', reason}
+ *   restore(key)            → value | nil
+ *   checkpoint_delete(key)  → 'ok' | {'error', reason}
+ *
+ * Shared with the interpreter: the implementation (storage, encoding,
+ * blocking section) is sw_durable_* in swarmrt_node.c. */
+static sw_val_t *_builtin_checkpoint(sw_val_t **a, int n) {
+    return sw_durable_checkpoint(n >= 1 ? a[0] : NULL, n >= 2 ? a[1] : NULL);
+}
+
+static sw_val_t *_builtin_restore(sw_val_t **a, int n) {
+    return sw_durable_restore(n >= 1 ? a[0] : NULL);
+}
+
+static sw_val_t *_builtin_checkpoint_delete(sw_val_t **a, int n) {
+    return sw_durable_delete(n >= 1 ? a[0] : NULL);
 }
 
 /* ================================================================
@@ -7195,12 +7220,52 @@ static sw_val_t *_builtin_strip_html(sw_val_t **a, int n) {
 
 /* === LiveView HTTP/WS Builtins === */
 
-/* http_listen(port) → 'ok' | 'error' — starts HTTP server, handler = calling process */
+/* Option lookup for http_listen's opts map: `%{bind: ...}` and
+ * `%{"bind" => ...}` both work (atom or string key). */
+static sw_val_t *_sw_http_opt(sw_val_t *opts, const char *key) {
+    sw_val_t *v = sw_val_map_get(opts, sw_val_atom(key));
+    if (!v || v->type == SW_VAL_NIL) v = sw_val_map_get(opts, sw_val_string(key));
+    return (v && v->type != SW_VAL_NIL) ? v : NULL;
+}
+
+/* http_listen(port [, opts]) → 'ok' | 'error' — starts HTTP server, handler
+ * = calling process. Binds 127.0.0.1 unless opts.bind / SW_HTTP_BIND says
+ * otherwise. opts.ws_origins: list of origin strings (or one comma string)
+ * a WebSocket upgrade may come from, on top of same-origin + loopback. */
 static sw_val_t *_builtin_http_listen(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
-    sw_io_init();
     uint16_t port = (uint16_t)a[0]->v.i;
-    sw_process_t *bp = sw_http_listen(port, sw_self());
+    sw_http_opts_t opts = {0};
+    char *origins = NULL;
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_MAP) {
+        sw_val_t *b = _sw_http_opt(a[1], "bind");
+        if (b && b->type == SW_VAL_STRING) opts.bind = b->v.str;
+        else if (b) return sw_val_atom("error");
+        sw_val_t *o = _sw_http_opt(a[1], "ws_origins");
+        if (o && o->type == SW_VAL_STRING) {
+            origins = strdup(o->v.str);
+        } else if (o && o->type == SW_VAL_LIST) {
+            size_t len = 1;
+            for (int i = 0; i < o->v.tuple.count; i++) {
+                sw_val_t *e = o->v.tuple.items[i];
+                if (!e || e->type != SW_VAL_STRING) return sw_val_atom("error");
+                len += strlen(e->v.str) + 1;
+            }
+            origins = (char *)calloc(1, len);
+            for (int i = 0; origins && i < o->v.tuple.count; i++) {
+                if (i) strcat(origins, ",");
+                strcat(origins, o->v.tuple.items[i]->v.str);
+            }
+        } else if (o) {
+            return sw_val_atom("error");
+        }
+        opts.ws_origins = origins;
+    } else if (n >= 2 && a[1] && a[1]->type != SW_VAL_NIL) {
+        return sw_val_atom("error");
+    }
+    sw_io_init();
+    sw_process_t *bp = sw_http_listen_opts(port, sw_self(), &opts);
+    free(origins);   /* the bridge keeps its own copy */
     if (!bp) return sw_val_atom("error");
     return sw_val_atom("ok");
 }
@@ -7258,7 +7323,10 @@ static sw_val_t *_builtin_ws_request_headers(sw_val_t **a, int n) {
 static sw_val_t *_builtin_ws_request_path(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT)
         return sw_val_string("");
-    return sw_val_string(sw_ws_request_path((int)a[0]->v.i));
+    char *p = sw_ws_request_path_dup((int)a[0]->v.i);
+    sw_val_t *r = sw_val_string(p ? p : "");
+    free(p);
+    return r;
 }
 
 /* live_js() → string containing client-side LiveView JavaScript */
@@ -9560,6 +9628,9 @@ static void _sw_wsc_reader_entry(void *raw) {
     _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)raw;
     int handle = ra->handle;
     free(ra);
+    /* Claim the read path before the first recv: wsc_set_handler may still
+     * be returning from sw_spawn, and wsc_recv rejects every other caller. */
+    if (handle >= 0 && handle < _SW_WSC_MAX) _sw_wsc[handle].reader_proc = sw_self();
 
     for (;;) {
         if (handle < 0 || handle >= _SW_WSC_MAX || !_sw_wsc[handle].used) break;
@@ -9621,13 +9692,21 @@ static sw_val_t *_builtin_wsc_set_handler(sw_val_t **a, int n) {
     _sw_wsc_reader_arg_t *ra = (_sw_wsc_reader_arg_t *)malloc(sizeof(*ra));
     if (!ra) return sw_val_atom("error");
     ra->handle = handle;
-    sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
-    if (!rp) { free(ra); return sw_val_atom("error"); }
-    /* Record handler + reader BEFORE returning so the wsc_recv guard can
-     * tell the reader's own loop from a stray user wsc_recv. */
+    /* Record the handler BEFORE the spawn publishes it: the reader may run
+     * on another scheduler before sw_spawn returns, and it used to find no
+     * handler, exit, and leave the handle unread for good (a frame sent to
+     * it was never delivered — test_voice_bridge_async lost a leg ~1 run
+     * in 5 under load). The reader records reader_proc itself. */
     _sw_wsc[handle].handler = a[1]->v.pid;
-    _sw_wsc[handle].reader_proc = rp;
     _sw_wsc[handle].reader_running = 1;
+    sw_process_t *rp = sw_spawn(_sw_wsc_reader_entry, ra);
+    if (!rp) {
+        free(ra);
+        _sw_wsc[handle].handler = NULL;
+        _sw_wsc[handle].reader_running = 0;
+        return sw_val_atom("error");
+    }
+    _sw_wsc[handle].reader_proc = rp;
     return sw_val_atom("ok");
 }
 

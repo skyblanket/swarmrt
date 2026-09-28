@@ -236,6 +236,19 @@ test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
 
+# The install path end to end: swc on PATH from an install laid out like a
+# release archive, `swc new`, and the new project's own tests.
+.PHONY: test-install
+test-install: swc libswarmrt
+	@bash scripts/install_smoke.sh
+
+# Package manager: swc add / install / update / remove, swarm.lock pinning,
+# dependency-aware imports on swc build + swc run, and name/URL/ref
+# validation. Offline — the remotes are local bare git repos. Needs git.
+.PHONY: test-pkg
+test-pkg: swc libswarmrt
+	@bash tests/pkg/run_pkg_tests.sh
+
 # Security regression: the curl-backed HTTP builtins must not pass
 # caller-supplied URLs / headers through a shell. Builds the injection
 # probe and fails if any shell payload executes (canary file appears).
@@ -713,7 +726,7 @@ libswarmrt: core-objs
 swc: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
-		$(SRC_DIR)/swarmrt_battery_interp.c \
+		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c $(SRC_DIR)/swc_pkg.c \
 		-o $(BIN_DIR)/swc $(LDFLAGS)
 
 # Example: compile a .sw file

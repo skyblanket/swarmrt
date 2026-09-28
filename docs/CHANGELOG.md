@@ -4,6 +4,160 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-27 — wsc_set_handler could drop a connection
+
+**fix(ws): an async WebSocket client could stop delivering frames for good.**
+`wsc_set_handler` spawned the reader process before recording the handler. When the
+reader ran first on another scheduler it found no handler, exited, and the handle was
+never read again: every later frame on it was lost. Under CPU load
+`test_voice_bridge_async` lost one of its two legs in 13 of 30 runs. The handler is now
+recorded before the spawn, and the reader claims the read path itself; 0 of 30 under
+the same load.
+
+## 2026-09-27 — maps: O(1) adds and hashed lookups
+
+**perf(maps): building a map one key at a time is linear.** `map_put` copied and
+scanned the whole map on every call (20,000 keys: 3,639 ms). A compiled map now lives
+in a shared, growable store with a hash index; a put that adds a key extends the store
+in place when the map owns its edge (the list-store technique), so older map values
+never see the new slot. 20,000 keys: 25 ms; 100,000: 137 ms. Values stay immutable:
+two maps branched from one base, replaced keys and atom/string key equivalence are
+pinned by `tests/sw/test_map_store.sw` (14).
+
+## 2026-09-27 — `swc new`, and swc works from PATH and from a release archive
+
+**feat(swc): `swc new <name>` creates an agent project.** From `templates/agent`: one
+agent that can call a tool (`agent.sw`, `tools.sw`), a fan-out over `tasks.txt` with
+`Std.task_stream` (8 in flight, 30 s deadline each, `main.sw`), a Makefile, and offline
+tests against an in-process mock model, including an agent that crashes and one that
+hangs (`agent_test.sw`, about 3 s). `make test` needs no network and no API key.
+
+**fix(swc): swc found its headers, runtime library and stdlib relative to `argv[0]`.**
+Run as `swc` from `PATH`, that is just a name, so every build outside the checkout
+failed (`swarmrt_native.h: No such file`, `cannot resolve import 'Std'`). swc now uses
+its real path (`/proc/self/exe`, `_NSGetExecutablePath`, else a `PATH` search);
+`SWARMRT_HOME` overrides the install root.
+
+**fix(release): the archive could not build a program.** It shipped `swc` at the top
+level with three headers and no `lib/`, while swc looks for `<root>/src`, `<root>/bin`
+and `<root>/lib`. Archives now use that layout (`bin/`, `src/`, `lib/`, `templates/`),
+built by `scripts/install_layout.sh`. `scripts/install_smoke.sh` (`make test-install`,
+Linux and macOS CI, and the release job before upload) runs `swc new`, the new
+project's tests and a stdlib import from outside the repo.
+
+---
+## 2026-09-27 — packages: swc add / install
+
+**feat(swc): a package manager — `swarm.json`, `swarm.lock`, `swc add` / `install` /
+`update` / `remove`.** A project lists dependencies in `swarm.json` at its root, each
+`{"git": "<url>", "ref": "<tag|branch|sha>"}` or `{"path": "<dir>"}`. `swc add <name>
+<git-url>[@ref]` (or `--path <dir>`) records one, fetches it into
+`.swarm/deps/<name>/` and pins the resolved commit in `swarm.lock`. `swc install`
+(alias `swc deps`) checks out exactly the locked commits, even after the remote's
+branch moves or a tag is re-pointed, and checks that `HEAD` is the locked sha. `swc
+update` re-resolves every ref. `swc remove` drops a dependency and its checkout. A
+dependency with its own `swarm.json` brings its dependencies too, flat (one version
+per name). Two different refs for one name are an error that names both requesters.
+A failed `add` / `remove` puts `swarm.json` back. git runs through fork+execvp with an
+argv vector, never a shell string. Names must match `[a-z0-9_-]+`. URLs that start
+with `-` or use `<transport>::` helpers (`ext::`, `fd::`) are refused, and so are refs
+that aren't `[A-Za-z0-9._/+-]` or that start with `-`. The error messages name the
+actual problem: missing git, fetch failure, bad ref, a locked commit gone from the
+remote, sha mismatch.
+
+**change(swc): imports resolve from installed packages.** `import Foo` now looks next
+to the input file, then in every `<project>/.swarm/deps/<pkg>/` and its `src/`, then in
+`lib/`. The project is the nearest ancestor with a `swarm.json`. A package's own
+imports resolve inside that package first. A module that two packages both provide is
+an "ambiguous" error, and install warns when a package shadows a `lib/` module. `swc
+build` and `swc run` now share one resolver (`resolve_import` / `load_imports` in
+`swc.c`) instead of two copies of the lookup loop. The resolver also stops re-loading
+a file whose `module` line doesn't match the import name, which used to load it again
+for every importer up to the 64-module cap. Files outside a project resolve exactly as
+before.
+
+Gates: `make test-pkg` (`tests/pkg/run_pkg_tests.sh`, 67 checks, offline: the
+"remotes" are local bare git repos). It covers add/install/update/remove, the lock
+pinning shas across a moved branch and a force-moved tag, transitive and path deps,
+build and run of programs that import dependency modules, conflicts, bad refs,
+unreachable remotes, missing git, and name/URL/ref injection attempts (a canary file
+must never appear). It runs in CI on Linux and macOS. Reference:
+[docs/PACKAGES.md](PACKAGES.md).
+## 2026-09-27 — durable agent state
+
+**feat(lang): `checkpoint` / `restore` / `checkpoint_delete` keep agent state across
+OS-process restarts.** When the OS process died, every process's state went with it.
+`checkpoint(key, value)` now writes any sw value to one SQLite table in `SW_STATE_DB`
+(default `./.swarm/state.db`) as a single atomic `INSERT OR REPLACE` (WAL,
+`synchronous=FULL`) and returns `'ok'` or `{'error', reason}`; `restore(key)` returns
+it after a restart, or `nil`. Values use the distribution layer's type-preserving
+encoding (`sw_marshal`) behind a versioned header, so atoms, tuples, maps and binary
+bytes come back exactly; JSON would have turned them into strings and lists. Pids and
+funs are rejected with `{'error', 'not_serializable'}` instead of being stored as nil,
+since a pid means nothing to the next OS process. Encodings that would truncate a
+tuple, map or atom are rejected too. The calls run inside a blocking section, so the
+other processes on that scheduler keep running during disk I/O. The interpreter and
+compiled binaries share one implementation (`sw_durable_*` in `swarmrt_node.c`). The
+tool-registry lint requires the `db` capability for all three.
+
+**feat(lib): `lib/Durable.sw`.** `Durable.loop(key, init, step)` restores the saved
+state, calls `step` until it returns `{'done', result}`, checkpoints after every
+`{'next', state}` and clears the key when done. `load` / `save` / `clear` are the
+pieces for a hand-written loop, such as a supervised worker that loads its state on
+start.
+
+Gates: `tests/sw/test_durable.sw` (36). It round-trips every value type and checks
+the rejections. A child SIGKILLs itself partway through a step, and the re-run
+resumes from the last checkpoint with no step lost or repeated. `Durable.loop` is
+killed and resumed the same way. A `dyn_supervisor` child that panics comes back with
+its checkpointed count. `tests/sw/conform/t19_durable.sw` checks interpreter =
+compiled; `run_conform.sh` now gives each program its own empty `SW_STATE_DB`.
+## 2026-09-27 — HTTP server hardening
+
+**change(http): `http_listen` binds `127.0.0.1` by default.** It bound every
+interface, so a dev server, an agent's control socket or a LiveView page was
+reachable from the network as soon as it started. Wider binds are explicit:
+`http_listen(port, %{bind: "0.0.0.0"})` or `SW_HTTP_BIND` (the option wins), the same
+shape as `SW_NODE_BIND` for distribution. `sw_tcp_listen` now refuses an address
+`inet_pton` can't parse instead of leaving it zeroed (every interface).
+`examples/voice_agent.sw` passes `bind: "0.0.0.0"`. **Migration:** a server that must
+be reachable from other hosts (containers, `Health` probes from a kubelet or load
+balancer) sets `SW_HTTP_BIND=0.0.0.0` or passes `bind`.
+
+**fix(security): WebSocket upgrades check `Origin`.** A browser page on any site
+could open a socket to an `http_listen` server with the user's cookies (cross-site
+WebSocket hijacking). An upgrade carrying an `Origin` that is not loopback,
+same-origin (its authority equals `Host`) or in `http_listen`'s `ws_origins` option /
+`SW_WS_ORIGINS` (comma list, `*` allows any) now gets `403` and never reaches the
+handler. Upgrades without `Origin` (`wsc_connect`, curl, Telnyx) are accepted as
+before.
+
+**fix(http): closed connections free their port struct; the bridge frees its
+garbage.** The IO thread may hold a port in an event batch fetched before the close,
+so the struct was never freed. `sw_port_close_free` shuts the socket down at once and
+leaves the fd and struct to the IO thread, which frees them between batches once no
+`sw_port_ref` pin is held; the HTTP writers pin the port for the duration of a write.
+The bridge process, a C loop that never reaches a turn checkpoint, also kept every
+header map and message tuple it built (~1.7 KB per request); it now rewinds its heap
+before each event, and `ws_request_headers` builds its map in the caller's heap from
+raw bytes kept on the connection. 20,000 `Connection: close` requests: RSS +39 MB
+with the port fix alone, +0.8 MB with both; the new `swarm_stats()` `io_ports` stays
+at 2. The old code did not finish that run: it crashed after 22 and after 776
+connections in two tries (a handler-side close freed buffers the bridge was parsing),
+and in a third a request was never answered. Closing the fd on the caller's thread
+also let an in-flight read on the IO thread land on a newly accepted socket that
+reused the number; the fd is now closed only by the IO thread. The run now completes
+with none lost. A WS frame the parser rejects now closes the
+connection instead of abandoning the slot with its socket open.
+
+Gates: `tests/sw/test_http_bind.sw` (9), `tests/sw/test_ws_origin.sw` (10),
+`tests/sw/test_http_port_free.sw` (3; 700 connections over hang-up, server-close and
+`ws_close` paths). All three fail on the previous code.
+
+**fix(ws): `ws_request_path` read a string a close could free.** It returned the
+connection's path pointer without the lock and the caller copied it afterwards; it is
+now copied under the lock, as `ws_request_headers` already was.
+
 ## 2026-09-24 — batteries out of core
 
 **change(lang): PDF, Chrome and the audio codecs are batteries you import.**

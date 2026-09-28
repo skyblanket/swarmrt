@@ -57,7 +57,10 @@ fun main() {
 }
 
 fun acceptor_init() {
-  http_listen(8080)
+  # Telnyx connects from the internet, so bind every interface (the default
+  # is 127.0.0.1). Telnyx sends no Origin header, so the WS Origin check
+  # does not get in its way.
+  http_listen(8080, %{bind: "0.0.0.0"})
   print("voice_agent listening on ws://0.0.0.0:8080 (Telnyx Media Streaming)")
   acceptor_loop()
 }
