@@ -4,6 +4,48 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-09-27 — HTTP server hardening
+
+**change(http): `http_listen` binds `127.0.0.1` by default.** It bound every
+interface, so a dev server, an agent's control socket or a LiveView page was
+reachable from the network as soon as it started. Wider binds are explicit:
+`http_listen(port, %{bind: "0.0.0.0"})` or `SW_HTTP_BIND` (the option wins), the same
+shape as `SW_NODE_BIND` for distribution. `sw_tcp_listen` now refuses an address
+`inet_pton` can't parse instead of leaving it zeroed (every interface).
+`examples/voice_agent.sw` passes `bind: "0.0.0.0"`. **Migration:** a server that must
+be reachable from other hosts (containers, `Health` probes from a kubelet or load
+balancer) sets `SW_HTTP_BIND=0.0.0.0` or passes `bind`.
+
+**fix(security): WebSocket upgrades check `Origin`.** A browser page on any site
+could open a socket to an `http_listen` server with the user's cookies (cross-site
+WebSocket hijacking). An upgrade carrying an `Origin` that is not loopback,
+same-origin (its authority equals `Host`) or in `http_listen`'s `ws_origins` option /
+`SW_WS_ORIGINS` (comma list, `*` allows any) now gets `403` and never reaches the
+handler. Upgrades without `Origin` (`wsc_connect`, curl, Telnyx) are accepted as
+before.
+
+**fix(http): closed connections free their port struct; the bridge frees its
+garbage.** The IO thread may hold a port in an event batch fetched before the close,
+so the struct was never freed. `sw_port_close_free` shuts the socket down at once and
+leaves the fd and struct to the IO thread, which frees them between batches once no
+`sw_port_ref` pin is held; the HTTP writers pin the port for the duration of a write.
+The bridge process, a C loop that never reaches a turn checkpoint, also kept every
+header map and message tuple it built (~1.7 KB per request); it now rewinds its heap
+before each event, and `ws_request_headers` builds its map in the caller's heap from
+raw bytes kept on the connection. 20,000 `Connection: close` requests: RSS +39 MB
+with the port fix alone, +0.8 MB with both; the new `swarm_stats()` `io_ports` stays
+at 2. The old code did not finish that run: it crashed after 22 and after 776
+connections in two tries (a handler-side close freed buffers the bridge was parsing),
+and in a third a request was never answered. Closing the fd on the caller's thread
+also let an in-flight read on the IO thread land on a newly accepted socket that
+reused the number; the fd is now closed only by the IO thread. The run now completes
+with none lost. A WS frame the parser rejects now closes the
+connection instead of abandoning the slot with its socket open.
+
+Gates: `tests/sw/test_http_bind.sw` (9), `tests/sw/test_ws_origin.sw` (10),
+`tests/sw/test_http_port_free.sw` (3; 700 connections over hang-up, server-close and
+`ws_close` paths). All three fail on the previous code.
+
 ## 2026-09-24 — batteries out of core
 
 **change(lang): PDF, Chrome and the audio codecs are batteries you import.**

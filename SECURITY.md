@@ -50,8 +50,19 @@ to contain what it documents.
   the Otonomy endpoint (matched on the parsed host, not a substring).
 - **`shell_sandboxed`** execs the sandbox tool directly; the command string is
   interpreted only by the shell *inside* the sandbox.
-- **The HTTP server** (`http_listen`) binds all interfaces (it is meant to be
-  reachable, e.g. for health checks); WebSocket upgrades do not check `Origin`.
+- **The HTTP server** (`http_listen`) binds `127.0.0.1` unless the call
+  passes `%{bind: "0.0.0.0"}` or `SW_HTTP_BIND` says otherwise; a malformed
+  bind address is an error, not a fallback to every interface.
+- **WebSocket upgrades** that carry an `Origin` header are refused with `403`
+  unless the Origin is loopback, same-origin (its host:port equals the
+  request's `Host`), or listed in `http_listen`'s `ws_origins` option or
+  `SW_WS_ORIGINS` (`*` allows any). This stops a web page on another site
+  from opening a socket to a local server with the user's cookies
+  (cross-site WebSocket hijacking). Upgrades without `Origin` — non-browser
+  clients — are accepted, and the check does not authenticate anyone: a
+  handler that needs auth must still check it (e.g. via
+  `ws_request_headers`). Same-origin trusts `Host`, so it does not stop DNS
+  rebinding; a server that must resist that should validate `Host` itself.
 
 ## Known issues
 

@@ -45,6 +45,22 @@
  * count as activity since conn_on_data timestamps every inbound byte). */
 #define SW_HTTP_IDLE_TIMEOUT_MS_DEFAULT 30000u
 
+/* === Bind address + WebSocket Origin policy ===
+ * http_listen binds 127.0.0.1 unless told otherwise: http_listen(port,
+ * %{bind: "0.0.0.0"}) or the SW_HTTP_BIND env var (the option wins). A
+ * WebSocket upgrade that carries an Origin header is refused with 403
+ * unless the Origin is loopback (localhost / 127.0.0.1 / [::1], any port),
+ * matches the request's own Host (same-origin), or is listed in
+ * http_listen's ws_origins option or the SW_WS_ORIGINS env var (comma
+ * list; both lists apply; "*" allows any). An upgrade with NO Origin is
+ * accepted: browsers always send one, so its absence means a non-browser
+ * client (wsc_connect, curl, a telephony provider), which Origin checks do
+ * not constrain anyway. */
+typedef struct {
+    const char *bind;        /* IPv4 address; NULL/"" = SW_HTTP_BIND or 127.0.0.1 */
+    const char *ws_origins;  /* comma-separated allowlist; NULL = none */
+} sw_http_opts_t;
+
 /* Connection modes */
 typedef enum {
     SW_HTTP_MODE_HTTP,      /* Awaiting HTTP request */
@@ -74,18 +90,20 @@ typedef struct {
     char                ws_key[128]; /* Sec-WebSocket-Key from upgrade */
     int                 active;      /* 1 = in use, 0 = free slot */
 
-    /* Parsed request headers, delivered to the handler.
-     *  - For plain HTTP: built per request, handed off (by reference) inside
-     *    the {'http_request', ...} tuple, then cleared. When a POST body has
-     *    to be buffered across reads, this map is held here until the body
-     *    completes and the request is dispatched.
+    /* Raw request header block (the header lines after the request line,
+     * each CRLF-terminated; malloc'd, NUL-terminated). The header MAP is
+     * built from it when needed, in the heap of whoever needs it — a value
+     * kept here would live in the bridge's heap, which is rewound after
+     * every event.
+     *  - For plain HTTP: saved per request, turned into the MAP inside the
+     *    {'http_request', ...} tuple, then freed. When a POST body has to be
+     *    buffered across reads, it is held here until the body completes.
      *  - For a WebSocket upgrade: kept for the lifetime of the connection so
      *    the handler can query it via ws_request_headers(conn) / the path via
      *    ws_request_path(conn) (the Origin/Authorization/signature headers the
      *    UPGRADE request carried).
-     * NULL = no headers captured (yet). Owned by the connection; freed on
-     * dispatch (HTTP) or conn_free (WS). */
-    sw_val_t           *req_headers;
+     * NULL = no headers captured (yet). */
+    char               *req_hdr;
     char               *req_path;    /* request/upgrade path+query (WS); NULL = none */
 
     /* WebSocket fragmentation reassembly (continuation frames, opcode 0x0).
@@ -104,19 +122,40 @@ typedef struct {
      * single bridge fiber (same threading model as the data path). */
     uint64_t            last_activity_ms;
     sw_process_t       *owner;
+
+    /* Close/free handshake with the owning bridge. busy = the bridge is in
+     * the middle of processing this conn's bytes (set and cleared under
+     * g_http_lock); a close from another thread (the handler's ws_close or
+     * a Connection: close response) then only detaches + closes the port
+     * and sets closed, and the bridge frees the slot's buffers when its
+     * pass ends, instead of having them freed underneath it. drop = the WS
+     * frame parser wants the connection gone (oversize / malformed frame);
+     * the bridge closes it after the parse. */
+    int                 busy;
+    int                 closed;
+    int                 drop;
+
+    struct sw_http_bridge *bridge;  /* listener this conn came in on (Origin policy) */
 } sw_http_conn_t;
 
 /* Bridge state (passed to bridge process) */
-typedef struct {
+typedef struct sw_http_bridge {
     sw_port_t          *listener;
     sw_process_t       *handler;    /* Default handler (.sw process) */
     uint16_t            port;
+    char               *ws_origins; /* http_listen's ws_origins, comma-joined; NULL = none */
 } sw_http_bridge_t;
 
 /* === API (called from builtins) === */
 
-/* Start HTTP server on port, handler = calling process */
+/* Start HTTP server on port, handler = calling process. Binds per
+ * SW_HTTP_BIND (default 127.0.0.1); no extra WS origins. */
 sw_process_t *sw_http_listen(uint16_t port, sw_process_t *handler);
+
+/* Same, with explicit options (NULL = defaults). NULL on a bad bind
+ * address or a failed bind/listen. */
+sw_process_t *sw_http_listen_opts(uint16_t port, sw_process_t *handler,
+                                  const sw_http_opts_t *opts);
 
 /* Send HTTP response (text body) */
 int sw_http_respond(int conn_id, int status, const char *headers, const char *body);

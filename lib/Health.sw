@@ -14,6 +14,10 @@
 # stats), so an operator or readiness probe sees real runtime state.
 # Anything else is 404. COMPILED-ONLY in practice: http_listen needs the
 # scheduler + IO bridge of a `swc build` binary.
+#
+# Binds 127.0.0.1 like every http_listen server; set SW_HTTP_BIND=0.0.0.0
+# when the probe comes from another host (a Kubernetes kubelet, a load
+# balancer).
 
 module Health
 

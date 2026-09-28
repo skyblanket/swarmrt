@@ -49,6 +49,12 @@ typedef struct sw_port {
     uint32_t recv_buf_size;
 
     struct sw_port *next;   /* Global port list */
+
+    /* Deferred free (sw_port_close_free). refs = pins held by threads that
+     * are about to write to the port; the IO thread frees a retired port
+     * only between event batches and only once refs is 0. */
+    _Atomic uint32_t refs;
+    struct sw_port *retire_next;
 } sw_port_t;
 
 /* Data message sent to owner */
@@ -92,6 +98,28 @@ void sw_port_set_active(sw_port_t *port, int active);
 
 /* Close a port. Sends SW_TAG_PORT_CLOSED to owner. */
 void sw_port_close(sw_port_t *port);
+
+/* Close a port AND free its struct once nothing can still reach it. For
+ * owners that drop every pointer to the port at close (the HTTP server);
+ * the plain sw_port_close never frees, because its callers may keep the
+ * pointer. The socket is shut down immediately (the peer sees FIN); the fd
+ * and struct are released by the IO thread after the event batch in
+ * progress has finished (a batch fetched before the close may still name
+ * the port) and after every sw_port_ref pin is dropped. Sends no
+ * SW_TAG_PORT_CLOSED. Messages already queued that carry the pointer stay
+ * safe to compare against (not to dereference): a new port can only reuse
+ * the address after they were queued. Call at most once per port. */
+void sw_port_close_free(sw_port_t *port);
+
+/* Pin / unpin a port against sw_port_close_free's reclamation. Take the pin
+ * under whatever lock hands out the pointer, so a close can't slip between
+ * the lookup and the pin. */
+void sw_port_ref(sw_port_t *port);
+void sw_port_unref(sw_port_t *port);
+
+/* Port structs currently allocated (open, closed-not-freed, or retired and
+ * awaiting the IO thread). swarm_stats() reports it as io_ports. */
+int64_t sw_io_ports_live(void);
 
 /* Transfer port ownership to another process. */
 void sw_port_controlling_process(sw_port_t *port, sw_process_t *new_owner);
