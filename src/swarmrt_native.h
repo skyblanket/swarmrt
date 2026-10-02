@@ -464,7 +464,10 @@ struct sw_scheduler {
     uint64_t steal_attempts;
     uint64_t reductions;
     volatile uint64_t loop_iters;    /* Debug: total scheduler loop iterations */
-    volatile uint64_t procs_run;     /* Debug: processes executed */
+    /* Processes dispatched. Written only by this scheduler's thread; the
+     * deadlock watchdog reads it to tell "nothing ran" from "something
+     * woke between two of its reads". */
+    _Atomic uint64_t procs_run;
     volatile uint64_t idle_waits;    /* Debug: times entered idle wait */
 
     /* State */

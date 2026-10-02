@@ -357,10 +357,24 @@ static _Atomic int g_off_parked;
  * the very fix the warning recommends. We do NOT warn on an empty swarm
  * (live_count == 0).
  *
- * All reads are best-effort — we hold no locks.  A false positive is
- * possible if a message is in flight at the exact moment we scan; that
- * is acceptable for a warn-only detector.
+ * The reads are not one atomic snapshot: the slab scan comes first and
+ * the wake-source checks after, so a process seen parked can be woken in
+ * between (an offload job finishing, a timer firing) and the scan would
+ * read as a deadlock. A real deadlock persists and nothing runs, so we
+ * warn only when two consecutive scans find every process stuck and no
+ * scheduler dispatched a process from the start of the first to the end
+ * of the second (the procs_run counters). A woken process is always
+ * dispatched before it can change anything we read.
  */
+static uint64_t watchdog_dispatches(sw_swarm_t *sw, uint32_t nsched) {
+    uint64_t n = 0;
+    for (uint32_t s = 0; s < nsched; s++) {
+        sw_scheduler_t *sc = sw->schedulers[s];
+        if (sc) n += atomic_load_explicit(&sc->procs_run, memory_order_acquire);
+    }
+    return n;
+}
+
 static void *watchdog_thread_fn(void *arg) {
     (void)arg;
 
@@ -371,6 +385,9 @@ static void *watchdog_thread_fn(void *arg) {
         long v = strtol(ms_env, NULL, 10);
         if (v >= 100) interval_ms = (unsigned long)v;
     }
+
+    int prev_stuck = 0;          /* the previous scan found a quiet deadlock */
+    uint64_t prev_runs = 0;      /* dispatch count at the end of that scan */
 
     while (!g_watchdog_stop) {
         /* Wait one interval OR an instant shutdown signal — no chunked
@@ -403,6 +420,7 @@ static void *watchdog_thread_fn(void *arg) {
             sw_scheduler_t *sc = sw->schedulers[s];
             sched_pids[s] = sc ? sc->sched_proc.pid : (uint64_t)-1;
         }
+        uint64_t runs_start = watchdog_dispatches(sw, nsched);
 
         int live_count  = 0;
         int stuck_count = 0;
@@ -447,7 +465,14 @@ static void *watchdog_thread_fn(void *arg) {
             if (atomic_load_explicit(&g_off_parked, memory_order_acquire) > 0) wake_pending = 1;
         }
 
-        if (live_count > 0 && stuck_count == live_count && active_ports == 0 && !wake_pending) {
+        int stuck = live_count > 0 && stuck_count == live_count && active_ports == 0 && !wake_pending;
+        uint64_t runs_end = watchdog_dispatches(sw, nsched);
+        int quiet = stuck && runs_end == runs_start;
+        int report = quiet && prev_stuck && runs_start == prev_runs;
+        prev_stuck = quiet;
+        prev_runs = runs_end;
+
+        if (report) {
             fprintf(stderr,
                 "[swarmrt] WARNING: all %d process%s blocked in `receive`"
                 " with an empty mailbox for >%lums — possible deadlock.\n"
@@ -1620,7 +1645,9 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 continue;
             }
 
-            sched->procs_run++;
+            atomic_store_explicit(&sched->procs_run,
+                atomic_load_explicit(&sched->procs_run, memory_order_relaxed) + 1,
+                memory_order_release);
             atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
             proc->scheduler = sched;
             proc->fcalls = SWARM_CONTEXT_REDS;

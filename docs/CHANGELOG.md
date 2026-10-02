@@ -4,6 +4,21 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-02 — the deadlock watchdog warned when a wake landed mid-scan
+
+**fix(watchdog): no "possible deadlock" warning from a wake that lands mid-scan.** The
+watchdog reads every process's state first and its wake sources (offload jobs in
+flight, timers, ports) afterwards. An `exec_argv` / `http_*` / `llm_complete` call that
+finished between the two reads looked like a process blocked with nothing to wake it.
+`tests/sw/watchdog/slow_offload.sw` hit this in the `main` CI runs for #6 and #7, and
+a program making back-to-back `exec_argv` calls got 19 warnings over 10 runs at
+`SW_DEADLOCK_MS=100`. The watchdog now warns only when two consecutive scans find
+everything blocked and no scheduler dispatched a process from the start of the first
+to the end of the second (`procs_run`, now `_Atomic`). A real deadlock is still
+reported, one interval later. With the fix, 0 of 21 runs warned. Gate:
+`tests/sw/watchdog/offload_loop.sw`. It warned in 3 of 6 runs on the old code and in
+none now, under 1, 4 or 8 schedulers.
+
 ## 2026-09-27 — wsc_set_handler could drop a connection
 
 **fix(ws): an async WebSocket client could stop delivering frames for good.**
