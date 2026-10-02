@@ -64,6 +64,11 @@ to contain what it documents.
   `ws_request_headers`). Same-origin trusts `Host`, so it does not stop DNS
   rebinding; a server that must resist that should validate `Host` itself.
 
+## Audit summary
+
+[docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) lists what the September 2026
+review found and fixed, the regression test for each, and the known limits.
+
 ## Known issues
 
 Non-security stability bugs are tracked openly in
