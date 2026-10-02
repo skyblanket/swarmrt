@@ -24,9 +24,10 @@ not covered by the stability guarantees above and is published as a GitHub
 
 ### Compatibility notes specific to SwarmRT
 
-- **No package registry is a feature, not a gap.** There is no Hex/npm-style
-  dependency resolution; a program is `swc build`-ed from source you control.
-  So "dependency compatibility" is not a versioned surface.
+- **No package registry is a feature, not a gap.** Packages are git repos or
+  local directories pinned to commit shas in `swarm.lock`
+  ([PACKAGES.md](PACKAGES.md)); there are no semver ranges to resolve. So
+  "dependency compatibility" is not a versioned surface.
 - **`sw` has no stable serialization format across majors.** Distribution wire
   frames and the on-disk obfuscation format may change on a MAJOR; a running
   cluster should run one runtime version.
@@ -54,8 +55,10 @@ not covered by the stability guarantees above and is published as a GitHub
    ./tests/soak/run_soak.sh`) and an **independent adversarial review**.
 
 2. **Bump `VERSION`** to the release version (drop the `-rc.N` suffix for a
-   final), and add a `docs/CHANGELOG.md` entry (newest first) with any
-   migration notes. Commit.
+   final), and add a `docs/CHANGELOG.md` entry (newest first) headed
+   `## <date> — v<version>` with any migration notes. That entry becomes the
+   GitHub release notes; preview them with
+   `bash scripts/release_notes.sh v$(cat VERSION)`. Commit.
 
 3. **Tag and push:**
    ```
@@ -65,8 +68,10 @@ not covered by the stability guarantees above and is published as a GitHub
    The `Release` workflow (`.github/workflows/release.yml`) then builds `swc` +
    `libswarmrt.a` on macOS-arm64, Linux-x86_64, and Linux-arm64, verifies the
    tag matches `VERSION` and that `swc --version` reports it, packages each
-   with the public headers, checksums everything, and publishes the GitHub
-   Release (marked *prerelease* automatically for `rc`/`alpha`/`beta` tags).
+   in the install layout (`bin/ src/ lib/ templates/ docs/`), smoke-tests each
+   extracted archive from outside the checkout (`scripts/install_smoke.sh`),
+   checksums everything, and publishes the GitHub Release (marked
+   *prerelease* automatically for `rc`/`alpha`/`beta` tags).
 
 ## Release gates (what "1.0.0" requires)
 

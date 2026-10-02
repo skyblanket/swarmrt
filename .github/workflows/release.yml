@@ -117,39 +117,15 @@ jobs:
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Release notes
+        # The CHANGELOG entry headed "## <date> — <tag>", then install steps.
+        run: bash scripts/release_notes.sh "$GITHUB_REF_NAME" > dist/notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: "SwarmRT ${{ github.ref_name }}"
-          body: |
-            ## SwarmRT ${{ github.ref_name }}
-
-            BEAM-shaped C runtime + the `sw` language for AI agents. Each release
-            ships the `swc` compiler and `libswarmrt.a` as a single self-contained
-            native archive per platform — no VM, no runtime install.
-
-            ### Install
-            Download the archive for your platform, extract, and put `swc` on PATH:
-            ```bash
-            tar xzf swarmrt-*-<platform>.tar.gz
-            ./swarmrt-*/bin/swc --version
-            ./swarmrt-*/bin/swc build yourprogram.sw -o yourprogram
-            ```
-
-            ### Platforms
-            | Archive | Platform |
-            |---------|----------|
-            | `swarmrt-*-darwin-arm64.tar.gz` | macOS Apple Silicon |
-            | `swarmrt-*-linux-x86_64.tar.gz` | Linux x86_64 |
-            | `swarmrt-*-linux-arm64.tar.gz` | Linux ARM64 |
-
-            Each archive contains `bin/swc`, `bin/libswarmrt.a`, the runtime
-            headers (`src/`), the stdlib (`lib/`), the project templates
-            (`templates/`), `README.md` and `LICENSE`. Put `bin/` on your PATH
-            and run `swc new myagent`. See `docs/DEPLOYMENT.md` for operating a
-            compiled binary in production and `docs/CHANGELOG.md` for changes.
-
-            Verify downloads against `checksums.txt`.
+          body_path: dist/notes.md
           files: |
             dist/*.tar.gz
             dist/checksums.txt

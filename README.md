@@ -103,6 +103,19 @@ The language is called **`sw`** and is designed so an LLM can write it correctly
 
 ## Quickstart (60 seconds)
 
+**From a release** ([v2.0.0](https://github.com/skyblanket/swarmrt/releases/tag/v2.0.0): macOS arm64, Linux x86_64, Linux arm64):
+
+```bash
+curl -LO https://github.com/skyblanket/swarmrt/releases/download/v2.0.0/swarmrt-v2.0.0-linux-x86_64.tar.gz
+tar xzf swarmrt-v2.0.0-linux-x86_64.tar.gz
+export PATH="$PWD/swarmrt-v2.0.0-linux-x86_64/bin:$PATH"
+swc new myagent && cd myagent && make test     # offline: a mock model, no API key
+```
+
+`swc build` still needs a C compiler and the system libraries below.
+
+**From source:**
+
 ```bash
 # Install the C system libraries SwarmRT links against:
 #   Ubuntu / Debian:
@@ -117,7 +130,7 @@ make swc libswarmrt          # builds the compiler + runtime library
 ./counter
 ```
 
-That's it. No package manager for the language, no language server install, no VM image. The compiler is one binary and the runtime is one static library.
+That's it. No VM image, no language server install, no runtime to deploy next to your binary. The compiler is one binary and the runtime is one static library.
 
 **Dependencies (small list, all in every major distro):** `cc` (clang or gcc) + pthreads (libc), plus four system libraries — `-lsqlite3`, `-lssl -lcrypto`, `-lz`, `-lm`. `sqlite` powers `db_*` builtins, openssl powers the WebSocket handshake, zlib is for PDF decompression, libm is for codegen-emitted math. If you want a truly minimal build later, those modules can be feature-flagged off.
 

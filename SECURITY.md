@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-SwarmRT is pre-1.0 and ships from `main`. Security fixes land on `main`;
-there are no separately maintained release branches.
+Security fixes land on `main` and ship in the next tagged release. Only the
+latest release (currently 2.x) is supported; there are no separately
+maintained release branches, so upgrade to get a fix.
 
 ## Reporting a vulnerability
 

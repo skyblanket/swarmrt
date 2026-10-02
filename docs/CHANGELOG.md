@@ -4,6 +4,85 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-02 — v2.0.0
+
+**release: SwarmRT 2.0.0.** Everything since `v1.0.0` (2026-07-08); the dated
+entries in [docs/CHANGELOG.md](CHANGELOG.md) have the details. It is a major release
+because `sw` programs that built on 1.x may need an import or an environment variable
+(migration notes below), and because the C value layout changed.
+
+What's new:
+
+- **`swc new <name>`** creates an agent project: an agent with a tool, a fan-out
+  over a task list, and offline tests against a mock model that need no API key.
+- **Packages.** `swc add` / `install` / `update` / `remove` with `swarm.json` and
+  `swarm.lock`. Dependencies are git repos or local directories, pinned to commit
+  shas ([docs/PACKAGES.md](PACKAGES.md)).
+- **Durable state.** `checkpoint` / `restore` / `checkpoint_delete` and
+  `lib/Durable.sw` keep agent state in SQLite across OS-process restarts.
+- **Install from a release archive.** `bin/ src/ lib/ templates/ docs/`; put `bin/` on
+  `PATH` and `swc` finds its headers, runtime library and stdlib from there
+  (`SWARMRT_HOME` overrides).
+- **Smaller binaries.** PDF, Chrome and the audio codecs are compiled in only when a
+  module imports them. Hello world went from 1.67 MB to 1.44 MB.
+- **Speed.**
+  - Startup takes 12 ms, and a hello-world RSS is 5.6 MB.
+  - Preemption happens at every call.
+  - List idioms and map adds are O(1). Building a 20,000-key map dropped from 3.6 s to 25 ms.
+  - Blocking HTTP, LLM and shell calls run on an offload pool, so they no longer pin a scheduler.
+- **Language.**
+  - Undefined names are compile errors on every path.
+  - Function values and pipes behave the same compiled and interpreted.
+  - The interpreter has tail calls.
+  - New builtins: `eprint`, `stdout_to_stderr` and `fd_write`.
+- **Security.**
+  - Localhost-only defaults for HTTP and distribution.
+  - Optional MACs on distribution frames.
+  - WebSocket `Origin` checks.
+  - Host-matched API keys.
+  - No shell interpolation in the sandbox or the LLM builtins.
+  - Pids that stay safe across slot reuse.
+  - Strict JSON.
+
+  See [docs/SECURITY_AUDIT.md](SECURITY_AUDIT.md).
+- **Reliability.**
+  - The HTTP server no longer drops requests, leaks fds or double-frees on close.
+  - A WebSocket client can no longer silently stop reading.
+  - The deadlock watchdog no longer cries wolf.
+  - SIGPIPE no longer kills the process.
+
+**Migration from 1.x:**
+
+1. **Batteries need an import.** A module that calls `pdf_*` needs `import Pdf`, one
+   that calls `chrome_launch` needs `import Chrome`, and one that calls `audio_*`
+   needs `import Audio`. The build error names the import to add.
+2. **LLM calls need an endpoint.** `llm_complete` and `llm_stream` no longer fall
+   back to a hosted proxy. Set `LLM_URL` (any OpenAI-compatible
+   `/v1/chat/completions`), pass `opts.url`, or choose a provider with
+   `LLM_PROVIDER` / `opts.provider` (`openai`, `ollama`, `otonomy`; `otonomy` is the
+   old default).
+3. **Servers bind 127.0.0.1.**
+   - To reach `http_listen` from other hosts (containers, load-balancer and kubelet `Health` probes), set `SW_HTTP_BIND=0.0.0.0` or pass `%{bind: "0.0.0.0"}`.
+   - For a multi-host cluster, `node_start` needs `SW_NODE_BIND=0.0.0.0` and the same `SW_NODE_COOKIE` on every node.
+4. **Cross-origin WebSocket upgrades are refused.**
+   - A browser page served from another origin needs `ws_origins` or `SW_WS_ORIGINS`.
+   - Clients that send no `Origin` (`wsc_connect`, curl) are unaffected.
+5. **`json_decode` is strict.** Truncated input or trailing data returns `nil`
+   instead of a partial value.
+6. **Undefined names fail the build** on `swc build`, `swc run` and `swc test`.
+   Code that referenced an undefined name on a path that never ran now has to fix
+   it.
+7. **Release archives changed layout.**
+   - `swc` is now `bin/swc`, next to `bin/libswarmrt.a`, `src/`, `lib/`, `templates/` and `docs/`.
+   - Scripts that unpacked the 1.x flat archive need the new path.
+8. **C embedders recompile.** `sw_val_t` changed: pid values carry a numeric id
+   (use `sw_pid_of`), and maps carry a store pointer. Rebuild against the 2.0
+   headers.
+9. **One runtime version per cluster.** The distribution frame header gained a MAC
+   field, so 1.x and 2.x nodes can't talk to each other. Upgrade a cluster all at once.
+
+---
+
 ## 2026-10-02 — the deadlock watchdog warned when a wake landed mid-scan
 
 **fix(watchdog): no "possible deadlock" warning from a wake that lands mid-scan.** The
