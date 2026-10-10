@@ -9,6 +9,8 @@
 
 https://github.com/skyblanket/swarmrt/raw/main/docs/assets/swarmrt-film.mp4
 
+SwarmRT is a native actor runtime for resilient AI agents: BEAM-style processes, supervisors and deadlines, ahead-of-time compiled to one small binary.
+
 Each agent is a process with its own memory, a supervisor that restarts it and a deadline that ends it. A crash stays in its process. The runtime is written in C and compiles your program ahead of time to a native binary that starts in about 12 ms. The language on top, `sw`, is small enough that models write it correctly from the docs alone ([eval](eval/)).
 
 ## Five minutes
@@ -53,39 +55,6 @@ Against a local mock with 500 ms latency, 200 prompts run in 2.1 s on 4 cores: f
 - **Local-first.** No default cloud endpoint. PDF, browser and audio code is compiled in only when a module imports it ([batteries](docs/SW_LANGUAGE.md)).
 - **One binary.** No VM, no interpreter to install; the release archive is the compiler, the runtime library and the stdlib.
 - **Model-friendly code.** Undefined names are rejected before anything runs, on the compiled and interpreted paths alike.
-
-## The language
-
-```sw
-module Counter
-export [main, counter]
-
-fun counter(start) {
-    receive {
-        {'increment', by} -> counter(start + by)
-        {'get', from}     -> send(from, {'count', start}) ; counter(start)
-        'stop'            -> print("Counter stopped at " ++ start)
-    }
-}
-
-fun main() {
-    pid = spawn(counter(0))
-    send(pid, {'increment', 5})
-    send(pid, {'increment', 3})
-    send(pid, {'get', self()})
-
-    receive { {'count', n} -> print("Count: " ++ n) }
-    send(pid, 'stop')
-}
-```
-
-```bash
-$ ./bin/swc build examples/counter.sw -o counter && ./counter
-Count: 8
-Counter stopped at 8
-```
-
----
 
 ## What this is
 
@@ -143,7 +112,7 @@ That's it. No VM image, no language server install, no runtime to deploy next to
 | **Running AI agents** | First-class actor model so each agent is a process. Selective receive for tool replies. ETS for shared state. HTTP / WebSocket / Chrome DevTools builtins so an agent can call APIs and drive a browser without spawning a Node sidecar. |
 | **Building distributed systems** | Erlang-style multi-node TCP distribution. Supervisors with one-for-one / one-for-all / rest-for-one strategies. Process linking and monitoring. Versioned module registry with rollback for C embedders (no `sw`-level hot reload yet — see below). |
 | **Writing concurrent programs** | Tens of thousands of live processes per node (each live process owns an mmap'd stack, so stock Linux's `vm.max_map_count=65530` caps it near 30K — raise it for 100K). ~150ns context switches. Lock-free MPSC mailboxes. No `async`/`await` keyword salad — just `spawn` and `receive`. |
-| **Avoiding language overhead** | One binary, no VM, no GC pauses, ~12ms startup. (Memory model — **Ownership v2**: each sw process has a **value arena** freed when the process exits. Escaped values get a lifecycle owner: a **sent message** is deep-copied into a region the receiver *adopts* on match (and reclaims at exit / next turn); **spawn arguments** are adopted into the child's arena; and a long-lived tail-recursive loop is bounded by a **scoped turn-checkpoint** that reclaims each turn's garbage above the function's entry floor. So memory stays bounded under fixed concurrency: a fixed-width spawn workload with 32 KB args, a fixed-depth large-message stream, and a 100k-turn loop all hold **flat** peak RSS as the job count scales 10× (`make gc-slope`). Cross-process messages are deep-copied (BEAM no-shared-heap). **Remaining caveat:** ETS entries, supervisor child closures, and timer/cron closures are still global-heap (reclaimed at OS exit / table destroy); the interpreter has no arena (short-lived). The binary statically links libswarmrt and dynamically links the four system libs above — no runtime install or VM image. |
+| **Avoiding language overhead** | One binary, no VM, no GC pauses, ~12ms startup. (**Ownership v2** memory model: each process's arena frees at exit; sent messages and spawn args are adopted by the receiver and reclaimed; long-lived loops are bounded by a turn-checkpoint - memory stays flat under fixed concurrency, proven by the `make gc-slope` CI gate. Remaining global-heap owners: ETS entries and supervisor/timer closures. Full model in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).) The binary statically links libswarmrt and dynamically links the four system libs below - no runtime install or VM image. |
 
 ---
 
@@ -264,6 +233,18 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 **Working example:** [examples/llm_agent.sw](examples/llm_agent.sw) — a real LLM-driven agent in ~170 lines (prompt → http_post_stream → parse tool tags → `case` dispatch → loop). Set `API_KEY` and run; works against any OpenAI-compatible endpoint.
 
 **Real-world stack:** [swarm-code](https://github.com/skyblanket/swarm-code) — a terminal coding agent that uses all of the above in anger.
+
+---
+
+## Security posture
+
+- **Local-first by default.** A scaffolded agent sends nothing anywhere until you set `LLM_URL` or `LLM_PROVIDER`. There is no default cloud endpoint.
+- **Localhost binds.** Servers bind `127.0.0.1` unless you say otherwise.
+- **Keys stay in your environment.** API keys come from env vars you set and are passed to the model endpoint via a 0600 header file, out of `ps` - and there is no default endpoint to send them to.
+- **Audited.** An internal security audit (September 2026) fixed its findings on `main`, each with a regression test that fails on the old code - see [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). Distribution binds localhost by default and supports an optional per-frame MAC (`SW_NODE_COOKIE`); frames are not encrypted or replay-protected.
+- **Sandboxed tool dispatch.** `shell_sandboxed(cmd, opts)` uses sandbox-exec on macOS / firejail on Linux with the network blocked by default; `exec_argv` forks without a shell so user-supplied arguments can't inject.
+
+Reports: [SECURITY.md](SECURITY.md).
 
 ---
 
