@@ -17,7 +17,7 @@ notes="$(awk -v tag="$tag" '
     found && /^---$/ { exit }
     found { print }
 ' "$root/docs/CHANGELOG.md" |
-    sed -E "s#\]\(([A-Za-z0-9_./-]+\.md)\)#](${repo}/blob/${tag}/docs/\1)#g")"
+    sed -E "s#\]\(([A-Za-z0-9_./-]+\.md(\#[A-Za-z0-9_-]+)?)\)#](${repo}/blob/${tag}/docs/\1)#g")"
 
 echo "## SwarmRT ${tag}"
 echo

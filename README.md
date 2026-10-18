@@ -72,12 +72,12 @@ The language is called **`sw`** and is designed so an LLM can write it correctly
 
 ## Quickstart (60 seconds)
 
-**From a release** ([v2.0.0](https://github.com/skyblanket/swarmrt/releases/tag/v2.0.0): macOS arm64, Linux x86_64, Linux arm64):
+**From a release** ([v2.0.1](https://github.com/skyblanket/swarmrt/releases/tag/v2.0.1): macOS arm64, Linux x86_64, Linux arm64):
 
 ```bash
-curl -LO https://github.com/skyblanket/swarmrt/releases/download/v2.0.0/swarmrt-v2.0.0-linux-x86_64.tar.gz
-tar xzf swarmrt-v2.0.0-linux-x86_64.tar.gz
-export PATH="$PWD/swarmrt-v2.0.0-linux-x86_64/bin:$PATH"
+curl -LO https://github.com/skyblanket/swarmrt/releases/download/v2.0.1/swarmrt-v2.0.1-linux-x86_64.tar.gz
+tar xzf swarmrt-v2.0.1-linux-x86_64.tar.gz
+export PATH="$PWD/swarmrt-v2.0.1-linux-x86_64/bin:$PATH"
 swc new myagent && cd myagent && make test     # offline: a mock model, no API key
 ```
 

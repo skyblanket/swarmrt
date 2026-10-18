@@ -4,6 +4,29 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-18 — v2.0.1
+
+**release: SwarmRT 2.0.1.** A fix release for 2.0.0, which shipped no
+archives: its macOS build failed the archive smoke test on the bug below. What 2.0
+changes, and how to migrate from 1.x, is in the
+[v2.0.0 entry](CHANGELOG.md#2026-10-02--v200).
+
+**fix(runtime): a subprocess pipe leaked into sibling children.** The pipes that
+`exec_argv`, the `http_*` and LLM builtins and the other subprocess builtins read a child's output through were
+created without close-on-exec. A child that another offload worker forked while
+one of those pipes was open inherited its write end, so the reader saw EOF only
+when that sibling exited. A quick call running next to a slow one took as long as
+the slow one. A finished request looked lost: in the `swc new` template's offline test, a
+60-second "hang" agent held a healthy agent's reply until the 2-second deadline
+fired, about once in 25 runs under load. The pipes now use `pipe2(O_CLOEXEC)`
+(Linux), or `pipe` + `FD_CLOEXEC` under a lock that every fork also takes (macOS),
+via `sw_pipe_cloexec` / `sw_fork`. Gate: `tests/sw/test_exec_fd_leak.sw` runs 200
+quick `exec_argv` calls while 60 `sleep 1` children fork. On the old code the slowest
+quick call took 1,003 ms in 6 of 6 runs; now it passes 6 of 6. The template test
+under CPU load: 1 of 25 failed before, 0 of 40 after.
+
+---
+
 ## 2026-10-02 — v2.0.0
 
 **release: SwarmRT 2.0.0.** Everything since `v1.0.0` (2026-07-08); the dated
