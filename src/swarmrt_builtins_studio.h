@@ -1054,8 +1054,8 @@ static _sw_popen_pid_t _sw_popen_pid(const char *cmd) {
     r.pid = -1;
 #ifndef _WIN32
     int pipefd[2];
-    if (pipe(pipefd) < 0) return r;
-    pid_t pid = fork();
+    if (sw_pipe_cloexec(pipefd) < 0) return r;
+    pid_t pid = sw_fork();
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
@@ -1098,8 +1098,8 @@ static _sw_popen_pid_t _sw_popen_argv(char *const argv[], const char *stderr_pat
     r.pid = -1;
 #ifndef _WIN32
     int pipefd[2];
-    if (pipe(pipefd) < 0) return r;
-    pid_t pid = fork();
+    if (sw_pipe_cloexec(pipefd) < 0) return r;
+    pid_t pid = sw_fork();
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
@@ -1549,17 +1549,17 @@ static sw_val_t *_builtin_subprocess_spawn(sw_val_t **a, int n) {
     if (slot < 0) { pthread_mutex_unlock(&_sw_subproc_lock); return sw_val_int(-1); }
 
     int p_in[2], p_out[2];
-    if (pipe(p_in) != 0) {
+    if (sw_pipe_cloexec(p_in) != 0) {
         pthread_mutex_unlock(&_sw_subproc_lock);
         return sw_val_int(-1);
     }
-    if (pipe(p_out) != 0) {
+    if (sw_pipe_cloexec(p_out) != 0) {
         close(p_in[0]); close(p_in[1]);
         pthread_mutex_unlock(&_sw_subproc_lock);
         return sw_val_int(-1);
     }
 
-    pid_t pid = fork();
+    pid_t pid = sw_fork();
     if (pid < 0) {
         close(p_in[0]); close(p_in[1]); close(p_out[0]); close(p_out[1]);
         pthread_mutex_unlock(&_sw_subproc_lock);
@@ -5274,8 +5274,8 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
  * everything; return {exit_code, output} or nil if it could not start. */
 static sw_val_t *_sw_run_argv_merged(char *const argv[]) {
     int pipefd[2];
-    if (pipe(pipefd) < 0) return sw_val_nil();
-    pid_t pid = fork();
+    if (sw_pipe_cloexec(pipefd) < 0) return sw_val_nil();
+    pid_t pid = sw_fork();
     if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return sw_val_nil(); }
     if (pid == 0) {
         close(pipefd[0]);
@@ -5958,9 +5958,9 @@ static sw_val_t *_builtin_shell_detached(sw_val_t **a, int n) {
     const char *exit_path = a[2]->v.str;
 
     int pfd[2];
-    if (pipe(pfd) != 0) return sw_val_nil();
+    if (sw_pipe_cloexec(pfd) != 0) return sw_val_nil();
 
-    pid_t inter = fork();
+    pid_t inter = sw_fork();
     if (inter < 0) { close(pfd[0]); close(pfd[1]); return sw_val_nil(); }
 
     if (inter == 0) {

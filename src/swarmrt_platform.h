@@ -259,6 +259,15 @@ static inline int sw_wake_pipe_create(sw_fd_t fds[2]) {
     return pipe(fds);
 }
 #define sw_wake_pipe_close(fds) do { close(fds[0]); close(fds[1]); } while(0)
+
+/* A pipe whose ends a forked child does not inherit (close-on-exec), and the
+ * fork that goes with it (swarmrt_io.c). Builtins fork curl / commands from
+ * several offload workers at once; a plain pipe() end leaked into a sibling
+ * child, so a reader saw EOF only when that sibling exited (a 60 s request
+ * held a finished one's output open). dup2 onto the child's stdio clears the
+ * flag, so the child's own redirections still work. */
+int sw_pipe_cloexec(int fds[2]);
+pid_t sw_fork(void);
 #endif
 
 /* ============================================================

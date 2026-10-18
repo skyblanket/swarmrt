@@ -34,6 +34,7 @@
 #include "swarmrt_ets.h"
 #include "swarmrt_varena.h"  /* per-process value arena (GC v1) */
 #include "swarmrt_node.h"    /* sw_send_dispatch: structure-preserving send */
+#include "swarmrt_platform.h" /* sw_pipe_cloexec, sw_fork */
 #define SW_AUDIO_BASE64_ONLY   /* the codecs are the Audio battery: swarmrt_battery_interp.c */
 #include "swarmrt_audio.h"   /* base64 helpers */
 #include "swarmrt_otp.h"     /* sw_supervisor_start + child spec (interp supervise) */
@@ -4696,8 +4697,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         argv2[1 + nlist] = NULL;
         /* pipe + fork + exec */
         int pfd[2];
-        if (pipe(pfd) != 0) { free(argv2); return sw_val_nil(); }
-        pid_t pid = fork();
+        if (sw_pipe_cloexec(pfd) != 0) { free(argv2); return sw_val_nil(); }
+        pid_t pid = sw_fork();
         if (pid < 0) { close(pfd[0]); close(pfd[1]); free(argv2); return sw_val_nil(); }
         if (pid == 0) {
             /* child */
@@ -4750,8 +4751,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         const char *log_path  = args[1]->v.str;
         const char *exit_path = args[2]->v.str;
         int pfd[2];
-        if (pipe(pfd) != 0) return sw_val_nil();
-        pid_t inter = fork();
+        if (sw_pipe_cloexec(pfd) != 0) return sw_val_nil();
+        pid_t inter = sw_fork();
         if (inter < 0) { close(pfd[0]); close(pfd[1]); return sw_val_nil(); }
         if (inter == 0) {
             close(pfd[0]);

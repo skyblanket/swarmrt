@@ -652,6 +652,39 @@ sw_port_t *sw_tcp_connect(const char *addr, uint16_t port) {
     return p;
 }
 
+#ifndef _WIN32
+/* Linux: pipe2 sets close-on-exec atomically. Elsewhere pipe() + FD_CLOEXEC
+ * leaves a window in which another thread's fork could copy the ends, so
+ * creating such a pipe and forking exclude each other. */
+static pthread_mutex_t g_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int sw_pipe_cloexec(int fds[2]) {
+#if defined(__linux__)
+    return pipe2(fds, O_CLOEXEC);
+#else
+    pthread_mutex_lock(&g_spawn_lock);
+    int rc = pipe(fds);
+    if (rc == 0) {
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+    pthread_mutex_unlock(&g_spawn_lock);
+    return rc;
+#endif
+}
+
+pid_t sw_fork(void) {
+#if defined(__linux__)
+    return fork();
+#else
+    pthread_mutex_lock(&g_spawn_lock);
+    pid_t pid = fork();
+    if (pid != 0) pthread_mutex_unlock(&g_spawn_lock);   /* the child execs or exits */
+    return pid;
+#endif
+}
+#endif
+
 int sw_tcp_send(sw_port_t *port, const void *data, uint32_t len) {
     if (!port || __atomic_load_n(&port->state, __ATOMIC_ACQUIRE) != SW_PORT_OPEN ||
         port->type != SW_PORT_TCP_CONN)
