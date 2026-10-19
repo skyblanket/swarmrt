@@ -32,7 +32,8 @@ fun main() {
     sleep(100)
     # an orphan nobody reaps (no init in a container) lingers as a zombie: only
     # a live, non-zombie process counts as having survived
-    alive = shell("if [ -r /proc/" ++ gc ++ "/status ] && ! grep -q '^State:.Z' /proc/" ++ gc ++ "/status; then echo alive; else echo dead; fi")
+    # (`ps` rather than /proc so this also checks on macOS)
+    alive = shell("st=$(ps -o stat= -p " ++ gc ++ " 2>/dev/null); case \"$st\" in \"\"|Z*) echo dead;; *) echo alive;; esac")
     f = f + check("timeout_kills_grandchild", yes(string_trim(elem(alive, 1)) == "dead"))
 
     # a command that finishes inside the timeout is untouched
