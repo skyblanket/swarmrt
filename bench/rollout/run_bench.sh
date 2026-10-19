@@ -3,6 +3,7 @@
 # to stdout and per-run files to $OUT_DIR.
 #
 #   bash run_bench.sh [N] [CONC]
+#   MOCK=sw bash run_bench.sh ...    # serve the model API from mock_server.sw
 #
 # Scenarios:
 #   api      model faults (429, 500, a hung request), a hung tool that leaves a
@@ -25,9 +26,16 @@ export SW_DEADLOCK_DETECT=0
 
 "$here/../../bin/swc" build "$here/swarmrt_runner.sw" -o "$OUT_DIR/swarmrt_runner" >/dev/null || exit 1
 
-python3 "$here/mock_server.py" "$PORT" > "$OUT_DIR/mock.log" 2>&1 &
-MOCK=$!
-trap 'kill $MOCK 2>/dev/null' EXIT
+# MOCK=sw serves the model API from mock_server.sw instead (dogfooding
+# SwarmRT's HTTP server). The Python mock is the neutral default.
+if [ "${MOCK:-py}" = sw ]; then
+    "$here/../../bin/swc" build "$here/mock_server.sw" -o "$OUT_DIR/mock_server" >/dev/null || exit 1
+    PORT="$PORT" "$OUT_DIR/mock_server" > "$OUT_DIR/mock.log" 2>&1 &
+else
+    python3 "$here/mock_server.py" "$PORT" > "$OUT_DIR/mock.log" 2>&1 &
+fi
+MOCK_PID=$!
+trap 'kill $MOCK_PID 2>/dev/null' EXIT
 for _ in $(seq 50); do curl -sf "127.0.0.1:$PORT/stats" >/dev/null && break; sleep 0.1; done
 
 cleanup_strays() { pkill -f '^sleep 300$' 2>/dev/null; pkill -f "^curl .*127.0.0.1:$PORT" 2>/dev/null; true; }

@@ -63,6 +63,11 @@ pip install aiohttp
 bash bench/rollout/run_bench.sh 10000 128   # N episodes, concurrency
 ```
 
+`MOCK=sw bash bench/rollout/run_bench.sh ...` serves the model API from
+`mock_server.sw` instead of `mock_server.py`. It has the same contract and
+dogfoods SwarmRT's HTTP server under load. Comparisons use the Python mock, so
+a SwarmRT server bug can't skew SwarmRT's own numbers.
+
 Each run prints one JSON line. Per-run results, logs and timings go to
 `bench/rollout/out/`.
 
