@@ -4,16 +4,59 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
-## 2026-10-18 — v2.0.1
+## 2026-10-19 — v2.1.0
 
-**release: SwarmRT 2.0.1.** A fix release for 2.0.0, which shipped no
-archives: its macOS build failed the archive smoke test on the bug below. What 2.0
-changes, and how to migrate from 1.x, is in the
-[v2.0.0 entry](CHANGELOG.md#2026-10-02--v200).
+**release: SwarmRT 2.1.0.** The first archives since 1.0.0: the 2.0.0 tag
+published none, because its macOS build failed the archive smoke test on the pipe
+leak fixed below. Upgrading from 1.x? The 2.0 changes and migration notes are in
+the [v2.0.0 entry](CHANGELOG.md#2026-10-02--v200). New since 2.0.0, all
+backward-compatible:
+
+- **`cond`** for multi-way branching on unrelated conditions (`cond { a -> x ;
+  b -> y ; _ -> z }`). It desugars to nested `if`, so `swc run` and compiled
+  binaries agree.
+- **`exec_managed(cmd, args, opts)`**, which is `exec_argv` (no shell) plus a
+  timeout that kills the child's whole process group (exit 124), `cwd`, `stdin`
+  / `stdin_file`, `stdout_file` / `stderr_file` and `env_unset`. The child dies
+  with its caller.
+- **Docs:** a Loops section on list comprehensions and the `Std` list helpers,
+  and `shell_managed` in `API_REFERENCE.md`.
+- **Fixes:** subprocess pipes leaked into sibling children (a quick call waited
+  on a slow one); an `exec_managed` child outlived a killed caller; `env_unset`
+  ran `unsetenv` between `fork` and `exec`.
+
+---
+
+## 2026-10-19 — exec_managed: the child outlived a killed caller; unsafe code after fork
+
+**fix(builtins): a killed caller takes its `exec_managed` child with it.**
+`exec_managed` without `timeout_ms` waited for the child however its caller ended.
+A process killed while it waited (`exit_proc`, a supervisor, a `Std.task_stream`
+deadline) left the child running: a `sleep 7` survived its caller's 300 ms
+deadline. The wait loop now treats the caller's death like a timeout and
+SIGTERMs, then SIGKILLs, the child's process group. The kill path frees the
+caller's slot without resuming it, and a new process can reuse the slot and clear
+`kill_flag`, so the check also compares the caller's never-reused numeric pid.
+Gate: `killed_caller_kills_child` in `tests/sw/test_exec_managed.sw`, which failed
+3 of 3 runs on the old code and passes every run now. (`swc run` is
+single-scheduler, so nothing can kill a caller mid-call there.)
+
+**fix(builtins): `env_unset` no longer runs `unsetenv` in the forked child.**
+Between `fork` and `exec` in a threaded program only async-signal-safe calls are
+allowed, and `unsetenv` can take the environment or malloc lock that another
+thread held at fork time, deadlocking the child. The trimmed environment is now
+built in the parent, and the child only assigns `environ`. New check:
+`env_unset_keeps_others`. `exec_managed` arrived in #14, and #15's portable
+grandchild check (`ps`, not `/proc`, which made the check pass vacuously on
+macOS) is included.
+
+---
+
+## 2026-10-18 — subprocess pipes leaked into sibling children
 
 **fix(runtime): a subprocess pipe leaked into sibling children.** The pipes that
-`exec_argv`, the `http_*` and LLM builtins and the other subprocess builtins read a child's output through were
-created without close-on-exec. A child that another offload worker forked while
+`exec_argv`, the `http_*` and LLM builtins and the other subprocess builtins read
+a child's output through were created without close-on-exec. A child that another offload worker forked while
 one of those pipes was open inherited its write end, so the reader saw EOF only
 when that sibling exited. A quick call running next to a slow one took as long as
 the slow one. A finished request looked lost: in the `swc new` template's offline test, a
