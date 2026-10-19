@@ -40,8 +40,11 @@ fun main() {
     f = f + check("timeout_not_hit", yes(elem(r, 0) == 0 && elem(r, 1) == "fast\n"))
 
     # cwd
-    r = exec_managed("pwd", [], %{cwd: dir ++ "/sub"})
-    f = f + check("cwd", yes(string_trim(elem(r, 1)) == dir ++ "/sub"))
+    # (reads a relative file rather than comparing `pwd`: macOS /tmp is a
+    # symlink, so pwd prints the resolved path)
+    file_write(dir ++ "/sub/marker.txt", "in sub")
+    r = exec_managed("cat", ["marker.txt"], %{cwd: dir ++ "/sub"})
+    f = f + check("cwd", yes(elem(r, 0) == 0 && elem(r, 1) == "in sub"))
 
     # stdin_file and stdin
     file_write(dir ++ "/in.txt", "from file")
