@@ -4736,6 +4736,146 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         return sw_val_tuple(items, 2);
 #endif
     }
+    /* exec_managed(cmd, args [, opts]): see _builtin_exec_managed in
+     * swarmrt_builtins_studio.h for the option semantics. Same behaviour,
+     * minimal form, for `swc run`/REPL parity. */
+    if (strcmp(fname, "exec_managed") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
+#ifdef _WIN32
+        return sw_val_nil();
+#else
+        sw_val_t *lst = (nargs >= 2 && args[1] && args[1]->type == SW_VAL_LIST) ? args[1] : NULL;
+        sw_val_t *opts = (nargs >= 3 && args[2] && args[2]->type == SW_VAL_MAP) ? args[2] : NULL;
+        int nlist = lst ? lst->v.tuple.count : 0;
+        const char *o_str[5] = {NULL};   /* cwd stdin_file stdin stdout_file stderr_file */
+        static const char *o_key[5] = {"cwd", "stdin_file", "stdin", "stdout_file", "stderr_file"};
+        int64_t timeout_ms = 0;
+        sw_val_t *unset = NULL;
+        if (opts) {
+            for (int k = 0; k < 5; k++) {
+                sw_val_t *v = sw_val_map_get(opts, sw_val_atom(o_key[k]));
+                if (!v || v->type == SW_VAL_NIL) v = sw_val_map_get(opts, sw_val_string(o_key[k]));
+                if (v && v->type == SW_VAL_STRING) o_str[k] = v->v.str;
+            }
+            sw_val_t *tv = sw_val_map_get(opts, sw_val_atom("timeout_ms"));
+            if (!tv || tv->type == SW_VAL_NIL) tv = sw_val_map_get(opts, sw_val_string("timeout_ms"));
+            if (tv && tv->type == SW_VAL_INT) timeout_ms = tv->v.i;
+            unset = sw_val_map_get(opts, sw_val_atom("env_unset"));
+            if (!unset || unset->type == SW_VAL_NIL) unset = sw_val_map_get(opts, sw_val_string("env_unset"));
+            if (unset && unset->type != SW_VAL_LIST) unset = NULL;
+        }
+        char **argv2 = (char **)malloc(sizeof(char *) * (1 + nlist + 1));
+        if (!argv2) return sw_val_nil();
+        argv2[0] = args[0]->v.str;
+        for (int i = 0; i < nlist; i++) {
+            sw_val_t *elem = lst->v.tuple.items[i];
+            argv2[1 + i] = (elem && elem->type == SW_VAL_STRING) ? elem->v.str : (char *)"";
+        }
+        argv2[1 + nlist] = NULL;
+        int in_fd = -1;
+        if (!o_str[1] && o_str[2]) {
+            char tmpl[] = "/tmp/sw_exec_in_XXXXXX";
+            in_fd = mkstemp(tmpl);
+            if (in_fd < 0) { free(argv2); return sw_val_nil(); }
+            unlink(tmpl);
+            size_t len = strlen(o_str[2]), off = 0;
+            while (off < len) {
+                ssize_t w = write(in_fd, o_str[2] + off, len - off);
+                if (w < 0) { if (errno == EINTR) continue; break; }
+                off += (size_t)w;
+            }
+            if (off < len || lseek(in_fd, 0, SEEK_SET) < 0) { close(in_fd); free(argv2); return sw_val_nil(); }
+        }
+        int pfd[2] = {-1, -1};
+        if (!o_str[3] && sw_pipe_cloexec(pfd) != 0) { if (in_fd >= 0) close(in_fd); free(argv2); return sw_val_nil(); }
+        fflush(stdout); fflush(stderr);
+        pid_t pid = sw_fork();
+        if (pid < 0) {
+            if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
+            if (in_fd >= 0) close(in_fd);
+            free(argv2);
+            return sw_val_nil();
+        }
+        if (pid == 0) {
+            setpgid(0, 0);
+            if (o_str[1]) { in_fd = open(o_str[1], O_RDONLY); if (in_fd < 0) _exit(127); }
+            if (in_fd >= 0) { dup2(in_fd, STDIN_FILENO); if (in_fd != STDIN_FILENO) close(in_fd); }
+            int outfd = o_str[3] ? open(o_str[3], O_WRONLY | O_CREAT | O_TRUNC, 0644) : pfd[1];
+            if (outfd < 0) _exit(127);
+            dup2(outfd, STDOUT_FILENO);
+            if (outfd != STDOUT_FILENO) close(outfd);
+            if (pfd[0] >= 0) close(pfd[0]);
+            int errfd = o_str[4] ? open(o_str[4], O_WRONLY | O_CREAT | O_TRUNC, 0644)
+                                 : open("/dev/null", O_WRONLY);
+            if (errfd < 0) _exit(127);
+            dup2(errfd, STDERR_FILENO);
+            if (errfd != STDERR_FILENO) close(errfd);
+            if (unset)
+                for (int i = 0; i < unset->v.tuple.count; i++) {
+                    sw_val_t *nm = unset->v.tuple.items[i];
+                    if (nm && nm->type == SW_VAL_STRING) unsetenv(nm->v.str);
+                }
+            if (o_str[0] && chdir(o_str[0]) != 0) _exit(127);
+            execvp(argv2[0], argv2);
+            _exit(127);
+        }
+        setpgid(pid, pid);
+        free(argv2);
+        if (in_fd >= 0) close(in_fd);
+        if (pfd[1] >= 0) close(pfd[1]);
+        size_t cap = 65536, got = 0;
+        char *buf = (char *)malloc(cap);
+        if (!buf) { if (pfd[0] >= 0) close(pfd[0]); killpg(pid, SIGKILL); waitpid(pid, NULL, 0); return sw_val_nil(); }
+        if (pfd[0] >= 0) { int fl = fcntl(pfd[0], F_GETFL, 0); if (fl >= 0) fcntl(pfd[0], F_SETFL, fl | O_NONBLOCK); }
+        uint64_t t0 = recv_now_ms();
+        int out_open = pfd[0] >= 0, reaped = 0, wstatus = 0, timed_out = 0;
+        while (!(reaped && !out_open)) {
+            if (timeout_ms > 0 && (int64_t)(recv_now_ms() - t0) >= timeout_ms) { timed_out = 1; break; }
+            if (out_open) {
+                fd_set rf; FD_ZERO(&rf); FD_SET(pfd[0], &rf);
+                struct timeval tv = {0, 20000};
+                if (select(pfd[0] + 1, &rf, NULL, NULL, &tv) > 0) {
+                    char chunk[8192];
+                    ssize_t rn = read(pfd[0], chunk, sizeof(chunk));
+                    if (rn == 0) { close(pfd[0]); out_open = 0; }
+                    else if (rn < 0) {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { close(pfd[0]); out_open = 0; }
+                    } else {
+                        if (got + (size_t)rn + 1 > cap) {
+                            while (got + (size_t)rn + 1 > cap) cap *= 2;
+                            char *tmp = (char *)realloc(buf, cap);
+                            if (!tmp) { free(buf); close(pfd[0]); killpg(pid, SIGKILL); waitpid(pid, NULL, 0); return sw_val_nil(); }
+                            buf = tmp;
+                        }
+                        memcpy(buf + got, chunk, (size_t)rn);
+                        got += (size_t)rn;
+                    }
+                }
+            } else {
+                usleep(10000);
+            }
+            if (!reaped && waitpid(pid, &wstatus, WNOHANG) == pid) reaped = 1;
+        }
+        int exit_code;
+        if (timed_out) {
+            killpg(pid, SIGTERM);
+            for (int i = 0; i < 20 && !reaped; i++) {
+                if (waitpid(pid, &wstatus, WNOHANG) == pid) reaped = 1; else usleep(10000);
+            }
+            killpg(pid, SIGKILL);
+            if (!reaped) waitpid(pid, &wstatus, 0);
+            if (out_open) close(pfd[0]);
+            exit_code = 124;
+        } else {
+            exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+        }
+        buf[got] = '\0';
+        sw_val_t *items[2];
+        items[0] = sw_val_int(exit_code);
+        items[1] = sw_val_string(buf);
+        free(buf);
+        return sw_val_tuple(items, 2);
+#endif
+    }
     /* shell_detached(cmd, log_path, exit_path) → pid_int | nil.
      * Double-fork + setsid so the worker is reparented and leads its own
      * process group; stdin=/dev/null, stdout/stderr→log_path, exit code→
@@ -6791,7 +6931,7 @@ static const char *k_interp_builtins[] = {
     "bytes_to_string","checkpoint","checkpoint_delete","codepoint_at","db_close","db_exec","db_open","db_query",
     "ed25519_verify","error","ets_cas","ets_count","ets_delete","ets_drop","ets_get",
     "ets_list","ets_new","ets_put","ets_take","ets_update","ets_update_counter",
-    "exec_argv","expect","file_append","file_delete","file_exists","file_list",
+    "exec_argv","exec_managed","expect","file_append","file_delete","file_exists","file_list",
     "file_mkdir","file_read","file_read_bytes","file_write","file_write_bytes",
     "filter","getenv","json_escape","json_get","map","map_merge","map_remove",
     "math_ceil","math_cos","math_exp","math_floor","math_log","math_pow",
@@ -6820,7 +6960,8 @@ static const char *lint_required_cap(const char *name) {
         strcmp(name, "shell_managed") == 0 ||
         strcmp(name, "shell_detached") == 0 ||
         strcmp(name, "pid_kill_group") == 0 ||
-        strcmp(name, "exec_argv") == 0) return "shell";
+        strcmp(name, "exec_argv") == 0 ||
+        strcmp(name, "exec_managed") == 0) return "shell";
     return NULL;
 }
 

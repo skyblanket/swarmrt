@@ -987,6 +987,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n);
  * ============================================================ */
 
 #include <termios.h>
+#include <poll.h>
 
 #define SW_RL_HIST_MAX 64
 
@@ -5922,6 +5923,216 @@ static sw_val_t *_builtin_exec_argv(sw_val_t **a, int n) {
 
     int wstatus = _sw_popen_pid_close(pp);
     int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+
+    sw_val_t *items[2];
+    items[0] = sw_val_int(exit_code);
+    items[1] = sw_val_string(buf);
+    free(buf);
+    return sw_val_tuple(items, 2);
+#endif
+}
+
+/* Option lookup for exec_managed's opts map: atom or string key. */
+static sw_val_t *_sw_exec_opt(sw_val_t *opts, const char *key) {
+    if (!opts || opts->type != SW_VAL_MAP) return NULL;
+    sw_val_t *v = sw_val_map_get(opts, sw_val_atom(key));
+    if (!v || v->type == SW_VAL_NIL) v = sw_val_map_get(opts, sw_val_string(key));
+    return (v && v->type != SW_VAL_NIL) ? v : NULL;
+}
+
+static const char *_sw_exec_opt_str(sw_val_t *opts, const char *key) {
+    sw_val_t *v = _sw_exec_opt(opts, key);
+    return (v && v->type == SW_VAL_STRING) ? v->v.str : NULL;
+}
+
+/* exec_managed(cmd, args_list [, opts]) → {exit_code, stdout}
+ *
+ * exec_argv (fork+exec, no shell) plus the supervision shell_managed has:
+ *   timeout_ms  : > 0 → SIGTERM the child's process group, 200ms later
+ *                 SIGKILL; exit code 124. Absent/<= 0 → no limit.
+ *   cwd         : chdir in the child before exec.
+ *   stdin_file  : path opened as the child's stdin.
+ *   stdin       : string fed to the child's stdin (stdin_file wins).
+ *   stdout_file : child stdout is written (truncated) there; the returned
+ *                 stdout string is then "".
+ *   stderr_file : child stderr is written (truncated) there; default is
+ *                 /dev/null, as with exec_argv.
+ *   env_unset   : list of environment variable names removed for the child.
+ * The child always leads its own process group, so grandchildren die with it
+ * on timeout. With no opts it behaves exactly like exec_argv. A child that
+ * can't be set up (bad cwd/stdin_file/redirect path, no such program) exits
+ * 127. Returns nil on fork/pipe failure or bad arguments. */
+static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
+#ifdef _WIN32
+    (void)a; (void)n;
+    return sw_val_nil();
+#else
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
+        return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_exec_managed, a, n);
+    const char *cmd = a[0]->v.str;
+
+    int nlist = 0;
+    sw_val_t *list = (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) ? a[1] : NULL;
+    if (list) nlist = list->v.tuple.count;
+    sw_val_t *opts = (n >= 3 && a[2] && a[2]->type == SW_VAL_MAP) ? a[2] : NULL;
+
+    int64_t timeout_ms = 0;
+    sw_val_t *tv = _sw_exec_opt(opts, "timeout_ms");
+    if (tv && tv->type == SW_VAL_INT) timeout_ms = tv->v.i;
+    const char *cwd         = _sw_exec_opt_str(opts, "cwd");
+    const char *stdin_file  = _sw_exec_opt_str(opts, "stdin_file");
+    const char *stdin_str   = _sw_exec_opt_str(opts, "stdin");
+    const char *stdout_file = _sw_exec_opt_str(opts, "stdout_file");
+    const char *stderr_file = _sw_exec_opt_str(opts, "stderr_file");
+    sw_val_t *unset = _sw_exec_opt(opts, "env_unset");
+    if (unset && unset->type != SW_VAL_LIST) unset = NULL;
+
+    char **argv = (char **)malloc(sizeof(char *) * (1 + nlist + 1));
+    if (!argv) return sw_val_nil();
+    argv[0] = (char *)cmd;
+    for (int i = 0; i < nlist; i++) {
+        sw_val_t *elem = list->v.tuple.items[i];
+        argv[1 + i] = (elem && elem->type == SW_VAL_STRING) ? elem->v.str : (char *)"";
+    }
+    argv[1 + nlist] = NULL;
+
+    /* A `stdin` string goes through an unlinked temp file: the child just
+     * reads a file, so there is no pipe to deadlock on while we also drain
+     * its stdout. */
+    int in_fd = -1;
+    if (!stdin_file && stdin_str) {
+        char tmpl[] = "/tmp/sw_exec_in_XXXXXX";
+        in_fd = mkstemp(tmpl);
+        if (in_fd < 0) { free(argv); return sw_val_nil(); }
+        unlink(tmpl);
+        size_t len = strlen(stdin_str), off = 0;
+        while (off < len) {
+            ssize_t w = write(in_fd, stdin_str + off, len - off);
+            if (w < 0) { if (errno == EINTR) continue; break; }
+            off += (size_t)w;
+        }
+        if (off < len || lseek(in_fd, 0, SEEK_SET) < 0) {
+            close(in_fd); free(argv); return sw_val_nil();
+        }
+    }
+
+    int pfd[2] = {-1, -1};
+    if (!stdout_file && sw_pipe_cloexec(pfd) != 0) {
+        if (in_fd >= 0) close(in_fd);
+        free(argv);
+        return sw_val_nil();
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = sw_fork();
+    if (pid < 0) {
+        if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
+        if (in_fd >= 0) close(in_fd);
+        free(argv);
+        return sw_val_nil();
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        if (stdin_file) {
+            in_fd = open(stdin_file, O_RDONLY);
+            if (in_fd < 0) _exit(127);
+        }
+        if (in_fd >= 0) { dup2(in_fd, STDIN_FILENO); if (in_fd != STDIN_FILENO) close(in_fd); }
+        int outfd = stdout_file ? open(stdout_file, O_WRONLY | O_CREAT | O_TRUNC, 0644) : pfd[1];
+        if (outfd < 0) _exit(127);
+        dup2(outfd, STDOUT_FILENO);
+        if (outfd != STDOUT_FILENO) close(outfd);
+        if (pfd[0] >= 0) close(pfd[0]);
+        int errfd = stderr_file ? open(stderr_file, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+                                : open("/dev/null", O_WRONLY);
+        if (errfd < 0) _exit(127);
+        dup2(errfd, STDERR_FILENO);
+        if (errfd != STDERR_FILENO) close(errfd);
+        if (unset) {
+            for (int i = 0; i < unset->v.tuple.count; i++) {
+                sw_val_t *nm = unset->v.tuple.items[i];
+                if (nm && nm->type == SW_VAL_STRING) unsetenv(nm->v.str);
+            }
+        }
+        if (cwd && chdir(cwd) != 0) _exit(127);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    setpgid(pid, pid);   /* also set from the parent: closes the race with killpg */
+    free(argv);
+    if (in_fd >= 0) close(in_fd);
+    if (pfd[1] >= 0) close(pfd[1]);
+
+    size_t cap = 65536, got = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        if (pfd[0] >= 0) close(pfd[0]);
+        killpg(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return sw_val_nil();
+    }
+    if (pfd[0] >= 0) {
+        int fl = fcntl(pfd[0], F_GETFL, 0);
+        if (fl >= 0) fcntl(pfd[0], F_SETFL, fl | O_NONBLOCK);
+    }
+
+    uint64_t t_start = _sw_now_ms();
+    int out_open = pfd[0] >= 0;
+    int reaped = 0, wstatus = 0, timed_out = 0;
+    while (!(reaped && !out_open)) {
+        if (timeout_ms > 0 && (int64_t)(_sw_now_ms() - t_start) >= timeout_ms) {
+            timed_out = 1;
+            break;
+        }
+        if (out_open) {
+            struct pollfd pf = { pfd[0], POLLIN, 0 };
+            int pr = poll(&pf, 1, 20);
+            if (pr > 0) {
+                char chunk[8192];
+                ssize_t rn = read(pfd[0], chunk, sizeof(chunk));
+                if (rn == 0) { close(pfd[0]); out_open = 0; }
+                else if (rn < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        close(pfd[0]); out_open = 0;
+                    }
+                } else {
+                    if (got + (size_t)rn + 1 > cap) {
+                        while (got + (size_t)rn + 1 > cap) cap *= 2;
+                        char *tmp = (char *)realloc(buf, cap);
+                        if (!tmp) {
+                            free(buf); close(pfd[0]);
+                            killpg(pid, SIGKILL); waitpid(pid, NULL, 0);
+                            return sw_val_nil();
+                        }
+                        buf = tmp;
+                    }
+                    memcpy(buf + got, chunk, (size_t)rn);
+                    got += (size_t)rn;
+                }
+            }
+        } else {
+            _sw_nap_us(10000);
+        }
+        if (!reaped && waitpid(pid, &wstatus, WNOHANG) == pid) reaped = 1;
+    }
+
+    int exit_code;
+    if (timed_out) {
+        killpg(pid, SIGTERM);
+        for (int i = 0; i < 20 && !reaped; i++) {
+            if (waitpid(pid, &wstatus, WNOHANG) == pid) reaped = 1;
+            else _sw_nap_us(10000);
+        }
+        killpg(pid, SIGKILL);
+        if (!reaped) waitpid(pid, &wstatus, 0);
+        if (out_open) close(pfd[0]);
+        exit_code = 124;
+    } else {
+        exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+    }
+    buf[got] = '\0';
 
     sw_val_t *items[2];
     items[0] = sw_val_int(exit_code);
