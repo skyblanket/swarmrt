@@ -1025,6 +1025,107 @@ static node_t *par_primary_inner(par_t *p) {
         return mknode(N_SELF, t.line);
     }
 
+    /* `cond` multi-way branch:
+     *
+     *   cond { c1 -> B1 ; c2 -> B2 ; _ -> B3 }
+     *
+     * DESUGAR — pure parse-time rewrite into nested `if` (like `with` into
+     * `case`), so interpreter and codegen agree by construction:
+     *
+     *   if (c1) { B1 } else { if (c2) { B2 } else { B3 } }
+     *
+     * `_` is the catch-all and must come last. Without it, no match yields
+     * nil (an `if` with no else). `cond` stays an ordinary identifier unless
+     * directly followed by `{`. */
+    if (t.type == TOK_IDENT && strcmp(t.text, "cond") == 0) {
+        lex_t sl = p->lex; tok_t sc = p->cur;
+        par_adv(p);
+        if (p->cur.type != TOK_LBRACE) {
+            p->lex = sl; p->cur = sc;
+        } else {
+            par_adv(p);
+            node_t *conds[64]; node_t *bodies[64]; int n = 0;
+            int has_default = 0;
+            while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+                while (p->cur.type == TOK_SEMI) par_adv(p);
+                if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+                if (has_default || n >= 64) {
+                    snprintf(p->errmsg, sizeof(p->errmsg),
+                             has_default ? "line %d: `cond` clauses after `_` are unreachable"
+                                         : "line %d: too many `cond` clauses (max 64)",
+                             p->cur.line);
+                    p->err = 1;
+                    break;
+                }
+                node_t *c;
+                if (p->cur.type == TOK_IDENT && strcmp(p->cur.text, "_") == 0) {
+                    par_adv(p);
+                    c = NULL;
+                    has_default = 1;
+                } else {
+                    c = par_expr(p);
+                }
+                par_expect(p, TOK_ARROW, "'->'");
+                node_t *cbody;
+                if (p->cur.type == TOK_LBRACE && par_arm_brace_is_tuple(p)) {
+                    cbody = par_expr(p);
+                } else if (p->cur.type == TOK_LBRACE) {
+                    par_adv(p);
+                    cbody = par_block(p);
+                    par_expect(p, TOK_RBRACE, "'}'");
+                } else {
+                    cbody = mknode(N_BLOCK, p->cur.line);
+                    cbody->v.block.stmts = NULL;
+                    cbody->v.block.nstmts = 0;
+                    while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->err) {
+                        while (p->cur.type == TOK_SEMI) par_adv(p);
+                        if (p->cur.type == TOK_RBRACE || p->cur.type == TOK_EOF) break;
+                        lex_t save_lex = p->lex;
+                        tok_t save_cur = p->cur;
+                        int save_err = p->err;
+                        node_t *expr = par_stmt(p);
+                        if (p->cur.type == TOK_ARROW) {
+                            p->lex = save_lex;
+                            p->cur = save_cur;
+                            p->err = save_err;
+                            node_free(expr);
+                            break;
+                        }
+                        cbody->v.block.nstmts++;
+                        cbody->v.block.stmts = realloc(cbody->v.block.stmts,
+                            sizeof(node_t*) * cbody->v.block.nstmts);
+                        cbody->v.block.stmts[cbody->v.block.nstmts - 1] = expr;
+                    }
+                }
+                conds[n] = c; bodies[n] = cbody; n++;
+            }
+            par_expect(p, TOK_RBRACE, "'}'");
+            if (!p->err && n == 0) {
+                snprintf(p->errmsg, sizeof(p->errmsg),
+                         "line %d: `cond` needs at least one `condition -> body` clause", t.line);
+                p->err = 1;
+            }
+            if (p->err) {
+                for (int i = 0; i < n; i++) {
+                    if (conds[i]) node_free(conds[i]);
+                    node_free(bodies[i]);
+                }
+                return mknode(N_INT, t.line);
+            }
+            node_t *inner = NULL;
+            int last = n - 1;
+            if (has_default) { inner = bodies[last]; last--; }
+            for (int i = last; i >= 0; i--) {
+                node_t *iff = mknode(N_IF, conds[i]->line);
+                iff->v.iff.cond = conds[i];
+                iff->v.iff.then_b = bodies[i];
+                iff->v.iff.else_b = inner;
+                inner = iff;
+            }
+            return inner;
+        }
+    }
+
     if (t.type == TOK_IDENT) {
         par_adv(p);
         /* `fn(params){ body }` — a Rust/Gleam-shaped lambda literal, the form
