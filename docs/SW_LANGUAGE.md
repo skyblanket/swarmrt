@@ -155,7 +155,7 @@ fun greet(name) {
 - Body is one or more expressions; the last expression's value is the return value.
 - Parameters are positional; default values: `fun greet(name = "world") { ... }`.
 - No explicit `return` — Erlang-style trailing-expression-is-the-value.
-- Recursion is the loop construct (no `for`/`while`). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
+- There is no `for`/`while` statement; see **Loops** below.
 
 ```sw
 fun count_down(n) {
@@ -167,6 +167,47 @@ fun count_down(n) {
     }
 }
 ```
+
+#### Loops
+
+Reach for the highest-level form that fits; hand-rolled recursion is the last resort.
+
+**List comprehensions** build a new list from an existing one: `[expr for x in list]`. Add `when guard` to keep only the elements where the guard holds (the guard is evaluated on the source element, before `expr`). An empty source or a guard that never passes gives `[]`.
+
+```sw
+module LoopComp
+export [main]
+
+fun main() {
+    nums = [1, 2, 3, 4, 5, 6]
+    print([x * 2 for x in nums])                    # => [2, 4, 6, 8, 10, 12]
+    print([x for x in nums when x % 2 == 0])        # => [2, 4, 6]
+    print([x * 2 for x in nums when x % 2 != 0])    # => [2, 6, 10]
+}
+```
+
+**`Std` list helpers** (`import Std`): `Std.map(lst, f)`, `Std.filter(lst, pred)`, `Std.each(lst, f)` (side effects, returns `'ok'`), `Std.find(lst, pred)` (first match or `nil`), `Std.any(lst, pred)` and `Std.all(lst, pred)` (`'true'`/`'false'`). Use `any`/`all`/`find` instead of a recursive walk that stops early.
+
+```sw
+module LoopStd
+import Std
+export [main]
+
+fun main() {
+    nums = [1, 2, 3, 4]
+    print(Std.map(nums, fn(x) { x + 1 }))             # => [2, 3, 4, 5]
+    print(Std.filter(nums, fn(x) { x > 2 }))          # => [3, 4]
+    print(Std.find(nums, fn(x) { x > 2 }))            # => 3
+    print(Std.any(nums, fn(x) { x == 3 }))            # => :true
+    print(Std.all(nums, fn(x) { x > 1 }))             # => :false
+    Std.each(nums, fn(x) { print(x) })                # => 1
+    # => 2
+    # => 3
+    # => 4
+}
+```
+
+**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
 
 Multi-statement function bodies are fine; statements are separated by newlines (no `;` needed):
 
