@@ -1,17 +1,77 @@
 {
+  "_comment": "A PR's tier is the strictest among its files (first matching tier per file; any 'human' wins). src/swarmrt_lang.c is the interpreter, including builtins that fork/exec, so it stays in the runtime tier until the gate has a track record.",
   "build": "make swc libswarmrt",
   "suite": "make test-sw",
   "test_runners": [
-    { "paths": ["tests/sw/repl/test_"], "cmd": "./bin/swc test {file}", "prove_fails": true },
-    { "paths": ["tests/sw/test_"], "cmd": "b=$(mktemp) && ./bin/swc build {file} -o $b && timeout 180 $b", "prove_fails": true },
-    { "paths": ["tests/sw/conform/"], "cmd": "d=$(mktemp -d) && { ./bin/swc run {file} 2>/dev/null; echo \"exit=$?\"; } > $d/interp; ./bin/swc build {file} -o $d/bin >/dev/null 2>&1 && { $d/bin 2>/dev/null; echo \"exit=$?\"; } > $d/compiled; diff $d/interp $d/compiled", "prove_fails": false }
+    {
+      "paths": [
+        "tests/sw/repl/test_"
+      ],
+      "cmd": "./bin/swc test {file}",
+      "prove_fails": true
+    },
+    {
+      "paths": [
+        "tests/sw/test_"
+      ],
+      "cmd": "b=$(mktemp) && ./bin/swc build {file} -o $b && timeout 180 $b",
+      "prove_fails": true
+    },
+    {
+      "paths": [
+        "tests/sw/conform/"
+      ],
+      "cmd": "d=$(mktemp -d) && { timeout 120 ./bin/swc run {file} 2>/dev/null; echo \"exit=$?\"; } > $d/interp; timeout 300 ./bin/swc build {file} -o $d/bin >/dev/null 2>&1 && { timeout 120 $d/bin 2>/dev/null; echo \"exit=$?\"; } > $d/compiled; diff $d/interp $d/compiled",
+      "prove_fails": false
+    }
   ],
-  "required_checks": ["quickstart", "hardening-gates", "macos", "fuzz"],
+  "required_checks": [
+    "quickstart",
+    "hardening-gates",
+    "macos",
+    "fuzz"
+  ],
   "tiers": [
-    { "name": "docs", "paths": ["docs/", "README.md", "examples/"], "merge": "auto" },
-    { "name": "tests", "paths": ["tests/"], "merge": "auto" },
-    { "name": "language", "paths": ["src/swarmrt_lang.c", "src/swarmrt_parse", "lib/"], "merge": "auto", "extra": ["./tests/sw/run_conform.sh"] },
-    { "name": "runtime", "paths": ["src/", "Makefile"], "merge": "human", "extra": ["make test-full", "FUZZ_CC=gcc make tsan-gate"] }
+    {
+      "name": "docs",
+      "paths": [
+        "docs/",
+        "README.md",
+        "examples/"
+      ],
+      "merge": "auto"
+    },
+    {
+      "name": "tests",
+      "paths": [
+        "tests/"
+      ],
+      "merge": "auto"
+    },
+    {
+      "name": "language",
+      "paths": [
+        "src/swarmrt_parse",
+        "lib/",
+        "tests/sw/conform/"
+      ],
+      "merge": "auto",
+      "extra": [
+        "./tests/sw/run_conform.sh"
+      ]
+    },
+    {
+      "name": "runtime",
+      "paths": [
+        "src/",
+        "Makefile"
+      ],
+      "merge": "human",
+      "extra": [
+        "make test-full",
+        "FUZZ_CC=gcc make tsan-gate"
+      ]
+    }
   ],
   "default_merge": "human"
 }
