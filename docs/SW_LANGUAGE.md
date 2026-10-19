@@ -412,6 +412,21 @@ case parse(line) {
 
 This is the structured replacement for nested `if/else` ladders. Use it whenever you'd write `if (x == 'a') { ... } else { if (x == 'b') { ... } else { ... } }`.
 
+### cond — multi-way branching
+
+When the branches test *unrelated* conditions (not one value's shape), use `cond` instead of a `} else { if (...) {` ladder:
+
+```sw
+cond {
+    state == "MERGED"          -> "merged"
+    mergeable == "CONFLICTING" -> "conflict"
+    timestamp() > deadline     -> "red_timeout"
+    _                          -> "keep_polling"
+}
+```
+
+Clauses are tried top to bottom; the first condition that is true (same rule as `if`) runs its body, and the whole `cond` evaluates to that body. `_` is the catch-all and must be the last clause. With no `_` and no match, the result is `nil`. Bodies take the same shapes as `case` arms: a bare expression or tuple, a `{ block }`, or statements. It desugars at parse time into nested `if`, so `swc run` and compiled binaries behave identically. `cond` is only special when directly followed by `{`; it is still usable as a variable name.
+
 ### with — happy-path error chains
 
 A fallible pipeline — decode, check, extract, validate, call — is a chain where each step must succeed before the next runs, and *any* failure short-circuits to one place. Nesting `case` for that is verbose and easy to get wrong. `with` is the construct for it (Elixir semantics):
