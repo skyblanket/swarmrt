@@ -5945,6 +5945,42 @@ static const char *_sw_exec_opt_str(sw_val_t *opts, const char *key) {
     return (v && v->type == SW_VAL_STRING) ? v->v.str : NULL;
 }
 
+/* The process exec_managed waits for has been killed or is gone. The kill
+ * path frees the slot without resuming the caller, and a new process can
+ * reuse the slot (clearing kill_flag), so also compare the never-reused
+ * numeric pid captured at the start. */
+static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
+    if (!p) return 0;
+    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
+}
+
+/* environ minus the names in `unset` (an sw list of strings), as a malloc'd
+ * array the child can assign to `environ` before exec. NULL = no change.
+ * The strings stay owned by environ; only the array is freed. */
+extern char **environ;
+static char **_sw_env_without(sw_val_t *unset) {
+    if (!unset || unset->type != SW_VAL_LIST || unset->v.tuple.count == 0) return NULL;
+    size_t n = 0;
+    while (environ[n]) n++;
+    char **out = (char **)malloc(sizeof(char *) * (n + 1));
+    if (!out) return NULL;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char *e = environ[i];
+        const char *eq = strchr(e, '=');
+        size_t nlen = eq ? (size_t)(eq - e) : strlen(e);
+        int drop = 0;
+        for (int j = 0; j < unset->v.tuple.count && !drop; j++) {
+            sw_val_t *nm = unset->v.tuple.items[j];
+            if (nm && nm->type == SW_VAL_STRING && strlen(nm->v.str) == nlen &&
+                strncmp(nm->v.str, e, nlen) == 0) drop = 1;
+        }
+        if (!drop) out[k++] = (char *)e;
+    }
+    out[k] = NULL;
+    return out;
+}
+
 /* exec_managed(cmd, args_list [, opts]) → {exit_code, stdout}
  *
  * exec_argv (fork+exec, no shell) plus the supervision shell_managed has:
@@ -6017,9 +6053,16 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         }
     }
 
+    /* env_unset: build the child's environment HERE. Between fork and exec
+     * only async-signal-safe calls are allowed (another thread may hold the
+     * malloc or environment lock at fork time), so the child just assigns
+     * `environ`; unsetenv in the child could deadlock it. */
+    char **envp = _sw_env_without(unset);
+
     int pfd[2] = {-1, -1};
     if (!stdout_file && sw_pipe_cloexec(pfd) != 0) {
         if (in_fd >= 0) close(in_fd);
+        free(envp);
         free(argv);
         return sw_val_nil();
     }
@@ -6030,6 +6073,7 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
     if (pid < 0) {
         if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
         if (in_fd >= 0) close(in_fd);
+        free(envp);
         free(argv);
         return sw_val_nil();
     }
@@ -6050,17 +6094,13 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         if (errfd < 0) _exit(127);
         dup2(errfd, STDERR_FILENO);
         if (errfd != STDERR_FILENO) close(errfd);
-        if (unset) {
-            for (int i = 0; i < unset->v.tuple.count; i++) {
-                sw_val_t *nm = unset->v.tuple.items[i];
-                if (nm && nm->type == SW_VAL_STRING) unsetenv(nm->v.str);
-            }
-        }
+        if (envp) environ = envp;
         if (cwd && chdir(cwd) != 0) _exit(127);
         execvp(argv[0], argv);
         _exit(127);
     }
     setpgid(pid, pid);   /* also set from the parent: closes the race with killpg */
+    free(envp);
     free(argv);
     if (in_fd >= 0) close(in_fd);
     if (pfd[1] >= 0) close(pfd[1]);
@@ -6081,8 +6121,14 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
     uint64_t t_start = _sw_now_ms();
     int out_open = pfd[0] >= 0;
     int reaped = 0, wstatus = 0, timed_out = 0;
+    /* The caller can be killed while we wait (exit_proc, a supervisor, a
+     * Std.task_stream deadline): that only sets its kill_flag. Treat it like
+     * a timeout, or the child outlives the process supervising it. */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
     while (!(reaped && !out_open)) {
-        if (timeout_ms > 0 && (int64_t)(_sw_now_ms() - t_start) >= timeout_ms) {
+        if ((timeout_ms > 0 && (int64_t)(_sw_now_ms() - t_start) >= timeout_ms) ||
+            _sw_caller_gone(caller, caller_id)) {
             timed_out = 1;
             break;
         }

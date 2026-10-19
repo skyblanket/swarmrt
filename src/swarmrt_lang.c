@@ -4269,6 +4269,34 @@ static void _sw_interp_mkparent(const char *path) {
     free(tmp);
 }
 
+#ifndef _WIN32
+/* environ minus the names in `unset` (an sw list of strings), for
+ * exec_managed's child to assign before exec. NULL = no change. */
+extern char **environ;
+static char **interp_env_without(sw_val_t *unset) {
+    if (!unset || unset->type != SW_VAL_LIST || unset->v.tuple.count == 0) return NULL;
+    size_t n = 0;
+    while (environ[n]) n++;
+    char **out = (char **)malloc(sizeof(char *) * (n + 1));
+    if (!out) return NULL;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char *e = environ[i];
+        const char *eq = strchr(e, '=');
+        size_t nlen = eq ? (size_t)(eq - e) : strlen(e);
+        int drop = 0;
+        for (int j = 0; j < unset->v.tuple.count && !drop; j++) {
+            sw_val_t *nm = unset->v.tuple.items[j];
+            if (nm && nm->type == SW_VAL_STRING && strlen(nm->v.str) == nlen &&
+                strncmp(nm->v.str, e, nlen) == 0) drop = 1;
+        }
+        if (!drop) out[k++] = (char *)e;
+    }
+    out[k] = NULL;
+    return out;
+}
+#endif
+
 /* Returns NULL if `fname` isn't a recognized extra builtin — caller
  * continues to user-fn lookup. */
 static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
@@ -4886,13 +4914,18 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             }
             if (off < len || lseek(in_fd, 0, SEEK_SET) < 0) { close(in_fd); free(argv2); return sw_val_nil(); }
         }
+        /* env_unset is applied by building the environment here: the child
+         * may only make async-signal-safe calls before exec (see
+         * _sw_env_without in swarmrt_builtins_studio.h). */
+        char **envp = interp_env_without(unset);
         int pfd[2] = {-1, -1};
-        if (!o_str[3] && sw_pipe_cloexec(pfd) != 0) { if (in_fd >= 0) close(in_fd); free(argv2); return sw_val_nil(); }
+        if (!o_str[3] && sw_pipe_cloexec(pfd) != 0) { if (in_fd >= 0) close(in_fd); free(envp); free(argv2); return sw_val_nil(); }
         fflush(stdout); fflush(stderr);
         pid_t pid = sw_fork();
         if (pid < 0) {
             if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
             if (in_fd >= 0) close(in_fd);
+            free(envp);
             free(argv2);
             return sw_val_nil();
         }
@@ -4910,16 +4943,13 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             if (errfd < 0) _exit(127);
             dup2(errfd, STDERR_FILENO);
             if (errfd != STDERR_FILENO) close(errfd);
-            if (unset)
-                for (int i = 0; i < unset->v.tuple.count; i++) {
-                    sw_val_t *nm = unset->v.tuple.items[i];
-                    if (nm && nm->type == SW_VAL_STRING) unsetenv(nm->v.str);
-                }
+            if (envp) environ = envp;
             if (o_str[0] && chdir(o_str[0]) != 0) _exit(127);
             execvp(argv2[0], argv2);
             _exit(127);
         }
         setpgid(pid, pid);
+        free(envp);
         free(argv2);
         if (in_fd >= 0) close(in_fd);
         if (pfd[1] >= 0) close(pfd[1]);
@@ -4929,8 +4959,12 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (pfd[0] >= 0) { int fl = fcntl(pfd[0], F_GETFL, 0); if (fl >= 0) fcntl(pfd[0], F_SETFL, fl | O_NONBLOCK); }
         uint64_t t0 = recv_now_ms();
         int out_open = pfd[0] >= 0, reaped = 0, wstatus = 0, timed_out = 0;
+        sw_process_t *caller = sw_self();   /* killed while we wait → kill the child too */
+        uint64_t caller_id = caller ? caller->pid : 0;
         while (!(reaped && !out_open)) {
-            if (timeout_ms > 0 && (int64_t)(recv_now_ms() - t0) >= timeout_ms) { timed_out = 1; break; }
+            if ((timeout_ms > 0 && (int64_t)(recv_now_ms() - t0) >= timeout_ms) ||
+                (caller && (caller->kill_flag || caller->pid != caller_id ||
+                            caller->state == SW_PROC_FREE))) { timed_out = 1; break; }
             if (out_open) {
                 fd_set rf; FD_ZERO(&rf); FD_SET(pfd[0], &rf);
                 struct timeval tv = {0, 20000};

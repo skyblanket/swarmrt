@@ -4,6 +4,8 @@ module Test_exec_managed
 # process-group kill, cwd, stdin / stdin_file, stdout_file / stderr_file and
 # env_unset.
 
+import Std
+
 fun check(name, cond) {
     if (cond == 'true') { print("PASS " ++ name) ; 0 }
     else { print("FAIL " ++ name) ; 1 }
@@ -70,6 +72,21 @@ fun main() {
     r = exec_managed("sh", ["-c", "echo \"[$HOME]\""], %{env_unset: ["HOME"]})
     f = f + check("env_unset", yes(elem(r, 1) == "[]\n"))
 
+    # env_unset leaves the rest of the environment alone
+    r = exec_managed("sh", ["-c", "echo \"[$PATH]\""], %{env_unset: ["HOME"]})
+    f = f + check("env_unset_keeps_others", yes(elem(r, 1) != "[]\n"))
+
+    # a killed caller takes its child with it: a task_stream deadline kills the
+    # worker while it waits in exec_managed (no timeout_ms), and the child must
+    # not outlive it. (Compiled only, as this suite runs: `swc run` is
+    # single-scheduler, so nothing can kill a caller mid-call there.)
+    rs = Std.task_stream(["x"], fn(t) { exec_managed("sleep", ["7.25"], %{}) },
+                         %{max_concurrency: 1, timeout_ms: 300})
+    sleep(500)
+    left = shell("pgrep -f 'sleep [7][.]25' >/dev/null && echo running || echo gone")
+    f = f + check("killed_caller_kills_child", yes(hd(rs) == {'error', 'timeout'} && string_trim(elem(left, 1)) == "gone"))
+    shell("pkill -f 'sleep [7][.]25'")
+
     shell("rm -rf " ++ dir)
-    if (f == 0) { print("OK exec_managed 13/13") ; sys_exit(0) } else { print("FAIL exec_managed") ; sys_exit(1) }
+    if (f == 0) { print("OK exec_managed 15/15") ; sys_exit(0) } else { print("FAIL exec_managed") ; sys_exit(1) }
 }
