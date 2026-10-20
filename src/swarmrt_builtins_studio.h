@@ -1715,6 +1715,96 @@ cleaned:
 }
 
 /* ============================================================
+ * Caller-aware HTTP waits
+ * ============================================================
+ *
+ * The blocking HTTP builtins run on an offload worker for a parked caller
+ * (_sw_offl_self). A killed caller frees its slot without resuming, so the
+ * worker polls the caller's identity (the same test exec_managed uses) and
+ * kills its curl child when the caller is gone, rather than waiting out
+ * curl's --max-time. opts.timeout_ms maps to that --max-time. */
+
+#define SW_HTTP_TIMEOUT_ERR "error: timeout"
+
+/* opts.timeout_ms (atom or string key) in milliseconds; 0 = builtin default. */
+static int64_t _sw_http_timeout_ms(sw_val_t *opts) {
+    if (!opts || opts->type != SW_VAL_MAP) return 0;
+    sw_val_t *v = sw_val_map_get(opts, sw_val_atom("timeout_ms"));
+    if (!v || v->type == SW_VAL_NIL) v = sw_val_map_get(opts, sw_val_string("timeout_ms"));
+    return (v && v->type == SW_VAL_INT && v->v.i > 0) ? v->v.i : 0;
+}
+
+/* curl --max-time argument: `ms` as "S.mmm" seconds (curl takes fractions;
+ * integer math keeps it locale-independent), or def_secs when ms is 0. */
+static void _sw_max_time_arg(char *buf, size_t cap, int64_t ms, int def_secs) {
+    if (ms > 0) snprintf(buf, cap, "%lld.%03lld", (long long)(ms / 1000), (long long)(ms % 1000));
+    else snprintf(buf, cap, "%d", def_secs);
+}
+
+static void _sw_http_max_time(char *buf, size_t cap, sw_val_t *opts, int def_secs) {
+    _sw_max_time_arg(buf, cap, _sw_http_timeout_ms(opts), def_secs);
+}
+
+/* curl exit 28 = CURLE_OPERATION_TIMEDOUT (the --max-time elapsed). */
+static int _sw_curl_timed_out(int wstatus) {
+#ifndef _WIN32
+    return WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 28;
+#else
+    (void)wstatus;
+    return 0;
+#endif
+}
+
+/* Sleep ms, waking early (returns 1) once the caller is gone. */
+static int _sw_nap_unless_gone(sw_process_t *p, uint64_t id, uint64_t ms) {
+    uint64_t end = _sw_now_ms() + ms;
+    for (;;) {
+        if (_sw_caller_gone(p, id)) return 1;
+        uint64_t now = _sw_now_ms();
+        if (now >= end) return 0;
+        uint64_t left = end - now;
+        _sw_nap_us((unsigned)((left < 100 ? left : 100) * 1000));
+    }
+}
+
+/* Drain a curl child's stdout to EOF (its own output is tiny: the -w status,
+ * or nothing), then reap it into *wstatus and close ch->fp; returns 1. If the
+ * caller is gone first, kill the child's process group and return 0. `out`
+ * (optional, cap bytes) keeps the bytes read; *out_len gets their count. */
+static int _sw_curl_drain(_sw_popen_pid_t *ch, sw_process_t *p, uint64_t id,
+                          char *out, size_t cap, size_t *out_len, int *wstatus) {
+    int fd = fileno(ch->fp);
+    size_t len = 0;
+    for (;;) {
+        if (_sw_caller_gone(p, id)) {
+            _sw_pkill_close(*ch);
+            ch->fp = NULL;
+            ch->pid = -1;
+            return 0;
+        }
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = {0, 100000};
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (!FD_ISSET(fd, &rfds)) continue;
+        char rb[256];
+        ssize_t rd = read(fd, rb, sizeof(rb));
+        if (rd < 0) { if (errno == EINTR) continue; break; }
+        if (rd == 0) break;
+        for (ssize_t i = 0; out && i < rd && len + 1 < cap; i++) out[len++] = rb[i];
+    }
+    if (out && cap) out[len] = 0;
+    if (out_len) *out_len = len;
+    *wstatus = _sw_popen_pid_close(*ch);
+    ch->fp = NULL;
+    return 1;
+}
+
+/* ============================================================
  * http_post — popen+select implementation with soft interrupt
  * ============================================================
  *
@@ -1739,6 +1829,13 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok))
         SW_OFFLOAD_BUILTIN(_builtin_http_post, a, n);
     const char *url = a[0]->v.str, *body = a[2]->v.str;
+    /* The caller we run for: a killed caller (exit_proc, a task_stream
+     * deadline) takes its curl child down with it. opts (4th arg) may carry
+     * timeout_ms. */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
+    char max_time[32];
+    _sw_http_max_time(max_time, sizeof(max_time), n >= 4 ? a[3] : NULL, 300);
 
     /* Body via temp file — keeps the JSON out of argv entirely (and out
      * of any shell). curl reads it with -d @file. */
@@ -1768,7 +1865,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
     argv[argc++] = "--max-time";
-    argv[argc++] = "300";
+    argv[argc++] = max_time;
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
             sw_val_t *h = headers->v.tuple.items[i];
@@ -1798,14 +1895,18 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     int stdin_fd = -1;
     if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) stdin_fd = STDIN_FILENO;
 
-    int interrupted = 0;
+    int interrupted = 0, gone = 0, timed_out = 0;
     char *resp_buf = NULL;
     size_t resp_len = 0;
     size_t resp_cap_local = 65536;
 
     int delays[] = {0, 5, 15};
     for (int attempt = 0; attempt < 3 && !interrupted; attempt++) {
-        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+        /* Retry sleep (0 on the first try); a dead caller spawns no curl. */
+        if (_sw_nap_unless_gone(caller, caller_id, (uint64_t)delays[attempt] * 1000)) {
+            gone = 1;
+            break;
+        }
 
         if (resp_buf) free(resp_buf);
         resp_buf = (char *)malloc(resp_cap_local);
@@ -1821,6 +1922,13 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
         char readbuf[4096];
         int done = 0;
         while (!done) {
+            /* Caller killed while we wait: kill curl now, not at --max-time. */
+            if (_sw_caller_gone(caller, caller_id)) {
+                gone = 1;
+                _sw_pkill_close(ch);
+                ch.fp = NULL; ch.pid = -1;
+                break;
+            }
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(pipe_fd, &rfds);
@@ -1828,9 +1936,9 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
             int max_fd = pipe_fd;
             if (stdin_fd > max_fd) max_fd = stdin_fd;
 
-            /* 1-second tick — just keeps select from blocking forever
-             * if both fds go quiet. Could be longer; 1s is fine. */
-            struct timeval tv = {1, 0};
+            /* 100 ms tick — bounds how long a killed caller's curl outlives
+             * its kill; the stdin watch and EOF are still handled per tick. */
+            struct timeval tv = {0, 100000};
             int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
             if (ret < 0) {
                 if (errno == EINTR) continue;
@@ -1877,8 +1985,12 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
             }
         }
 
-        if (!interrupted && ch.fp) _sw_popen_pid_close(ch);
-        if (interrupted) break;
+        if (ch.fp) {
+            int wst = _sw_popen_pid_close(ch);
+            /* A timed-out request is final: retrying would just wait again. */
+            if (_sw_curl_timed_out(wst)) { timed_out = 1; break; }
+        }
+        if (interrupted || gone) break;
 
         /* Server error or empty body → retry. Otherwise we're done. */
         if (resp_len > 0 &&
@@ -1896,6 +2008,14 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (interrupted) {
         free(resp_buf);
         return sw_val_string("__INTERRUPTED__");
+    }
+    if (gone) {
+        free(resp_buf);
+        return sw_val_nil();
+    }
+    if (timed_out) {
+        free(resp_buf);
+        return sw_val_string(SW_HTTP_TIMEOUT_ERR);
     }
 
     sw_val_t *r = sw_val_string(resp_buf);
@@ -4935,6 +5055,10 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
         return sw_val_nil();
     SW_OFFLOAD_BUILTIN(_builtin_http_get, a, n);
     const char *url = a[0]->v.str;
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
+    char max_time[32];
+    _sw_http_max_time(max_time, sizeof(max_time), n >= 3 ? a[2] : NULL, 120);
 
     char outf[256];
     snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json",
@@ -4952,8 +5076,7 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
     argv[argc++] = "--max-time";
-    /* note: --max-time value 120 below */
-    argv[argc++] = "120";
+    argv[argc++] = max_time;
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) {
         for (int i = 0; i < a[1]->v.tuple.count; i++) {
             sw_val_t *h = a[1]->v.tuple.items[i];
@@ -4978,11 +5101,19 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     char *resp = NULL;
     size_t resp_len = 0;
     int delays[] = {0, 3, 10};
+    int gone = 0, timed_out = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+        if (_sw_nap_unless_gone(caller, caller_id, (uint64_t)delays[attempt] * 1000)) {
+            gone = 1;
+            break;
+        }
         /* spawn curl (no shell) and wait for it; output lands in outf */
         _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
-        if (ch.fp) _sw_popen_pid_close(ch);
+        if (ch.fp) {
+            int wst = 0;
+            if (!_sw_curl_drain(&ch, caller, caller_id, NULL, 0, NULL, &wst)) { gone = 1; break; }
+            if (_sw_curl_timed_out(wst)) { timed_out = 1; break; }
+        }
         FILE *fp = fopen(outf, "r");
         if (!fp) continue;
         size_t cap = 65536;
@@ -5007,6 +5138,8 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
     free(hdr_strs);
     free(argv);
+    if (gone) { free(resp); return sw_val_nil(); }
+    if (timed_out) { free(resp); return sw_val_string(SW_HTTP_TIMEOUT_ERR); }
     if (!resp) return sw_val_string("");
     sw_val_t *r = sw_val_string(resp);
     free(resp);
@@ -5134,6 +5267,8 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
         return _sw_hr_error("http_request: url must be a string");
     SW_OFFLOAD_BUILTIN(_builtin_http_request, a, n);
     const char *url = a[0]->v.str;
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     /* opts (optional map): method / headers / body */
     sw_val_t *opts = (n >= 2) ? a[1] : NULL;
@@ -5154,6 +5289,9 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
         sw_val_t *hv = sw_val_map_get(opts, kh);
         if (hv && (hv->type == SW_VAL_MAP || hv->type == SW_VAL_LIST)) headers = hv;
     }
+
+    char max_time[32];
+    _sw_http_max_time(max_time, sizeof(max_time), opts, 300);
 
     /* Temp files: request body, response body, response header dump. */
     char body_file[256], out_file[256], hdr_file[256];
@@ -5191,7 +5329,7 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
     argv[argc++] = "--max-time";
-    argv[argc++] = "300";
+    argv[argc++] = max_time;
     argv[argc++] = "-o";
     argv[argc++] = out_file;
     argv[argc++] = "-D";
@@ -5246,16 +5384,10 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     size_t code_len = 0;
     code_buf[0] = 0;
     _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
-    if (ch.fp) {
-        char rb[64];
-        size_t rd;
-        while ((rd = fread(rb, 1, sizeof(rb), ch.fp)) > 0) {
-            for (size_t i = 0; i < rd && code_len + 1 < sizeof(code_buf); i++)
-                code_buf[code_len++] = rb[i];
-        }
-        code_buf[code_len] = 0;
-        _sw_popen_pid_close(ch);
-    }
+    int spawned = ch.fp != NULL, gone = 0, wst = 0;
+    if (spawned &&
+        !_sw_curl_drain(&ch, caller, caller_id, code_buf, sizeof(code_buf), &code_len, &wst))
+        gone = 1;
 
     /* http_code is a decimal int curl prints last (000 == no response). */
     long status = strtol(code_buf, NULL, 10);
@@ -5274,9 +5406,11 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     free(argv);
 
     /* No spawn / no response code → transport failure. */
-    if (!ch.fp || status <= 0) {
+    if (!spawned || gone || status <= 0) {
         free(resp_body);
         free(resp_hdrs);
+        if (gone) return _sw_hr_error("http_request: caller gone");
+        if (_sw_curl_timed_out(wst)) return _sw_hr_error("http_request: timeout");
         return _sw_hr_error(code_buf[0] ? "http_request: transport failure"
                                         : "http_request: curl failed to spawn");
     }
@@ -6948,8 +7082,10 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
  * llm_complete(prompt)
  * llm_complete(prompt, opts_map)
  *   opts: %{url: "...", provider: "...", model: "...", api_key: "...",
- *           max_tokens: 4096, temperature: 0.7, retries: 0, min_chars: 50}
- * Returns: string (the completion text), or "error: ..." on failure.
+ *           max_tokens: 4096, temperature: 0.7, retries: 0, min_chars: 50,
+ *           timeout_ms: 300000}
+ * Returns: string (the completion text), or "error: ..." on failure. A
+ * request that runs past timeout_ms returns "error: timeout" (not retried).
  *
  * There is no built-in endpoint: a program says where its prompts go (see
  * _sw_llm_resolve). Without one, both LLM builtins fail with a message
@@ -7179,15 +7315,24 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     int attempts = 1 + (retries > 0 ? retries : 0);
     if (attempts > 5) attempts = 5; /* cap at 5 */
     sw_val_t *last_result = sw_val_string("error: no response");
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     for (int attempt = 0; attempt < attempts; attempt++) {
-        if (attempt > 0) sw_sleep(2); /* 2s backoff between retries */
+        /* 2s backoff between retries; a killed caller ends the retries. */
+        if (attempt > 0 && _sw_nap_unless_gone(caller, caller_id, 2000)) break;
 
-        sw_val_t *post_args[3] = { sw_val_string(url), hdr_list, sw_val_string(body) };
-        sw_val_t *resp = _builtin_http_post(post_args, 3);
+        /* The opts map rides along: http_post reads only its timeout_ms. */
+        sw_val_t *post_args[4] = { sw_val_string(url), hdr_list, sw_val_string(body),
+                                   (n >= 2) ? a[1] : NULL };
+        sw_val_t *resp = _builtin_http_post(post_args, 4);
         if (!resp || resp->type != SW_VAL_STRING) {
             last_result = sw_val_string("error: no response");
             continue;
+        }
+        if (strcmp(resp->v.str, SW_HTTP_TIMEOUT_ERR) == 0) {
+            last_result = resp;   /* timed out: final, not retried */
+            break;
         }
 
         /* Extract content from response: choices[0].message.content
@@ -8072,6 +8217,7 @@ typedef struct {
     char *url;
     int max_tokens;
     double temperature;
+    int64_t timeout_ms;   /* opts.timeout_ms; 0 = the default ceiling */
     char error[512];   /* set when no endpoint resolved (url == NULL) */
 } _llm_stream_ctx_t;
 
@@ -8134,7 +8280,9 @@ static void _llm_stream_entry(void *raw) {
     char body_arg[300], hdr_arg[300];
     snprintf(body_arg, sizeof(body_arg), "@%s", tmpf);
     snprintf(hdr_arg, sizeof(hdr_arg), "@%s", hdrf);
-    char *argv[] = { "curl", "-sS", "-N", "--connect-timeout", "30", "--max-time", "300",
+    char max_time[32];
+    _sw_max_time_arg(max_time, sizeof(max_time), ctx->timeout_ms, 300);
+    char *argv[] = { "curl", "-sS", "-N", "--connect-timeout", "30", "--max-time", max_time,
                      "-H", hdr_arg, "-d", body_arg, ctx->url, NULL };
     _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
     FILE *fp = ch.fp;
@@ -8211,15 +8359,15 @@ static void _llm_stream_entry(void *raw) {
         }
     }
 
-    _sw_popen_pid_close(ch);
+    int timed_out = _sw_curl_timed_out(_sw_popen_pid_close(ch));
     swbs_unlink(tmpf);
     swbs_unlink(hdrf);
 
-    /* Send completion message */
+    /* Send completion message (a timeout with no text is reported as such) */
     {
         sw_val_t *items[2];
         items[0] = sw_val_atom("llm_done");
-        items[1] = sw_val_string(full_text);
+        items[1] = sw_val_string(timed_out && full_len == 0 ? SW_HTTP_TIMEOUT_ERR : full_text);
         sw_send_value(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
     }
     free(full_text);
@@ -8233,7 +8381,8 @@ cleanup:
 }
 
 /* llm_stream(prompt, opts) → pid
- * Spawns background process that sends {'llm_token', text} and {'llm_done', full_text} */
+ * Spawns background process that sends {'llm_token', text} and {'llm_done', full_text}
+ * (opts.timeout_ms bounds the request; a timeout with no text sends "error: timeout") */
 static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
 
@@ -8255,6 +8404,7 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
             else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) opt_url = v->v.str;
             else if (strcmp(k, "provider") == 0 && v->type == SW_VAL_STRING) opt_provider = v->v.str;
             else if (strcmp(k, "max_tokens") == 0 && v->type == SW_VAL_INT) ctx->max_tokens = (int)v->v.i;
+            else if (strcmp(k, "timeout_ms") == 0 && v->type == SW_VAL_INT && v->v.i > 0) ctx->timeout_ms = v->v.i;
             else if (strcmp(k, "temperature") == 0) {
                 if (v->type == SW_VAL_FLOAT) ctx->temperature = v->v.f;
                 else if (v->type == SW_VAL_INT) ctx->temperature = (double)v->v.i;
