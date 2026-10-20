@@ -517,7 +517,7 @@ The grant is checked statically (including module-level `let` globals, so a tool
 
 Every version is kept as **replayable source** — `tool_history(name)` returns `[{version, src}, …]` (the last 16), so an agent's self-modification is fully auditable: nothing it wrote about itself is lost. (In-memory per session; persist it to SQLite yourself if you need it across restarts.)
 
-Each `tool_call` builds its intermediates and result in a per-call region that the caller adopts, so they are reclaimed with the calling process (and by its turn checkpoints): a tight 100k-call loop stays flat in RSS, and `make gc-slope` gates it (`tests/gc/slope_tool.sw`).
+Each `tool_call` builds its intermediates and result in a per-call region that the caller adopts, so they are reclaimed with the calling process (and by its turn checkpoints): a tight 100k-call loop stays flat in RSS, and `make gc-slope` gates it (`tests/gc/slope_tool.sw`). Values a tool writes to ETS are copied into the table and copied out on read, so an entry outlives the process that wrote it (`tests/sw/test_tool_ets_store.sw`).
 
 Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); and compose tool source with `++`, not f-string `{{` braces.
 

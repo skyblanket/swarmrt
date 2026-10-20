@@ -4023,6 +4023,16 @@ static int _interp_vets_free_ids[_INTERP_VETS_MAX_TABLES];   /* ets_drop'd ids *
 static int _interp_vets_nfree = 0;
 static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
 
+/* The store owns its keys and values as global-heap copies: a tool's region or a
+ * process arena can be freed while the entry lives (see tool_call / process_destroy),
+ * so a raw pointer into either would dangle. Readers get their own copy. */
+static sw_val_t *_interp_vets_store(sw_val_t *v) { return sw_val_deep_copy_global(v); }
+static sw_val_t *_interp_vets_out(sw_val_t *v) {
+    sw_value_arena_t *target = sw_swap_alloc_target(NULL);
+    sw_swap_alloc_target(target);
+    return target ? deep_copy_into(v, target) : sw_val_deep_copy_local(v);
+}
+
 static uint32_t _interp_vets_hash(sw_val_t *v) {
     uint64_t h = 14695981039346656037ULL;
     if (!v) return 0;
@@ -5219,7 +5229,11 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         t->active = 0;
         for (int b = 0; b < _INTERP_VETS_BUCKETS; b++) {
             _interp_vets_entry_t *e = t->buckets[b];
-            while (e) { _interp_vets_entry_t *next = e->next; free(e); e = next; }
+            while (e) {
+                _interp_vets_entry_t *next = e->next;
+                sw_val_free(e->key); sw_val_free(e->value); free(e);
+                e = next;
+            }
             t->buckets[b] = NULL;
         }
         pthread_rwlock_unlock(&t->lock);
@@ -5237,14 +5251,16 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
-                e->value = args[2];
+                sw_val_t *nv = _interp_vets_store(args[2]);
+                sw_val_free(e->value);
+                e->value = nv;
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("ok");
             }
             e = e->next;
         }
         _interp_vets_entry_t *ne = (_interp_vets_entry_t *)malloc(sizeof(_interp_vets_entry_t));
-        ne->key = args[1]; ne->value = args[2]; ne->next = t->buckets[bucket];
+        ne->key = _interp_vets_store(args[1]); ne->value = _interp_vets_store(args[2]); ne->next = t->buckets[bucket];
         t->buckets[bucket] = ne;
         pthread_rwlock_unlock(&t->lock);
         return sw_val_atom("ok");
@@ -5259,7 +5275,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
-                sw_val_t *v = e->value;
+                sw_val_t *v = _interp_vets_out(e->value);
                 pthread_rwlock_unlock(&t->lock);
                 return v ? v : sw_val_nil();
             }
@@ -5278,7 +5294,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_entry_t **pp = &t->buckets[bucket];
         while (*pp) {
             if (_interp_vets_key_eq((*pp)->key, args[1])) {
-                _interp_vets_entry_t *dead = *pp; *pp = dead->next; free(dead);
+                _interp_vets_entry_t *dead = *pp; *pp = dead->next;
+                sw_val_free(dead->key); sw_val_free(dead->value); free(dead);
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("ok");
             }
@@ -5298,8 +5315,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         while (*pp) {
             if (_interp_vets_key_eq((*pp)->key, args[1])) {
                 _interp_vets_entry_t *dead = *pp;
-                sw_val_t *val = dead->value;
-                *pp = dead->next; free(dead);
+                sw_val_t *val = _interp_vets_out(dead->value);
+                *pp = dead->next;
+                sw_val_free(dead->key); sw_val_free(dead->value); free(dead);
                 pthread_rwlock_unlock(&t->lock);
                 return val ? val : sw_val_nil();
             }
@@ -5322,7 +5340,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             if (_interp_vets_key_eq(e->key, args[1])) {
                 if (e->value && e->value->type == SW_VAL_INT) {
                     int64_t result = e->value->v.i + delta;
-                    e->value = sw_val_int(result);
+                    sw_val_free(e->value);
+                    e->value = _interp_vets_store(sw_val_int(result));
                     pthread_rwlock_unlock(&t->lock);
                     return sw_val_int(result);
                 }
@@ -5332,9 +5351,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             e = e->next;
         }
         int64_t seeded = initial + delta;
-        sw_val_t *stored = sw_val_int(seeded);
+        sw_val_t *stored = _interp_vets_store(sw_val_int(seeded));
         _interp_vets_entry_t *ne = (_interp_vets_entry_t *)malloc(sizeof(_interp_vets_entry_t));
-        ne->key = args[1]; ne->value = stored; ne->next = t->buckets[bucket];
+        ne->key = _interp_vets_store(args[1]); ne->value = stored; ne->next = t->buckets[bucket];
         t->buckets[bucket] = ne;
         pthread_rwlock_unlock(&t->lock);
         return sw_val_int(seeded);
@@ -5350,7 +5369,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
                 if (_interp_vets_key_eq(e->value, args[2])) {
-                    e->value = args[3];
+                    sw_val_t *nv = _interp_vets_store(args[3]);
+                    sw_val_free(e->value);
+                    e->value = nv;
                     pthread_rwlock_unlock(&t->lock);
                     return sw_val_atom("true");
                 }
@@ -5385,7 +5406,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *old_val = NULL;
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
-            if (_interp_vets_key_eq(e->key, args[1])) { old_val = e->value; break; }
+            if (_interp_vets_key_eq(e->key, args[1])) { old_val = _interp_vets_out(e->value); break; }
             e = e->next;
         }
         pthread_rwlock_unlock(&t->lock);
@@ -5410,7 +5431,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         e = t->buckets[bucket];
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
-                e->value = new_val;
+                sw_val_t *nv = _interp_vets_store(new_val);
+                sw_val_free(e->value);
+                e->value = nv;
                 pthread_rwlock_unlock(&t->lock);
                 return new_val;
             }
@@ -5450,7 +5473,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         for (int bi = 0; bi < _INTERP_VETS_BUCKETS; bi++) {
             for (_interp_vets_entry_t *e = t->buckets[bi]; e; e = e->next) {
                 if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
-                sw_val_t *pair[2] = { e->key, e->value };
+                sw_val_t *pair[2] = { _interp_vets_out(e->key), _interp_vets_out(e->value) };
                 items[cnt++] = sw_val_tuple(pair, 2);
             }
         }
