@@ -5998,6 +5998,34 @@ static char **_sw_env_without(sw_val_t *unset) {
     return out;
 }
 
+/* The file execvp would run for `cmd` under the child's environment `envp`
+ * (NULL = environ), as a malloc'd path; NULL if no PATH entry has it. Runs in
+ * the parent, so the child needs no libc search. As with execvp, a `cmd` with
+ * a slash is used as is, and a missing PATH means "/bin:/usr/bin". */
+static char *_sw_resolve_exec(const char *cmd, char **envp) {
+    if (strchr(cmd, '/')) return strdup(cmd);
+    const char *path = NULL;
+    for (char **e = envp ? envp : environ; *e && !path; e++)
+        if (strncmp(*e, "PATH=", 5) == 0) path = *e + 5;
+    if (!path) path = "/bin:/usr/bin";
+    size_t clen = strlen(cmd);
+    for (const char *p = path;;) {
+        const char *end = strchr(p, ':');
+        size_t dlen = end ? (size_t)(end - p) : strlen(p);
+        /* an empty PATH entry means the current directory */
+        size_t off = dlen ? dlen + 1 : 0;
+        char *cand = (char *)malloc(off + clen + 1);
+        if (!cand) return NULL;
+        memcpy(cand, p, dlen);
+        if (dlen) cand[dlen] = '/';
+        memcpy(cand + off, cmd, clen + 1);
+        if (access(cand, X_OK) == 0) return cand;
+        free(cand);
+        if (!end) return NULL;
+        p = end + 1;
+    }
+}
+
 /* exec_managed(cmd, args_list [, opts]) → {exit_code, stdout}
  *
  * exec_argv (fork+exec, no shell) plus the supervision shell_managed has:
@@ -6072,8 +6100,8 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
 
     /* env_unset: build the child's environment HERE. Between fork and exec
      * only async-signal-safe calls are allowed (another thread may hold the
-     * malloc or environment lock at fork time), so the child just assigns
-     * `environ`; unsetenv in the child could deadlock it. */
+     * malloc or environment lock at fork time), so the child passes this
+     * array straight to execve; unsetenv in the child could deadlock it. */
     char **envp = _sw_env_without(unset);
 
     int pfd[2] = {-1, -1};
@@ -6084,12 +6112,17 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         return sw_val_nil();
     }
 
+    /* The program path is searched here too, so the child can execve it
+     * without a PATH walk. */
+    char *prog = _sw_resolve_exec(cmd, envp);
+
     fflush(stdout);
     fflush(stderr);
     pid_t pid = sw_fork();
     if (pid < 0) {
         if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
         if (in_fd >= 0) close(in_fd);
+        free(prog);
         free(envp);
         free(argv);
         return sw_val_nil();
@@ -6111,12 +6144,12 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         if (errfd < 0) _exit(127);
         dup2(errfd, STDERR_FILENO);
         if (errfd != STDERR_FILENO) close(errfd);
-        if (envp) environ = envp;
         if (cwd && chdir(cwd) != 0) _exit(127);
-        execvp(argv[0], argv);
+        if (prog) execve(prog, argv, envp ? envp : environ);
         _exit(127);
     }
     setpgid(pid, pid);   /* also set from the parent: closes the race with killpg */
+    free(prog);
     free(envp);
     free(argv);
     if (in_fd >= 0) close(in_fd);
