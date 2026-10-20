@@ -7895,7 +7895,7 @@ static const struct { const char *name; int arity; } k_builtin_value_arity[] = {
     { "tl", 1 }, { "to_float", 1 }, { "to_int", 1 }, { "to_string", 1 },
     { "typeof", 1 },
     { "bytes_concat", 2 }, { "byte_at", 2 }, { "elem", 2 }, { "filter", 2 },
-    { "json_get", 2 }, { "list_append", 2 }, { "map", 2 }, { "map_get", 2 },
+    { "json_get", 2 }, { "list_append", 2 }, { "map", 2 },
     { "map_has_key", 2 }, { "map_merge", 2 }, { "map_remove", 2 },
     { "math_pow", 2 }, { "string_contains", 2 }, { "string_ends_with", 2 },
     { "string_index_of", 2 }, { "string_split", 2 }, { "string_starts_with", 2 },
