@@ -304,6 +304,7 @@ FUZZ_ASAN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:quarantine_size_mb
 
 .PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json fuzz-ws fuzz-db isolation-gate
 fuzz-parse: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-parse: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
@@ -313,11 +314,13 @@ fuzz-parse: dirs
 # on malformed or adversarially-nested input (the corpus includes a
 # 5000-deep array; g_jd_depth must bound it).
 fuzz-json: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-json: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_json.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_json $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
 
 fuzz-marshal: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-marshal: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_marshal.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_marshal $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
@@ -326,6 +329,7 @@ fuzz-marshal: dirs
 # -DSW_FUZZ_HTTP exposes sw_http_fuzz_parse() in swarmrt_http.c (built once,
 # in FUZZ_RT, with the flag applied to the whole single-command compile).
 fuzz-http: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-http: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
@@ -335,6 +339,7 @@ fuzz-http: dirs
 # fragmentation/reassembly realloc path. Reuses -DSW_FUZZ_HTTP (both hooks
 # live in swarmrt_http.c).
 fuzz-ws: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-ws: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_ws.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_ws $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_ws tests/fuzz/corpus/ws
@@ -344,6 +349,7 @@ fuzz-ws: dirs
 # includes swarmrt_builtins_studio.h exactly like generated code, so it
 # drives the real static implementations.
 fuzz-db: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-db: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_db.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_db $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
@@ -487,6 +493,7 @@ gc-stress: swc libswarmrt
 # regions (no leak / UAF / double-free on rejection).
 .PHONY: mailbox-flood
 mailbox-flood: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "mailbox-flood: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) \
 	    tests/stress/mailbox_flood.c $(FUZZ_RT) -o $(BIN_DIR)/mailbox_flood $(LDFLAGS)
 	@SW_MAILBOX_MAX=1000 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood capped

@@ -15,7 +15,7 @@ make swc libswarmrt
 ```
 
 The sanitizer gates (`make gc-stress`, `make alloc-fault`, `make lsan-gate`,
-`make tsan-gate`, and `scripts/gc_asan_run.sh`) also need the sanitizer runtime
+`make tsan-gate`, `make fuzz`, and `scripts/gc_asan_run.sh`) also need the sanitizer runtime
 that matches your clang. On Ubuntu/Debian install `libclang-rt-<N>-dev`, where
 `<N>` is the major version from `clang --version` (for example
 `libclang-rt-18-dev`); it provides the ASAN, UBSAN and TSan runtimes. If it is
