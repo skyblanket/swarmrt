@@ -85,8 +85,9 @@ typedef struct {
     uint32_t            content_length; /* Content-Length from headers, 0 = none */
     int                 body_pending;   /* 1 = still accumulating body bytes */
 
-    /* Connection persistence */
-    int                 keep_alive;     /* 1 = keep connection open after response */
+    /* Connection persistence. The parser sets it while the handler's
+     * sw_http_respond reads it on another thread, so it is atomic. */
+    _Atomic int         keep_alive;     /* 1 = keep connection open after response */
 
     /* WebSocket state */
     char                ws_key[128]; /* Sec-WebSocket-Key from upgrade */
