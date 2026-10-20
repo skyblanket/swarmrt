@@ -17,8 +17,16 @@
 module Watchdog_idle_http_server
 export [main]
 
+# Listener port for this fixture. run_tests.sh exports SW_TEST_PORT_BASE per
+# run so two suite runs on one host can't bind the same port; run by hand,
+# the base falls back to 9000.
+fun test_port(offset) {
+    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
+    base + offset
+}
+
 fun main() {
-    http_listen(8137)
+    http_listen(test_port(180))
     print("LISTENING")
     serve()
 }
