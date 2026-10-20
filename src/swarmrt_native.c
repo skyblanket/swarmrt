@@ -1452,8 +1452,12 @@ sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
     return proc;
 }
 
-/* Signal one parked scheduler so overflow work is picked up at once (the
- * idle loop's 0.5ms timed park would find it anyway). */
+/* Signal one parked scheduler so overflow work or a new earliest timer is
+ * picked up at once. The target is CLAIMED (idle cleared under idle_lock)
+ * so a second waker in the same window signals a different parked scheduler
+ * rather than re-signalling this one, whose wakeup is already pending. The
+ * claimed scheduler re-polls the overflow queue and timer head before it
+ * parks again. */
 static void wake_one_idle_scheduler(void) {
     if (!g_swarm) return;
     for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
@@ -1463,6 +1467,7 @@ static void wake_one_idle_scheduler(void) {
         if (atomic_load_explicit(&rq->idle, memory_order_relaxed) &&
             !atomic_load_explicit(&rq->blocking, memory_order_relaxed)) {
             pthread_mutex_lock(&rq->idle_lock);
+            atomic_store_explicit(&rq->idle, 0, memory_order_release);
             pthread_cond_signal(&rq->idle_cond);
             pthread_mutex_unlock(&rq->idle_lock);
             return;
