@@ -62,7 +62,7 @@
 static int g_kq = -1;
 #endif
 static pthread_t g_io_thread;
-static volatile int g_io_running = 0;
+static _Atomic int g_io_running = 0;
 
 static sw_port_t *g_ports = NULL;           /* Global port list */
 static pthread_mutex_t g_ports_lock = PTHREAD_MUTEX_INITIALIZER;
