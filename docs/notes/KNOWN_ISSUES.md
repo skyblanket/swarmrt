@@ -18,15 +18,16 @@ like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
 
 ### A few blocking builtins still occupy their scheduler OS thread
 
-`http_get`, `http_request`, `http_post`, `exec_argv`, `shell_sandboxed` and
-subagent-mode `http_post_stream` run on the runtime's offload pool (see "Recently
-cleared"), and so does `llm_complete`, whose request goes through `http_post` (200
-completions against a 500ms mock endpoint, 64 in flight, finish in 2.1s on 4
-cores). Still on the calling scheduler's thread: `read_line`/`read_key`/`read_choice`,
-`shell_managed`, TTY-mode `http_post_stream`, `subprocess_recv_line` and `db_*`.
-Those run inside a blocking section, so the processes queued behind them move to
-idle schedulers (see "Recently cleared"); what they cost is one OS thread each for
-the duration. With every scheduler thread inside one, nothing else runs.
+`http_get`, `http_request`, `http_post`, `exec_argv`, `exec_managed`, `shell_managed`,
+`shell_sandboxed`, `db_exec`, `db_query` and subagent-mode `http_post_stream` run on
+the runtime's offload pool (see "Recently cleared"), and so does `llm_complete`, whose
+request goes through `http_post` (200 completions against a 500ms mock endpoint, 64 in
+flight, finish in 2.1s on 4 cores). Still on the calling scheduler's thread:
+`read_line`/`read_key`/`read_choice`, `shell_managed`, TTY-mode `http_post_stream`,
+`subprocess_recv_line`, `checkpoint` and `restore`. Those run inside a blocking
+section, so the processes queued behind them move to idle schedulers (see "Recently
+cleared"); what they cost is one OS thread each for the duration. With every scheduler
+thread inside one, nothing else runs.
 
 **Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
@@ -87,6 +88,20 @@ Compiled maps now share a growable store with a hash index over string, atom and
 keys: adding a key is amortised O(1) and `map_get` is a hash probe (20,000 keys: 25ms;
 100,000: 137ms). Replacing an existing key still copies the map (other values keep the
 old one). The interpreter keeps plain arrays. Gate: `tests/sw/test_map_store.sw`.
+
+### `db_exec` and `db_query` pinned their scheduler thread (cleared 2026-10-20)
+
+`db_exec` and `db_query` ran their whole call inside a blocking section. They now run on
+the offload pool, so a slow query no longer holds a scheduler. Offloading exposed a
+pre-existing race in `db_open`: two opens on different schedulers could claim the same
+slot, which crashed the process. Each slot is now guarded by its own lock, so two calls
+on different connections still run in parallel. Gate: `tests/sw/test_db_offload.sw`
+(8 readers waiting on a lock: ~1.0s on 2 schedulers, ~2.0s before).
+
+`shell_managed` is not moved yet. Its blocking section already lets queued processes
+run on extra threads: 64 concurrent `shell_managed("sleep 1", 5000)` finish in ~1.4s
+on 1 to 4 schedulers, not the ~32s this entry used to claim. Moving it to the offload
+pool made 256 concurrent calls slower (~8s against ~5s), and the cause is not yet known.
 
 ### The HTTP server leaked memory per connection and per request (cleared 2026-09-27)
 

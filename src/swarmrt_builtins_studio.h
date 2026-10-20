@@ -4865,28 +4865,56 @@ static sw_val_t *_builtin_trap_exit(sw_val_t **a, int n) {
  * matching sqlite types; everything else is coerced to string.
  *
  * Linked against system libsqlite3. Connection cap = 32.
- */
+ *
+ * Calls run on offload workers, so slots are guarded per slot: every read or
+ * write of _sw_sqlite_db[i] happens under _sw_sqlite_conn[i]. That makes
+ * claiming a free slot atomic and stops db_close freeing a connection that a
+ * worker is still using. Two calls on DIFFERENT connections run in parallel;
+ * SQLite itself serializes calls on one connection. */
 #define _SW_SQLITE_MAX 32
 static sqlite3 *_sw_sqlite_db[_SW_SQLITE_MAX];
+static pthread_mutex_t _sw_sqlite_conn[_SW_SQLITE_MAX];
+static pthread_once_t _sw_sqlite_conn_once = PTHREAD_ONCE_INIT;
+
+static void _sw_sqlite_conn_init(void) {
+    for (int i = 0; i < _SW_SQLITE_MAX; i++) pthread_mutex_init(&_sw_sqlite_conn[i], NULL);
+}
+
+/* Holds a slot's lock until the enclosing builtin returns (cleanup attribute). */
+static void _sw_sqlite_unlock(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }
+#define SW_SQLITE_LOCK(slot) \
+    pthread_once(&_sw_sqlite_conn_once, _sw_sqlite_conn_init); \
+    pthread_mutex_t *_sw_sqlite_held __attribute__((cleanup(_sw_sqlite_unlock))) = \
+        &_sw_sqlite_conn[slot]; \
+    pthread_mutex_lock(_sw_sqlite_held)
 
 static sw_val_t *_builtin_db_open(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
-    int slot = -1;
-    for (int i = 0; i < _SW_SQLITE_MAX; i++) if (!_sw_sqlite_db[i]) { slot = i; break; }
-    if (slot < 0) return sw_val_int(-1);
-    sqlite3 *db = NULL;
-    if (sqlite3_open(a[0]->v.str, &db) != SQLITE_OK) {
-        if (db) sqlite3_close(db);
-        return sw_val_int(-1);
+    pthread_once(&_sw_sqlite_conn_once, _sw_sqlite_conn_init);
+    for (int slot = 0; slot < _SW_SQLITE_MAX; slot++) {
+        pthread_mutex_lock(&_sw_sqlite_conn[slot]);
+        if (!_sw_sqlite_db[slot]) {
+            sqlite3 *db = NULL;
+            if (sqlite3_open(a[0]->v.str, &db) == SQLITE_OK) {
+                _sw_sqlite_db[slot] = db;
+                pthread_mutex_unlock(&_sw_sqlite_conn[slot]);
+                return sw_val_int(slot);
+            }
+            if (db) sqlite3_close(db);
+            pthread_mutex_unlock(&_sw_sqlite_conn[slot]);
+            return sw_val_int(-1);
+        }
+        pthread_mutex_unlock(&_sw_sqlite_conn[slot]);
     }
-    _sw_sqlite_db[slot] = db;
-    return sw_val_int(slot);
+    return sw_val_int(-1);
 }
 
 static sw_val_t *_builtin_db_close(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
     int slot = (int)a[0]->v.i;
-    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+    if (slot < 0 || slot >= _SW_SQLITE_MAX) return sw_val_atom("error");
+    SW_SQLITE_LOCK(slot);
+    if (!_sw_sqlite_db[slot]) return sw_val_atom("error");
     sqlite3_close(_sw_sqlite_db[slot]);
     _sw_sqlite_db[slot] = NULL;
     return sw_val_atom("ok");
@@ -4951,11 +4979,14 @@ static sw_val_t *_sw_db_row_to_map(sqlite3_stmt *stmt) {
 }
 
 static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
+    SW_OFFLOAD_BUILTIN(_builtin_db_exec, a, n);
     SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
     int slot = (int)a[0]->v.i;
-    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+    if (slot < 0 || slot >= _SW_SQLITE_MAX) return sw_val_atom("error");
+    SW_SQLITE_LOCK(slot);
+    if (!_sw_sqlite_db[slot]) return sw_val_atom("error");
 
     /* 3-arg overload: db_exec(h, sql, [args]) — prepare + bind + step, no
      * rows returned. Lets writes (INSERT/UPDATE/DELETE) use placeholders
@@ -4985,11 +5016,14 @@ static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
+    SW_OFFLOAD_BUILTIN(_builtin_db_query, a, n);
     SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_list(NULL, 0);
     int slot = (int)a[0]->v.i;
-    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_list(NULL, 0);
+    if (slot < 0 || slot >= _SW_SQLITE_MAX) return sw_val_list(NULL, 0);
+    SW_SQLITE_LOCK(slot);
+    if (!_sw_sqlite_db[slot]) return sw_val_list(NULL, 0);
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(_sw_sqlite_db[slot], a[1]->v.str, -1, &stmt, NULL) != SQLITE_OK)
