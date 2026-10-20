@@ -3874,7 +3874,7 @@ void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
  *   ref = send_request(server);
  *   reply = sw_receive_tagged(ref, 5000);  // Only get MY reply
  */
-void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
+static void *sw_receive_tagged_impl(uint64_t tag, uint64_t timeout_ms, int adopt) {
     sw_process_t *proc = tls_current;
     if (!proc) return NULL;
 
@@ -3886,7 +3886,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         mailbox_drain(&proc->mailbox);
         sw_msg_t *m = mailbox_pop_tagged(proc, tag);
         if (m) {
-            void *payload = msg_take_payload(m, 0);
+            void *payload = msg_take_payload(m, adopt);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -3907,7 +3907,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
                 atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
-                void *payload = msg_take_payload(m, 0);
+                void *payload = msg_take_payload(m, adopt);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -4234,6 +4234,16 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
  * switch into another fiber. */
 void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag) {
     return sw_receive_any_impl(timeout_ms, out_tag, 1);
+}
+
+void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
+    return sw_receive_tagged_impl(tag, timeout_ms, 0);
+}
+
+/* Selective receive with the adopt semantics of sw_recv_any_adopt. For pmap,
+ * which matches its own results by tag and then incorporates the payload. */
+void *sw_recv_tagged_adopt(uint64_t tag, uint64_t timeout_ms) {
+    return sw_receive_tagged_impl(tag, timeout_ms, 1);
 }
 
 /* ============================================================================

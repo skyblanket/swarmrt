@@ -723,7 +723,7 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
 | `reduce(fn, lst, init)` | foldl; `fn` is called as `fn(acc, item)` |
-| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap) and silently maps a slow item to `nil` on a fixed ~5s wall.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
+| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap). The whole call shares one 5s deadline; an item with no result by then is `{'error', 'timeout'}`, not `nil`.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
 | `a..b` | inclusive integer range as a list: `1..3` is `[1, 2, 3]` (`Std.range(a, b)` is end-exclusive, Python-style) |
 | `[h \| t]` / `list_append(lst, x)` | prepend / append — both O(1) amortized for the accumulator patterns (`build(n - 1, [n \| acc])`, `grow(list_append(acc, x))`); `tl(lst)` is O(1) |
 | `map_new()` | new empty map (same as the `%{}` literal) |
