@@ -20,6 +20,7 @@
 #include <time.h>
 #include "swarmrt_test.h"
 #include "swarmrt_lang.h"
+#include "swc_imports.h"
 
 /* ANSI colors for terminal output */
 #define C_GREEN  "\033[32m"
@@ -45,7 +46,7 @@ static double time_ms(struct timespec *start, struct timespec *end) {
            (end->tv_nsec - start->tv_nsec) / 1e6;
 }
 
-int sw_test_run_file(const char *path) {
+int sw_test_run_file(const char *path, const char *lib_dir) {
     char *source = read_file(path);
     if (!source) {
         fprintf(stderr, "test: cannot open '%s'\n", path);
@@ -59,18 +60,35 @@ int sw_test_run_file(const char *path) {
         return 1;
     }
 
-    /* Same static name check as `swc build`. */
+    /* Load imports the way `swc run` does (siblings, installed packages,
+     * then lib/), then the same static name check as `swc build`: each
+     * module against the whole set. */
+    void *mods[64];
+    const char *mod_paths[64];
+    int nmods = 0;
+    mods[nmods] = ast; mod_paths[nmods++] = strdup(path);
     {
-        void *mods[1] = { ast };
-        int unresolved = sw_resolve_module(ast, mods, 1, path);
-        if (unresolved) {
-            fprintf(stderr, "test: %d name error%s in '%s'\n",
-                    unresolved, unresolved == 1 ? "" : "s", path);
+        import_ctx_t ictx;
+        import_ctx_init(&ictx, path, lib_dir);
+        int conflicts = load_imports(mods, mod_paths, &nmods, 64, &ictx, 0);
+        import_ctx_free(&ictx);
+        if (conflicts) {
+            for (int a = 0; a < nmods; a++) free((char *)mod_paths[a]);
             return 1;
         }
     }
+    int unresolved = 0;
+    for (int a = 0; a < nmods; a++)
+        unresolved += sw_resolve_module(mods[a], mods, nmods, mod_paths[a]);
+    for (int a = 0; a < nmods; a++) free((char *)mod_paths[a]);
+    if (unresolved) {
+        fprintf(stderr, "test: %d name error%s in '%s'\n",
+                unresolved, unresolved == 1 ? "" : "s", path);
+        return 1;
+    }
 
-    /* Extract test_* function names from AST */
+    /* Extract test_* function names from the file's own functions. Before
+     * the merge below, so imported modules' test_* functions don't run. */
     node_t *mod = (node_t *)ast;
     const char *test_names[256];
     int ntest = 0;
@@ -80,6 +98,11 @@ int sw_test_run_file(const char *path) {
         if (strncmp(fname, "test_", 5) == 0 && ntest < 256)
             test_names[ntest++] = fname;
     }
+
+    /* Merge imported functions into the file's module, as `swc run` does,
+     * so each test's interpreter can call Mod.fn and the module's siblings. */
+    for (int a = 1; a < nmods; a++)
+        merge_module_funs(mod, (node_t *)mods[a], 1);
 
     if (ntest == 0) {
         printf(C_DIM "=== %s ===" C_RESET "\n", path);
@@ -163,7 +186,7 @@ static int is_test_file(const char *name) {
     return 0;
 }
 
-int sw_test_run_dir(const char *dir_path) {
+int sw_test_run_dir(const char *dir_path, const char *lib_dir) {
     DIR *d = opendir(dir_path);
     if (!d) {
         fprintf(stderr, "test: cannot open directory '%s'\n", dir_path);
@@ -179,7 +202,7 @@ int sw_test_run_dir(const char *dir_path) {
 
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", dir_path, ent->d_name);
-        total_failures += sw_test_run_file(path);
+        total_failures += sw_test_run_file(path, lib_dir);
         files_run++;
     }
     closedir(d);
