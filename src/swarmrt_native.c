@@ -925,7 +925,15 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->monitors_me = NULL;
     proc->my_monitors = NULL;
     proc->kill_flag = 0;
+    /* Release the previous occupant's panic message (kept past its death
+     * for late link()/monitor()). Swapped out under link_lock so a reader
+     * holding it never sees a freed pointer. */
+    pthread_mutex_lock(&g_swarm->link_lock);
+    char *_old_pm = proc->panic_msg;
+    proc->panic_msg = NULL;
     proc->exit_reason = 0;
+    pthread_mutex_unlock(&g_swarm->link_lock);
+    free(_old_pm);
     proc->reg_entry = NULL;
     proc->ets_tables = NULL;
 
@@ -1002,28 +1010,25 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.count = 0;
     atomic_store_explicit(&proc->mb_len, 0, memory_order_relaxed);
 
-    /* Free the panic_msg string set by sw_process_panic. UNDER link_lock:
-     * a late sw_monitor on this (already-EXITING/FREE) process reads
-     * panic_msg in its already-dead delivery path under the same lock, so
-     * the free must serialise with it or the monitor reads freed memory.
-     * NULL-under-lock means the monitor sees either a valid pointer or
-     * NULL, never freed-but-non-NULL. */
-    /* The varena/spawn_region DETACH also happens inside this same critical
-     * section (snapshot-then-NULL under link_lock, free after unlock): the
-     * process_info builtin reads proc->varena->total_bytes cross-thread for
-     * its 'memory' stat, under link_lock. Detaching under the lock gives it
-     * the same guarantee panic_msg has — a reader holding link_lock sees
-     * either a live arena header or NULL, never freed-but-non-NULL. The
-     * frees stay outside the lock (O(chunks), no need to hold it). */
+    /* panic_msg is deliberately NOT freed here. A link() or monitor() that
+     * lands after this process has died still has to report its reason and
+     * message (the 'stack overflow' text); the message stays with the slot
+     * until the slot is recycled (process_init_arena) or the slab is torn
+     * down. Freeing it here made a late link() see NULL and deliver a bare
+     * -1 reason instead of the panic message.
+     *
+     * The varena/spawn_region DETACH happens under link_lock (snapshot-then-
+     * NULL): the process_info builtin reads proc->varena->total_bytes
+     * cross-thread for its 'memory' stat, under link_lock. Detaching under
+     * the lock gives it a guarantee a reader holding link_lock sees either a
+     * live arena header or NULL, never freed-but-non-NULL. The frees stay
+     * outside the lock (O(chunks), no need to hold it). */
     pthread_mutex_lock(&g_swarm->link_lock);
-    char *_pm = proc->panic_msg;
-    proc->panic_msg = NULL;
     struct sw_value_arena *_va = proc->varena;
     proc->varena = NULL;
     struct sw_value_arena *_sr = proc->spawn_region;
     proc->spawn_region = NULL;
     pthread_mutex_unlock(&g_swarm->link_lock);
-    free(_pm);
 
     /* GC v1: reclaim this process's whole value arena in O(chunks). Runs after
      * the fiber has returned, so there are no live sw_val_t* C-stack roots.
@@ -2218,6 +2223,10 @@ void sw_shutdown(int swarm_id) {
                 free(slab[i].gen_exec);
                 slab[i].gen_exec = NULL;
             }
+            /* Last panic message of the slot's final occupant (see
+             * process_destroy) — freed at slab teardown. */
+            free(slab[i].panic_msg);
+            slab[i].panic_msg = NULL;
         }
     }
 
@@ -3164,13 +3173,21 @@ int sw_link(sw_process_t *other) {
     sw_process_t *self = tls_current;
     if (!self || !other || self == other) return -1;
     if (other->state == SW_PROC_EXITING || other->state == SW_PROC_FREE) {
-        /* Linking to dead process — deliver exit signal immediately */
+        /* Linking to dead process — deliver exit signal immediately. The
+         * reason and message are copied under link_lock (the same lock
+         * process_exit publishes them under); the copy is ours to free. */
+        pthread_mutex_lock(&g_swarm->link_lock);
+        uint64_t pid = other->pid;
+        int reason = other->exit_reason;
+        char *msg = other->panic_msg ? strdup(other->panic_msg) : NULL;
+        pthread_mutex_unlock(&g_swarm->link_lock);
         if (self->flags & SW_FLAG_TRAP_EXIT) {
-            deliver_signal(self, SW_TAG_EXIT, other->pid, 0, other->exit_reason, other->panic_msg);
-        } else if (other->exit_reason != 0) {
+            deliver_signal(self, SW_TAG_EXIT, pid, 0, reason, msg);
+        } else if (reason != 0) {
             self->kill_flag = 1;
-            self->exit_reason = other->exit_reason;
+            self->exit_reason = reason;
         }
+        free(msg);
         return 0;
     }
 
@@ -3323,10 +3340,10 @@ uint64_t sw_monitor(sw_process_t *target) {
     sw_proc_state_t st = atomic_load_explicit(&target->state, memory_order_relaxed);
     if (st == SW_PROC_EXITING || st == SW_PROC_FREE) {
         int reason = atomic_load_explicit(&target->exit_reason, memory_order_relaxed);
-        /* COPY panic_msg under the lock: process_destroy frees it under the
-         * same lock, so capturing the bare pointer and using it after the
-         * unlock (deliver_signal strdups it) would race that free. The
-         * copy is ours; free it after delivery. */
+        /* COPY panic_msg under the lock: process_init_arena releases it under
+         * the same lock when the slot is recycled, so capturing the bare
+         * pointer and using it after the unlock (deliver_signal strdups it)
+         * would race that free. The copy is ours; free it after delivery. */
         char *msg = target->panic_msg ? strdup(target->panic_msg) : NULL;
         pthread_mutex_unlock(&g_swarm->link_lock);
         deliver_signal(self, SW_TAG_DOWN, target->pid, ref, reason, msg);
