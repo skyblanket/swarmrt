@@ -235,6 +235,7 @@ examples: swc libswarmrt
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
+	@bash ./tests/sw/run_stdin.sh
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.

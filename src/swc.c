@@ -39,6 +39,7 @@
 #include "swarmrt_new.h"
 #include "swarmrt_native.h"
 #include "swarmrt_io.h"
+#include "swarmrt_readfile.h"
 #include "swc_pkg.h"
 #include <pthread.h>
 #include <limits.h>
@@ -73,31 +74,15 @@ static void usage(void) {
 
 /* Read entire file into malloc'd string */
 static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "swc: cannot open '%s'\n", path); return NULL; }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
-    size_t n = fread(buf, 1, len, f);
-    buf[n] = '\0';
-    fclose(f);
+    char *buf = sw_read_file_all(path);
+    if (!buf) fprintf(stderr, "swc: cannot read '%s'\n", path);
     return buf;
 }
 
 /* Silent read — returns NULL without a message. Used when probing import
  * candidate paths (a miss is expected, not an error). */
 static char *read_file_quiet(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
-    size_t n = fread(buf, 1, len, f);
-    buf[n] = '\0';
-    fclose(f);
-    return buf;
+    return sw_read_file_all(path);
 }
 
 /* Extract module name from AST */
