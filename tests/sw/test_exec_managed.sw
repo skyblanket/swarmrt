@@ -87,6 +87,25 @@ fun main() {
     f = f + check("killed_caller_kills_child", yes(hd(rs) == {'error', 'timeout'} && string_trim(elem(left, 1)) == "gone"))
     shell("pkill -f 'sleep [7][.]25'")
 
+    # exit_proc on a caller inside exec_managed (with a long timeout_ms) kills
+    # the child and its backgrounded grandchild. Liveness via `ps`, not /proc.
+    cpid = dir ++ "/c.pid"
+    gpid = dir ++ "/g.pid"
+    shell("rm -f " ++ cpid ++ " " ++ gpid)
+    victim = spawn(fun() {
+        exec_managed("sh", ["-c", "echo $$ > " ++ cpid ++ "; sleep 8.5 & echo $! > " ++ gpid ++ "; wait"],
+                     %{timeout_ms: 60000})
+    })
+    sleep(700)
+    exit_proc(victim, 'kill')
+    sleep(800)
+    c = string_trim(file_read(cpid))
+    g = string_trim(file_read(gpid))
+    live = "for p in " ++ c ++ " " ++ g ++ "; do st=$(ps -o stat= -p $p 2>/dev/null); case \"$st\" in \"\"|Z*) ;; *) echo alive;; esac; done; echo done"
+    r = shell(live)
+    f = f + check("exit_proc_kills_group", yes(string_trim(elem(r, 1)) == "done"))
+    shell("kill -9 " ++ c ++ " " ++ g ++ " 2>/dev/null")
+
     shell("rm -rf " ++ dir)
-    if (f == 0) { print("OK exec_managed 15/15") ; sys_exit(0) } else { print("FAIL exec_managed") ; sys_exit(1) }
+    if (f == 0) { print("OK exec_managed 16/16") ; sys_exit(0) } else { print("FAIL exec_managed") ; sys_exit(1) }
 }
