@@ -36,6 +36,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which heavy jobs a PR needs. A docs-only PR skips macos and
+  # hardening-gates; a PR that only touches sw tests, lib/ or the parser
+  # skips hardening-gates (sanitizers, soak, stress cover the C runtime).
+  # A skipped job reports "skipped", which counts as passing. Pushes to main
+  # always run everything, so main stays fully covered.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      macos: ${{ steps.f.outputs.macos }}
+      hardening: ${{ steps.f.outputs.hardening }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: f
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"; echo "hardening=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The PR checkout is the merge commit; its first parent is the base.
+          files=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$files"
+          docs='^(docs/|examples/)|\.md$'
+          light='^(docs/|examples/|tests/sw/|lib/|src/swarmrt_parse)|\.md$'
+          if printf '%s\n' "$files" | grep -qvE "$docs"; then echo "macos=true" >> "$GITHUB_OUTPUT"; else echo "macos=false" >> "$GITHUB_OUTPUT"; fi
+          if printf '%s\n' "$files" | grep -qvE "$light"; then echo "hardening=true" >> "$GITHUB_OUTPUT"; else echo "hardening=false" >> "$GITHUB_OUTPUT"; fi
+
   quickstart:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -121,6 +149,8 @@ jobs:
     # No `needs: quickstart` — runs in parallel for fastest signal. A
     # README regression and a sanitizer regression are independent facts;
     # serializing them only delays whichever one you broke.
+    needs: changes
+    if: needs.changes.outputs.hardening == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -312,6 +342,8 @@ jobs:
     # NOTE: macOS Apple-clang ASAN has NO LeakSanitizer, so the leak gates are
     # Linux-only (see hardening-gates); this leg covers build + behavior + the
     # UAF/poison ASAN checks + the operational gates.
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
     runs-on: macos-14   # Apple silicon (arm64)
     timeout-minutes: 25
     steps:
