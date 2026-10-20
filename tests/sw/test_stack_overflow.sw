@@ -9,10 +9,12 @@ module Test_stack_overflow
 #    100k iterations here CRASH pre-fix (SIGBUS on the guard page) and run
 #    flat post-fix.
 #
-# 2) red-zone recovery: a genuinely non-TCO-able deep recursion (mutual
-#    ping/pong) must die as a NORMAL per-process panic — EXIT delivered to
-#    the linked, trapping parent; OS process survives. Pre-fix the whole
-#    binary died by native signal and no supervision layer ever ran.
+# 2) red-zone recovery: a genuinely non-tail deep recursion (`1 + runaway()`)
+#    must die as a NORMAL per-process panic — EXIT delivered to the linked,
+#    trapping parent; OS process survives. Pre-fix the whole binary died by
+#    native signal and no supervision layer ever ran. (Mutual tail calls are
+#    optimized now, so a ping/pong tail cycle loops forever instead; see
+#    test_mutual_tail.sw.)
 
 fun tick_loop(n) {
     receive {
@@ -24,9 +26,15 @@ fun tick_loop(n) {
     }
 }
 
-fun ping(n) { pong(n + 1) }
-fun pong(n) { ping(n + 1) }
-fun runaway() { ping(0) }
+fun runaway(n) { 1 + runaway(n + 1) }
+
+# Hold the overflow until the parent has linked us: a child that dies before
+# link() reaches a reaped process, and the link then carries only the int reason.
+fun runaway_on_go() {
+    receive {
+        'go' -> runaway(0)
+    }
+}
 
 fun main() {
     failures = 0
@@ -38,8 +46,9 @@ fun main() {
 
     # --- 2. stack overflow is a recoverable actor panic, not process death
     trap_exit('true')
-    w = spawn(runaway())
+    w = spawn(runaway_on_go())
     link(w)
+    send(w, 'go')
     got = receive {
         {'EXIT', _, reason} -> reason
         after 30000 { 'no_exit' }

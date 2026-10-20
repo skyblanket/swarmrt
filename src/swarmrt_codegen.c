@@ -60,6 +60,7 @@ typedef struct {
     char cur_params[16][128];
     int cur_nparams;
     int has_tail;
+    int tc_hop; /* 1 inside a module function body: tail calls may hop (emit_call) */
 
     /* declared local variables in current function */
     char declared[256][128];
@@ -1018,12 +1019,23 @@ static int find_spawn_id(cg_ctx_t *ctx, node_t *call_node) {
     return -1;
 }
 
-/* Check if function body contains self-recursive tail calls */
+/* A call that emit_call compiles as a hop when it sits in tail position: a
+ * direct call to another function of this module (see the module-function
+ * branch of emit_call). Builtins and qualified calls are never hops. */
+static int is_hop_call(cg_ctx_t *ctx, node_t *n) {
+    if (n->type != N_CALL || n->v.call.func->type != N_IDENT) return 0;
+    const char *fname = n->v.call.func->v.sval;
+    return !is_builtin(fname) && !strchr(fname, '.') && is_module_func(ctx, fname) &&
+           n->v.call.nargs <= SW_TC_MAX;
+}
+
+/* Check if function body contains tail calls that loop back (self-calls) or
+ * hop to another module function. Either one needs the `_gc_floor` checkpoint. */
 static int has_tail_calls(cg_ctx_t *ctx, node_t *n) {
     if (!n) return 0;
     switch (n->type) {
     case N_CALL:
-        return is_self_call(ctx, n);
+        return is_self_call(ctx, n) || is_hop_call(ctx, n);
     case N_BLOCK:
         if (n->v.block.nstmts == 0) return 0;
         return has_tail_calls(ctx, n->v.block.stmts[n->v.block.nstmts - 1]);
@@ -1487,6 +1499,8 @@ static void emit_forward_decls(cg_ctx_t *ctx, node_t *mod) {
     FILE *f = ctx->out;
     fprintf(f, "/* === Forward declarations === */\n");
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_fl);\n",
+                ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
         fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
     }
@@ -1610,6 +1624,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         int save_nparams = ctx->cur_nparams;
         int save_ndeclared = ctx->ndeclared;
         int save_has_tail = ctx->has_tail;
+        int save_tc_hop = ctx->tc_hop;
         strncpy(save_func, ctx->cur_func, 127);
         for (int j = 0; j < save_nparams; j++)
             strncpy(save_params[j], ctx->cur_params[j], 127);
@@ -1618,6 +1633,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         ctx->cur_nparams = fn->v.fun.nparams;
         ctx->ndeclared = 0;
         ctx->has_tail = 0;
+        ctx->tc_hop = 0; /* a lambda has no driver: its tail calls stay plain calls */
 
         /* Extract explicit parameters */
         for (int j = 0; j < fn->v.fun.nparams; j++) {
@@ -1665,6 +1681,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         ctx->cur_nparams = save_nparams;
         ctx->ndeclared = save_ndeclared;
         ctx->has_tail = save_has_tail;
+        ctx->tc_hop = save_tc_hop;
         for (int j = 0; j < save_nparams; j++)
             strncpy(ctx->cur_params[j], save_params[j], 127);
     }
@@ -2535,6 +2552,36 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "tool_history") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
+        if (tail && ctx->tc_hop && ctx->has_tail && nargs <= SW_TC_MAX) {
+            /* Mutual tail call: park the args and return SW_TC_HOP, so the
+             * driver (sw_tc_drive) calls the target body after this frame is
+             * gone and the C stack stays flat. Same turn-checkpoint as a
+             * self-call, floor inherited: the target takes `_gc_floor` from the
+             * park (emit_function), so a hop chain keeps the entry floor and
+             * the arena stays bounded. The args are read in the callee's
+             * prologue before any yield or other call can reuse the park. */
+            fprintf(f, "    {\n");
+            if (nargs > 0) {
+                fprintf(f, "      sw_val_t *_gc_v[] = {");
+                for (int i = 0; i < nargs; i++)
+                    fprintf(f, "%s%s", i ? ", " : "", arg_vars[i]);
+                fprintf(f, "};\n");
+            }
+            fprintf(f, "      sw_value_arena_t *_gc_a = sw_self_varena();\n");
+            fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
+            fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", nargs > 0 ? "_gc_v" : "NULL", nargs);
+            fprintf(f, "      if (sw_check_reds()) sw_yield();\n");
+            for (int i = 0; i < nargs; i++)
+                fprintf(f, "      sw_tc_next_args[%d] = _gc_v[%d];\n", i, i);
+            fprintf(f, "    }\n");
+            fprintf(f, "    sw_tc_next_fn = %s_%s__b;\n", ctx->mod_name, fname);
+            fprintf(f, "    sw_tc_next_n = %d;\n", nargs);
+            fprintf(f, "    sw_tc_next_floor = _gc_floor;\n");
+            fprintf(f, "    _sw_trace_pop();\n");
+            fprintf(f, "    return SW_TC_HOP;\n");
+            out[0] = '\0';
+            return;
+        }
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
         else
@@ -3672,6 +3719,7 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         strncpy(ctx->cur_params[i], fn->v.fun.params[i], 127);
     ctx->ndeclared = 0;
     ctx->has_tail = has_tail_calls(ctx, fn->v.fun.body);
+    ctx->tc_hop = 1;
 
     /* Emit a #line directive so any C compiler error inside this
      * function points back to the .sw source instead of the
@@ -3685,8 +3733,9 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         ctx->last_line_emitted = 0;
     }
 
-    fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
+    fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_fl) {\n",
             ctx->mod_name, fn->v.fun.name);
+    fprintf(f, "    (void)_fl;\n");
 
     /* Parameter extraction */
     if (fn->v.fun.nparams > 0) {
@@ -3714,9 +3763,10 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     /* Red-zone stack guard: turn a would-be fiber-stack overflow (native
      * SIGBUS/SIGSEGV on the guard page = whole-OS-process death, no
      * supervision) into a normal per-process panic while there is still
-     * headroom for the panic path. Fires on deep NON-self recursion —
-     * self-tail-calls take the goto below and never re-enter here. */
-    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep recursion? mutual tail calls are not TCO'd (self-tail-calls are); keep the loop in one function or raise SW_PROC_STACK\");\n",
+     * headroom for the panic path. Fires on deep NON-tail recursion —
+     * self-tail-calls take the goto below and module-function tail calls
+     * return to the driver (sw_tc_drive), so neither re-enters here deeper. */
+    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep non-tail recursion? tail calls do not grow the stack; make the recursive call the last thing the function does, or raise SW_PROC_STACK\");\n",
             ctx->mod_name, fn->v.fun.name);
     /* Reduction-counted preemption at every call (BEAM-style): a process
      * yields once it has made SWARM_CONTEXT_REDS calls or loop turns, so a
@@ -3728,9 +3778,11 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
 
     /* Tail call label. Ownership v2: record the arena "floor" at entry — the
      * scoped turn-checkpoint (emit_call) reclaims only what THIS function
-     * allocates above it, never the caller's live values below it. */
+     * allocates above it, never the caller's live values below it. A hop
+     * (emit_call) arrives with the floor of the chain's entry in `_fl`, so the
+     * whole mutual loop shares one floor, as a self-loop does. */
     if (ctx->has_tail) {
-        fprintf(f, "    sw_varena_mark_t _gc_floor = sw_varena_mark(sw_self_varena());\n");
+        fprintf(f, "    sw_varena_mark_t _gc_floor = _fl ? *_fl : sw_varena_mark(sw_self_varena());\n");
         fprintf(f, "    (void)_gc_floor;\n");
         fprintf(f, "_tail:;\n");
     }
@@ -3748,6 +3800,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     else
         fprintf(f, "    return sw_val_nil();\n");
 
+    fprintf(f, "}\n\n");
+
+    /* The public entry: a normal call runs the body and then any hops it
+     * parked, so callers see one ordinary function. */
+    fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
+            ctx->mod_name, fn->v.fun.name);
+    fprintf(f, "    return sw_tc_drive(%s_%s__b(_args, _nargs, NULL));\n",
+            ctx->mod_name, fn->v.fun.name);
     fprintf(f, "}\n\n");
 }
 

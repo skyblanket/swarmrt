@@ -1843,8 +1843,9 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
 
     /* Stack overflow detection: a fault inside (or within a page below) the
      * RUNNING process's guard page means its fiber stack overflowed —
-     * almost always deep non-self recursion (mutual tail calls are not
-     * TCO'd; self-tail-calls compile to a flat loop). Say so, instead of
+     * almost always deep non-tail recursion (tail calls between module
+     * functions and self-tail-calls run flat; a tail call through a lambda
+     * does not). Say so, instead of
      * leaving a bare crash banner to be mistaken for a runtime bug.
      *
      * BOTH signals matter: Linux delivers a guard-page hit as SIGSEGV, but
@@ -1862,9 +1863,9 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
         if (fault < guard_top && fault >= guard_bot) {
             len = snprintf(msg, sizeof(msg),
                 "\n\033[1;31mpanic\033[0m: stack overflow in process #%llu (%zuKB fiber stack)\n"
-                "  likely cause: deep NON-SELF recursion — mutual tail calls are not\n"
-                "  TCO'd (self-tail-calls are). Keep the loop in one function, raise\n"
-                "  SW_PROC_STACK, or see docs/notes/KNOWN_ISSUES.md.\n",
+                "  likely cause: deep NON-TAIL recursion, or a tail call through a lambda\n"
+                "  (module-function and self tail calls are TCO'd). Make the recursive\n"
+                "  call a tail call, raise SW_PROC_STACK, or see docs/notes/KNOWN_ISSUES.md.\n",
                 (unsigned long long)cur->pid, (size_t)(cur->stack_size / 1024));
             write(STDERR_FILENO, msg, len);
             signal(sig, SIG_DFL);
