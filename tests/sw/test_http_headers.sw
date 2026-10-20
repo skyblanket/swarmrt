@@ -41,7 +41,8 @@ fun header_loop() {
         {'http_request', conn, _method, _path, headers, _body} ->
             auth = case map_get(headers, "authorization") { 'nil' -> "<none>" v -> v }
             xt   = case map_get(headers, "x-test-header") { 'nil' -> "<none>" v -> v }
-            http_respond(conn, 200, "Content-Type: text/plain\r\n", auth ++ "|" ++ xt)
+            dup  = case map_get(headers, "x-dup") { 'nil' -> "<none>" v -> v }
+            http_respond(conn, 200, "Content-Type: text/plain\r\n", auth ++ "|" ++ xt ++ "|" ++ dup)
             header_loop()
         _other ->
             header_loop()
@@ -78,7 +79,8 @@ fun main() {
     # the server; the VALUE (mixed case) must come back intact.
     bearer = "Bearer secret-round-trip-token-42"
     custom = "telnyx-sig-abc123"
-    hdrs = [{"Authorization", bearer}, {"X-Test-Header", custom}]
+    hdrs = [{"Authorization", bearer}, {"X-Test-Header", custom},
+            {"X-Dup", "one"}, {"X-Dup", "two"}]
 
     body = get_retry("http://127.0.0.1:9131/auth", hdrs, 100)
     fails = 0
@@ -87,7 +89,7 @@ fun main() {
             print("FAIL http_headers_connect: http_get returned nil")
             fails = 1
         _ ->
-            expected = bearer ++ "|" ++ custom
+            expected = bearer ++ "|" ++ custom ++ "|one, two"
             fails = fails + assert_eq("http_headers_roundtrip", body, expected)
     }
 

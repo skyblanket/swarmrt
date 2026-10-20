@@ -482,9 +482,9 @@ static uint8_t *find_header_end(uint8_t *buf, uint32_t len) {
  * `map_get(headers, "authorization")` regardless of on-the-wire casing);
  * values are the raw field text with surrounding whitespace trimmed.
  *
- * A duplicate header name overwrites the earlier value via sw_val_map_put
- * (last wins) — adequate for auth/signature reads; combine-with-comma is not
- * required by any caller. Returns an empty map if there are no header lines.
+ * A duplicate header name is combined with the earlier value as
+ * "first, second" (RFC 9110 §5.3), so no occurrence is silently dropped.
+ * Returns an empty map if there are no header lines.
  * Never reads past hdr_end; never writes past the bounded stack temporaries. */
 static sw_val_t *http_parse_headers(const char *hdr_start, const char *hdr_end) {
     sw_val_t *map = sw_val_map_new(NULL, NULL, 0);
@@ -526,8 +526,15 @@ static sw_val_t *http_parse_headers(const char *hdr_start, const char *hdr_end) 
             value[vlen] = '\0';
 
             sw_val_t *k = sw_val_string(name);
+            sw_val_t *prev = sw_val_map_get(map, k);
+            if (prev && prev->type == SW_VAL_STRING) {
+                /* Duplicate name: append ", value" (truncating at the cap). */
+                char joined[SW_HTTP_MAX_HDR_VALUE];
+                snprintf(joined, sizeof(joined), "%s, %s", prev->v.str, value);
+                memcpy(value, joined, sizeof(value));
+            }
             sw_val_t *v = sw_val_string(value);
-            map = sw_val_map_put(map, k, v); /* last-wins on duplicate name */
+            map = sw_val_map_put(map, k, v);
             kept++;
         }
         /* Advance past CRLF. */
