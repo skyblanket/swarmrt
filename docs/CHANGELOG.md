@@ -26,6 +26,45 @@ mutations, no crash.
 tail calls flat, because its runaway was a ping/pong tail cycle. It now
 overflows with non-tail recursion, like `test_stack_overflow`.
 
+## 2026-10-20 — llm_request: structured errors, Retry-After retries, per-endpoint limiter
+
+**feat(llm): `llm_request(prompt, opts)`** returns `{'ok', %{content, finish_reason,
+usage, latency_ms, attempts}}` or `{'error', %{kind, status, retry_after_ms, body,
+attempts}}`. The HTTP status, `Retry-After` and the error body are kept, so a caller can
+tell a 429 from a 500, a timeout or a 400. A 400 comes back at once as `'bad_request'`,
+with its body, and is not retried. Only 408, 429, 5xx and transport failures are retried.
+A `Retry-After` is waited out exactly; other retries use exponential backoff with jitter,
+capped by `max_backoff_ms`. `timeout_ms` bounds the whole call, and a retry whose wait
+would pass it is not made.
+
+**feat(llm): `llm_limit(url_or_provider, opts)`** sets a per-endpoint limiter shared by
+every process on the node: `rpm` (paced, no burst), `tpm` (token bucket) and
+`max_concurrency` (adaptive, as in Inspect: a 429 cuts the cap to 0.8×, at most once per
+15 s, and each success adds one back). Counts per endpoint (requests, 429s, retries,
+timeouts, transport errors, average latency) appear in `swarm_stats()` under
+`llm_endpoints`.
+
+**Unchanged:** `llm_complete` keeps its string result, its own retries and its 5 s / 15 s
+`http_post` backoff. It does not use the limiter. Moving it onto `llm_request` is a
+follow-up, once callers are ready for the structured result.
+
+**Not done:** the caller's death does not cancel retries. A call that is still retrying
+when its caller dies runs to its own `timeout_ms` (or to the end of its retries).
+
+**Gates:** `tests/sw/test_llm_request.sw` (a 429 with `Retry-After: 1` twice then 200 gives
+`ok` with 3 attempts in about 2 s; a 400 is `bad_request`, not retried; `timeout_ms` cuts
+off a 60 s `Retry-After`; a refused connection is `transport`, retried; the telemetry
+reports it), and `tests/sw/test_llm_limit.sw` (`rpm: 60` with 120 concurrent callers takes
+about 2 minutes, with no burst above one request per second; `max_concurrency: 2` holds six
+callers to three waves).
+
+**Measured:** a local server answering 429 `Retry-After: 1` once per request. The old
+`llm_complete` path took 5.03 s per response (`http_post`'s fixed 5 s retry). `llm_request`
+took 1.03 s. This checkout has no `bench/rollout`, so the bench's 800-response run was
+not repeated; this local run is the stand-in.
+
+---
+
 ## 2026-10-20 — http_request takes an atom method; the request method is documented as an atom
 
 **fix(http): `http_request(url, %{method: 'POST'})` silently sent a GET.** The
