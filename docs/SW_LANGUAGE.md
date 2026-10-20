@@ -145,6 +145,8 @@ let DEFAULT_PAIR = {7, "seven"}
 
 Globals are read-only after initialization. Any assignment to a module-global name inside a function creates a local variable that shadows the global for that scope; the global itself is unchanged.
 
+Globals are initialized in declaration order, imported modules before the entry module. A global's value may read only the globals declared before it in its own module; reading a later one, or itself, is a compile error (`global 'A' is used before it is defined`). A global is in scope only in the module that declares it, and two modules may not declare the same global name.
+
 ---
 
 ## 3. Functions

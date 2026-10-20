@@ -7723,6 +7723,7 @@ typedef struct {
     const char *path;      /* file of the module being checked */
     int errors;
     node_t *mod;           /* the module being checked */
+    int init_global;       /* index of the global initialiser being checked, or -1 */
 } rs_ctx_t;
 
 static void rs_add(rs_scope_t *s, const char *name) {
@@ -7832,13 +7833,19 @@ static int rs_is_module_func(rs_ctx_t *c, const char *name) {
     return 0;
 }
 
+/* A bare global name is one of the module's own globals: codegen resolves
+ * globals per module, so another module's global is not in scope here. */
 static int rs_is_global(rs_ctx_t *c, const char *name) {
-    for (int m = 0; m < c->nmods; m++) {
-        node_t *mod = c->mods[m];
-        for (int i = 0; i < mod->v.mod.nglobals; i++)
-            if (strcmp(mod->v.mod.globals[i].name, name) == 0) return 1;
-    }
+    for (int i = 0; i < c->mod->v.mod.nglobals; i++)
+        if (strcmp(c->mod->v.mod.globals[i].name, name) == 0) return 1;
     return 0;
+}
+
+/* Index of `name` among the module's globals, or -1. */
+static int rs_global_index(rs_ctx_t *c, const char *name) {
+    for (int i = 0; i < c->mod->v.mod.nglobals; i++)
+        if (strcmp(c->mod->v.mod.globals[i].name, name) == 0) return i;
+    return -1;
 }
 
 /* Levenshtein distance, bounded input (identifiers). */
@@ -8019,6 +8026,17 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
     case N_IDENT: {
         const char *name = n->v.sval;
         if (strchr(name, '.') || strcmp(name, "_") == 0) return;
+        /* A global initialiser runs at load, in declaration order: it may not
+         * read its own global or a later one (the slot is still empty). */
+        if (c->init_global >= 0 && !rs_has(s, name)) {
+            int gi = rs_global_index(c, name);
+            if (gi >= c->init_global) {
+                c->errors++;
+                fprintf(stderr, "swc: %s:%d: global '%s' is used before it is defined\n",
+                        c->path ? c->path : "?", n->line, name);
+                return;
+            }
+        }
         if (rs_has(s, name) || rs_is_module_func(c, name) || rs_is_global(c, name)) return;
         int arity = rs_builtin_value_arity(name);
         if (arity > 0) { rs_wrap_builtin(n, name, arity); return; }
@@ -8026,12 +8044,17 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
         return;
     }
     case N_FUN: {
+        /* A lambda's body runs when called, not at load, so it may name a
+         * later global even inside a global initialiser. */
+        int saved_init = c->init_global;
+        c->init_global = -1;
         rs_scope_t inner = { NULL, 0, 0, s };
         for (int i = 0; i < n->v.fun.nparams; i++) rs_add(&inner, n->v.fun.params[i]);
         rs_binders(n->v.fun.body, &inner);
         rs_check(c, n->v.fun.body, &inner);
         for (int i = 0; i < 16; i++) if (n->v.fun.defaults[i]) rs_check(c, n->v.fun.defaults[i], s);
         free(inner.names);
+        c->init_global = saved_init;
         return;
     }
     case N_ASSIGN: rs_check(c, n->v.assign.value, s); return;
@@ -8102,7 +8125,7 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
 int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path) {
     node_t *mod = (node_t *)mod_ast;
     if (!mod || mod->type != N_MODULE) return 0;
-    rs_ctx_t c = { (node_t **)mods, nmods, path, 0, mod };
+    rs_ctx_t c = { (node_t **)mods, nmods, path, 0, mod, -1 };
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
         node_t *fn = mod->v.mod.funs[i];
         rs_scope_t top = { NULL, 0, 0, NULL };
@@ -8110,6 +8133,26 @@ int sw_resolve_module(void *mod_ast, void **mods, int nmods, const char *path) {
         rs_binders(fn->v.fun.body, &top);
         rs_check(&c, fn->v.fun.body, &top);
         for (int d = 0; d < 16; d++) if (fn->v.fun.defaults[d]) rs_check(&c, fn->v.fun.defaults[d], &top);
+        free(top.names);
+    }
+    /* Global initialisers, in declaration order. */
+    for (int g = 0; g < mod->v.mod.nglobals; g++) {
+        const char *gname = mod->v.mod.globals[g].name;
+        /* The interpreter keeps one global namespace for the whole program,
+         * so a name defined by two modules would be read from the wrong one. */
+        for (int m = 0; m < nmods; m++) {
+            node_t *o = (node_t *)mods[m];
+            if (!o || o == mod || o->type != N_MODULE) continue;
+            for (int i = 0; i < o->v.mod.nglobals; i++)
+                if (strcmp(o->v.mod.globals[i].name, gname) == 0) {
+                    c.errors++;
+                    fprintf(stderr, "swc: %s: global '%s' is also defined in module '%s'; rename one\n",
+                            path ? path : "?", gname, o->v.mod.name);
+                }
+        }
+        rs_scope_t top = { NULL, 0, 0, NULL };
+        c.init_global = g;
+        rs_check(&c, mod->v.mod.globals[g].val, &top);
         free(top.names);
     }
     return c.errors;

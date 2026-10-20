@@ -169,6 +169,7 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
     /* Merge every imported module's functions into the root module. */
     for (int a = 1; a < nmods; a++)
         merge_module_funs(root, (node_t *)mods[a], 1);
+    merge_module_globals(root, mods, nmods);
 
     /* Run main(). */
     sw_interp_t *interp = sw_lang_new(main_ast);

@@ -36,6 +36,12 @@ void path_dirname(const char *path, char *out, size_t outsz);
  * collisions. AST nodes are shared, not copied. */
 void merge_module_funs(node_t *dst, node_t *src, int qualify);
 
+/* Put the top-level `let` globals of every imported module (mods[1..nmods-1],
+ * load order) in front of dst's own, so the interpreter initialises them in
+ * the order codegen does: imported modules first, the entry module last.
+ * AST nodes are shared, not copied, as in merge_module_funs. */
+void merge_module_globals(node_t *dst, void **mods, int nmods);
+
 void import_ctx_init(import_ctx_t *c, const char *input_path, const char *lib_dir);
 void import_ctx_free(import_ctx_t *c);
 

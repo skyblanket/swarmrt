@@ -226,6 +226,24 @@ int load_imports(void **mods, const char **paths, int *nmods, int max,
     return conflicts;
 }
 
+/* Prepend the globals of mods[1..nmods-1] to dst's globals, keeping load
+ * order among the imports. Built back to front so the result reads
+ * imports first, dst last. */
+void merge_module_globals(node_t *dst, void **mods, int nmods) {
+    for (int a = nmods - 1; a >= 1; a--) {
+        node_t *src = (node_t *)mods[a];
+        int n = src->v.mod.nglobals, old = dst->v.mod.nglobals;
+        if (n == 0) continue;
+        dst->v.mod.globals = realloc(dst->v.mod.globals,
+                                     sizeof(*dst->v.mod.globals) * (size_t)(old + n));
+        memmove(&dst->v.mod.globals[n], dst->v.mod.globals,
+                sizeof(*dst->v.mod.globals) * (size_t)old);
+        memcpy(dst->v.mod.globals, src->v.mod.globals,
+               sizeof(*src->v.mod.globals) * (size_t)n);
+        dst->v.mod.nglobals = old + n;
+    }
+}
+
 /* Append `src`'s functions into `dst`. Each imported function is added
  * under its module-qualified name "Mod.fn" (so `Mod.fn(...)` call sites
  * resolve in the interpreter, which stores qualified calls as a single

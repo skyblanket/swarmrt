@@ -97,6 +97,7 @@ int sw_test_run_file(const char *path, const char *lib_dir) {
      * so each test's interpreter can call Mod.fn and the module's siblings. */
     for (int a = 1; a < nmods; a++)
         merge_module_funs(mod, (node_t *)mods[a], 1);
+    merge_module_globals(mod, mods, nmods);
 
     if (ntest == 0) {
         printf(C_DIM "=== %s ===" C_RESET "\n", path);
