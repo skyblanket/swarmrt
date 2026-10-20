@@ -440,8 +440,9 @@ The point is to surface real gaps — the first baseline run flagged several qui
 Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
 
 ```bash
-make swc libswarmrt              # compiler + runtime library only (you usually want this)
-make all                         # everything: compiler, library, examples, demos
+make                             # default goal (= make all): bin/swc + bin/libswarmrt.a
+make swc libswarmrt              # the same two targets, spelled out
+make examples                    # also compile the example programs in examples/
 make test-sw                     # sw-language tests
 make test-all                    # backward-compat alias for test-core
 make test-full                   # comprehensive gate (core + OTP + phases + search + tools)
