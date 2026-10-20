@@ -8,8 +8,11 @@ module Test_db_offload
 #
 # Two processes each run a ~1s recursive-CTE query on one shared handle. A
 # third process sleeps 100ms and reports when it woke. The timer must fire
-# well before either query finishes. The test must pass even with
-# SW_SCHEDULERS=2 (run it that way to exercise the bug's trigger).
+# well before either query finishes.
+#
+# The trigger needs every scheduler to hold a query, which depends on the
+# scheduler count (one per core by default), so the test re-runs itself with
+# SW_SCHEDULERS=2 — the same shape as test_blocking_section.
 
 fun busy(parent, h, i) {
     t0 = timestamp()
@@ -45,7 +48,7 @@ fun report(busy_ms, tick_ms, fails) {
     else { print("FAIL db_offload") ; sys_exit(1) }
 }
 
-fun main() {
+fun child() {
     h = db_open(":memory:")
     if (h < 0) { print("FAIL db_open") ; sys_exit(1) }
     t0 = timestamp()
@@ -53,4 +56,15 @@ fun main() {
     spawn(busy(self(), h, 2))
     spawn(tick(self(), t0))
     collect(3, 0, 0, 0)
+}
+
+fun main() {
+    if (getenv("SW_DB_OFFLOAD_CHILD") == "1") { child() }
+    else {
+        me = hd(os_args())
+        out = elem(shell("SW_DB_OFFLOAD_CHILD=1 SW_SCHEDULERS=2 '" ++ me ++ "' 2>&1"), 1)
+        print(string_trim(out))
+        if (string_contains(out, "OK db_offload 3/3")) { sys_exit(0) }
+        else { sys_exit(1) }
+    }
 }
