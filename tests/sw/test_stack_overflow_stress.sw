@@ -18,9 +18,10 @@ fun spawn_spinners(n) {
     else { spawn(spin(30000000)) ; spawn_spinners(n - 1) }
 }
 
-fun runaway_ping(n) { runaway_pong(n + 1) }
-fun runaway_pong(n) { runaway_ping(n + 1) }
-fun runaway() { runaway_ping(0) }
+# Non-tail recursion: mutual tail calls are optimized now, so a ping/pong
+# tail cycle would loop forever instead of overflowing.
+fun runaway_deep(n) { 1 + runaway_deep(n + 1) }
+fun runaway() { runaway_deep(0) }
 
 fun pause(ms) {
     receive {

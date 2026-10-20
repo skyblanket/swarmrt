@@ -687,6 +687,10 @@ static int http_chunk_size(const uint8_t *line, uint32_t len, uint64_t *out) {
     if (i == 0) return -400;
     if (i < len && line[i] != ';' && line[i] != ' ' && line[i] != '\t' && line[i] != '\r')
         return -400;
+    /* A CR is only valid as the last byte (the CRLF's CR): `5\rXYZ` is not
+     * a size line, and a front proxy may frame it differently. */
+    for (uint32_t j = i; j + 1 < len; j++)
+        if (line[j] == '\r') return -400;
     *out = v;
     return 0;
 }
@@ -812,6 +816,12 @@ static void http_try_parse(int cid, sw_port_t *port) {
     uint32_t content_length = 0;
     int has_content_length = 0;
     int is_chunked = 0;
+    /* Request-smuggling guards (RFC 9112 §6): bad_framing is set for a
+     * Transfer-Encoding we can't decode, for Content-Length values that
+     * disagree or aren't digits, and for TE and CL together. Such a request
+     * is refused with a 400 and the connection closed, so a proxy in front
+     * of us can't disagree with us about where the next request starts. */
+    int has_te = 0, te_last_chunked = 0, bad_framing = 0;
     int keep_alive = (strstr(version, "1.1") != NULL) ? 1 : 0; /* HTTP/1.1 default */
     /* For the WS Origin check. An over-long value is kept truncated, which
      * can only fail to match (i.e. fails closed). */
@@ -851,16 +861,34 @@ static void http_try_parse(int cid, sw_port_t *port) {
         if (strncasecmp(line, "Content-Length:", 15) == 0) {
             char *val = line + 15;
             while (*val == ' ' || *val == '\t') val++;
-            content_length = (uint32_t)strtoul(val, NULL, 10);
+            char *num_end = val;
+            while (num_end < line_end && *num_end >= '0' && *num_end <= '9') num_end++;
+            char *rest = num_end;
+            while (rest < line_end && (*rest == ' ' || *rest == '\t')) rest++;
+            uint32_t v = (uint32_t)strtoul(val, NULL, 10);
+            if (num_end == val || rest != line_end ||
+                (has_content_length && v != content_length))
+                bad_framing = 1;
+            content_length = v;
             has_content_length = 1;
         }
         if (strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
-            char *val = line + 18;
-            while (*val == ' ' || *val == '\t') val++;
-            /* RFC 7230: chunked is always the last (or only) coding */
-            if (strncasecmp(val, "chunked", 7) == 0 ||
-                (line_end - val >= 7 && strncasecmp(line_end - 7, "chunked", 7) == 0)) {
-                is_chunked = 1;
+            /* A comma list of codings, possibly over several header lines.
+             * Only a lone `chunked` is supported: anything after it breaks
+             * the framing (RFC 9112 §6.1), and a coding before it (gzip,
+             * chunked) would hand the handler bytes we never decoded. */
+            char *p = line + 18;
+            has_te = 1;
+            while (p < line_end) {
+                while (p < line_end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+                if (p >= line_end) break;
+                char *tok = p;
+                while (p < line_end && *p != ',') p++;
+                char *tend = p;
+                while (tend > tok && (tend[-1] == ' ' || tend[-1] == '\t')) tend--;
+                int is_ch = (tend - tok == 7 && strncasecmp(tok, "chunked", 7) == 0);
+                if (te_last_chunked || !is_ch) bad_framing = 1;
+                te_last_chunked = is_ch;
             }
         }
         if (strncasecmp(line, "Origin:", 7) == 0 ||
@@ -885,6 +913,20 @@ static void http_try_parse(int cid, sw_port_t *port) {
         }
 
         line = line_end + 2;
+    }
+
+    if (has_te) {
+        if (!te_last_chunked) bad_framing = 1;   /* gzip etc.: can't frame it */
+        if (has_content_length) bad_framing = 1; /* CL + TE: classic smuggling */
+        is_chunked = !bad_framing;
+    }
+    if (bad_framing) {
+        fprintf(stderr,
+            "swarmrt_http: rejecting %s %s on conn %d — ambiguous body framing "
+            "(Transfer-Encoding / Content-Length)\n", method, path, cid);
+        c->keep_alive = 0;
+        sw_http_respond(cid, 400, NULL, "Bad Request");
+        return;
     }
 
     /* Reject oversized declared bodies up front with a 413 instead of
