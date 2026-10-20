@@ -8,23 +8,6 @@ a repro, impact, and current hypothesis.
 These are genuine limitations, not crashes. Each is reproducible with the
 shipped `bin/swc`.
 
-### Interpreter (`swc run`) first-spawn scheduling flake on constrained hosts
-
-On the tree-walking `swc run` path (single cooperative scheduler), the FIRST
-`spawn(closure_value)` in a fresh runtime occasionally does not schedule its
-child, so the child's effect never appears even after ~1s of polling.
-Subsequent spawns in the same run are unaffected — it looks like a
-cold-scheduler race on the very first fiber.
-
-**Impact:** interpreter/dev path only — the COMPILED path (the shipping
-product) is unaffected and runs the child every time. **Repro:** only observed
-on the 2-core GitHub-hosted Linux CI runner; NOT reproducible locally
-(`test_spawn_value` interp passes 100/100 on multi-core macOS, even under load).
-**Hypothesis:** a first-spawn/runqueue initialization race that only surfaces
-under heavy core contention. **Workaround (in `tests/sw/run/test_spawn_value.sw`):**
-re-spawn the idempotent closure if its effect hasn't appeared. A real fix needs
-a Linux repro host to bisect the interp scheduler's first-fiber enqueue.
-
 ### Interpreter non-tail recursion is bounded
 
 The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see
@@ -82,6 +65,17 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### Interpreter `spawn(closure)` child's ETS write was lost (cleared 2026-10-20)
+
+Reported as a first-spawn scheduling flake, but the scheduler was not at fault. The
+child did run; its `ets_put` stored the key and value as pointers into the child's own
+per-process arena, which is freed when the child exits. The interpreter's ETS did not
+deep-copy into the global heap the way the compiled path does, so the parent later read
+a dangling key that never matched (`ets_get` returned nil). It reproduced on a 2-core
+Linux host with `taskset -c 0,1`, depending on allocator reuse. The interpreter ETS now
+copies keys and values in on write, copies out on read/take, and frees on
+replace/delete/drop. `tests/sw/run/test_spawn_value.sw` no longer re-spawns.
 
 ### Building a map one key at a time was quadratic (cleared 2026-09-27)
 
