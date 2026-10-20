@@ -207,7 +207,7 @@ fun main() {
 }
 ```
 
-**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
+**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame, and a deep chain overflows the default 128KB per-process stack. That raises a recoverable per-process `stack overflow` panic (links, monitors and supervisors see the exit); raise the limit with `SW_PROC_STACK` (e.g. `SW_PROC_STACK=1m`). Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
 
 Multi-statement function bodies are fine; statements are separated by newlines (no `;` needed):
 
@@ -817,7 +817,7 @@ Needs `import Chrome` (a battery; see §2).
 | `process_list()` | all live pids |
 | `registered()` | all registered `{name, pid}` pairs |
 | `swarm_stats()` | node-level metrics map: `processes` (live), `schedulers`, `spawns` / `crashes` / `restarts` (monotonic since boot), `mailbox_dropped` / `msgsize_dropped` (cap-drop counters), `overflow_queue`, and `scheduler_stats` — a per-scheduler list of `%{id, procs_run, loop_iters, idle_waits, steals}` |
-| `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Works under `swc run` too, once imported (see note below). |
+| `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Works under `swc run` once imported (see note below). |
 | `import Health` → `Health.start(port)` / `Health.serve(port)` | operator liveness/readiness HTTP endpoint: `/healthz` → 200 `"ok"`, `/readyz` → 200 `swarm_stats()` as JSON, 404 elsewhere. `start` spawns the server (returns its pid); `serve` runs it in the calling process (blocks). See `examples/health_endpoint.sw`. Compiled-only. |
 | `pid_alive(os_pid)` | `'true'` if the OS process (integer pid from `subprocess_spawn`) is still running, `'false'` if it has exited. Uses `kill(pid, 0)` — no signal sent. Does **not** take sw actor pids returned by `spawn()`. |
 | `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |
@@ -830,7 +830,7 @@ Needs `import Chrome` (a battery; see §2).
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
-> **Under `swc run`.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work. The `Swarm` library works too, but only after `import Swarm`; without the import, `Swarm.top()` fails with `undefined function`. These builtins are stubbed in the interpreter and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, the `tool_*` registry below, `http_listen`, `http_respond`, the `ws_*` and `wsc_*` socket calls, `chrome_launch`, `telemetry_*`, and `pubsub_*`. The first stub call prints a short note on stderr; later stub calls are silent. For those, run `swc build file.sw -o bin/x && bin/x`.
+> **Process primitives by mode.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work there, and `Swarm` works once imported. Under `swc test` and the REPL no runtime is booted: `spawn` fails with `spawn failed: process table full`, `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function`. Under all three modes the stubbed builtins print a note on stderr and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, the `tool_*` registry below, `http_listen`, `http_respond`, the `ws_*` and `wsc_*` socket calls, `chrome_launch`, `telemetry_*`, and `pubsub_*`. For full semantics of any of these, run `swc build file.sw -o bin/x && bin/x`.
 
 ### Tool registry — self-defined, hot-loaded tools
 An agent can write a new tool *as `sw` source at runtime* and call it live, with no restart — the source is parsed and run by the interpreter that ships inside every compiled binary. The tool's entry function is `run`.
@@ -1158,7 +1158,7 @@ bin/swc build src/main.sw -o bin/program
 # Optimised + obfuscated build
 bin/swc build src/main.sw -o bin/program -O --obfusc --strip
 
-# Run a .sw file directly without producing a binary (interpret + JIT)
+# Run a .sw file directly without producing a binary (interpreter)
 bin/swc run my_program.sw
 
 # Run sw interpreter tests (point at a file or directory of test_*.sw files)
