@@ -303,6 +303,10 @@ static size_t g_env_proc_stack = 0;
 /* GC v2: region handed to the next sw_spawn_opts to record on the child's
  * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
 static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
+/* Usable stack for the next sw_spawn_root only (0 = use the defaults). Same
+ * thread-local, consumed-at-spawn shape as the region above: it never touches
+ * the global sw_proc_stack_size, which scheduler threads read concurrently. */
+static __thread size_t g_pending_spawn_stack = 0;
 
 /* Per-process teardown hook handed to the next sw_spawn_opts to record on the
  * child's proc->on_destroy BEFORE it is runnable — so even a pre-trampoline kill
@@ -846,8 +850,9 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
          * sets sw_proc_stack_size large (like the 8MB OS main thread it used
          * to run on) BEFORE sw_init. Lazy mmap means physical = touched pages,
          * so a large reservation costs nothing for shallow programs. */
-        size_t usable = sw_proc_stack_size ? sw_proc_stack_size
-                      : g_env_proc_stack   ? g_env_proc_stack
+        size_t usable = g_pending_spawn_stack ? g_pending_spawn_stack
+                      : sw_proc_stack_size   ? sw_proc_stack_size
+                      : g_env_proc_stack     ? g_env_proc_stack
                       : (size_t)SW_PROC_STACK_SIZE;
 #ifdef _WIN32
         long page_size = 4096;
@@ -2349,6 +2354,13 @@ sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_ar
     g_pending_spawn_region = region;
     sw_process_t *p = sw_spawn_opts(entry, arg, SW_PRIO_NORMAL);
     g_pending_spawn_region = NULL;   /* clear if spawn failed before consuming */
+    return p;
+}
+
+sw_process_t *sw_spawn_root(void (*entry)(void*), void *arg, size_t stack_size) {
+    g_pending_spawn_stack = stack_size;
+    sw_process_t *p = sw_spawn_opts(entry, arg, SW_PRIO_NORMAL);
+    g_pending_spawn_stack = 0;       /* only the root takes this size */
     return p;
 }
 

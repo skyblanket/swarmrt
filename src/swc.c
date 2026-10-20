@@ -489,9 +489,7 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
     sw_io_init();
     sw_install_shutdown_signals();   /* SIGTERM/SIGINT → graceful drain (Phase 4) */
     /* Root gets the deep stack; spawned interpreter processes keep 8MB. */
-    sw_proc_stack_size = SW_ROOT_STACK_SIZE;
-    sw_spawn(run_main_entry, &boot);
-    sw_proc_stack_size = 8 * 1024 * 1024;
+    sw_spawn_root(run_main_entry, &boot, SW_ROOT_STACK_SIZE);
 
     /* Wait for the root process's main() to return (set by run_main_entry) OR
      * a SIGTERM/SIGINT to request shutdown, whichever first. An abnormal root

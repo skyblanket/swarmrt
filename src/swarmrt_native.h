@@ -789,6 +789,9 @@ void **sw_self_try_chain(void);
  * until the child's trampoline adopts it. Reclaimed by process_destroy if the
  * child dies pre-trampoline; on spawn failure (NULL) the caller reclaims it. */
 sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_arena *region);
+/* Spawn the ROOT process (the program's main) with `stack_size` usable stack
+ * instead of the default. Does not change the global sw_proc_stack_size. */
+sw_process_t *sw_spawn_root(void (*entry)(void*), void *arg, size_t stack_size);
 /* Spawn with a per-process teardown hook recorded BEFORE the child is runnable
  * (proc->on_destroy = dtor, on_destroy_arg = arg), so even a pre-trampoline kill
  * reclaims `arg` via process_destroy. dtor(arg) frees the spawn arg. On spawn
