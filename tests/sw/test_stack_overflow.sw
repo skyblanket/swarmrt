@@ -26,7 +26,11 @@ fun tick_loop(n) {
 
 fun ping(n) { pong(n + 1) }
 fun pong(n) { ping(n + 1) }
-fun runaway() { ping(0) }
+fun runaway() {
+    # Wait until the parent has linked us. Overflowing before link() loses the
+    # reason string: a link to an already-dead process sees only the int code.
+    receive { 'go' -> ping(0) }
+}
 
 fun main() {
     failures = 0
@@ -40,6 +44,7 @@ fun main() {
     trap_exit('true')
     w = spawn(runaway())
     link(w)
+    send(w, 'go')
     got = receive {
         {'EXIT', _, reason} -> reason
         after 30000 { 'no_exit' }
