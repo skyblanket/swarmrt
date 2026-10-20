@@ -105,16 +105,16 @@ fun reset(t, conn, body) {
 
 fun handle(t, conn, method, path, body) {
     cond {
-        method == "POST" && path == "/v1/chat/completions" -> chat(t, conn, body)
-        method == "GET" && path == "/stats" -> stats(t, conn)
-        method == "POST" && path == "/reset" -> reset(t, conn, body)
+        method == 'POST' && path == "/v1/chat/completions" -> chat(t, conn, body)
+        method == 'GET' && path == "/stats" -> stats(t, conn)
+        method == 'POST' && path == "/reset" -> reset(t, conn, body)
         _ -> http_respond(conn, 404, json_headers(), "{\"error\":{\"message\":\"not found\"}}")
     }
 }
 
 fun loop(t) {
     receive {
-        {'http_request', conn, method, path, _h, body} ->
+        {'http_request', conn, method, path, _h, body} ->   # method is an atom: 'GET', 'POST'
             spawn(handle(t, conn, method, path, body))   # one process per request
             loop(t)
         _ -> loop(t)
