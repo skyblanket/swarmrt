@@ -1,5 +1,5 @@
 {
-  "_comment": "A PR's tier is the strictest among its files (first matching tier per file; any 'human' wins). src/swarmrt_lang.c is the interpreter, including builtins that fork/exec, so it stays in the runtime tier until the gate has a track record.",
+  "_comment": "A PR's tier is the strictest among its files (first matching tier per file; any 'human' wins). src/swarmrt_lang.c is the interpreter, including builtins that fork/exec, so it stays in the runtime tier until the gate has a track record. CI by tier: docs need quickstart only; sw tests and language changes need quickstart, macos and fuzz; runtime C and other tests need all four (the top-level list). The workflow skips the jobs a tier doesn't need.",
   "build": "make swc libswarmrt",
   "suite": "make test-sw",
   "test_runners": [
@@ -39,14 +39,22 @@
         "README.md",
         "examples/"
       ],
-      "merge": "auto"
+      "merge": "auto",
+      "required_checks": [
+        "quickstart"
+      ]
     },
     {
       "name": "tests",
       "paths": [
-        "tests/"
+        "tests/sw/"
       ],
-      "merge": "auto"
+      "merge": "auto",
+      "required_checks": [
+        "quickstart",
+        "macos",
+        "fuzz"
+      ]
     },
     {
       "name": "language",
@@ -58,7 +66,19 @@
       "merge": "auto",
       "extra": [
         "./tests/sw/run_conform.sh"
+      ],
+      "required_checks": [
+        "quickstart",
+        "macos",
+        "fuzz"
       ]
+    },
+    {
+      "name": "tests-other",
+      "paths": [
+        "tests/"
+      ],
+      "merge": "auto"
     },
     {
       "name": "runtime",
