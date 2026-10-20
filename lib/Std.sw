@@ -15,11 +15,12 @@ export [
     zip, unzip, partition, group_by, sort, sort_by, reverse,
     flatten, unique, contains, find, any, all, count, last, init,
     chunk_every, intersperse, max_by, min_by, sum, product,
+    reduce, reduce_while,
     # map / filter / reduce are GLOBAL builtins; Std.map / Std.filter /
-    # Std.join also work because that's what an Elixir-shaped guess
-    # reaches for, and the miss used to surface as a raw linker error.
-    # (No Std.reduce — sum/product call the global `reduce` bare, and a
-    # same-named module fun would shadow it.) join == string_join.
+    # Std.reduce / Std.join also work because that's what an Elixir-shaped
+    # guess reaches for, and the miss used to surface as a raw linker error.
+    # sum/product don't call the global `reduce` bare (they use _reduce_acc),
+    # so Std.reduce can shadow it inside this module. join == string_join.
     map, filter, join,
     # ---- map ops ----
     map_each, map_filter,
@@ -273,11 +274,31 @@ fun _min_by_acc(lst, key_fn, best, best_key) {
     }
 }
 
+# reduce(lst, init, fn(acc, x)) — left fold. Returns init for an empty list.
+# Tail-recursive, so a long list runs in flat stack.
+fun reduce(lst, init, f) { _reduce_acc(lst, init, f) }
+fun _reduce_acc(lst, acc, f) {
+    if (length(lst) == 0) { acc }
+    else { _reduce_acc(tl(lst), f(acc, hd(lst)), f) }
+}
+
+# reduce_while(lst, init, fn(acc, x)) — like reduce, but fn returns
+# {'cont', acc} to keep going or {'halt', acc} to stop early.
+fun reduce_while(lst, init, f) { _reduce_while_acc(lst, init, f) }
+fun _reduce_while_acc(lst, acc, f) {
+    if (length(lst) == 0) { acc }
+    else {
+        step = f(acc, hd(lst))
+        if (elem(step, 0) == 'halt') { elem(step, 1) }
+        else { _reduce_while_acc(tl(lst), elem(step, 1), f) }
+    }
+}
+
 # sum(lst) — assumes numeric elements.
-fun sum(lst) { reduce(fun(acc, x) { acc + x }, lst, 0) }
+fun sum(lst) { _reduce_acc(lst, 0, fun(acc, x) { acc + x }) }
 
 # product(lst) — assumes numeric elements.
-fun product(lst) { reduce(fun(acc, x) { acc * x }, lst, 1) }
+fun product(lst) { _reduce_acc(lst, 1, fun(acc, x) { acc * x }) }
 
 # ============================================================
 # MAP OPS — sw maps are immutable; helpers return new maps.
@@ -306,7 +327,7 @@ fun _map_filter(ks, m, pred, acc) {
 # STRING OPS
 # ============================================================
 
-# Std.map / Std.filter / Std.reduce — the global builtins exist, but
+# Std.map / Std.filter — the global builtins exist, but
 # Std.map / Std.filter is what an Elixir-shaped guess reaches for, and
 # the miss used to die as a raw linker error. Self-contained (not
 # delegating to the same-named builtin) and order-tolerant like the

@@ -215,6 +215,23 @@ fun main() {
 }
 ```
 
+**Folds**: `Std.reduce(lst, init, fn(acc, x))` is a left fold; it returns `init` for an empty list and is tail-recursive, so long lists are fine. `Std.reduce_while` is the same, but `fn` returns `{'cont', acc}` to keep going or `{'halt', acc}` to stop early.
+
+```sw
+module LoopReduce
+import Std
+export [main]
+
+fun main() {
+    nums = [1, 2, 3, 4]
+    print(Std.reduce(nums, 0, fn(acc, x) { acc + x }))    # => 10
+    print(Std.reduce([], 42, fn(acc, x) { acc + x }))     # => 42
+    print(Std.reduce_while(nums, 0, fn(acc, x) {
+        if (acc + x > 4) { {'halt', acc} } else { {'cont', acc + x} }
+    }))                                                   # => 3
+}
+```
+
 **Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame, and a deep chain overflows the default 128KB per-process stack. That raises a recoverable per-process `stack overflow` panic (links, monitors and supervisors see the exit); raise the limit with `SW_PROC_STACK` (e.g. `SW_PROC_STACK=1m`). Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
 
 Multi-statement function bodies are fine; statements are separated by newlines (no `;` needed):
