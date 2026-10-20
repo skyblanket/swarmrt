@@ -7801,15 +7801,12 @@ static int rs_builtin_value_arity(const char *name) {
 /* Rewrite the identifier node `n` (a builtin used as a value) in place into
  * the anonymous lambda `fun(_p0, ..) { name(_p0, ..) }`. Both backends then
  * see an ordinary closure, so the interpreter and codegen agree by
- * construction. The name is copied out first: `n->v.sval` shares storage with
- * the fields being overwritten. */
+ * construction. The callee name is copied into the new call node before
+ * `n->v` is cleared, since `name` may point into `n->v.sval`. */
 static void rs_wrap_builtin(node_t *n, const char *name, int arity) {
-    char bname[128];
-    snprintf(bname, sizeof(bname), "%s", name);
-
     node_t *call = mknode(N_CALL, n->line);
     call->v.call.func = mknode(N_IDENT, n->line);
-    snprintf(call->v.call.func->v.sval, sizeof(call->v.call.func->v.sval), "%s", bname);
+    snprintf(call->v.call.func->v.sval, sizeof(call->v.call.func->v.sval), "%s", name);
     call->v.call.nargs = arity;
     call->v.call.args = calloc((size_t)arity, sizeof(node_t *));
 
