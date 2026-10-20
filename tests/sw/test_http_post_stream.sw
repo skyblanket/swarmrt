@@ -68,9 +68,23 @@ fun sse_no_index() {
 
 # Server: route by path so one listener can serve several SSE fixtures and a
 # 404 case in one test run.
-fun serve(port) {
-    http_listen(port)
-    serve_loop()
+fun serve(parent, port) {
+    if (http_listen(port) == 'ok') {
+        send(parent, {'listening', port})
+        serve_loop()
+    } else {
+        send(parent, 'busy')
+    }
+}
+
+# Binds the first free port at or above `port`: a fixed port can be held by
+# another test run on the same host (see test_http_port_free.sw).
+fun start_server(port, tries) {
+    spawn(serve(self(), port))
+    receive {
+        {'listening', bound} -> bound
+        'busy' -> if (tries <= 1) { 0 } else { start_server(port + 1, tries - 1) }
+    }
 }
 
 fun serve_loop() {
@@ -140,11 +154,9 @@ fun main() {
         print("OK test_http_post_stream 0/0 (SKIP: needs >=2 schedulers — blocking client + in-process server)")
         sys_exit(0)
     }
-    port = 9131
+    port = start_server(9131, 50)
     base = f"http://127.0.0.1:{port}"
     body = json_encode(%{model: "stub", stream: 'true', messages: []})
-
-    spawn(fun() { serve(port) })
     fails = 0
 
     # 1. "data: " (with space) — success, content accumulates across deltas.
@@ -179,7 +191,8 @@ fun main() {
     }
 
     # 4. Connection refused on a dead port — tagged {'error, "curl exit ..."}.
-    r4 = http_post_stream(f"http://127.0.0.1:9132/dead",
+    # Well clear of the server's fallback range, so the server never binds it.
+    r4 = http_post_stream(f"http://127.0.0.1:{port + 1000}/dead",
                           [{"Content-Type", "application/json"}], body)
     case r4 {
         {'ok', _j4} ->
