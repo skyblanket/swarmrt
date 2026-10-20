@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # Full CMake build, so a CMake-only break (a source missing from
-# CMakeLists.txt, a link error only the CMake leg hits) fails the build
-# instead of surfacing on the Windows/MinGW path. Runs from the Makefile's
-# `check-cmake` target, which `make swc` and `make libswarmrt` depend on,
-# so CI's Linux quickstart job exercises it.
+# CMakeLists.txt, a link error only the CMake leg hits) is caught here
+# instead of on the Windows/MinGW path. Run it with `make check-cmake`.
 #
-# Linux only: the macOS leg does not run CMake. Without cmake, a local
-# build skips with a warning; CI (GitHub Actions sets CI=true) fails.
+# Linux only: the macOS leg does not run CMake. Without cmake this fails
+# rather than skipping, because a skipped check looks like a passing one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,12 +13,8 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 
 if ! command -v cmake >/dev/null 2>&1; then
-    if [ -n "${CI:-}" ]; then
-        echo "error: cmake not found; the CMake build check cannot run in CI" >&2
-        exit 1
-    fi
-    echo "warning: cmake not found; skipping the CMake build check" >&2
-    exit 0
+    echo "error: cmake not found; install cmake to run the CMake build check" >&2
+    exit 1
 fi
 
 # bin/ is shared with the Makefile, and CMake writes swc there too. That is

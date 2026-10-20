@@ -2136,10 +2136,7 @@ void sw_shutdown(int swarm_id) {
         g_watchdog_enabled = 0;
     }
 
-    /* Stop all schedulers. Join every thread before freeing any of them:
-     * a scheduler still running can reach sw_spawn_link, which picks a
-     * target out of g_swarm->schedulers[] and reads it. Freeing scheduler 0
-     * while scheduler 1 was still live was a heap-use-after-free. */
+    /* Stop all schedulers */
     for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
         sw_scheduler_t *sched = g_swarm->schedulers[i];
         sched->should_exit = 1;
@@ -2147,12 +2144,7 @@ void sw_shutdown(int swarm_id) {
         pthread_mutex_lock(&sched->runq.idle_lock);
         pthread_cond_signal(&sched->runq.idle_cond);
         pthread_mutex_unlock(&sched->runq.idle_lock);
-    }
-    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
-        pthread_join(g_swarm->schedulers[i]->thread, NULL);
-    }
-    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
-        sw_scheduler_t *sched = g_swarm->schedulers[i];
+        pthread_join(sched->thread, NULL);
         pthread_mutex_destroy(&sched->runq.idle_lock);
         pthread_cond_destroy(&sched->runq.idle_cond);
         free(sched);

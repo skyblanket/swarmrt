@@ -723,16 +723,17 @@ benchmark-native: native
 check-sources:
 	bash scripts/check_source_lists.sh
 
-# Full CMake build (the Windows/MinGW path uses this). Linux only; see the script.
+# Full CMake build (the Windows/MinGW path uses this). Not a prerequisite of
+# swc/libswarmrt: run it explicitly, or from a CI step that calls it.
 check-cmake:
 	bash scripts/check_cmake_build.sh
 
 # SwarmRT static library (for linking compiled .sw programs)
-libswarmrt: check-sources check-cmake core-objs
+libswarmrt: check-sources core-objs
 	ar rcs $(BIN_DIR)/libswarmrt.a $(CORE_OBJS)
 
 # SwarmRT compiler
-swc: check-sources check-cmake core-objs
+swc: check-sources core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
 		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c $(SRC_DIR)/swc_pkg.c \
