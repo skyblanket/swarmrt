@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "swarmrt_lang.h"
+#include "swarmrt_codegen.h"
 #include "swc_imports.h"
 #include "swc_pkg.h"
 #include <limits.h>
