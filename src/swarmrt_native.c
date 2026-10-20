@@ -2765,14 +2765,16 @@ void sw_send(sw_process_t *to, void *msg) {
     m->next = NULL;
     m->prev = NULL;
 
+    /* Count before the push: the receiver may read our counters as soon as
+     * the message is visible, before this function returns. */
+    if (tls_current) tls_current->messages_sent++;
+
     /* Lock-free MPSC push */
     mailbox_push(&to->mailbox, m);
     trev(TREV_PUSH, to->pid, m->from_pid);
 
     /* Wake if waiting (lock-free) */
     mailbox_wake(to);
-
-    if (tls_current) tls_current->messages_sent++;
 }
 
 void *sw_receive(uint64_t timeout_ms) {
@@ -3799,11 +3801,13 @@ static void send_tagged_internal(sw_process_t *to, uint64_t tag, void *msg,
     m->prev = NULL;
     /* region=NULL, pkind=SW_PK_RAW already set by msg_alloc — RAW payload path. */
 
+    /* Count before the push: the receiver may read our counters as soon as
+     * the message is visible, before this function returns. */
+    if (tls_current) tls_current->messages_sent++;
+
     /* Lock-free MPSC push + wake */
     mailbox_push(&to->mailbox, m);
     mailbox_wake(to);
-
-    if (tls_current) tls_current->messages_sent++;
 }
 
 void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
@@ -3860,10 +3864,12 @@ void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
     m->region = region;
     m->pkind = SW_PK_VALUE;
 
+    /* Count before the push, as in sw_send: the receiver may read our
+     * counters as soon as the message is visible. */
+    if (tls_current) tls_current->messages_sent++;
+
     mailbox_push(&to->mailbox, m);
     mailbox_wake(to);
-
-    if (tls_current) tls_current->messages_sent++;
 }
 
 /*
