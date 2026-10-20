@@ -17,6 +17,7 @@
 set -u
 REPO="${SWARMRT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
 cd "$REPO" || { echo "VERDICT: FAIL (no repo at $REPO)"; exit 99; }
+. "$REPO/scripts/gate_common.sh"
 
 SW="${1:?usage: gc_slope.sh <probe.sw> <low> <high> <budget_mb> [tag]}"
 LOW="${2:?need low count}"; HIGH="${3:?need high count}"; BUDGET="${4:?need budget_mb}"
@@ -28,6 +29,10 @@ TIMER=""
 if /usr/bin/time -v true >/dev/null 2>&1; then TIMER="gnu"
 elif /usr/bin/time -l true >/dev/null 2>&1; then TIMER="bsd"
 elif command -v gtime >/dev/null 2>&1; then TIMER="gtime"; fi
+gate_print_limits "$(basename "$SW")"
+if [ -z "$TIMER" ]; then
+  echo "VERDICT: FAIL (missing prerequisite: no peak-RSS timer — install GNU 'time', e.g. sudo apt-get install time)"; exit 1
+fi
 
 # Run the probe at <count>; echo its peak RSS in KB on a clean run (exit 0 +
 # PROBE_OK), else echo "FAIL:<reason>". RSS is parsed per the detected timer.

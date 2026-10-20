@@ -21,6 +21,8 @@
 
 set -u
 SWARMRT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$SWARMRT_ROOT/scripts/gate_common.sh"
+gate_print_limits spin-wedge-hunt
 SWC="$SWARMRT_ROOT/bin/swc"
 BIN="$SWARMRT_ROOT/tests/stress/.build/spin_wedge_probe"
 RUNS="${RUNS:-40}"
