@@ -1,8 +1,9 @@
 # Swarm.sw — live introspection: see the processes you spawned and how they're
 # supervised. Pure-sw over the process_list / process_info / registered builtins.
 #
-# Under `swc run` the process_list / process_info / registered builtins return
-# live data, so Swarm.top()/tree() work there too.
+# Compiled-only in practice: under `swc run` the import does not load
+# (Swarm.top/0 is undefined), though the process_list / process_info /
+# registered builtins themselves return live data there.
 
 module Swarm
 

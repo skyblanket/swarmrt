@@ -476,7 +476,7 @@ Swarm.print_tree()   # prints an indented tree, returns the root count
 
 `top()` is a flat snapshot; `tree()` reconstructs the hierarchy from each process's parent link (set by `spawn_link` / the supervisors), so a worker started with `sup_start_child` shows up nested under its supervisor. Use it to drive a LiveView dashboard, log a periodic census, or just answer "what's alive and who's supervising it?" while debugging.
 
-It's a thin pure-sw library over the `process_list` / `process_info` builtins. Under `swc run` those builtins return live data, so `Swarm.top()` and `Swarm.print_tree()` work there too. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
+It's a thin pure-sw library over the `process_list` / `process_info` builtins. Under `swc run` those builtins return live data, but the `Swarm` import does not load there (`Swarm.top()` fails with `undefined function`), so call `Swarm.*` from a `swc build` binary. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
 
 ---
 
