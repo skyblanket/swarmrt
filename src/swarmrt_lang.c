@@ -2662,21 +2662,14 @@ sw_val_t *sw_now_iso(void) {
  * Rebuild the whole value DAG on the global heap so it survives the source
  * process's arena being freed. No memoization: there are no cycles (all
  * constructors build bottom-up) and DAG-shared subvalues copy as a tree, so
- * the result is alias-free and sw_val_free can recurse it safely. A depth
- * cap (matching the marshal/json limits) guards pathological nesting against
- * fiber-stack overflow.
+ * the result is alias-free and sw_val_free can recurse it safely. The walk is
+ * iterative (an explicit frame stack, no depth cap), so nesting depth is
+ * bounded by memory, never by the fiber's C stack, and nothing is truncated.
  *
  * PIDs copy by value (the slab pointer outlives any one process). Compiled
  * closures (cfunc + captures) copy the cfunc and deep-copy each capture;
- * interpreter closures (body AST + closure_env) never reach here (they exist
- * only in the single-process interpreter, which has no arena to free). */
-#define SW_COPY_MAX_DEPTH 256
-
-/* Set while the interpreter ETS copies a value (_interp_vets_store/_out): a
- * stored value must come back whole, so no depth cap. The runtime already
- * recurses over the same nesting in sw_val_free and equality, so this adds
- * no new limit. */
-static __thread int g_copy_uncapped = 0;
+ * interpreter closures (body AST + closure_env) share the AST and hold a ref
+ * on the env, so they are never walked. */
 
 /* === Deep-copy context ===
  * One per top-level deep copy (thread-local, nestable). `memo` maps a source
@@ -2762,13 +2755,73 @@ static sw_val_t *fresh_scalar(sw_val_t *v) {
     return r;
 }
 
-static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
 static void env_retain(sw_env_t *e);
 
-static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
+/* Containers have children to walk. An interpreter closure (body set) shares
+ * its AST and has none. */
+static int dc_is_container(const sw_val_t *v) {
+    return v->type == SW_VAL_TUPLE || v->type == SW_VAL_LIST ||
+           v->type == SW_VAL_MAP || (v->type == SW_VAL_FUN && !v->v.fun.body);
+}
+
+/* Leaves (scalars, strings, bytes, pids): nothing to recurse into. */
+static sw_val_t *deep_copy_leaf(sw_val_t *v) {
+    switch (v->type) {
+    case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
+    case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
+    case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
+    case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
+    case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
+    case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
+    case SW_VAL_PID:    return sw_val_pid_id(v->v.pidv.ptr, v->v.pidv.id);
+    case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
+    case SW_VAL_FUN: {
+        /* Interpreter closure: share its AST, and hold a ref on its env so the
+         * env outlives the frame that built the closure. */
+        sw_val_t *r = val_alloc(sizeof(sw_val_t));
+        r->type = SW_VAL_FUN;
+        r->v.fun.name = v->v.fun.name;
+        r->v.fun.num_params = v->v.fun.num_params;
+        r->v.fun.body = v->v.fun.body;
+        r->v.fun.closure_env = v->v.fun.closure_env;
+        env_retain(r->v.fun.closure_env);
+        return r;
+    }
+    default: return sw_val_nil();
+    }
+}
+
+/* A container being copied. `out` collects its children's copies in child
+ * order (a map's keys, then its values); `idx` is the next child to visit. */
+typedef struct {
+    sw_val_t *src;
+    sw_val_t **out;
+    int total, idx;
+} dc_frame_t;
+
+static int dc_child_count(const sw_val_t *v) {
+    switch (v->type) {
+    case SW_VAL_MAP: return 2 * v->v.map.count;
+    case SW_VAL_FUN: return v->v.fun.ncaptures;
+    default:         return v->v.tuple.count;
+    }
+}
+
+static sw_val_t *dc_child(const sw_val_t *v, int i) {
+    switch (v->type) {
+    case SW_VAL_MAP: {
+        int n = v->v.map.count;
+        return i < n ? v->v.map.keys[i] : v->v.map.vals[i - n];
+    }
+    case SW_VAL_FUN: return v->v.fun.captures[i];
+    default:         return v->v.tuple.items[i];
+    }
+}
+
+/* The copy of v when it needs no walk (nil, immortal, kept, memoised, or a
+ * leaf); NULL for a container that still has to be copied. */
+static sw_val_t *dc_try(sw_val_t *v) {
     if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
-    if (depth > SW_COPY_MAX_DEPTH && !g_copy_uncapped)
-        return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
     /* Global-heap graphs are freed node by node (ETS replace/delete, timer
      * and supervisor closures, v1 message fallback), so they must not share
      * immortals; copies into regions/arenas (bulk-freed) may. */
@@ -2779,68 +2832,67 @@ static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
         sw_val_t *seen = dc_lookup(g_dc, v);
         if (seen) return seen;
     }
-    sw_val_t *copy = deep_copy_node(v, depth);
-    if (g_dc && copy && copy != v) dc_insert(g_dc, v, copy);
+    if (dc_is_container(v)) return NULL;
+    sw_val_t *copy = deep_copy_leaf(v);
+    if (g_dc && copy != v) dc_insert(g_dc, v, copy);
     return copy;
 }
 
-static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
-    switch (v->type) {
-    case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
-    case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
-    case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
-    case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
-    case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
-    case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
-    case SW_VAL_PID:    return sw_val_pid_id(v->v.pidv.ptr, v->v.pidv.id);
-    case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
-    case SW_VAL_TUPLE:
-    case SW_VAL_LIST: {
-        int n = v->v.tuple.count;
-        sw_val_t **items = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
-        for (int i = 0; i < n; i++)
-            items[i] = deep_copy_rec(v->v.tuple.items[i], depth + 1);
-        sw_val_t *r = (v->type == SW_VAL_TUPLE)
-                          ? sw_val_tuple(items, n)
-                          : sw_val_list(items, n);
-        free(items);
-        return r;
-    }
+/* Build the container's copy from its already-copied children. */
+static sw_val_t *dc_build(const sw_val_t *src, sw_val_t **out, int total) {
+    switch (src->type) {
+    case SW_VAL_TUPLE: return sw_val_tuple(out, total);
+    case SW_VAL_LIST:  return sw_val_list(out, total);
     case SW_VAL_MAP: {
-        int n = v->v.map.count;
-        sw_val_t **ks = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
-        sw_val_t **vs = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
-        for (int i = 0; i < n; i++) {
-            ks[i] = deep_copy_rec(v->v.map.keys[i], depth + 1);
-            vs[i] = deep_copy_rec(v->v.map.vals[i], depth + 1);
+        int n = total / 2;
+        return sw_val_map_new(out, out ? out + n : NULL, n);
+    }
+    default: return sw_val_fun_native(src->v.fun.cfunc, src->v.fun.num_params, out, total);
+    }
+}
+
+static void dc_push(dc_frame_t **st, size_t *n, size_t *cap, sw_val_t *src) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *st = realloc(*st, *cap * sizeof(**st));
+    }
+    dc_frame_t *f = &(*st)[(*n)++];
+    f->src = src;
+    f->total = dc_child_count(src);
+    f->idx = 0;
+    f->out = f->total ? malloc(sizeof(sw_val_t *) * f->total) : NULL;
+}
+
+/* Deep-copy v's graph with an explicit frame stack rather than recursion, so
+ * nesting depth costs heap, never fiber stack, and no value is truncated.
+ * Children are copied before their parent (post-order); every container is
+ * memoised, so DAG-shared subvalues copy once. */
+static sw_val_t *deep_copy_rec(sw_val_t *v) {
+    sw_val_t *r = dc_try(v);
+    if (r) return r;
+    dc_frame_t *st = NULL;
+    size_t n = 0, cap = 0;
+    sw_val_t *result = NULL;
+    dc_push(&st, &n, &cap, v);
+    while (n) {
+        dc_frame_t *f = &st[n - 1];
+        if (f->idx < f->total) {
+            sw_val_t *child = dc_child(f->src, f->idx);
+            sw_val_t *c = dc_try(child);
+            f->idx++;
+            if (c) f->out[f->idx - 1] = c;
+            else dc_push(&st, &n, &cap, child);   /* may realloc: f is stale */
+        } else {
+            sw_val_t *built = dc_build(f->src, f->out, f->total);
+            free(f->out);
+            if (g_dc) dc_insert(g_dc, f->src, built);
+            n--;
+            if (n == 0) result = built;
+            else st[n - 1].out[st[n - 1].idx - 1] = built;
         }
-        sw_val_t *r = sw_val_map_new(ks, vs, n);
-        free(ks); free(vs);
-        return r;
     }
-    case SW_VAL_FUN: {
-        if (v->v.fun.body) {
-            /* Interpreter closure: share its AST, and hold a ref on its env
-             * so the env outlives the frame that built the closure. */
-            sw_val_t *r = val_alloc(sizeof(sw_val_t));
-            r->type = SW_VAL_FUN;
-            r->v.fun.name = v->v.fun.name;
-            r->v.fun.num_params = v->v.fun.num_params;
-            r->v.fun.body = v->v.fun.body;
-            r->v.fun.closure_env = v->v.fun.closure_env;
-            env_retain(r->v.fun.closure_env);
-            return r;
-        }
-        int nc = v->v.fun.ncaptures;
-        sw_val_t **caps = (nc > 0) ? malloc(sizeof(sw_val_t *) * nc) : NULL;
-        for (int i = 0; i < nc; i++)
-            caps[i] = deep_copy_rec(v->v.fun.captures[i], depth + 1);
-        sw_val_t *r = sw_val_fun_native(v->v.fun.cfunc, v->v.fun.num_params, caps, nc);
-        free(caps);
-        return r;
-    }
-    default: return sw_val_nil();
-    }
+    free(st);
+    return result;
 }
 
 /* Redirect this THREAD's value allocations into `region` (NULL restores the
@@ -2859,7 +2911,7 @@ sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     g_alloc_force_global = 1;
     dc_ctx_t dc, *saved;
     dc_begin(&dc, &saved);
-    sw_val_t *r = deep_copy_rec(v, 0);
+    sw_val_t *r = deep_copy_rec(v);
     dc_end(&dc, saved);
     g_alloc_force_global = save;
     return r;
@@ -2877,7 +2929,7 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v) {
     g_alloc_force_global = 0;
     dc_ctx_t dc, *saved;
     dc_begin(&dc, &saved);
-    sw_val_t *r = deep_copy_rec(v, 0);
+    sw_val_t *r = deep_copy_rec(v);
     dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
@@ -2896,7 +2948,7 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
     g_alloc_force_global = 0;
     dc_ctx_t dc, *saved;
     dc_begin(&dc, &saved);
-    sw_val_t *r = deep_copy_rec(v, 0);
+    sw_val_t *r = deep_copy_rec(v);
     dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
@@ -2935,7 +2987,7 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
     dc_begin(&dc, &saved);
     dc.keep = keep;
     dc.nkeep = nkeep;
-    for (int i = 0; i < n; i++) args[i] = deep_copy_rec(args[i], 0);
+    for (int i = 0; i < n; i++) args[i] = deep_copy_rec(args[i]);
     dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
@@ -4048,20 +4100,12 @@ static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
  * process arena can be freed while the entry lives (see tool_call / process_destroy),
  * so a raw pointer into either would dangle. Readers get their own copy. */
 static sw_val_t *_interp_vets_store(sw_val_t *v) {
-    int save = g_copy_uncapped;
-    g_copy_uncapped = 1;
-    sw_val_t *r = sw_val_deep_copy_global(v);
-    g_copy_uncapped = save;
-    return r;
+    return sw_val_deep_copy_global(v);
 }
 static sw_val_t *_interp_vets_out(sw_val_t *v) {
     sw_value_arena_t *target = sw_swap_alloc_target(NULL);
     sw_swap_alloc_target(target);
-    int save = g_copy_uncapped;
-    g_copy_uncapped = 1;
-    sw_val_t *r = target ? deep_copy_into(v, target) : sw_val_deep_copy_local(v);
-    g_copy_uncapped = save;
-    return r;
+    return target ? deep_copy_into(v, target) : sw_val_deep_copy_local(v);
 }
 
 static uint32_t _interp_vets_hash(sw_val_t *v) {

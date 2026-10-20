@@ -789,9 +789,10 @@ stats:
 # and the 80k spawn storm under -fsanitize=thread and fails on any
 # unsuppressed race. The fiber runtime is TSan-clean because cross-thread
 # fiber migration synchronizes through the runq's C11 atomics — TSan sees
-# the happens-before edges; no fiber annotations needed. Suppressions
-# (tests/stress/tsan.supp) cover only the documented warn-only watchdog
-# scanner. The storm runs its full 80k spawns — ~2 min under TSan.
+# the happens-before edges; no fiber annotations needed. The watchdog
+# scanner and sw_stats are race-free via _Atomic fields, so
+# tests/stress/tsan.supp holds no suppressions. The storm runs its full
+# 80k spawns — ~2 min under TSan.
 .PHONY: tsan-gate
 tsan-gate: swc
 	@./bin/swc build --emit-c tests/gc/slope_message.sw -o $(BIN_DIR)/_tsm_emit >/dev/null 2>&1 || true
