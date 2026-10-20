@@ -31,9 +31,23 @@ fun assert_eq(name, actual, expected) {
 # with "<authorization>|<x-test-header>" so the client can verify the exact
 # bytes survived. The server lowercases header NAMES, so we look them up
 # lowercased (the VALUE casing is preserved).
-fun header_server() {
-    http_listen(9131)
-    header_loop()
+fun header_server(parent, port) {
+    if (http_listen(port) == 'ok') {
+        send(parent, {'listening', port})
+        header_loop()
+    } else {
+        send(parent, 'busy')
+    }
+}
+
+# Binds the first free port at or above `port`: a fixed port can be held by
+# another test run on the same host (see test_http_port_free.sw).
+fun start_server(port, tries) {
+    spawn(header_server(self(), port))
+    receive {
+        {'listening', bound} -> bound
+        'busy' -> if (tries <= 1) { 0 } else { start_server(port + 1, tries - 1) }
+    }
 }
 
 fun header_loop() {
@@ -72,7 +86,7 @@ fun main() {
         print("OK test_http_headers 0/0 (SKIP: needs >=3 schedulers — blocking client + in-process server)")
         sys_exit(0)
     }
-    spawn(fun() { header_server() })
+    port = start_server(9131, 50)
 
     # Bearer token + a custom header. Only the header NAME is lowercased by
     # the server; the VALUE (mixed case) must come back intact.
@@ -80,7 +94,7 @@ fun main() {
     custom = "telnyx-sig-abc123"
     hdrs = [{"Authorization", bearer}, {"X-Test-Header", custom}]
 
-    body = get_retry("http://127.0.0.1:9131/auth", hdrs, 100)
+    body = get_retry(f"http://127.0.0.1:{port}/auth", hdrs, 100)
     fails = 0
     case body {
         'nil' ->

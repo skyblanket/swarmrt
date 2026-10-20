@@ -13,9 +13,24 @@ module Test_http_port_free
 
 import Std
 
-fun server() {
-    http_listen(9161)
-    serve()
+# Binds the first free port at or above `port`. The port is not fixed: another
+# test run on the same host can hold a fixed one, and then http_listen answers
+# from that run's server instead of ours.
+fun server(parent, port) {
+    if (http_listen(port) == 'ok') {
+        send(parent, {'listening', port})
+        serve()
+    } else {
+        send(parent, 'busy')
+    }
+}
+
+fun start_server(port, tries) {
+    spawn(server(self(), port))
+    receive {
+        {'listening', bound} -> bound
+        'busy' -> if (tries <= 1) { 0 } else { start_server(port + 1, tries - 1) }
+    }
 }
 
 fun serve() {
@@ -26,40 +41,40 @@ fun serve() {
     }
 }
 
-fun wait_up(attempts) {
-    r = http_request("http://127.0.0.1:9161/ping", %{})
+fun wait_up(base, attempts) {
+    r = http_request(f"{base}/ping", %{})
     case r {
-        {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) }
+        {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(base, attempts - 1) }
         _ -> 'up'
     }
 }
 
-fun hangups(i, n, ok) {
+fun hangups(base, i, n, ok) {
     if (i == n) { ok }
     else {
-        body = http_get("http://127.0.0.1:9161/x")
-        hangups(i + 1, n, if (body == "ok") { ok + 1 } else { ok })
+        body = http_get(f"{base}/x")
+        hangups(base, i + 1, n, if (body == "ok") { ok + 1 } else { ok })
     }
 }
 
-fun server_closes(i, n, ok) {
+fun server_closes(base, i, n, ok) {
     if (i == n) { ok }
     else {
-        r = http_request("http://127.0.0.1:9161/c", %{headers: %{"Connection" => "close"}})
+        r = http_request(f"{base}/c", %{headers: %{"Connection" => "close"}})
         good = case r { {'error', _} -> false _ -> true }
-        server_closes(i + 1, n, if (good) { ok + 1 } else { ok })
+        server_closes(base, i + 1, n, if (good) { ok + 1 } else { ok })
     }
 }
 
-fun ws_rounds(i, n, ok) {
+fun ws_rounds(url, i, n, ok) {
     if (i == n) { ok }
     else {
-        h = wsc_connect("ws://127.0.0.1:9161/ws")
+        h = wsc_connect(url)
         good = case h {
             'nil' -> false
             _ -> wsc_send(h, "bye") ; wsc_recv(h, 2000) ; wsc_close(h) ; true
         }
-        ws_rounds(i + 1, n, if (good) { ok + 1 } else { ok })
+        ws_rounds(url, i + 1, n, if (good) { ok + 1 } else { ok })
     }
 }
 
@@ -68,17 +83,18 @@ fun io_ports() {
 }
 
 fun main() {
-    spawn(server())
-    if (wait_up(100) != 'up') { print("FAIL server_up") ; sys_exit(1) }
+    port = start_server(9161, 50)
+    base = f"http://127.0.0.1:{port}"
+    if (wait_up(base, 100) != 'up') { print("FAIL server_up") ; sys_exit(1) }
     sleep(300)
     before = io_ports()
     fails = 0
     if (before >= 0) { print("PASS io_ports_reported") }
     else { print("FAIL io_ports_reported: swarm_stats() has no io_ports") ; fails = fails + 1 }
 
-    a = hangups(0, 300, 0)
-    b = server_closes(0, 300, 0)
-    c = ws_rounds(0, 100, 0)
+    a = hangups(base, 0, 300, 0)
+    b = server_closes(base, 0, 300, 0)
+    c = ws_rounds(f"ws://127.0.0.1:{port}/ws", 0, 100, 0)
     sleep(500)
     later = io_ports()
     if (a == 300 && b == 300 && c == 100) { print("PASS all_ok") }
