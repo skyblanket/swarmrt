@@ -54,10 +54,19 @@ fun test_past_cap() {
     }
 }
 
+# A deep value stored in ETS and then overwritten: the global-heap free of the
+# old copy must walk it without overflowing the fiber stack.
+fun test_ets_replace_deep() {
+    t = ets_new()
+    ets_put(t, 'k', nest('leaf', 5000))
+    ets_put(t, 'k', 1)
+    assert_eq("ets_replace_deep", ets_get(t, 'k'), 1)
+}
+
 fun main() {
-    fails = test_within_cap() + test_past_cap()
+    fails = test_within_cap() + test_past_cap() + test_ets_replace_deep()
     if (fails == 0) {
-        print("OK test_deep_send 2/2")
+        print("OK test_deep_send 3/3")
         sys_exit(0)
     } else {
         print("FAIL test_deep_send")

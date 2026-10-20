@@ -205,38 +205,55 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
     }
 }
 
-/* Fully recursive free of a global-heap value tree that a long-lived owner (an
- * ETS entry, a timer closure) deep-copied via sw_val_deep_copy_global and is now
- * discarding. Mirrors deep_copy_rec's allocations (every node val_alloc'd;
- * strings/atoms and bytes own their buffers; tuple/list/map/fun element arrays
- * are malloc'd). Unlike sw_val_free it recurses into MAP keys/vals and FUN
- * captures, because such a value is a deep_copy_global tree — fully independent,
- * no interned or shared nodes (verified: every sw_val_* constructor allocates
- * fresh) — so the WHOLE graph must go. Caller must ensure no one else holds the
- * pointer (ETS copies values OUT to readers; a one-shot timer frees only after
- * its single apply returns). */
-static void _sw_free_global_val(sw_val_t *v) {
-    if (!v || v->immortal) return;
-    switch (v->type) {
-    case SW_VAL_STRING: case SW_VAL_ATOM:
-        free(v->v.str); break;
-    case SW_VAL_BYTES:
-        free(v->v.bytes.data); break;
-    case SW_VAL_TUPLE: case SW_VAL_LIST:
-        for (int i = 0; i < v->v.tuple.count; i++) _sw_free_global_val(v->v.tuple.items[i]);
-        free(v->v.tuple.items); break;
-    case SW_VAL_MAP:
-        for (int i = 0; i < v->v.map.count; i++) {
-            _sw_free_global_val(v->v.map.keys[i]);
-            _sw_free_global_val(v->v.map.vals[i]);
-        }
-        free(v->v.map.keys); free(v->v.map.vals); break;
-    case SW_VAL_FUN:
-        for (int i = 0; i < v->v.fun.ncaptures; i++) _sw_free_global_val(v->v.fun.captures[i]);
-        free(v->v.fun.captures); break;
-    default: break;
+/* Push a non-immortal child onto the free worklist (growing it as needed). */
+static void _sw_free_push(sw_val_t ***st, size_t *n, size_t *cap, sw_val_t *c) {
+    if (!c || c->immortal) return;
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *st = realloc(*st, *cap * sizeof(**st));
     }
-    free(v);
+    (*st)[(*n)++] = c;
+}
+
+/* Free a global-heap value tree that a long-lived owner (an ETS entry, a timer
+ * closure) deep-copied via sw_val_deep_copy_global and is now discarding.
+ * Mirrors deep_copy_rec's allocations (every node val_alloc'd; strings/atoms and
+ * bytes own their buffers; tuple/list/map/fun element arrays are malloc'd).
+ * Unlike sw_val_free it reaches MAP keys/vals and FUN captures, because such a
+ * value is a deep_copy_global tree — fully independent, no interned or shared
+ * nodes (verified: every sw_val_* constructor allocates fresh) — so the WHOLE
+ * graph must go. The walk uses an explicit worklist, not recursion, so a deeply
+ * nested value (the copy has no depth cap) cannot overflow the fiber stack.
+ * Caller must ensure no one else holds the pointer (ETS copies values OUT to
+ * readers; a one-shot timer frees only after its single apply returns). */
+static void _sw_free_global_val(sw_val_t *root) {
+    sw_val_t **st = NULL;
+    size_t n = 0, cap = 0;
+    _sw_free_push(&st, &n, &cap, root);
+    while (n) {
+        sw_val_t *v = st[--n];
+        switch (v->type) {
+        case SW_VAL_STRING: case SW_VAL_ATOM:
+            free(v->v.str); break;
+        case SW_VAL_BYTES:
+            free(v->v.bytes.data); break;
+        case SW_VAL_TUPLE: case SW_VAL_LIST:
+            for (int i = 0; i < v->v.tuple.count; i++) _sw_free_push(&st, &n, &cap, v->v.tuple.items[i]);
+            free(v->v.tuple.items); break;
+        case SW_VAL_MAP:
+            for (int i = 0; i < v->v.map.count; i++) {
+                _sw_free_push(&st, &n, &cap, v->v.map.keys[i]);
+                _sw_free_push(&st, &n, &cap, v->v.map.vals[i]);
+            }
+            free(v->v.map.keys); free(v->v.map.vals); break;
+        case SW_VAL_FUN:
+            for (int i = 0; i < v->v.fun.ncaptures; i++) _sw_free_push(&st, &n, &cap, v->v.fun.captures[i]);
+            free(v->v.fun.captures); break;
+        default: break;
+        }
+        free(v);
+    }
+    free(st);
 }
 
 static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
