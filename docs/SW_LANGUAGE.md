@@ -207,7 +207,7 @@ fun main() {
 }
 ```
 
-**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame, and a deep chain overflows the default 128KB per-process stack. That raises a recoverable per-process `stack overflow` panic (links, monitors and supervisors see the exit); raise the limit with `SW_PROC_STACK` (e.g. `SW_PROC_STACK=1m`). Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
+**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
 
 Multi-statement function bodies are fine; statements are separated by newlines (no `;` needed):
 
@@ -1158,7 +1158,7 @@ bin/swc build src/main.sw -o bin/program
 # Optimised + obfuscated build
 bin/swc build src/main.sw -o bin/program -O --obfusc --strip
 
-# Run a .sw file directly without producing a binary (interpreter)
+# Run a .sw file directly without producing a binary (interpret + JIT)
 bin/swc run my_program.sw
 
 # Run sw interpreter tests (point at a file or directory of test_*.sw files)
