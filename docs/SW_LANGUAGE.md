@@ -830,7 +830,7 @@ Needs `import Chrome` (a battery; see §2).
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
-> **Compiled-only.** The process/scheduler primitives (spawn, send, receive, the supervisors, `process_list`/`process_info`/`registered` / `Swarm.*`, and the `tool_*` registry below) need the real scheduler / embedded interpreter, which the REPL path doesn't run. Under `swc run`, `swc test`, and the REPL they print a one-line note and return `nil` — run `swc build file.sw -o bin/x && bin/x` for full semantics.
+> **Under `swc run`.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info`, `registered`, and `Swarm.*` all work. These builtins are stubbed in the interpreter: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, the `tool_*` registry below, `http_listen`, `http_respond`, the `ws_*` and `wsc_*` socket calls, `telemetry_*`, and `pubsub_*`. Each prints a note once and returns `nil`. For those, run `swc build file.sw -o bin/x && bin/x`.
 
 ### Tool registry — self-defined, hot-loaded tools
 An agent can write a new tool *as `sw` source at runtime* and call it live, with no restart — the source is parsed and run by the interpreter that ships inside every compiled binary. The tool's entry function is `run`.
