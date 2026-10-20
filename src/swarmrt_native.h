@@ -772,6 +772,8 @@ void sw_sleep_ms(uint64_t ms);
 /* Ownership v2: sw_receive_any that adopts a VALUE region into the caller's
  * arena (caller incorporates the payload; must NOT free it). Used by pmap. */
 void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag);
+/* Selective receive with the same adopt semantics, matching on tag. */
+void *sw_recv_tagged_adopt(uint64_t tag, uint64_t timeout_ms);
 
 /* Generated-code error slot for the current process (thread-local fallback when
  * outside a process). The generated `_sw_error` macro is (*sw_self_error_slot()).
