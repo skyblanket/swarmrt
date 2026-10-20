@@ -517,7 +517,9 @@ The grant is checked statically (including module-level `let` globals, so a tool
 
 Every version is kept as **replayable source** — `tool_history(name)` returns `[{version, src}, …]` (the last 16), so an agent's self-modification is fully auditable: nothing it wrote about itself is lost. (In-memory per session; persist it to SQLite yourself if you need it across restarts.)
 
-Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); each `tool_call` allocates its result without freeing intermediates (fine per turn; a tight 100k-call loop will grow memory); and compose tool source with `++`, not f-string `{{` braces.
+Each `tool_call` builds its intermediates and result in a per-call region that the caller adopts, so they are reclaimed with the calling process (and by its turn checkpoints): a tight 100k-call loop stays flat in RSS, and `make gc-slope` gates it (`tests/gc/slope_tool.sw`).
+
+Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); and compose tool source with `++`, not f-string `{{` braces.
 
 The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart. Boot on Linux x86_64 measured about 29 ms with the default process table and about 8 ms with `SW_MAX_PROCS=1024` (minimum of 40 runs, 2026-10-19, host load 12–25). The figures move with host load: re-sampled on 2026-10-20 at load average ~170 on 4 vCPUs, the same binaries took 27–44 ms (default) and 23–33 ms (`SW_MAX_PROCS=1024`). So the "<10 ms" figure is only reproduced on a quiet host, not under contention.
 

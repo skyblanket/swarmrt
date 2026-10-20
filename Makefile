@@ -632,6 +632,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  200  2000  10 interval || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_tool.sw      10000 100000 24 tool  || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
