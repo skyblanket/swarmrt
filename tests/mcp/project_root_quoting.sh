@@ -31,6 +31,9 @@ OUT=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"autopilot_start","arguments":{"goal":"g","steps":["a"]}}}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"autopilot_status","arguments":{}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"git_diff","arguments":{}}}' \
+    '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"git_log","arguments":{}}}' \
+    '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"codebase_overview","arguments":{}}}' \
     | timeout 10 "$BIN" "$ROOT" 2>/dev/null || true)
 
 if [ -e "$CANARY" ]; then
@@ -41,6 +44,27 @@ fi
 case "$OUT" in
     *'dirty_files'*'f.txt'*) ;;
     *) echo "FAIL: autopilot_status did not report f.txt as dirty" >&2
+       echo "$OUT" >&2
+       exit 1 ;;
+esac
+
+case "$OUT" in
+    *'"id":4'*'f.txt'*) ;;
+    *) echo "FAIL: git_diff did not report f.txt" >&2
+       echo "$OUT" >&2
+       exit 1 ;;
+esac
+
+case "$OUT" in
+    *'"id":5'*'init'*) ;;
+    *) echo "FAIL: git_log did not report the init commit" >&2
+       echo "$OUT" >&2
+       exit 1 ;;
+esac
+
+case "$OUT" in
+    *'"id":6'*'git_head'*) ;;
+    *) echo "FAIL: codebase_overview did not report git_head" >&2
        echo "$OUT" >&2
        exit 1 ;;
 esac
