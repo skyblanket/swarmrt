@@ -15,6 +15,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <signal.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "swarmrt_io.h"
 #include "swarmrt_otp.h"
 #include "swarmrt_ets.h"
@@ -375,6 +379,50 @@ static void test_multi_connections(void) {
  * Main
  * ========================================================================= */
 
+/* A peer that closes while we still write must make sw_tcp_send fail with
+ * EPIPE. SIGPIPE is put back to its default action first: that is the case
+ * that used to kill the whole node, and a passing run shows the send itself
+ * no longer raises it. The port is deregistered so the event loop does not
+ * consume the peer's EOF and close the port before the sends run. */
+static void test_send_after_peer_close(void) {
+    signal(SIGPIPE, SIG_DFL);
+
+    uint16_t port = test_port_base + 90;
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(port);
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(lfd, (struct sockaddr *)&sin, sizeof(sin)) != 0 || listen(lfd, 1) != 0) {
+        TEST_FAIL("send_after_peer_close (listen)");
+        close(lfd);
+        return;
+    }
+
+    sw_port_t *conn = sw_tcp_connect("127.0.0.1", port);
+    int peer = accept(lfd, NULL, NULL);
+    close(lfd);
+    if (!conn || peer < 0) {
+        TEST_FAIL("send_after_peer_close (connect)");
+        if (peer >= 0) close(peer);
+        return;
+    }
+    sw_port_set_active(conn, 0);
+    close(peer);
+
+    char buf[65536];
+    memset(buf, 'x', sizeof(buf));
+    int rc = 0;
+    for (int i = 0; i < 100 && rc >= 0; i++)
+        rc = sw_tcp_send(conn, buf, sizeof(buf));
+
+    TEST_CHECK("send to closed peer returns error, process survives", rc < 0);
+    sw_port_close(conn);
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
@@ -400,6 +448,7 @@ int main(int argc, char *argv[]) {
     test_port_close_notify();
     test_controlling_process();
     test_multi_connections();
+    test_send_after_peer_close();
 
     sw_io_shutdown();
     sw_stats(0);
