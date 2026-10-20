@@ -123,6 +123,12 @@ static sw_port_t *port_alloc(sw_fd_t fd, sw_port_type_t type, sw_process_t *owne
     if (type == SW_PORT_TCP_CONN) {
         p->recv_buf = (uint8_t *)malloc(SW_IO_RECV_BUF);
         p->recv_buf_size = SW_IO_RECV_BUF;
+#ifdef SO_NOSIGPIPE
+        /* macOS has no MSG_NOSIGNAL: a send to a peer that closed raises
+         * SIGPIPE unless the socket itself opts out. */
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     }
 
     /* Add to global list */
@@ -692,7 +698,12 @@ int sw_tcp_send(sw_port_t *port, const void *data, uint32_t len) {
 
 #ifdef _WIN32
     int sent = send(port->fd, (const char *)data, len, 0);
+#elif defined(MSG_NOSIGNAL)
+    /* A peer that closed mid-send must come back as EPIPE, not SIGPIPE:
+     * the default action kills the whole node. */
+    ssize_t sent = send(port->fd, data, len, MSG_NOSIGNAL);
 #else
+    /* macOS: SO_NOSIGPIPE is set on the socket in port_alloc. */
     ssize_t sent = write(port->fd, data, len);
 #endif
     if (sent < 0) return -1;
