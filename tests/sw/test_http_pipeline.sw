@@ -39,7 +39,7 @@ fun pipeline_loop() {
 fun pipelined_bodies() {
     reqs = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"
     cmd = "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9471; printf '%s' '" ++ reqs ++
-          "' >&3; timeout 3 cat <&3 | grep -o 'ok:/[ab]'\""
+          "' >&3; perl -e 'alarm 3; exec @ARGV' cat <&3 | grep -o 'ok:/[ab]'\""
     shell(cmd)
 }
 
