@@ -25,7 +25,7 @@ fun configure(opts) {
     sinks = case map_get(opts, 'sinks') { nil -> [] ; s -> s }
     existing = whereis('telemetry_hub')
     if (existing != nil) { send(existing, 'stop') ; sleep(20) }
-    pid = spawn(hub_loop(sinks, 0))
+    pid = spawn(hub_loop(sinks, 0, %{}))
     register('telemetry_hub', pid)
     'ok'
 }
@@ -97,20 +97,22 @@ fun file_append_event(path, event) {
 
 # ---- internal hub ----
 
-fun hub_loop(sinks, total) {
+# `seen` is a set of every event name fanned out so far (name -> 'true').
+# It backs names(); a map keeps the membership check O(1) per event.
+fun hub_loop(sinks, total, seen) {
     receive {
         {'event', event} ->
             fan_out(sinks, event)
-            hub_loop(sinks, total + 1)
+            hub_loop(sinks, total + 1, map_put(seen, map_get(event, 'name'), 'true'))
         {'count', from} ->
             send(from, {'count', total})
-            hub_loop(sinks, total)
+            hub_loop(sinks, total, seen)
         {'names', from} ->
-            send(from, {'names', []})   # name registry is a TODO
-            hub_loop(sinks, total)
+            send(from, {'names', map_keys(seen)})
+            hub_loop(sinks, total, seen)
         {'flush', from} ->
             send(from, {'flushed', 'ok'})   # FIFO barrier — see flush()
-            hub_loop(sinks, total)
+            hub_loop(sinks, total, seen)
         'stop' -> 'done'
     }
 }

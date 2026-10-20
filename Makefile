@@ -73,13 +73,15 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
-        test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
+.PHONY: all clean v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
+        test test-v2 test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
-        test-sw benchmark benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
+        test-sw benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
         sws mcp mcp-wrap examples
 
-all: v1 v2 proc native
+# Default goal: the compiler and runtime library. The legacy prototypes
+# (swarmrt_simple/swarmrt/swarmrt_proc) live in attic/ and are not built.
+all: swc libswarmrt
 
 # Compile rules for core objects
 $(BUILD_DIR)/swarmrt_asm.o: $(SRC_DIR)/swarmrt_asm.S | dirs
@@ -95,21 +97,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | dirs
 
 core-objs: $(CORE_OBJS)
 
-v1: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_simple.c -o $(BUILD_DIR)/swarmrt_simple.o
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/parser.c -o $(BUILD_DIR)/parser.o
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o $(SRC_DIR)/main.c -o $(BIN_DIR)/swarmrt-v1 $(LDFLAGS)
-
 v2: dirs
 	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_v2.c -o $(BUILD_DIR)/swarmrt_v2.o
 	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_v2.o $(SRC_DIR)/test_v2.c -o $(BIN_DIR)/swarmrt-v2 $(LDFLAGS)
-
-# Process subsystem build (with optional assembly context switching)
-proc: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_proc.c -o $(BUILD_DIR)/swarmrt_proc.o
-	@$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_context.S -o $(BUILD_DIR)/swarmrt_context.o 2>/dev/null || true
-	@$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(BUILD_DIR)/swarmrt_context.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS) 2>/dev/null || \
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS)
 
 # Native runtime (benchmark)
 native: core-objs
@@ -139,14 +129,8 @@ dirs:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR)
 
 # Test targets
-test-v1: v1
-	./$(BIN_DIR)/swarmrt-v1 test
-
 test-v2: v2
 	./$(BIN_DIR)/swarmrt-v2
-
-test-proc: proc
-	./$(BIN_DIR)/swarmrt-proc
 
 test-native: native
 	./$(BIN_DIR)/swarmrt-native
@@ -205,11 +189,11 @@ test-phase10: phase10
 h2h: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/benchmark_h2h.c -o $(BIN_DIR)/bench-h2h $(LDFLAGS)
 
-test: test-v1 test-v2 test-proc
+test: test-v2
 
 # Core test gate (what test-all used to be). Kept as a named alias so
 # callers can depend on it without hard-coding the list.
-test-core: test-v1 test-v2 test-proc test-native test-sw
+test-core: test-v2 test-native test-sw
 
 # Backward-compat alias — contributors/scripts that invoke `make test-all`
 # continue to work unchanged.
@@ -235,6 +219,7 @@ examples: swc libswarmrt
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
+	@./tests/sw/run_stub_warn.sh
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.
@@ -725,10 +710,6 @@ stress: swc libswarmrt
 	@./tests/stress/run_stress.sh
 
 # Benchmarks
-benchmark: v1
-	$(CC) $(CFLAGS) $(SRC_DIR)/benchmark.c $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o -o $(BIN_DIR)/benchmark $(LDFLAGS)
-	./$(BIN_DIR)/benchmark
-
 benchmark-native: native
 	./$(BIN_DIR)/swarmrt-native
 
@@ -751,10 +732,6 @@ example-counter: swc libswarmrt
 atelier: swc libswarmrt
 	@mkdir -p studio/output
 	./$(BIN_DIR)/swc build studio/atelier.sw -o $(BIN_DIR)/atelier --emit-c
-
-parse-test: v1
-	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/hello.sw
-	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/counter.sw
 
 # Search module (SIMD fuzzy + vector search)
 search: dirs

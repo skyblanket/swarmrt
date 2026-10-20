@@ -2671,6 +2671,29 @@ static void tool_process_stats(json_node_t *args, jbuf_t *out) {
     jb_append(out, "}");
 }
 
+/* Write `s` into `out` as one POSIX shell word: wrapped in single quotes,
+ * with each embedded ' written as '\'' so nothing in the value is
+ * interpreted by the shell. Returns 0 if the result does not fit. */
+static int sh_quote(char *out, size_t outsz, const char *s) {
+    size_t n = 0;
+    if (outsz < 3) return 0;
+    out[n++] = '\'';
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') {
+            if (n + 5 > outsz) return 0;
+            memcpy(out + n, "'\\''", 4);
+            n += 4;
+        } else {
+            if (n + 2 > outsz) return 0;
+            out[n++] = *p;
+        }
+    }
+    if (n + 2 > outsz) return 0;
+    out[n++] = '\'';
+    out[n] = '\0';
+    return 1;
+}
+
 /* --- Autopilot tool implementations --- */
 
 static void tool_autopilot_start(json_node_t *args, jbuf_t *out) {
@@ -2768,11 +2791,15 @@ static void tool_autopilot_status(json_node_t *args, jbuf_t *out) {
 
     /* Git-aware: show modified + untracked files */
     {
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && (git diff --name-only; git diff --name-only --cached; git ls-files --others --exclude-standard) 2>/dev/null | sort -u | head -30",
-                 g_project_root);
-        FILE *proc = popen(cmd, "r");
+        char qroot[sizeof(g_project_root) * 4 + 3];
+        char cmd[sizeof(qroot) + 512];
+        FILE *proc = NULL;
+        if (sh_quote(qroot, sizeof(qroot), g_project_root)) {
+            snprintf(cmd, sizeof(cmd),
+                     "cd %s && (git diff --name-only; git diff --name-only --cached; git ls-files --others --exclude-standard) 2>/dev/null | sort -u | head -30",
+                     qroot);
+            proc = popen(cmd, "r");
+        }
         if (proc) {
             jb_append(out, ",\"dirty_files\":[");
             char fbuf[1024];
@@ -2832,10 +2859,14 @@ static void tool_autopilot_step(json_node_t *args, jbuf_t *out) {
 
     /* Capture files changed since autopilot started (git awareness) */
     {
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "cd '%s' && git diff --name-only HEAD 2>/dev/null | head -30",
-                 g_project_root);
-        FILE *proc = popen(cmd, "r");
+        char qroot[sizeof(g_project_root) * 4 + 3];
+        char cmd[sizeof(qroot) + 128];
+        FILE *proc = NULL;
+        if (sh_quote(qroot, sizeof(qroot), g_project_root)) {
+            snprintf(cmd, sizeof(cmd), "cd %s && git diff --name-only HEAD 2>/dev/null | head -30",
+                     qroot);
+            proc = popen(cmd, "r");
+        }
         if (proc) {
             jb_append(out, ",\"files_changed\":[");
             char fbuf[1024];
@@ -3112,6 +3143,8 @@ static char *run_cmd(const char *cmd, size_t max_out) {
 static void tool_git_diff(json_node_t *args, jbuf_t *out) {
     const char *ref = json_get_str(args, "ref");
     char cmd[4096];
+    char qroot[sizeof(g_project_root) * 4 + 3];
+    sh_quote(qroot, sizeof(qroot), g_project_root);
 
     if (ref && ref[0]) {
         if (!shell_arg_safe(ref)) {
@@ -3119,12 +3152,12 @@ static void tool_git_diff(json_node_t *args, jbuf_t *out) {
             return;
         }
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git diff --stat '%s' 2>&1 && echo '---DIFF---' && git diff '%s' 2>&1 | head -200",
-                 g_project_root, ref, ref);
+                 "cd %s && git diff --stat '%s' 2>&1 && echo '---DIFF---' && git diff '%s' 2>&1 | head -200",
+                 qroot, ref, ref);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git diff --stat HEAD 2>&1 && echo '---DIFF---' && git diff HEAD 2>&1 | head -200",
-                 g_project_root);
+                 "cd %s && git diff --stat HEAD 2>&1 && echo '---DIFF---' && git diff HEAD 2>&1 | head -200",
+                 qroot);
     }
 
     char *result = run_cmd(cmd, 32768);
@@ -3157,18 +3190,20 @@ static void tool_git_log(json_node_t *args, jbuf_t *out) {
     if (limit > 50) limit = 50;
 
     char cmd[4096];
+    char qroot[sizeof(g_project_root) * 4 + 3];
+    sh_quote(qroot, sizeof(qroot), g_project_root);
     if (path && path[0]) {
         if (!shell_arg_safe(path)) {
             jb_append(out, "{\"error\":\"Invalid path — contains unsafe characters\"}");
             return;
         }
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d -- '%s' 2>&1",
-                 g_project_root, limit, path);
+                 "cd %s && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d -- '%s' 2>&1",
+                 qroot, limit, path);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d 2>&1",
-                 g_project_root, limit);
+                 "cd %s && git log --oneline --format='%%h|%%an|%%ar|%%s' -%d 2>&1",
+                 qroot, limit);
     }
 
     char *result = run_cmd(cmd, 16384);
@@ -3327,16 +3362,19 @@ static void tool_codebase_overview(json_node_t *args, jbuf_t *out) {
     }
 
     /* Get top-level dirs */
+    char qroot[sizeof(g_project_root) * 4 + 3];
+    sh_quote(qroot, sizeof(qroot), g_project_root);
+
     char top_dirs_cmd[4096];
     snprintf(top_dirs_cmd, sizeof(top_dirs_cmd),
-             "cd '%s' && find . -maxdepth 2 -type d ! -path '*/.*' ! -path '*/node_modules/*' "
+             "cd %s && find . -maxdepth 2 -type d ! -path '*/.*' ! -path '*/node_modules/*' "
              "! -path '*/build/*' ! -path '*/__pycache__/*' ! -path '*/target/*' 2>/dev/null | head -30",
-             g_project_root);
+             qroot);
     char *dirs = run_cmd(top_dirs_cmd, 4096);
 
     /* Check if git repo */
     char git_cmd[4096];
-    snprintf(git_cmd, sizeof(git_cmd), "cd '%s' && git rev-parse --short HEAD 2>/dev/null", g_project_root);
+    snprintf(git_cmd, sizeof(git_cmd), "cd %s && git rev-parse --short HEAD 2>/dev/null", qroot);
     char *git_head = run_cmd(git_cmd, 64);
     if (git_head) {
         size_t gl = strlen(git_head);
@@ -3533,11 +3571,15 @@ static void tool_workspace_create(json_node_t *args, jbuf_t *out) {
     /* Workspace path */
     char ws_path[4096];
     snprintf(ws_path, sizeof(ws_path), "%s/.conductor/%s", g_project_root, name);
+    char qroot[sizeof(g_project_root) * 4 + 3];
+    char qws_path[sizeof(ws_path) * 4 + 3];
+    sh_quote(qroot, sizeof(qroot), g_project_root);
+    sh_quote(qws_path, sizeof(qws_path), ws_path);
 
     /* Create git worktree */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git worktree add -b '%s' '%s' HEAD 2>&1",
-             g_project_root, branch, ws_path);
+             "cd %s && git worktree add -b '%s' %s HEAD 2>&1",
+             qroot, branch, qws_path);
     char *result = run_cmd(cmd, 4096);
 
     if (!result || strstr(result, "fatal") || strstr(result, "error")) {
@@ -3598,9 +3640,11 @@ static void tool_workspace_list(json_node_t *args, jbuf_t *out) {
 
         /* Get git status for this workspace */
         char cmd[4096];
+        char qpath[sizeof(g_workspaces[i].path) * 4 + 3];
+        sh_quote(qpath, sizeof(qpath), g_workspaces[i].path);
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git diff --stat HEAD 2>/dev/null | tail -1",
-                 g_workspaces[i].path);
+                 "cd %s && git diff --stat HEAD 2>/dev/null | tail -1",
+                 qpath);
         char *status = run_cmd(cmd, 512);
         if (status) {
             size_t sl = strlen(status);
@@ -3658,13 +3702,17 @@ static void tool_workspace_archive(json_node_t *args, jbuf_t *out) {
 
     /* Remove worktree */
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "cd '%s' && git worktree remove '%s' --force 2>&1",
-             g_project_root, ws->path);
+    char qroot[sizeof(g_project_root) * 4 + 3];
+    char qws_path[sizeof(ws->path) * 4 + 3];
+    sh_quote(qroot, sizeof(qroot), g_project_root);
+    sh_quote(qws_path, sizeof(qws_path), ws->path);
+    snprintf(cmd, sizeof(cmd), "cd %s && git worktree remove %s --force 2>&1",
+             qroot, qws_path);
     char *result = run_cmd(cmd, 4096);
 
     /* Delete branch */
-    snprintf(cmd, sizeof(cmd), "cd '%s' && git branch -D '%s' 2>&1",
-             g_project_root, ws->branch);
+    snprintf(cmd, sizeof(cmd), "cd %s && git branch -D '%s' 2>&1",
+             qroot, ws->branch);
     char *br_result = run_cmd(cmd, 1024);
 
     ws->active = false;
@@ -3712,13 +3760,15 @@ static void tool_checkpoint_save(json_node_t *args, jbuf_t *out) {
 
     /* Commit tracked changes in workspace (exclude secrets) */
     char cmd[4096];
+    char qpath[sizeof(ws->path) * 4 + 3];
+    sh_quote(qpath, sizeof(qpath), ws->path);
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git add -u && git commit -m 'checkpoint: %s' --allow-empty 2>&1",
-             ws->path, label);
+             "cd %s && git add -u && git commit -m 'checkpoint: %s' --allow-empty 2>&1",
+             qpath, label);
     char *commit_result = run_cmd(cmd, 4096);
 
     /* Get commit hash */
-    snprintf(cmd, sizeof(cmd), "cd '%s' && git rev-parse HEAD 2>&1", ws->path);
+    snprintf(cmd, sizeof(cmd), "cd %s && git rev-parse HEAD 2>&1", qpath);
     char *hash = run_cmd(cmd, 64);
     if (hash) {
         size_t hl = strlen(hash);
@@ -3729,8 +3779,8 @@ static void tool_checkpoint_save(json_node_t *args, jbuf_t *out) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git update-ref refs/conductor/%s/%lld HEAD 2>&1",
-             ws->path, name, (long long)ts.tv_sec);
+             "cd %s && git update-ref refs/conductor/%s/%lld HEAD 2>&1",
+             qpath, name, (long long)ts.tv_sec);
     run_cmd(cmd, 256);
 
     pthread_mutex_unlock(&g_workspace_lock);
@@ -3784,15 +3834,17 @@ static void tool_checkpoint_restore(json_node_t *args, jbuf_t *out) {
     }
 
     char cmd[4096];
+    char qpath[sizeof(ws->path) * 4 + 3];
+    sh_quote(qpath, sizeof(qpath), ws->path);
 
     if (ref && ref[0]) {
         /* Restore to specific ref */
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git reset --hard '%s' 2>&1", ws->path, ref);
+                 "cd %s && git reset --hard '%s' 2>&1", qpath, ref);
     } else {
         /* List available checkpoints */
         snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && git log --oneline -10 2>&1", ws->path);
+                 "cd %s && git log --oneline -10 2>&1", qpath);
         char *log = run_cmd(cmd, 4096);
         pthread_mutex_unlock(&g_workspace_lock);
 
@@ -3848,9 +3900,13 @@ static void tool_workspace_diff(json_node_t *args, jbuf_t *out) {
 
     /* Get default branch */
     char cmd[4096];
+    char qroot[sizeof(g_project_root) * 4 + 3];
+    char qws_path[sizeof(ws->path) * 4 + 3];
+    sh_quote(qroot, sizeof(qroot), g_project_root);
+    sh_quote(qws_path, sizeof(qws_path), ws->path);
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo main",
-             g_project_root);
+             "cd %s && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo main",
+             qroot);
     char *default_branch = run_cmd(cmd, 128);
     if (default_branch) {
         size_t dl = strlen(default_branch);
@@ -3858,22 +3914,25 @@ static void tool_workspace_diff(json_node_t *args, jbuf_t *out) {
             default_branch[--dl] = '\0';
     }
 
+    char qbranch[sizeof(cmd) * 4 + 3];
+    sh_quote(qbranch, sizeof(qbranch), default_branch ? default_branch : "main");
+
     /* Diff stat */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git diff --stat '%s' 2>&1",
-             ws->path, default_branch ? default_branch : "main");
+             "cd %s && git diff --stat %s 2>&1",
+             qws_path, qbranch);
     char *stat_result = run_cmd(cmd, 8192);
 
     /* Diff content (limited) */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git diff '%s' 2>&1 | head -300",
-             ws->path, default_branch ? default_branch : "main");
+             "cd %s && git diff %s 2>&1 | head -300",
+             qws_path, qbranch);
     char *diff_result = run_cmd(cmd, 32768);
 
     /* Commit count */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git rev-list --count '%s'..HEAD 2>&1",
-             ws->path, default_branch ? default_branch : "main");
+             "cd %s && git rev-list --count %s..HEAD 2>&1",
+             qws_path, qbranch);
     char *commit_count = run_cmd(cmd, 32);
     if (commit_count) {
         size_t cl = strlen(commit_count);

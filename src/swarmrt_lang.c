@@ -558,6 +558,7 @@ static void node_free(node_t *n) {
         for (int i = 0; i < n->v.mod.nfuns; i++) node_free(n->v.mod.funs[i]);
         free(n->v.mod.funs);
         for (int i = 0; i < n->v.mod.nglobals; i++) node_free(n->v.mod.globals[i].val);
+        free(n->v.mod.globals);
         break;
     case N_FUN:
         node_free(n->v.fun.body);
@@ -628,7 +629,11 @@ static node_t *node_dup(node_t *n) {
     case N_MODULE:
         out->v.mod.funs = malloc(sizeof(node_t*) * (n->v.mod.nfuns ? n->v.mod.nfuns : 1));
         for (int i = 0; i < n->v.mod.nfuns; i++) out->v.mod.funs[i] = node_dup(n->v.mod.funs[i]);
-        for (int i = 0; i < n->v.mod.nglobals; i++) out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        out->v.mod.globals = malloc(sizeof(*out->v.mod.globals) * (n->v.mod.nglobals ? n->v.mod.nglobals : 1));
+        for (int i = 0; i < n->v.mod.nglobals; i++) {
+            memcpy(out->v.mod.globals[i].name, n->v.mod.globals[i].name, sizeof(out->v.mod.globals[i].name));
+            out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        }
         break;
     case N_FUN:
         out->v.fun.body = node_dup(n->v.fun.body);
@@ -2208,17 +2213,13 @@ static node_t *par_module(par_t *p) {
              * refs) are rejected at eval time since global_env is empty at load. */
             node_t *val = par_expr(p);
             if (p->err) break;
-            if (mod->v.mod.nglobals < 16) {
-                int gi = mod->v.mod.nglobals++;
-                strncpy(mod->v.mod.globals[gi].name, gname.text,
-                        sizeof(mod->v.mod.globals[gi].name)-1);
-                mod->v.mod.globals[gi].val = val;
-            } else {
-                snprintf(p->errmsg, sizeof(p->errmsg),
-                    "line %d: too many module globals (max 16)", gname.line);
-                p->err = 1;
-                node_free(val);
-            }
+            int gi = mod->v.mod.nglobals++;
+            mod->v.mod.globals = realloc(mod->v.mod.globals,
+                sizeof(*mod->v.mod.globals) * mod->v.mod.nglobals);
+            memset(mod->v.mod.globals[gi].name, 0, sizeof(mod->v.mod.globals[gi].name));
+            strncpy(mod->v.mod.globals[gi].name, gname.text,
+                    sizeof(mod->v.mod.globals[gi].name)-1);
+            mod->v.mod.globals[gi].val = val;
         } else {
             mod->v.mod.nfuns++;
             mod->v.mod.funs = realloc(mod->v.mod.funs, sizeof(node_t*) * mod->v.mod.nfuns);
@@ -4166,21 +4167,27 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
  *
  * This block bridges the gap with minimum-viable implementations of the
  * pure-functional builtins (no per-process scheduler state required).
- * Process-scheduler primitives (link/monitor/exit_proc/etc) print a one-
- * shot hint and return nil instead of silently dropping through.
+ * Process-scheduler primitives (link/monitor/exit_proc/etc) print a hint
+ * (once per name) and return nil instead of silently dropping through.
  * ========================================================================= */
 
 #define _REPL_SQLITE_MAX 32
 static sqlite3 *_repl_sqlite_db[_REPL_SQLITE_MAX];
 
-static int _repl_scheduler_warned = 0;
+/* One note per builtin name: a single shared flag would hide every stub after
+ * the first, so a test could pass on nil without anyone seeing why. */
+#define _REPL_WARNED_MAX 64
+static const char *_repl_warned_names[_REPL_WARNED_MAX];
+static int _repl_warned_count = 0;
 static void _repl_warn_scheduler(const char *name) {
-    if (_repl_scheduler_warned) return;
+    for (int i = 0; i < _repl_warned_count; i++)
+        if (strcmp(_repl_warned_names[i], name) == 0) return;
+    if (_repl_warned_count < _REPL_WARNED_MAX)
+        _repl_warned_names[_repl_warned_count++] = name;
     fprintf(stderr,
-        "note: '%s' (and similar scheduler primitives) return nil in the REPL;\n"
-        "      use `swc build file.sw -o bin/x && bin/x` for full process semantics.\n",
+        "note: '%s' is not available here and returns nil;\n"
+        "      use `swc build file.sw -o bin/x && bin/x` for the full runtime.\n",
         name);
-    _repl_scheduler_warned = 1;
 }
 
 /* ---- spawn(): re-enter the interpreter on a fresh fiber -------------------
@@ -6037,7 +6044,6 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
      * so a supervised worker would never run. Wiring needs an interpreter-aware
      * child trampoline + closure_env rebind — out of scope for call-the-native. */
     static const char *scheduler_names[] = {
-        "send",
         "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
         "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
         "http_listen", "http_respond", "ws_send", "ws_close",
@@ -6050,7 +6056,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     };
     for (int i = 0; scheduler_names[i]; i++) {
         if (strcmp(fname, scheduler_names[i]) == 0) {
-            _repl_warn_scheduler(fname);
+            _repl_warn_scheduler(scheduler_names[i]);
             return sw_val_nil();
         }
     }
@@ -7869,6 +7875,67 @@ static void rs_report(rs_ctx_t *c, rs_scope_t *s, const char *name, int line) {
     fprintf(stderr, "\n");
 }
 
+/* Arity of the builtins that may be used as a value (`map(to_string, xs)`).
+ * Each entry is the number of arguments the builtin's dispatch requires. A
+ * builtin not listed here is still rejected when used as a value. */
+static const struct { const char *name; int arity; } k_builtin_value_arity[] = {
+    { "abs", 1 }, { "base64_decode", 1 }, { "base64_encode", 1 },
+    { "byte_size", 1 }, { "bytes_from_base64", 1 }, { "bytes_to_base64", 1 },
+    { "bytes_to_string", 1 }, { "hd", 1 }, { "json_decode", 1 },
+    { "json_encode", 1 }, { "json_escape", 1 }, { "length", 1 },
+    { "map_keys", 1 }, { "map_size", 1 }, { "map_values", 1 },
+    { "math_ceil", 1 }, { "math_cos", 1 }, { "math_exp", 1 },
+    { "math_floor", 1 }, { "math_log", 1 }, { "math_round", 1 },
+    { "math_sin", 1 }, { "math_sqrt", 1 }, { "ord", 1 },
+    { "string_chars", 1 }, { "string_length", 1 }, { "string_lower", 1 },
+    { "string_to_bytes", 1 }, { "string_trim", 1 }, { "string_upper", 1 },
+    { "tl", 1 }, { "to_float", 1 }, { "to_int", 1 }, { "to_string", 1 },
+    { "typeof", 1 },
+    { "bytes_concat", 2 }, { "byte_at", 2 }, { "elem", 2 }, { "filter", 2 },
+    { "json_get", 2 }, { "list_append", 2 }, { "map", 2 }, { "map_get", 2 },
+    { "map_has_key", 2 }, { "map_merge", 2 }, { "map_remove", 2 },
+    { "math_pow", 2 }, { "string_contains", 2 }, { "string_ends_with", 2 },
+    { "string_index_of", 2 }, { "string_split", 2 }, { "string_starts_with", 2 },
+    { "map_put", 3 }, { "reduce", 3 }, { "string_replace", 3 }, { "string_sub", 3 },
+    { NULL, 0 }
+};
+
+static int rs_builtin_value_arity(const char *name) {
+    for (int i = 0; k_builtin_value_arity[i].name; i++)
+        if (strcmp(k_builtin_value_arity[i].name, name) == 0) return k_builtin_value_arity[i].arity;
+    return -1;
+}
+
+/* Rewrite the identifier node `n` (a builtin used as a value) in place into
+ * the anonymous lambda `fun(_p0, ..) { name(_p0, ..) }`. Both backends then
+ * see an ordinary closure, so the interpreter and codegen agree by
+ * construction. The callee name is copied into the new call node before
+ * `n->v` is cleared, since `name` may point into `n->v.sval`. */
+static void rs_wrap_builtin(node_t *n, const char *name, int arity) {
+    node_t *call = mknode(N_CALL, n->line);
+    call->v.call.func = mknode(N_IDENT, n->line);
+    snprintf(call->v.call.func->v.sval, sizeof(call->v.call.func->v.sval), "%s", name);
+    call->v.call.nargs = arity;
+    call->v.call.args = calloc((size_t)arity, sizeof(node_t *));
+
+    node_t *block = mknode(N_BLOCK, n->line);
+    block->v.block.stmts = calloc(1, sizeof(node_t *));
+    block->v.block.stmts[0] = call;
+    block->v.block.nstmts = 1;
+
+    memset(&n->v, 0, sizeof(n->v));
+    n->type = N_FUN;
+    n->v.fun.name[0] = '\0';
+    n->v.fun.nparams = arity;
+    for (int i = 0; i < arity; i++) {
+        snprintf(n->v.fun.params[i], sizeof(n->v.fun.params[i]), "_p%d", i);
+        call->v.call.args[i] = mknode(N_IDENT, n->line);
+        snprintf(call->v.call.args[i]->v.sval, sizeof(call->v.call.args[i]->v.sval),
+                 "_p%d", i);
+    }
+    n->v.fun.body = block;
+}
+
 static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s);
 
 /* ------------------------------------------------------------------
@@ -7950,6 +8017,8 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
         const char *name = n->v.sval;
         if (strchr(name, '.') || strcmp(name, "_") == 0) return;
         if (rs_has(s, name) || rs_is_module_func(c, name) || rs_is_global(c, name)) return;
+        int arity = rs_builtin_value_arity(name);
+        if (arity > 0) { rs_wrap_builtin(n, name, arity); return; }
         rs_report(c, s, name, n->line);
         return;
     }

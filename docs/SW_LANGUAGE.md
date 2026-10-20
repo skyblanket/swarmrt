@@ -122,7 +122,7 @@ fun summary(path) {
 
 ### Module-level `let` globals
 
-A module may declare up to 16 named constants at the top level using `let`. These are initialized once at compile time and visible to every function in the module.
+A module may declare any number of named constants at the top level using `let`. These are initialized once at startup and visible to every function in the module.
 
 ```sw
 module Config
@@ -133,7 +133,15 @@ let default_timeout = 30000
 let service_name = 'my_service'
 ```
 
-Supported literal types for module globals: `int`, `float`, `string`, and `atom`. Complex expressions, function calls, and list/map literals are **not** supported at module scope — put those inside `fun init()` or a similar startup function.
+Supported values for module globals: `int`, `float`, `string`, `atom`, and collection literals — lists, maps (`%{...}`), and tuples — including nested ones. Keep the right-hand side to constant data; anything that depends on runtime state belongs inside `fun init()` or a similar startup function.
+
+```sw
+module Limits
+
+let RETRY_LIMITS = %{"lo" => 0, "hi" => 100}
+let REGIONS = ["us-east", "eu-west"]
+let DEFAULT_PAIR = {7, "seven"}
+```
 
 Globals are read-only after initialization. Any assignment to a module-global name inside a function creates a local variable that shadows the global for that scope; the global itself is unchanged.
 
@@ -261,7 +269,7 @@ fun main() {
 }
 ```
 
-Builtins (`to_string`, `string_upper`, …) can be piped into (`xs |> length`) but not yet passed as values — wrap them: `map(fn(x) { to_string(x) }, xs)`.
+Builtins can be piped into (`xs |> length`) and passed as values: `map(to_string, xs)` and `f = string_upper` both work. A builtin used as a value is wrapped in a closure of its arity, so it behaves the same as the explicit `fun(x) { to_string(x) }`. This covers the fixed-arity builtins (`to_string`, `string_upper`, `length`, `map_get`, `reduce`, …). Variadic builtins such as `print` can't be passed as values yet; wrap them: `fun(x) { print(x) }`.
 
 ### Names are checked
 
@@ -796,7 +804,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 | `http_request(url, opts)` | **status-aware** request → `%{status: int, body: string, headers: %{lowercased keys}}` on a completed transport (incl. 4xx/5xx — the status is surfaced, not hidden), or `{'error, reason}` if the request never completed. `opts` is a map: `method` (default `"GET"`), `headers` (a `%{name=>value}` MAP **or** a list of `{name, value}` tuples), `body` (string). Unlike `http_post`/`http_get` (body-or-nil, status hidden) it lets a caller tell a 200 from a 4xx/5xx with a body. `http_post`/`http_get` are unchanged |
 | `http_post_stream(url, headers, body, [pid, name])` | streams to stdout incrementally; reasoning channel; ESC interrupt. Returns a **tagged** result: `{'ok, openai_json}` on success, `{'error, reason}` on curl-failure / non-2xx / empty-or-unparseable stream. Parses both `data: {...}` and `data:{...}` SSE framing |
 | **HTTP/WS server**: `http_listen`, `http_respond`, `ws_send`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `live_js` |
-| `http_listen(port)` / `http_listen(port, opts)` → `'ok'`/`'error'`; delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. **Binds `127.0.0.1`** unless `opts` has `bind: "0.0.0.0"` (or another IPv4 address) or `SW_HTTP_BIND` is set; the option wins. A WS upgrade whose `Origin` is not same-origin (Origin authority = `Host`), loopback, or listed in `opts.ws_origins` (list of strings) / `SW_WS_ORIGINS` gets `403`; an upgrade with no `Origin` (non-browser client) is accepted. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
+| `http_listen(port)` / `http_listen(port, opts)` → `'ok'`/`'error'`; delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. **Binds `127.0.0.1`** unless `opts` has `bind: "0.0.0.0"` (or another IPv4 address) or `SW_HTTP_BIND` is set; the option wins. A WS upgrade whose `Origin` is not same-origin (Origin authority = `Host`), loopback, or listed in `opts.ws_origins` (list of strings) / `SW_WS_ORIGINS` gets `403`; an upgrade with no `Origin` (non-browser client) is accepted. Same-origin trusts `Host`, so against DNS rebinding set `SW_HTTP_HOSTS` (comma list of `Host` values): when set, any request (upgrade or plain HTTP) whose `Host` is not listed gets `403`. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
 | **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_connect_tls(wss_url)` → handle (TLS `wss://`), `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_set_handler(h, pid)` (deliver frames to a process as messages), `wsc_close(h)` |
 
 ### Browser
@@ -830,7 +838,7 @@ Needs `import Chrome` (a battery; see §2).
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
-> **Process primitives by mode.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work there, and `Swarm` works once imported. Under `swc test` and the REPL no runtime is booted: `spawn` fails with `spawn failed: process table full` under `swc test`, `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function`. Under all three modes these stubbed builtins print a note on stderr and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, `tool_define`, `tool_call`, `tool_list`, `tool_rollback`, `tool_history`, `http_listen`, `http_respond`, `ws_send`, `ws_send_binary`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `wsc_connect`, `wsc_connect_tls`, `wsc_send`, `wsc_recv`, `wsc_set_handler`, `wsc_close`, `chrome_launch` (after `import Chrome`), `telemetry_emit`, `telemetry_subscribe`, `pubsub_subscribe` and `pubsub_broadcast`. Other names that look like socket, pubsub or telemetry calls, such as `ws_connect`, `pubsub_publish`, `pubsub_unsubscribe` and `telemetry_unsubscribe`, do not exist in the interpreter and fail with `undefined function`. For full semantics of any of these, run `swc build file.sw -o bin/x && bin/x`.
+> **Process primitives by mode.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work there, and `Swarm` works once imported. Under `swc test` and the REPL no runtime is booted: `spawn` fails with `spawn failed: process table full` under `swc test`, `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function`. Under all three modes these stubbed builtins print a note on stderr (one per builtin name, pointing at `swc build`) and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, `tool_define`, `tool_call`, `tool_list`, `tool_rollback`, `tool_history`, `http_listen`, `http_respond`, `ws_send`, `ws_send_binary`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `wsc_connect`, `wsc_connect_tls`, `wsc_send`, `wsc_recv`, `wsc_set_handler`, `wsc_close`, `chrome_launch` (after `import Chrome`), `telemetry_emit`, `telemetry_subscribe`, `pubsub_subscribe` and `pubsub_broadcast`. Other names that look like socket, pubsub or telemetry calls, such as `ws_connect`, `pubsub_publish`, `pubsub_unsubscribe` and `telemetry_unsubscribe`, do not exist in the interpreter and fail with `undefined function`. For full semantics of any of these, run `swc build file.sw -o bin/x && bin/x`.
 
 ### Tool registry — self-defined, hot-loaded tools
 An agent can write a new tool *as `sw` source at runtime* and call it live, with no restart — the source is parsed and run by the interpreter that ships inside every compiled binary. The tool's entry function is `run`.
