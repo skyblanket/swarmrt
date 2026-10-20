@@ -235,6 +235,8 @@ examples: swc libswarmrt
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
+	@if [ -n "$$CI" ]; then $(MAKE) --no-print-directory check-cmake; \
+	else echo "note: check-cmake runs in CI only (set CI=1 or run 'make check-cmake')"; fi
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.
@@ -724,7 +726,8 @@ check-sources:
 	bash scripts/check_source_lists.sh
 
 # Full CMake build (the Windows/MinGW path uses this). Not a prerequisite of
-# swc/libswarmrt: run it explicitly, or from a CI step that calls it.
+# swc/libswarmrt, so local builds need no cmake. test-sw runs it under CI
+# (CI=1 is set by GitHub Actions), where a missing cmake fails the job.
 check-cmake:
 	bash scripts/check_cmake_build.sh
 

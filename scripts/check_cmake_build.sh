@@ -17,10 +17,9 @@ if ! command -v cmake >/dev/null 2>&1; then
     exit 1
 fi
 
-# bin/ is shared with the Makefile, and CMake writes swc there too. That is
-# harmless: `make swc` links bin/swc after this check, so the Makefile's
-# binary is the one that ends up in place.
+# CMake's outputs go under build/cmake, not bin/: bin/ holds the binaries the
+# Makefile built, and the test suite runs them after this check.
 build_dir=build/cmake
-cmake -S . -B "$build_dir" > /dev/null
+cmake -S . -B "$build_dir" -DSWARMRT_BIN_DIR="$PWD/$build_dir/bin" > /dev/null
 cmake --build "$build_dir" -j"$(nproc)"
 echo "cmake build ok"
