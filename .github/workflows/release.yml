@@ -33,7 +33,8 @@ jobs:
       - name: Install dependencies (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
-          sudo apt-get update -qq
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list*  # third-party mirror 403s fail the job; we need nothing from it
+          for i in 1 2 3; do sudo apt-get update -qq && break; sleep 10; done
           sudo apt-get install -y --no-install-recommends \
               build-essential libsqlite3-dev libssl-dev zlib1g-dev
 
