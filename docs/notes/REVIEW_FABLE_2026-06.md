@@ -213,6 +213,11 @@ reliable figure; medians were inflated by contention:
 | `swc --version` | 3 ms | 4–13 ms |
 | `/bin/true` fork+exec baseline | 2 ms | 3 ms |
 
+Re-sampled 2026-10-20 at load average ~170 on the same 4 vCPUs (60 launches per row, minimum):
+`swc run hello.sw` 13–15 ms, compiled default 27–44 ms, compiled with `SW_MAX_PROCS=1024`
+23–33 ms, `/bin/true` 2 ms. The 8 ms `SW_MAX_PROCS=1024` minimum did not reproduce under that
+load, so the "<10 ms" figure stands only as a quiet-host number (see BUILDING_AGENTS.md).
+
 The original 105–145 ms did not reproduce in a quiet window. The default boot is about 30 ms, not
 under 10 ms, and the cost is the default 100K-slot process table (`src/swarmrt_native.c`, ~L1911–1920);
 `SW_MAX_PROCS=1024` brings the floor to about 8 ms. Those numbers agree with the earlier sweep
