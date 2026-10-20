@@ -72,6 +72,14 @@ typedef enum {
     SW_HTTP_MODE_WS,        /* WebSocket upgraded */
 } sw_http_mode_t;
 
+/* Chunked request-body decoder states (sw_http_conn_t.chunk_state). */
+typedef enum {
+    SW_HTTP_CHUNK_SIZE,         /* expecting a chunk-size line */
+    SW_HTTP_CHUNK_DATA,         /* inside chunk data */
+    SW_HTTP_CHUNK_DATA_END,     /* expecting the CRLF after chunk data */
+    SW_HTTP_CHUNK_TRAILER,      /* after the 0-size chunk: trailer lines */
+} sw_http_chunk_state_t;
+
 /* Per-connection state */
 typedef struct {
     int                 id;         /* Connection handle (index in table) */
@@ -87,6 +95,16 @@ typedef struct {
     /* HTTP body buffering */
     uint32_t            content_length; /* Content-Length from headers, 0 = none */
     int                 body_pending;   /* 1 = still accumulating body bytes */
+
+    /* Transfer-Encoding: chunked body, decoded as it arrives (see
+     * http_chunked_feed in swarmrt_http.c). The wire bytes are consumed from
+     * buf; the decoded data accumulates in body_acc (NUL-terminated, malloc'd). */
+    int                 chunked;        /* 1 = body is chunked (body_pending set) */
+    sw_http_chunk_state_t chunk_state;
+    uint64_t            chunk_left;     /* data bytes left in the current chunk */
+    char               *body_acc;
+    uint64_t            body_len;
+    uint64_t            body_cap;
 
     /* Connection persistence */
     int                 keep_alive;     /* 1 = keep connection open after response */

@@ -123,6 +123,12 @@ static int conn_alloc(sw_port_t *port, sw_http_bridge_t *bridge) {
             c->ws_key[0] = '\0';
             c->content_length = 0;
             c->body_pending = 0;
+            c->chunked = 0;
+            c->chunk_state = SW_HTTP_CHUNK_SIZE;
+            c->chunk_left = 0;
+            c->body_acc = NULL;
+            c->body_len = 0;
+            c->body_cap = 0;
             c->keep_alive = 1; /* HTTP/1.1 default */
             c->req_hdr = NULL;
             c->req_path = NULL;
@@ -146,6 +152,7 @@ static void conn_clear_locked(sw_http_conn_t *c) {
     if (c->frag_buf) { free(c->frag_buf); c->frag_buf = NULL; }
     if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
     if (c->req_path) { free(c->req_path); c->req_path = NULL; }
+    if (c->body_acc) { free(c->body_acc); c->body_acc = NULL; }
     c->frag_len = 0;
     c->frag_cap = 0;
     c->frag_opcode = 0;
@@ -623,6 +630,154 @@ static sw_val_t *http_hdr_map(const char *raw) {
     return http_parse_headers(raw, n >= 2 ? raw + n - 2 : raw);
 }
 
+/* === Chunked request bodies (RFC 7230 §4.1) ===
+ *
+ * http_chunked_feed decodes a Transfer-Encoding: chunked body as it arrives.
+ * It consumes wire bytes from c->buf and appends the chunk data to
+ * c->body_acc, keeping its position in chunk_state / chunk_left, so a body
+ * spread over many reads is never rescanned. The decoded size is held to the
+ * same SW_HTTP_MAX_REQUEST cap as Content-Length, checked when each chunk-size
+ * line arrives, so an oversize upload is refused with a 413 before its data is
+ * read. Chunk extensions and trailer fields are accepted and ignored. */
+
+/* Longest chunk-size or trailer line accepted before the LF. */
+#define HTTP_CHUNK_LINE_MAX 4096
+
+static void http_chunk_reset(sw_http_conn_t *c) {
+    free(c->body_acc);
+    c->body_acc = NULL;
+    c->body_len = 0;
+    c->body_cap = 0;
+    c->chunked = 0;
+    c->chunk_state = SW_HTTP_CHUNK_SIZE;
+    c->chunk_left = 0;
+    c->body_pending = 0;
+}
+
+/* Grow body_acc to hold `need` bytes plus the NUL terminator. The cap never
+ * exceeds SW_HTTP_MAX_REQUEST + 1, since the caller has already bounded
+ * `need`. Returns 0, or -1 on OOM. */
+static int http_body_reserve(sw_http_conn_t *c, uint64_t need) {
+    if (need + 1 <= c->body_cap) return 0;
+    uint64_t cap = c->body_cap ? c->body_cap * 2 : 4096;
+    if (cap < need + 1) cap = need + 1;
+    if (cap > (uint64_t)http_max_request() + 1) cap = (uint64_t)http_max_request() + 1;
+    char *nb = (char *)realloc(c->body_acc, (size_t)cap);
+    if (!nb) return -1;
+    c->body_acc = nb;
+    c->body_cap = cap;
+    return 0;
+}
+
+/* Parse a chunk-size line (hex digits, then optional ";ext" / whitespace).
+ * Returns 0 with *out set, -400 when malformed, -413 when the size alone
+ * exceeds the body cap. */
+static int http_chunk_size(const uint8_t *line, uint32_t len, uint64_t *out) {
+    uint64_t v = 0;
+    uint32_t i = 0;
+    for (; i < len; i++) {
+        uint8_t ch = line[i];
+        int d = (ch >= '0' && ch <= '9') ? ch - '0'
+              : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10
+              : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
+        if (d < 0) break;
+        v = v * 16 + (uint64_t)d;   /* v <= cap before this, so no wrap */
+        if (v > http_max_request()) return -413;
+    }
+    if (i == 0) return -400;
+    if (i < len && line[i] != ';' && line[i] != ' ' && line[i] != '\t' && line[i] != '\r')
+        return -400;
+    *out = v;
+    return 0;
+}
+
+/* Decode the chunked body in c->buf as far as it goes. Returns 1 once the
+ * last-chunk and trailer section have arrived (the body is in body_acc), 0
+ * when more bytes are needed, -413 when the body would exceed the cap, -400
+ * on bad framing, -500 on OOM. Consumed wire bytes are removed from c->buf. */
+static int http_chunked_feed(sw_http_conn_t *c) {
+    uint64_t max = http_max_request();
+    uint32_t pos = 0;
+    int rc = 0;
+
+    for (;;) {
+        uint32_t avail = c->buf_len - pos;
+
+        if (c->chunk_state == SW_HTTP_CHUNK_SIZE ||
+            c->chunk_state == SW_HTTP_CHUNK_TRAILER) {
+            uint8_t *line = c->buf + pos;
+            uint8_t *lf = memchr(line, '\n', avail);
+            if (!lf) {
+                if (avail > HTTP_CHUNK_LINE_MAX) rc = -400;
+                break;
+            }
+            uint32_t linelen = (uint32_t)(lf - line);   /* LF excluded */
+            pos += linelen + 1;
+
+            if (c->chunk_state == SW_HTTP_CHUNK_TRAILER) {
+                /* An empty line ends the body; other lines are discarded. */
+                if (linelen == 0 || (linelen == 1 && line[0] == '\r')) { rc = 1; break; }
+                continue;
+            }
+
+            uint64_t size;
+            rc = http_chunk_size(line, linelen, &size);
+            if (rc < 0) break;
+            if (size > max - c->body_len) { rc = -413; break; }
+            if (size == 0) {
+                c->chunk_state = SW_HTTP_CHUNK_TRAILER;
+            } else {
+                c->chunk_state = SW_HTTP_CHUNK_DATA;
+                c->chunk_left = size;
+            }
+        } else if (c->chunk_state == SW_HTTP_CHUNK_DATA) {
+            uint64_t take = avail < c->chunk_left ? avail : c->chunk_left;
+            if (take > 0) {
+                if (http_body_reserve(c, c->body_len + take) < 0) { rc = -500; break; }
+                memcpy(c->body_acc + c->body_len, c->buf + pos, (size_t)take);
+                c->body_len += take;
+                c->chunk_left -= take;
+                pos += (uint32_t)take;
+            }
+            if (c->chunk_left > 0) break;
+            c->chunk_state = SW_HTTP_CHUNK_DATA_END;
+        } else {   /* SW_HTTP_CHUNK_DATA_END */
+            if (avail < 2) break;
+            if (c->buf[pos] != '\r' || c->buf[pos + 1] != '\n') { rc = -400; break; }
+            pos += 2;
+            c->chunk_state = SW_HTTP_CHUNK_SIZE;
+        }
+    }
+
+    if (pos > 0) {
+        memmove(c->buf, c->buf + pos, c->buf_len - pos);
+        c->buf_len -= pos;
+    }
+    if (c->body_acc) c->body_acc[c->body_len] = '\0';
+    return rc;
+}
+
+/* A chunked body failed to decode (st < 0): answer and close, the framing
+ * can't be resynchronised. */
+static void http_reject_chunked(int cid, int st) {
+    sw_http_conn_t *c = &g_http_conns[cid];
+    http_chunk_reset(c);
+    c->keep_alive = 0;
+    if (st == -413) {
+        fprintf(stderr,
+            "swarmrt_http: rejecting chunked request on conn %d — body exceeds "
+            "SW_HTTP_MAX_REQUEST (%u bytes)\n", cid, http_max_request());
+        sw_http_respond(cid, 413, NULL, "Payload Too Large");
+    } else if (st == -400) {
+        fprintf(stderr,
+            "swarmrt_http: rejecting chunked request on conn %d — malformed "
+            "chunked framing\n", cid);
+        sw_http_respond(cid, 400, NULL, "Bad Request");
+    } else {
+        sw_http_respond(cid, 500, NULL, "Internal Server Error");
+    }
+}
+
 /* `port` is the conn's (pinned) port, for the WS handshake write; NULL
  * from the fuzz harness. */
 static void http_try_parse(int cid, sw_port_t *port) {
@@ -630,6 +785,12 @@ static void http_try_parse(int cid, sw_port_t *port) {
 
     /* If we're waiting for body bytes, check if we have enough */
     if (c->body_pending) {
+        if (c->chunked) {
+            int st = http_chunked_feed(c);
+            if (st == 0) return;             /* still incomplete */
+            if (st < 0) { http_reject_chunked(cid, st); return; }
+            goto deliver_body;
+        }
         if (c->buf_len < c->content_length) return; /* still incomplete */
         /* Body complete — fall through to deliver below */
         goto deliver_body;
@@ -730,7 +891,7 @@ static void http_try_parse(int cid, sw_port_t *port) {
      * buffering toward the conn_on_data cap: strtoul gave the client a
      * free uint32-range Content-Length, i.e. a request to buffer ~4GB.
      * keep_alive=0 makes sw_http_respond close + free the slot. */
-    if (has_content_length && content_length > http_max_request()) {
+    if (!is_chunked && has_content_length && content_length > http_max_request()) {
         fprintf(stderr,
             "swarmrt_http: rejecting %s %s — Content-Length %u exceeds "
             "SW_HTTP_MAX_REQUEST (%u bytes)\n",
@@ -758,30 +919,6 @@ static void http_try_parse(int cid, sw_port_t *port) {
         }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         c->req_path = strdup(path);
-    }
-
-    /* Chunked transfer-encoding: not fully supported. Don't hang waiting for
-     * a Content-Length that will never arrive — drain anything that looks
-     * like a terminating chunk and dispatch with empty body. */
-    if (is_chunked && !has_content_length) {
-        fprintf(stderr,
-            "swarmrt_http: Transfer-Encoding: chunked is not yet supported; "
-            "dispatching %s %s with empty body\n", method, path);
-        /* Best-effort: if "0\r\n\r\n" is in the buffer, skip past it */
-        if (c->buf_len >= 5) {
-            for (uint32_t i = 0; i + 5 <= c->buf_len; i++) {
-                if (c->buf[i] == '0' && c->buf[i+1] == '\r' && c->buf[i+2] == '\n' &&
-                    c->buf[i+3] == '\r' && c->buf[i+4] == '\n') {
-                    uint32_t skip = i + 5;
-                    uint32_t rem = c->buf_len - skip;
-                    if (rem > 0)
-                        memmove(c->buf, c->buf + skip, rem);
-                    c->buf_len = rem;
-                    break;
-                }
-            }
-        }
-        content_length = 0;
     }
 
     c->keep_alive = keep_alive;
@@ -840,6 +977,21 @@ static void http_try_parse(int cid, sw_port_t *port) {
         return;
     }
 
+    /* Chunked request body: decode it as it arrives. Transfer-Encoding wins
+     * over Content-Length (RFC 7230 §3.3.3), so any CL value is ignored. The
+     * method/path are stashed in ws_key for deliver_body, as below. */
+    if (is_chunked) {
+        c->chunked = 1;
+        c->chunk_state = SW_HTTP_CHUNK_SIZE;
+        c->chunk_left = 0;
+        c->body_pending = 1;
+        snprintf(c->ws_key, sizeof(c->ws_key), "%s\x01%s", method, path);
+        int st = http_chunked_feed(c);
+        if (st == 0) return;
+        if (st < 0) { http_reject_chunked(cid, st); return; }
+        goto deliver_body;
+    }
+
     /* If body expected but not yet fully received, buffer it */
     if (content_length > 0 && c->buf_len < content_length) {
         c->content_length = content_length;
@@ -891,19 +1043,30 @@ deliver_body:
             int mlen = (int)(sep - c->ws_key);
             if (mlen > 15) mlen = 15;
             memcpy(method, c->ws_key, mlen);
-            strncpy(path, sep + 1, 511);
         }
+        /* The stash in ws_key is 128 bytes, so a long path is cut there;
+         * req_path keeps the whole path until delivery. */
+        if (c->req_path) strncpy(path, c->req_path, 511);
+        else if (sep) strncpy(path, sep + 1, 511);
 
-        char *body_buf = (char *)malloc(c->content_length + 1);
-        memcpy(body_buf, c->buf, c->content_length);
-        body_buf[c->content_length] = '\0';
+        char *body_buf;
+        if (c->chunked) {
+            /* Decoded in place by http_chunked_feed; NULL = empty body. */
+            body_buf = c->body_acc ? c->body_acc : (char *)calloc(1, 1);
+            c->body_acc = NULL;
+            http_chunk_reset(c);
+        } else {
+            body_buf = (char *)malloc(c->content_length + 1);
+            memcpy(body_buf, c->buf, c->content_length);
+            body_buf[c->content_length] = '\0';
 
-        uint32_t rem = c->buf_len - c->content_length;
-        if (rem > 0)
-            memmove(c->buf, c->buf + c->content_length, rem);
-        c->buf_len = rem;
-        c->body_pending = 0;
-        c->content_length = 0;
+            uint32_t rem = c->buf_len - c->content_length;
+            if (rem > 0)
+                memmove(c->buf, c->buf + c->content_length, rem);
+            c->buf_len = rem;
+            c->body_pending = 0;
+            c->content_length = 0;
+        }
         c->ws_key[0] = '\0';
 
         sw_val_t *items[6];
@@ -924,6 +1087,22 @@ deliver_body:
 
 /* === Connection Data Handler === */
 
+/* Close a connection whose unparsed request bytes outgrew SW_HTTP_MAX_REQUEST.
+ * Rate-limited stderr keeps the drop loud. */
+static void http_oversize_close(int cid, sw_port_t *port) {
+    static _Atomic uint32_t g_http_oversize_drops;
+    uint32_t d = atomic_fetch_add_explicit(&g_http_oversize_drops, 1,
+                                           memory_order_relaxed);
+    if ((d & 0xFF) == 0) {
+        fprintf(stderr,
+            "swarmrt_http: closing conn %d — request buffer would exceed "
+            "SW_HTTP_MAX_REQUEST (%u bytes); %u oversize connections "
+            "dropped so far\n",
+            cid, http_max_request(), d + 1);
+    }
+    conn_close(cid, port);
+}
+
 /* Runs on the owning bridge between conn_begin_pass / conn_end_pass, with
  * `port` pinned. */
 static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) {
@@ -938,19 +1117,14 @@ static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) 
      * streaming, WS bytes piling up behind a stalled parse). 64-bit sum so
      * buf_len+len can't wrap. Close + free the slot — same defensive shape
      * as the WS oversize rejection, and conn_close'd so the slot and buffer
-     * are actually reclaimed. Rate-limited stderr keeps the drop LOUD. */
-    if ((uint64_t)c->buf_len + (uint64_t)len + 1 > (uint64_t)http_max_request()) {
-        static _Atomic uint32_t g_http_oversize_drops;
-        uint32_t d = atomic_fetch_add_explicit(&g_http_oversize_drops, 1,
-                                               memory_order_relaxed);
-        if ((d & 0xFF) == 0) {
-            fprintf(stderr,
-                "swarmrt_http: closing conn %d — request buffer would exceed "
-                "SW_HTTP_MAX_REQUEST (%u bytes); %u oversize connections "
-                "dropped so far\n",
-                cid, http_max_request(), d + 1);
-        }
-        conn_close(cid, port);
+     * are actually reclaimed. Rate-limited stderr keeps the drop LOUD.
+     * WS frames are checked before the append. HTTP is checked after the
+     * parse below: a chunked body is drained by http_chunked_feed as it
+     * arrives (and its decoded size is capped there with a 413), so only
+     * what is still unparsed counts against the cap. */
+    int http_mode = c->mode == SW_HTTP_MODE_HTTP;
+    if (!http_mode && (uint64_t)c->buf_len + (uint64_t)len + 1 > (uint64_t)http_max_request()) {
+        http_oversize_close(cid, port);
         return;
     }
 
@@ -967,11 +1141,14 @@ static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) 
     c->buf_len += len;
     c->buf[c->buf_len] = '\0'; /* keep the scan buffer C-string safe */
 
-    if (c->mode == SW_HTTP_MODE_HTTP) {
+    if (http_mode) {
         http_try_parse(cid, port);
         /* After upgrade, parse any remaining data as WS */
         if (c->mode == SW_HTTP_MODE_WS && c->buf_len > 0 && !c->closed)
             ws_try_parse(cid, port);
+        else if (c->mode == SW_HTTP_MODE_HTTP && c->port &&
+                 (uint64_t)c->buf_len + 1 > (uint64_t)http_max_request())
+            http_oversize_close(cid, port);
     } else {
         ws_try_parse(cid, port);
     }

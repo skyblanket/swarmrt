@@ -298,7 +298,7 @@ needed.
 | `SW_SCHEDULERS` | CPU count | Number of scheduler threads. `1` for deterministic CLI tools. |
 | `SW_MAX_PROCS` | `100000` | Arena ceiling. Drop to `1024`/`4096` for fast-start CLI binaries — measured ~6 ms total wall (vs ~40 ms at the default ceiling) on Linux x86_64. Floor of 16. |
 | `SW_MAILBOX_MAX` | `1000000` | Mailbox depth cap (pending messages per process). User sends over the cap are dropped — loudly: a global counter (`sw_mailbox_dropped()`) plus a rate-limited stderr warning. EXIT/DOWN signals and timer fires are exempt, so supervision and `receive … after` keep working on a flooded process. `0` disables. |
-| `SW_HTTP_MAX_REQUEST` | `33554432` (32MB) | Max bytes buffered for one HTTP request (headers + body) and max accepted `Content-Length`. Oversized declared bodies get a `413`; connections that outgrow the buffer cap are closed. Min `4096`. |
+| `SW_HTTP_MAX_REQUEST` | `33554432` (32MB) | Max bytes buffered for one HTTP request (headers + body), max accepted `Content-Length`, and max decoded `Transfer-Encoding: chunked` body (chunked bodies are decoded as they arrive and handed to the handler whole). Oversized bodies get a `413`; malformed chunked framing gets a `400`; connections that outgrow the buffer cap are closed. Min `4096`. |
 | `SW_HTTP_IDLE_TIMEOUT_MS` | `30000` | Close an HTTP connection idle (no inbound bytes) this long and free its slot (slow-loris defense). `0` disables; established WebSockets are exempt unless `SW_HTTP_WS_IDLE_TIMEOUT_MS` is set. |
 | `SW_PROC_MEM_MAX` | `0` (off) | Per-process memory cap (bytes). A process over the cap dies loudly; the node + siblings survive. |
 | `SW_MSG_MAX_BYTES` | `0` (off) | Max size of a single local message (bytes). Over-cap sends are dropped loudly, leak-free. |
