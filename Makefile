@@ -363,6 +363,7 @@ fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db
 # expected. tests/stress/isolation_fuzz.sw.
 .PHONY: isolation-gate
 isolation-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits isolation-gate
 	@./bin/swc build tests/stress/isolation_fuzz.sw -o $(BIN_DIR)/isolation_fuzz >/dev/null
 	@$(BIN_DIR)/isolation_fuzz >$(BIN_DIR)/_iso.out 2>/dev/null; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_iso.out; then \
@@ -675,6 +676,7 @@ lsan-gate: swc
 .PHONY: alloc-fault
 alloc-fault: swc
 	@if [ "$$(uname)" != "Linux" ]; then echo "alloc-fault: SKIP (needs Linux ASAN)"; exit 0; fi
+	@bash scripts/gate_common.sh gate_print_limits alloc-fault
 	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "alloc-fault: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/alloc_fault.sw -o $(BIN_DIR)/_af_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -DSW_ALLOC_FAULT -g -O1 -fno-stack-protector \
