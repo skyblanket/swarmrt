@@ -290,6 +290,7 @@ FUZZ_ASAN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:quarantine_size_mb
 
 .PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json fuzz-ws fuzz-db isolation-gate
 fuzz-parse: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-parse: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
@@ -299,11 +300,13 @@ fuzz-parse: dirs
 # on malformed or adversarially-nested input (the corpus includes a
 # 5000-deep array; g_jd_depth must bound it).
 fuzz-json: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-json: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_json.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_json $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
 
 fuzz-marshal: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-marshal: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_marshal.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_marshal $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
@@ -312,6 +315,7 @@ fuzz-marshal: dirs
 # -DSW_FUZZ_HTTP exposes sw_http_fuzz_parse() in swarmrt_http.c (built once,
 # in FUZZ_RT, with the flag applied to the whole single-command compile).
 fuzz-http: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-http: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
@@ -321,6 +325,7 @@ fuzz-http: dirs
 # fragmentation/reassembly realloc path. Reuses -DSW_FUZZ_HTTP (both hooks
 # live in swarmrt_http.c).
 fuzz-ws: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-ws: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_ws.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_ws $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_ws tests/fuzz/corpus/ws
@@ -330,6 +335,7 @@ fuzz-ws: dirs
 # includes swarmrt_builtins_studio.h exactly like generated code, so it
 # drives the real static implementations.
 fuzz-db: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-db: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_db.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_db $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
@@ -349,6 +355,7 @@ fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db
 # expected. tests/stress/isolation_fuzz.sw.
 .PHONY: isolation-gate
 isolation-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits isolation-gate
 	@./bin/swc build tests/stress/isolation_fuzz.sw -o $(BIN_DIR)/isolation_fuzz >/dev/null
 	@$(BIN_DIR)/isolation_fuzz >$(BIN_DIR)/_iso.out 2>/dev/null; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_iso.out; then \
@@ -368,6 +375,8 @@ isolation-gate: swc libswarmrt
 # Emits the generated C, compiles it + the runtime under the sanitizers, runs it.
 .PHONY: gc-stress
 gc-stress: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits gc-stress
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "gc-stress: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/sw/test_uaf_stress.sw -o $(BIN_DIR)/_gc_stress_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
 	    tests/sw/test_uaf_stress.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_stress $(LDFLAGS)
@@ -470,6 +479,7 @@ gc-stress: swc libswarmrt
 # regions (no leak / UAF / double-free on rejection).
 .PHONY: mailbox-flood
 mailbox-flood: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "mailbox-flood: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) \
 	    tests/stress/mailbox_flood.c $(FUZZ_RT) -o $(BIN_DIR)/mailbox_flood $(LDFLAGS)
 	@SW_MAILBOX_MAX=1000 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood capped
@@ -485,6 +495,7 @@ mailbox-flood: dirs
 # and the capped run fails — the gate has been proven bidirectionally.
 .PHONY: quota-gate
 quota-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits quota-gate
 	@./bin/swc build tests/gc/quota_kill.sw -o $(BIN_DIR)/quota_kill >/dev/null
 	@SW_PROC_MEM_MAX=2000000 $(BIN_DIR)/quota_kill >$(BIN_DIR)/_qk.out 2>$(BIN_DIR)/_qk.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_qk.out; then \
@@ -513,6 +524,7 @@ quota-gate: swc libswarmrt
 # gate has been proven bidirectionally.
 .PHONY: msgsize-gate
 msgsize-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits msgsize-gate
 	@./bin/swc build tests/gc/msg_size_cap.sw -o $(BIN_DIR)/msg_size_cap >/dev/null
 	@SW_MSG_MAX_BYTES=65536 $(BIN_DIR)/msg_size_cap >$(BIN_DIR)/_mc.out 2>$(BIN_DIR)/_mc.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_mc.out; then \
@@ -578,6 +590,7 @@ shutdown-gate: swc libswarmrt
 # bidirectionally.
 .PHONY: crashlog-gate
 crashlog-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits crashlog-gate
 	@./bin/swc build tests/obs/crash_json.sw -o $(BIN_DIR)/crash_json >/dev/null
 	@SW_LOG_JSON=1 $(BIN_DIR)/crash_json >$(BIN_DIR)/_cj.out 2>$(BIN_DIR)/_cj.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_cj.out; then \
@@ -632,7 +645,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_tool.sw      10000 100000 24 tool  || rc=1; \
-	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
+	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded, or a probe could not run — see above)"; \
 	 exit $$rc
 
 # LeakSanitizer lifecycle gate (Phase 2.1) — Linux only (macOS Apple-clang
@@ -649,6 +662,8 @@ lsan-gate: swc
 	@if [ "$$(uname)" != "Linux" ]; then \
 	  echo "lsan-gate: SKIP (LeakSanitizer requires Linux clang/gcc ASAN)"; exit 0; \
 	fi
+	@bash scripts/gate_common.sh gate_print_limits lsan-gate
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "lsan-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/lsan_lifecycle.sw -o $(BIN_DIR)/_lsan_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -g -O1 -fno-stack-protector \
 	    tests/gc/lsan_lifecycle.gen.c $(FUZZ_RT) -o $(BIN_DIR)/lsan_gate $(LDFLAGS)
@@ -673,6 +688,8 @@ lsan-gate: swc
 .PHONY: alloc-fault
 alloc-fault: swc
 	@if [ "$$(uname)" != "Linux" ]; then echo "alloc-fault: SKIP (needs Linux ASAN)"; exit 0; fi
+	@bash scripts/gate_common.sh gate_print_limits alloc-fault
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "alloc-fault: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/alloc_fault.sw -o $(BIN_DIR)/_af_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -DSW_ALLOC_FAULT -g -O1 -fno-stack-protector \
 	    tests/gc/alloc_fault.gen.c $(FUZZ_RT) -o $(BIN_DIR)/alloc_fault $(LDFLAGS)
@@ -795,6 +812,8 @@ stats:
 # 80k spawns — ~2 min under TSan.
 .PHONY: tsan-gate
 tsan-gate: swc
+	@bash scripts/gate_common.sh gate_print_limits tsan-gate
+	@bash scripts/gate_common.sh gate_need_tsan "$(FUZZ_CC)" || { echo "tsan-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/slope_message.sw -o $(BIN_DIR)/_tsm_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
 	    tests/gc/slope_message.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_msg $(LDFLAGS)

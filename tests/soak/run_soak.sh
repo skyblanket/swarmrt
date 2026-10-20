@@ -20,6 +20,8 @@ SECS="${SOAK_SECONDS:-60}"
 BUDGET="${SOAK_RSS_BUDGET_MB:-256}"
 
 [ -x "$SWC" ] || { echo "error: build swc first"; exit 2; }
+. "$ROOT/scripts/gate_common.sh"
+gate_print_limits soak
 mkdir -p "$(dirname "$BIN")"
 "$SWC" build "$ROOT/tests/soak/soak.sw" -o "$BIN" >/dev/null 2>&1 || { echo "soak: compile FAIL"; exit 1; }
 
