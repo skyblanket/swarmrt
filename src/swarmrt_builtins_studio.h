@@ -3870,23 +3870,40 @@ static void *_tool_parse_big_stack(const char *src) {
  * The result is a heap-owned sw_val tree (thread-agnostic), valid after join.
  * On the helper thread sw_self()==NULL, so process primitives degrade to nil
  * (a tool can't send/receive/spawn into the host scheduler). */
-typedef struct { void *ast; const char *fn; sw_val_t **args; int n; sw_val_t *result; } _tool_eval_ctx;
+typedef struct { void *ast; const char *fn; sw_val_t **args; int n; sw_value_arena_t *out; sw_val_t *result; } _tool_eval_ctx;
 static void *_tool_eval_thread(void *arg) {
     _tool_eval_ctx *c = (_tool_eval_ctx *)arg;
+    /* The helper thread has no process arena, so every value the tool builds
+     * (intermediates and the result) lands in `out`, which the caller adopts
+     * or frees. Without this they went to the global heap and were never freed. */
+    sw_swap_alloc_target(c->out);
     c->result = sw_lang_call_fresh(c->ast, c->fn, c->args, c->n);
+    sw_swap_alloc_target(NULL);
     return NULL;
 }
+/* Take over the tool's region: a process adopts it (O(1), reclaimed with the
+ * process and by turn checkpoints); with no process the result is copied to the
+ * global heap and the region is freed. */
+static sw_val_t *_tool_take_region(sw_val_t *r, sw_value_arena_t *out) {
+    if (!out) return r;
+    sw_value_arena_t *mine = sw_self_varena();
+    if (mine) { sw_varena_adopt(mine, out); return r; }
+    sw_val_t *g = r ? sw_val_deep_copy_global(r) : NULL;
+    sw_varena_free_all(out);
+    return g;
+}
 static sw_val_t *_tool_eval_big_stack(void *ast, const char *fn, sw_val_t **args, int n) {
+    sw_value_arena_t *out = sw_varena_create_kind(4096, SW_REGION_MESSAGE);
+    _tool_eval_ctx ctx = { ast, fn, args, n, out, NULL };
     pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) return sw_lang_call_fresh(ast, fn, args, n);
+    if (pthread_attr_init(&attr) != 0) return _tool_take_region(sw_lang_call_fresh(ast, fn, args, n), out);
     pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
-    _tool_eval_ctx ctx = { ast, fn, args, n, NULL };
     pthread_t t;
     int rc = pthread_create(&t, &attr, _tool_eval_thread, &ctx);
     pthread_attr_destroy(&attr);
-    if (rc != 0) return sw_lang_call_fresh(ast, fn, args, n); /* fallback */
+    if (rc != 0) return _tool_take_region(sw_lang_call_fresh(ast, fn, args, n), out); /* fallback */
     pthread_join(t, NULL);
-    return ctx.result;
+    return _tool_take_region(ctx.result, out);
 }
 
 /* tool_define(name, src) -> 'ok' | {'error', reason}

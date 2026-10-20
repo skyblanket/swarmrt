@@ -122,7 +122,7 @@ fun summary(path) {
 
 ### Module-level `let` globals
 
-A module may declare up to 16 named constants at the top level using `let`. These are initialized once at compile time and visible to every function in the module.
+A module may declare any number of named constants at the top level using `let`. These are initialized once at startup and visible to every function in the module.
 
 ```sw
 module Config
@@ -133,7 +133,15 @@ let default_timeout = 30000
 let service_name = 'my_service'
 ```
 
-Supported literal types for module globals: `int`, `float`, `string`, and `atom`. Complex expressions, function calls, and list/map literals are **not** supported at module scope — put those inside `fun init()` or a similar startup function.
+Supported values for module globals: `int`, `float`, `string`, `atom`, and collection literals — lists, maps (`%{...}`), and tuples — including nested ones. Keep the right-hand side to constant data; anything that depends on runtime state belongs inside `fun init()` or a similar startup function.
+
+```sw
+module Limits
+
+let RETRY_LIMITS = %{"lo" => 0, "hi" => 100}
+let REGIONS = ["us-east", "eu-west"]
+let DEFAULT_PAIR = {7, "seven"}
+```
 
 Globals are read-only after initialization. Any assignment to a module-global name inside a function creates a local variable that shadows the global for that scope; the global itself is unchanged.
 
@@ -261,7 +269,7 @@ fun main() {
 }
 ```
 
-Builtins (`to_string`, `string_upper`, …) can be piped into (`xs |> length`) but not yet passed as values — wrap them: `map(fn(x) { to_string(x) }, xs)`.
+Builtins can be piped into (`xs |> length`) and passed as values: `map(to_string, xs)` and `f = string_upper` both work. A builtin used as a value is wrapped in a closure of its arity, so it behaves the same as the explicit `fun(x) { to_string(x) }`. This covers the fixed-arity builtins (`to_string`, `string_upper`, `length`, `map_get`, `reduce`, …). Variadic builtins such as `print` can't be passed as values yet; wrap them: `fun(x) { print(x) }`.
 
 ### Names are checked
 
@@ -830,7 +838,7 @@ Needs `import Chrome` (a battery; see §2).
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
-> **Process primitives by mode.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work there, and `Swarm` works once imported. Under `swc test` and the REPL no runtime is booted: `spawn` fails with `spawn failed: process table full` under `swc test`, `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function`. Under all three modes these stubbed builtins print a note on stderr and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, `tool_define`, `tool_call`, `tool_list`, `tool_rollback`, `tool_history`, `http_listen`, `http_respond`, `ws_send`, `ws_send_binary`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `wsc_connect`, `wsc_connect_tls`, `wsc_send`, `wsc_recv`, `wsc_set_handler`, `wsc_close`, `chrome_launch` (after `import Chrome`), `telemetry_emit`, `telemetry_subscribe`, `pubsub_subscribe` and `pubsub_broadcast`. Other names that look like socket, pubsub or telemetry calls, such as `ws_connect`, `pubsub_publish`, `pubsub_unsubscribe` and `telemetry_unsubscribe`, do not exist in the interpreter and fail with `undefined function`. For full semantics of any of these, run `swc build file.sw -o bin/x && bin/x`.
+> **Process primitives by mode.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work there, and `Swarm` works once imported. Under `swc test` and the REPL no runtime is booted: `spawn` fails with `spawn failed: process table full` under `swc test`, `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function`. Under all three modes these stubbed builtins print a note on stderr (one per builtin name, pointing at `swc build`) and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, `tool_define`, `tool_call`, `tool_list`, `tool_rollback`, `tool_history`, `http_listen`, `http_respond`, `ws_send`, `ws_send_binary`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `wsc_connect`, `wsc_connect_tls`, `wsc_send`, `wsc_recv`, `wsc_set_handler`, `wsc_close`, `chrome_launch` (after `import Chrome`), `telemetry_emit`, `telemetry_subscribe`, `pubsub_subscribe` and `pubsub_broadcast`. Other names that look like socket, pubsub or telemetry calls, such as `ws_connect`, `pubsub_publish`, `pubsub_unsubscribe` and `telemetry_unsubscribe`, do not exist in the interpreter and fail with `undefined function`. For full semantics of any of these, run `swc build file.sw -o bin/x && bin/x`.
 
 ### Tool registry — self-defined, hot-loaded tools
 An agent can write a new tool *as `sw` source at runtime* and call it live, with no restart — the source is parsed and run by the interpreter that ships inside every compiled binary. The tool's entry function is `run`.
