@@ -39,6 +39,7 @@
 #include "swarmrt_new.h"
 #include "swarmrt_native.h"
 #include "swarmrt_io.h"
+#include "swarmrt_readfile.h"
 #include "swc_pkg.h"
 #include "swc_imports.h"
 #include <pthread.h>
@@ -74,15 +75,8 @@ static void usage(void) {
 
 /* Read entire file into malloc'd string */
 static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "swc: cannot open '%s'\n", path); return NULL; }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
-    size_t n = fread(buf, 1, len, f);
-    buf[n] = '\0';
-    fclose(f);
+    char *buf = sw_read_file_all(path);
+    if (!buf) fprintf(stderr, "swc: cannot read '%s'\n", path);
     return buf;
 }
 

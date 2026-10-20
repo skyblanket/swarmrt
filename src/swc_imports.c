@@ -17,6 +17,7 @@
 #include "swarmrt_codegen.h"
 #include "swc_imports.h"
 #include "swc_pkg.h"
+#include "swarmrt_readfile.h"
 #include <limits.h>
 #ifndef _WIN32
   #include <libgen.h>
@@ -28,16 +29,7 @@
 /* Silent read — returns NULL without a message. Used when probing import
  * candidate paths (a miss is expected, not an error). */
 static char *read_file_quiet(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
-    size_t n = fread(buf, 1, len, f);
-    buf[n] = '\0';
-    fclose(f);
-    return buf;
+    return sw_read_file_all(path);
 }
 
 /* Extract module name from AST */
