@@ -357,7 +357,8 @@ Phase 3 is complete.
 
 **Done (release-discipline batch, 2026-07-03, branch `phase5-release`):**
 - **Version identity**: `VERSION` file (single source of truth) → Makefile `-DSWARMRT_VERSION`
-  + `-DSWARMRT_GITDESC` → `swc --version` / `version` / `-v` prints `1.0.0-rc.1 (<git describe>)`.
+  + `-DSWARMRT_GITDESC` → `swc --version` / `version` / `-v` prints `<VERSION> (<git describe>)`
+  (e.g. `2.1.0 (<git describe>)`; `VERSION` is `2.1.0` as of 2026-10-19).
 - **Multi-platform CI**: the Linux workflow's hardening job now runs every Phase-3/4 bidirectional
   gate (quota/msgsize/slowloris/isolation/crashlog/health/shutdown); `make fuzz` covers WS + SQLite;
   a `swc --version` assertion is in quickstart; a new **macos-14 (arm64)** job runs build + test-sw +
@@ -390,11 +391,14 @@ paid off — it found a **reproduced P0 use-after-free** the shipping suite miss
 - Verdict on the rest: the shutdown signal machinery, timer teardown, and wait-loop, and the ETS
   get/take/update/cas copy-out + free-on-replace paths, were independently confirmed solid.
 
-**Remaining before the `1.0.0` tag (ONE item):**
+**Version bump — DONE:** `v1.0.0` is tagged (`84876f0`, 2026-07-08), and later releases `v2.0.0` and
+`v2.1.0` exist; `VERSION` is `2.1.0` as of 2026-10-19. The former "bump to 1.0.0" step is no longer pending.
+
+**Still open from the 1.0.0 gate:**
 - **24h soak** on a dedicated Linux host: `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512
   ./tests/soak/run_soak.sh` (harness ready; needs a host — the intended box `sushi` was unreachable
   at 2026-07-03). Assert bounded RSS + zero sanitizer hits + no leaked process slots over the day.
-- Then bump `VERSION` 1.0.0-rc.1 → 1.0.0, tag `v1.0.0`, push (the release workflow does the rest).
+  No full 24h run is recorded in the repo; §2.6 still lists it as pending.
 
 ---
 

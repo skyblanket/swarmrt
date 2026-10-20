@@ -330,7 +330,7 @@ fun main() {
 
 `dyn_supervisor()` starts empty and is always `one_for_one` (each child independent). `sup_start_child(sup, {name, fn, restart})` takes the same `{name, fn, restart}` tuple as `supervise` — `name` may be `nil` for anonymous workers — and returns the child's pid (or `nil`). `:temporary` is the right policy for per-connection workers (a dropped call shouldn't be retried); use `:transient` if a crash, not a clean hangup, should reconnect. If a child crash-loops past `max_restarts` within `max_seconds` (default 3 / 5s, tunable via `dyn_supervisor(max_restarts, max_seconds)`), the supervisor kills its children and shuts down — the same circuit breaker as `supervise`, so a runaway child can't restart forever.
 
-Like all process primitives, these run only in compiled binaries (`swc build`). Under the interpreter (`swc run`, `swc test`, the REPL) they warn and return `nil`.
+`dyn_supervisor` and the `sup_*` calls are stubbed in the interpreter. Under `swc run`, `swc test` and the REPL the first call prints a note on stderr and returns `nil`; run them in a compiled binary (`swc build`).
 
 ---
 
@@ -476,7 +476,7 @@ Swarm.print_tree()   # prints an indented tree, returns the root count
 
 `top()` is a flat snapshot; `tree()` reconstructs the hierarchy from each process's parent link (set by `spawn_link` / the supervisors), so a worker started with `sup_start_child` shows up nested under its supervisor. Use it to drive a LiveView dashboard, log a periodic census, or just answer "what's alive and who's supervising it?" while debugging.
 
-It's a thin pure-sw library over the `process_list` / `process_info` builtins — and like all process primitives it's compiled-only (`swc build`); under the interpreter the underlying reads return `nil`. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
+It's a thin pure-sw library over the `process_list` / `process_info` builtins. Under `swc run` it works once the program has `import Swarm`; without the import, `Swarm.top()` fails with `undefined function`. Under `swc test` and the REPL no runtime is booted, so there are no live processes to read: `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function` even with the import. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
 
 ---
 
@@ -519,7 +519,7 @@ Every version is kept as **replayable source** — `tool_history(name)` returns 
 
 Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); each `tool_call` allocates its result without freeing intermediates (fine per turn; a tight 100k-call loop will grow memory); and compose tool source with `++`, not f-string `{{` braces.
 
-The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart (the runtime boots in <10ms).
+The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart. Boot on Linux x86_64 measured about 29 ms with the default process table and about 8 ms with `SW_MAX_PROCS=1024` (minimum of 40 runs, 2026-10-19, host load 12–25). The figures move with host load: re-sampled on 2026-10-20 at load average ~170 on 4 vCPUs, the same binaries took 27–44 ms (default) and 23–33 ms (`SW_MAX_PROCS=1024`). So the "<10 ms" figure is only reproduced on a quiet host, not under contention.
 
 ---
 
