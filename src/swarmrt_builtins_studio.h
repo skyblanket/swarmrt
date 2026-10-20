@@ -4706,8 +4706,20 @@ static sw_val_t *_builtin_trap_exit(sw_val_t **a, int n) {
 #define _SW_SQLITE_MAX 32
 static sqlite3 *_sw_sqlite_db[_SW_SQLITE_MAX];
 
+/* These run on the offload pool, so two processes can be inside them at
+ * once. The lock guards the slot table and every use of a connection: a
+ * handle is one sqlite3 connection (one caller at a time), and db_close
+ * must not free it under a running query. Same shape as g_durable_lock. */
+static pthread_mutex_t _sw_sqlite_lock = PTHREAD_MUTEX_INITIALIZER;
+static inline void _sw_sqlite_unlock_scope(int *unused) { (void)unused; pthread_mutex_unlock(&_sw_sqlite_lock); }
+#define SW_SQLITE_LOCK() \
+    int _sw_sqlite_lock_scope __attribute__((cleanup(_sw_sqlite_unlock_scope), unused)) = \
+        (pthread_mutex_lock(&_sw_sqlite_lock), 0)
+
 static sw_val_t *_builtin_db_open(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
+    SW_OFFLOAD_BUILTIN(_builtin_db_open, a, n);
+    SW_SQLITE_LOCK();
     int slot = -1;
     for (int i = 0; i < _SW_SQLITE_MAX; i++) if (!_sw_sqlite_db[i]) { slot = i; break; }
     if (slot < 0) return sw_val_int(-1);
@@ -4722,6 +4734,10 @@ static sw_val_t *_builtin_db_open(sw_val_t **a, int n) {
 
 static sw_val_t *_builtin_db_close(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_INT) return sw_val_atom("error");
+    /* Waits for any query in flight on this handle, so it must not pin a
+     * scheduler thread: offload it like the others. */
+    SW_OFFLOAD_BUILTIN(_builtin_db_close, a, n);
+    SW_SQLITE_LOCK();
     int slot = (int)a[0]->v.i;
     if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
     sqlite3_close(_sw_sqlite_db[slot]);
@@ -4788,9 +4804,11 @@ static sw_val_t *_sw_db_row_to_map(sqlite3_stmt *stmt) {
 }
 
 static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
-    SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_atom("error");
+    SW_OFFLOAD_BUILTIN(_builtin_db_exec, a, n);
+    SW_BLOCKING_SCOPE();
+    SW_SQLITE_LOCK();
     int slot = (int)a[0]->v.i;
     if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
 
@@ -4822,9 +4840,11 @@ static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
-    SW_BLOCKING_SCOPE();
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_INT || !a[1] || a[1]->type != SW_VAL_STRING)
         return sw_val_list(NULL, 0);
+    SW_OFFLOAD_BUILTIN(_builtin_db_query, a, n);
+    SW_BLOCKING_SCOPE();
+    SW_SQLITE_LOCK();
     int slot = (int)a[0]->v.i;
     if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_list(NULL, 0);
 

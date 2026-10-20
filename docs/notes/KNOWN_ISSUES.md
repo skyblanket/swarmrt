@@ -40,7 +40,7 @@ subagent-mode `http_post_stream` run on the runtime's offload pool (see "Recentl
 cleared"), and so does `llm_complete`, whose request goes through `http_post` (200
 completions against a 500ms mock endpoint, 64 in flight, finish in 2.1s on 4
 cores). Still on the calling scheduler's thread: `read_line`/`read_key`/`read_choice`,
-`shell_managed`, TTY-mode `http_post_stream`, `subprocess_recv_line` and `db_*`.
+`shell_managed`, TTY-mode `http_post_stream` and `subprocess_recv_line`.
 Those run inside a blocking section, so the processes queued behind them move to
 idle schedulers (see "Recently cleared"); what they cost is one OS thread each for
 the duration. With every scheduler thread inside one, nothing else runs.
@@ -82,6 +82,15 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### `db_*` pinned a scheduler thread (cleared 2026-10-20)
+
+`db_open`, `db_exec`, `db_query` and `db_close` ran SQLite on the calling scheduler's
+thread, so a slow query (or a `busy_timeout` wait) froze every process on that
+scheduler. Two processes each holding a ~1s query on `SW_SCHEDULERS=2` delayed a 100ms
+timer to ~7s. They now run on the offload pool. The connection table and every use of
+a connection sit behind one process-wide lock (as `checkpoint` does), so db calls
+serialise across handles. Gate: `tests/sw/test_db_offload.sw`.
 
 ### Building a map one key at a time was quadratic (cleared 2026-09-27)
 
