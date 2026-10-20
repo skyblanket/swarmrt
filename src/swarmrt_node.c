@@ -133,7 +133,11 @@ static void marsh_grow(uint8_t **buf, uint32_t *cap, uint32_t need) {
     *cap = nc;
 }
 
-static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
+#define SW_UNMARSH_MAX_DEPTH 256
+static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos, int depth) {
+    /* The receiver decodes at most SW_UNMARSH_MAX_DEPTH levels; anything deeper
+     * would arrive truncated, so refuse it here (the sender reports the failure). */
+    if (depth >= SW_UNMARSH_MAX_DEPTH) return -1;
     if (!v || v->type == SW_VAL_NIL) {
         marsh_grow(buf, cap, *pos + 1);
         (*buf)[(*pos)++] = SW_MARSHAL_NIL;
@@ -196,7 +200,7 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
             memcpy(*buf + *pos, &c, 4); *pos += 4;
         }
         for (int i = 0; i < v->v.tuple.count; i++)
-            if (marsh_val(v->v.tuple.items[i], buf, cap, pos) < 0) return -1;
+            if (marsh_val(v->v.tuple.items[i], buf, cap, pos, depth + 1) < 0) return -1;
         return 0;
     }
     case SW_VAL_MAP: {
@@ -205,8 +209,8 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
         (*buf)[(*pos)++] = SW_MARSHAL_MAP;
         memcpy(*buf + *pos, &c, 2); *pos += 2;
         for (int i = 0; i < v->v.map.count; i++) {
-            if (marsh_val(v->v.map.keys[i], buf, cap, pos) < 0) return -1;
-            if (marsh_val(v->v.map.vals[i], buf, cap, pos) < 0) return -1;
+            if (marsh_val(v->v.map.keys[i], buf, cap, pos, depth + 1) < 0) return -1;
+            if (marsh_val(v->v.map.vals[i], buf, cap, pos, depth + 1) < 0) return -1;
         }
         return 0;
     }
@@ -246,7 +250,7 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
 int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
     uint8_t *buf = NULL;
     uint32_t cap = 0, pos = 0;
-    if (marsh_val(v, &buf, &cap, &pos) < 0) { free(buf); return -1; }
+    if (marsh_val(v, &buf, &cap, &pos, 0) < 0) { free(buf); return -1; }
     *out = buf;
     *out_len = pos;
     return 0;
@@ -259,7 +263,6 @@ int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
  * count loops are bounded, so the unwind is bounded). */
 static sw_val_t *unmarsh_val_inner(const uint8_t *buf, uint32_t len, uint32_t *pos);
 static __thread int g_unmarsh_depth = 0;
-#define SW_UNMARSH_MAX_DEPTH 256
 static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
     if (g_unmarsh_depth >= SW_UNMARSH_MAX_DEPTH) return sw_val_nil();
     g_unmarsh_depth++;
@@ -404,6 +407,15 @@ void sw_send_dispatch(sw_val_t *target, sw_val_t *msg) {
             sw_node_send_pid(target->v.rpid.node, target->v.rpid.id,
                              SW_TAG_NONE, buf, blen);
             free(buf);
+        } else {
+            /* Unmarshalable (nested past the wire depth cap, or over 4 GB):
+             * a loud panic, not a silent drop or a truncated delivery. */
+            static const char msg_err[] =
+                "remote send: value nested deeper than 256 levels (or over 4 GB)";
+            fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg_err);
+            sw_process_t *me = sw_self();
+            if (me) sw_process_panic(me, -1, msg_err);
+            exit(1);
         }
     }
     /* else: silent no-op for nil / wrong type. Same forgiveness as

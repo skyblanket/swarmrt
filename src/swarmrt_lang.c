@@ -2663,7 +2663,8 @@ sw_val_t *sw_now_iso(void) {
  * constructors build bottom-up) and DAG-shared subvalues copy as a tree, so
  * the result is alias-free and sw_val_free can recurse it safely. A depth
  * cap (matching the marshal/json limits) guards pathological nesting against
- * fiber-stack overflow.
+ * fiber-stack overflow. Past the cap the copy panics the copying process
+ * rather than truncating the value: a silently nil'd subtree is data loss.
  *
  * PIDs copy by value (the slab pointer outlives any one process). Compiled
  * closures (cfunc + captures) copy the cfunc and deep-copy each capture;
@@ -2757,9 +2758,19 @@ static sw_val_t *fresh_scalar(sw_val_t *v) {
 
 static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
 
+/* Too deep to copy faithfully: panic the copying process (its links and
+ * supervisors see the reason) instead of handing back a truncated value. */
+static void copy_too_deep(void) {
+    static const char msg[] = "value nested deeper than 256 levels";
+    fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg);
+    sw_process_t *me = sw_self();
+    if (me) sw_process_panic(me, -1, msg);   /* NORETURN on a process */
+    exit(1);
+}
+
 static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
     if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
-    if (depth > SW_COPY_MAX_DEPTH) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
+    if (depth > SW_COPY_MAX_DEPTH) { copy_too_deep(); return NULL; }
     /* Global-heap graphs are freed node by node (ETS replace/delete, timer
      * and supervisor closures, v1 message fallback), so they must not share
      * immortals; copies into regions/arenas (bulk-freed) may. */
