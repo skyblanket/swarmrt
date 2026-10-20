@@ -343,7 +343,8 @@ Rebased onto the Phase-1 ownership work (`e1a7713`) and executed the
 | O4 cross-scheduler wake cost | **FIXED** — bounded spin-before-park in the scheduler idle loop (`SW_SPIN_US`, default 30µs, 0 disables; producer pays nothing — `idle` stays unset while spinning). Measured on the original repro: 58.4 → 4.5 µs per cross-scheduler ping-pong round trip (13×); spawn cycles −26%; same-sched unchanged at ~920ns. |
 | O6 diagnostics (remainder) | **FIXED** — real source paths registered by swc (diagnostics + #line use the actual file); module-qualified calls validate with did-you-mean ("module Std has no function 'mpa' — did you mean 'Std.map'?"). |
 | O7 codepoint strings | **FIXED** — `string_chars(s)` (UTF-8 codepoint split, both paths, conform-gated). |
-| O5 startup time, O8 gate portability docs | open (unchanged). |
+| O5 startup time | **CLOSED** — re-measured 2026-10-19: compiled boot ~29 ms default, ~8 ms with `SW_MAX_PROCS=1024`; the "<10 ms" claim is qualified (see the O5 section). |
+| O8 gate portability docs | open (unchanged). |
 
 **And the structural fix from the assessment section is in:** the
 dual-path conformance gate (`tests/sw/run_conform.sh` + `tests/sw/conform/`,
