@@ -924,6 +924,30 @@ returns `result`. `Durable.load(key, init)`, `Durable.save(key, state)`
 A crash inside a step re-runs that step from the previous checkpoint, so keep
 step side effects idempotent.
 
+`Durable.memo(key, fn)` makes one call inside a step durable: it returns the
+result checkpointed under `key` if there is one, otherwise it runs `fn()`,
+checkpoints the result and returns it. Wrap model and tool calls in it. If the
+process dies after the call returned but before the step checkpointed, the
+resumed run gets the saved answer, so the call is not billed again and sampling
+cannot give a different answer. Results are stored as `{'memo', result}`, so a
+`nil` result is memoized too. `loop()` does not clear memo keys; delete them
+with `checkpoint_delete` once the episode ends.
+
+```sw
+import Durable
+
+fun step(s) {
+    answer = Durable.memo("ep:" ++ to_string(map_get(s, "n")) ++ ":llm",
+                          fun() { llm_complete(map_get(s, "prompt")) })
+    {'done', answer}
+}
+
+fun main() {
+    print(Durable.loop("ep", %{"n" => 1, "prompt" => "hi"}, fun(s) { step(s) }))
+    checkpoint_delete("ep:1:llm")   # the memo key outlives loop()'s own clear
+}
+```
+
 ```sw
 module Demo
 import Durable

@@ -21,13 +21,16 @@
 # Semantics: the checkpoint is written AFTER each step returns, so a crash
 # inside a step re-runs that step from the previous state (at-least-once).
 # Keep side effects in a step idempotent, or record them in the state
-# before performing them. State must be checkpointable: no pids or funs
-# (store a registered name instead of a pid). A failed checkpoint panics —
-# carrying on would silently give up durability; let the supervisor decide.
+# before performing them. A model or tool call is not idempotent: wrap it in
+# Durable.memo(key, fn), which checkpoints the call's result, so a resumed step
+# gets the saved answer instead of billing the call again. State must be
+# checkpointable: no pids or funs (store a registered name instead of a pid).
+# A failed checkpoint panics — carrying on would silently give up durability;
+# let the supervisor decide.
 
 module Durable
 
-export [loop, load, save, clear]
+export [loop, load, save, clear, memo]
 
 # load(key, init) — the last checkpointed state for `key`, or `init` when
 # nothing is saved (first run, or after clear()).
@@ -46,6 +49,23 @@ fun save(key, state) {
 
 # clear(key) — forget the saved state; the next load() returns its init.
 fun clear(key) { checkpoint_delete(key) }
+
+# memo(key, fn) — the result checkpointed under `key` if there is one;
+# otherwise run fn(), checkpoint its result under `key`, and return it. Wrap a
+# model or tool call in it inside a step: if the process dies after the call
+# returned but before the step checkpointed, the resumed run gets the saved
+# answer instead of calling again (no second bill, no different sample). The
+# result is stored as {'memo', result}, so a fn that returns nil is memoized
+# too. Memo keys are not cleared by loop(); call checkpoint_delete on them once
+# the episode is over.
+fun memo(key, fn) {
+    saved = restore(key)
+    if (saved == nil) {
+        r = fn()
+        save(key, {'memo', r})
+        r
+    } else { elem(saved, 1) }
+}
 
 # loop(key, init, step) — restore, then step + checkpoint until step says
 # {'done', result}; clears the checkpoint and returns result.
