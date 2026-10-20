@@ -5396,12 +5396,17 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_table_t *t = &_interp_vets_tables[id];
         uint32_t bucket = _interp_vets_hash(args[1]);
 
-        /* Read the current value under the read lock. */
+        /* Snapshot a copy of the current value under the read lock. The lambda
+         * runs without the lock, and another process may replace or delete
+         * this key meanwhile and free the stored value. */
         pthread_rwlock_rdlock(&t->lock);
         sw_val_t *old_val = NULL;
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
-            if (_interp_vets_key_eq(e->key, args[1])) { old_val = e->value; break; }
+            if (_interp_vets_key_eq(e->key, args[1])) {
+                old_val = sw_val_deep_copy_local(e->value);
+                break;
+            }
             e = e->next;
         }
         pthread_rwlock_unlock(&t->lock);
