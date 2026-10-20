@@ -116,10 +116,13 @@ static void test_peer_list(void) {
     char names[8][SW_NODE_NAME_MAX];
     int count = sw_node_peers(names, 8);
 
-    int passed = (count >= 1 && strcmp(names[0], "beta@localhost") == 0);
+    /* Peers come back in connect order, and alpha and beta race to connect,
+     * so beta is not guaranteed to be first. Look for it anywhere in the list. */
+    int passed = 0;
     printf("  Peers: %d", count);
     for (int i = 0; i < count; i++) {
         printf(" [%s]", names[i]);
+        if (strcmp(names[i], "beta@localhost") == 0) passed = 1;
     }
     printf("\n");
     TEST_CHECK("peer_list", passed);
