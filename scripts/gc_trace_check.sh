@@ -17,6 +17,9 @@ set -u
 REPO="${SWARMRT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
 cd "$REPO" || { echo "VERDICT: FAIL (no repo at $REPO)"; exit 99; }
 SW="${1:?usage: gc_trace_check.sh <test.sw> [tag]}"; TAG="${2:-$$}"
+. "$REPO/scripts/gate_common.sh"
+gate_print_limits "$(basename "$SW")"
+msg=$(gate_need_asan cc) || { echo "VERDICT: PREREQ_MISSING ($msg)"; exit 1; }
 b="/tmp/gctrace_${TAG}"
 if command -v gtimeout >/dev/null 2>&1; then TO() { gtimeout "$@"; }
 elif command -v timeout >/dev/null 2>&1; then TO() { timeout "$@"; }

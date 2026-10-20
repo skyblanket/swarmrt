@@ -82,6 +82,7 @@
     },
     {
       "name": "runtime",
+      "builder": "sonnet",
       "paths": [
         "src/",
         "Makefile"

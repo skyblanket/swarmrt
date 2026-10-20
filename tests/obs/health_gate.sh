@@ -15,6 +15,9 @@
 set -u
 REPO="${SWARMRT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
 cd "$REPO" || { echo "health-gate: FAIL (no repo)"; exit 99; }
+. "$REPO/scripts/gate_common.sh"
+gate_print_limits health-gate
+gate_need_cmd curl "sudo apt-get install curl" || { echo "health-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 
 PORT="${HEALTH_GATE_PORT:-18123}"
 BASE="http://127.0.0.1:$PORT"

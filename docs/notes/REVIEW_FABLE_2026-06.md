@@ -349,7 +349,7 @@ Rebased onto the Phase-1 ownership work (`e1a7713`) and executed the
 | O6 diagnostics (remainder) | **FIXED** — real source paths registered by swc (diagnostics + #line use the actual file); module-qualified calls validate with did-you-mean ("module Std has no function 'mpa' — did you mean 'Std.map'?"). |
 | O7 codepoint strings | **FIXED** — `string_chars(s)` (UTF-8 codepoint split, both paths, conform-gated). |
 | O5 startup time | **CLOSED** — re-measured 2026-10-19: compiled boot ~29 ms default, ~8 ms with `SW_MAX_PROCS=1024`; the "<10 ms" claim is qualified (see the O5 section). |
-| O8 gate portability docs | open (unchanged). |
+| O8 gate portability | **FIXED** — gates print their host limits at startup (`scripts/gate_common.sh`); a missing ASAN runtime or GNU `time` fails with the package to install instead of a bare `ld`/`FAIL` line; CONTRIBUTING documents `libclang-rt`. |
 
 **And the structural fix from the assessment section is in:** the
 dual-path conformance gate (`tests/sw/run_conform.sh` + `tests/sw/conform/`,
