@@ -330,7 +330,7 @@ fun main() {
 
 `dyn_supervisor()` starts empty and is always `one_for_one` (each child independent). `sup_start_child(sup, {name, fn, restart})` takes the same `{name, fn, restart}` tuple as `supervise` — `name` may be `nil` for anonymous workers — and returns the child's pid (or `nil`). `:temporary` is the right policy for per-connection workers (a dropped call shouldn't be retried); use `:transient` if a crash, not a clean hangup, should reconnect. If a child crash-loops past `max_restarts` within `max_seconds` (default 3 / 5s, tunable via `dyn_supervisor(max_restarts, max_seconds)`), the supervisor kills its children and shuts down — the same circuit breaker as `supervise`, so a runaway child can't restart forever.
 
-Like all process primitives, these run only in compiled binaries (`swc build`). Under the interpreter (`swc run`, `swc test`, the REPL) they warn and return `nil`.
+`dyn_supervisor` and the `sup_*` calls are stubbed in the interpreter. Under `swc run`, `swc test` and the REPL the first call prints a note on stderr and returns `nil`; run them in a compiled binary (`swc build`).
 
 ---
 
@@ -476,7 +476,7 @@ Swarm.print_tree()   # prints an indented tree, returns the root count
 
 `top()` is a flat snapshot; `tree()` reconstructs the hierarchy from each process's parent link (set by `spawn_link` / the supervisors), so a worker started with `sup_start_child` shows up nested under its supervisor. Use it to drive a LiveView dashboard, log a periodic census, or just answer "what's alive and who's supervising it?" while debugging.
 
-It's a thin pure-sw library over the `process_list` / `process_info` builtins — and like all process primitives it's compiled-only (`swc build`); under the interpreter the underlying reads return `nil`. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
+It's a thin pure-sw library over the `process_list` / `process_info` builtins. Under `swc run` it works once the program has `import Swarm`; without the import, `Swarm.top()` fails with `undefined function`. Under `swc test` and the REPL no runtime is booted, so there are no live processes to read: `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function` even with the import. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
 
 ---
 
