@@ -26,6 +26,35 @@ mutations, no crash.
 tail calls flat, because its runaway was a ping/pong tail cycle. It now
 overflows with non-tail recursion, like `test_stack_overflow`.
 
+## 2026-10-20 — Std.task_stream reports each cell as it finishes (`on_result`)
+
+**feat(std): `task_stream` takes `on_result: fn(index, item, cell)`.** The
+callback runs from the calling process, in completion order, for every cell:
+`{'ok', v}`, `{'error', 'timeout'}` and `{'error', reason}`. It runs as soon as
+the cell is known, so a timeout or crash is durable before the stream ends.
+Before this, a caller could record its own successes from inside `fn` but not
+the cells `task_stream` builds itself, so a runner killed partway lost every
+failure before the kill. A resume then re-ran those items, and the hung ones
+paid their full deadline again. The returned list is unchanged.
+
+**feat(std): `Std.task_stream_each(list, fn, opts)`.** It takes the same opts,
+delivers cells only through `on_result`, and returns `%{ok, timeout, error}`
+counts. It keeps no result list, so a very large run stays in constant memory.
+
+**Guarantee:** each item's `on_result` runs exactly once, before `task_stream`
+returns, unless the OS process dies first.
+
+**Internals:** a worker's in-flight entry is the only dedupe state. It is
+removed when its cell is emitted, so a late `task_done` or `DOWN` for the same
+index is dropped. That is what lets `task_stream_each` skip the results map.
+
+Gate: the mixed ok/crash/timeout case in `tests/sw/test_task_stream.sw`. It
+checks `on_result` once per item with the returned cell, that a timeout's
+callback fires within deadline + 100 ms of the item starting, and the
+`task_stream_each` counts.
+
+---
+
 ## 2026-10-20 — http_request takes an atom method; the request method is documented as an atom
 
 **fix(http): `http_request(url, %{method: 'POST'})` silently sent a GET.** The

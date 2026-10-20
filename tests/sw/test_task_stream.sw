@@ -8,7 +8,9 @@ module Test_task_stream
 #   2. a slow item that overruns timeout_ms yields {'error','timeout'},
 #      not nil, and does not stall the fast items;
 #   3. concurrency NEVER exceeds max_concurrency — proven by an ETS gauge
-#      that each worker bumps on entry / drops on exit, recording the peak.
+#      that each worker bumps on entry / drops on exit, recording the peak;
+#   4. on_result runs once per item with the same cell as the returned list,
+#      and a timeout's callback fires within deadline + 100ms of its start.
 
 import Std
 
@@ -140,6 +142,63 @@ fun test_json_expect_bad() {
     }
 }
 
+# ---- 7. on_result: once per item, same cell as the returned list ----
+# Mixes ok, crash and timeout items. `seen` is a shared ETS table: the
+# callback writes each cell under its index, and the slow worker stamps its
+# start time so the timeout callback's lag can be measured.
+let seen = ets_new()
+
+fun record_cell(idx, cell) {
+    ets_update_counter(seen, 'calls', 1, 0)
+    ets_put(seen, idx, cell)
+    if (cell == {'error', 'timeout'}) {
+        ets_put(seen, 'timeout_lag', timestamp() - ets_get(seen, 'slow_start'))
+    }
+    'ok'
+}
+
+fun mixed_work(x) {
+    if (x == 2) { panic("boom on 2") }
+    else {
+        if (x == 3) { ets_put(seen, 'slow_start', timestamp()) ; sleep(3000) ; x }
+        else { x }
+    }
+}
+
+fun test_on_result_mixed() {
+    ets_put(seen, 'calls', 0)
+    res = Std.task_stream([1, 2, 3, 4], fun(x) { mixed_work(x) },
+                          %{max_concurrency: 4, timeout_ms: 300,
+                            on_result: fun(idx, item, cell) { record_cell(idx, cell) }})
+    calls = assert_eq("on_result_once_per_item", ets_get(seen, 'calls'), 4)
+    c0 = assert_eq("on_result_cell_0", ets_get(seen, 0), lat(res, 0))
+    c1 = assert_eq("on_result_cell_1", ets_get(seen, 1), lat(res, 1))
+    c2 = assert_eq("on_result_cell_2", ets_get(seen, 2), lat(res, 2))
+    c3 = assert_eq("on_result_cell_3", ets_get(seen, 3), lat(res, 3))
+    # The cells themselves: ok, crash, timeout, ok.
+    shape = assert_eq("on_result_shape", res,
+                      [{'ok', 1}, lat(res, 1), {'error', 'timeout'}, {'ok', 4}])
+    # The timeout callback fires within deadline + 100ms of the item starting,
+    # not at the end of the stream.
+    lag = ets_get(seen, 'timeout_lag')
+    fast = if (lag <= 400) { 'true' } else { 'false' }
+    lag_ok = assert_eq("on_result_timeout_lag", fast, 'true')
+    calls + c0 + c1 + c2 + c3 + shape + lag_ok
+}
+
+# ---- 8. task_stream_each: counts only, cells delivered via on_result ----
+fun test_each_counts() {
+    ets_put(seen, 'calls', 0)
+    counts = Std.task_stream_each([1, 2, 3, 4], fun(x) { mixed_work(x) },
+                                  %{max_concurrency: 4, timeout_ms: 300,
+                                    on_result: fun(idx, item, cell) { record_cell(idx, cell) }})
+    ok_n = assert_eq("each_ok", map_get(counts, 'ok'), 2)
+    to_n = assert_eq("each_timeout", map_get(counts, 'timeout'), 1)
+    er_n = assert_eq("each_error", map_get(counts, 'error'), 1)
+    calls = assert_eq("each_on_result_calls", ets_get(seen, 'calls'), 4)
+    ok_n + to_n + er_n + calls
+}
+
 fun main() {
     fails = 0
     fails = fails + test_order_and_ok()
@@ -151,6 +210,8 @@ fun main() {
     fails = fails + test_json_expect_ok()
     fails = fails + test_json_expect_missing()
     fails = fails + test_json_expect_bad()
-    if (fails == 0) { print("OK task_stream 15/15") ; sys_exit(0) }
+    fails = fails + test_on_result_mixed()
+    fails = fails + test_each_counts()
+    if (fails == 0) { print("OK task_stream 25/25") ; sys_exit(0) }
     else { print("FAIL task_stream " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }

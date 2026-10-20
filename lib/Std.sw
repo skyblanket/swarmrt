@@ -28,7 +28,7 @@ export [
     string_join, string_pad_left, string_pad_right, string_repeat,
     string_indent,
     # ---- concurrency ----
-    task_stream,
+    task_stream, task_stream_each,
     # ---- structured output ----
     json_expect
 ]
@@ -420,6 +420,19 @@ fun _indent_lines(lines, pad, acc) {
 #   on_timeout      : atom — 'error' (default) records {'error','timeout'};
 #                            'keep' leaves the slot open and waits forever
 #                            (timeout disabled for that item)
+#   on_result       : fn(index, item, cell) — called for every item as soon
+#                            as its cell is known, in COMPLETION order, from
+#                            the calling process. Timeouts and crashes reach
+#                            it too, so a caller can persist every failure
+#                            the moment it happens.
+#
+# Guarantee: each item's on_result runs exactly once, before task_stream
+# returns, unless the OS process dies first. The cell it receives is the
+# same one the returned list holds at that index.
+#
+# task_stream_each(list, fn, opts) takes the same opts and delivers cells
+# only through on_result. It returns %{ok: n, timeout: n, error: n} counts
+# and keeps no result list, so a very large run stays in constant memory.
 #
 # Implementation: pure sw over spawn_monitor + selective receive. The
 # calling process is the coordinator. It keeps at most N workers alive,
@@ -429,8 +442,43 @@ fun _indent_lines(lines, pad, acc) {
 # coordinator's `after` is the soonest in-flight deadline, so one slow
 # item can't stall the others.
 fun task_stream(lst, fn, opts) {
+    on_res = _ts_on_result(opts)
+    emit = fun(results, idx, item, cell) {
+        on_res(idx, item, cell)
+        map_put(results, idx, cell)
+    }
+    results = _ts_run(lst, fn, opts, %{}, emit)
+    _ts_collect(0, length(lst), results, [])
+}
+
+fun task_stream_each(lst, fn, opts) {
+    on_res = _ts_on_result(opts)
+    emit = fun(counts, idx, item, cell) {
+        on_res(idx, item, cell)
+        _ts_count(counts, cell)
+    }
+    _ts_run(lst, fn, opts, %{ok: 0, timeout: 0, error: 0}, emit)
+}
+
+# on_result defaults to a no-op so the loop can always call it.
+fun _ts_on_result(opts) {
+    case map_get(opts, 'on_result') {
+        nil -> fun(idx, item, cell) { 'ok' }
+        f   -> f
+    }
+}
+
+fun _ts_count(counts, cell) {
+    kind = if (elem(cell, 0) == 'ok') { 'ok' }
+           else { if (elem(cell, 1) == 'timeout') { 'timeout' } else { 'error' } }
+    map_put(counts, kind, map_get(counts, kind) + 1)
+}
+
+# Run the stream. `acc` is threaded through `emit(acc, idx, item, cell)`,
+# which returns the new accumulator. Returns the final accumulator.
+fun _ts_run(lst, fn, opts, acc, emit) {
     n = length(lst)
-    if (n == 0) { [] }
+    if (n == 0) { acc }
     else {
         max_c = case map_get(opts, 'max_concurrency') {
             nil -> n
@@ -441,13 +489,12 @@ fun task_stream(lst, fn, opts) {
         coord = self()
         # Workers are closures over (fn, item) — no shared table. State is
         # threaded through the loop: `pending` holds the undispatched items
-        # (in order, starting at index next_idx) and `results` maps
-        # idx -> tagged result.
+        # (in order, starting at index next_idx) and `left` counts the
+        # cells not yet emitted.
         k = _ts_min(max_c, n)
         started = _ts_refill([], lst, 0, k, fn, tmo, coord)
-        results = _ts_loop(elem(started, 0), elem(started, 1), elem(started, 2),
-                           n, max_c, fn, tmo, on_tmo, coord, %{})
-        _ts_collect(0, n, results, [])
+        _ts_loop(elem(started, 0), elem(started, 1), elem(started, 2),
+                 n, max_c, fn, tmo, on_tmo, coord, acc, emit)
     }
 }
 
@@ -463,16 +510,17 @@ fun _ts_refill(in_flight, pending, next_idx, max_c, fn, tmo, coord) {
     }
 }
 
-# Spawn one monitored worker for index `idx`. Returns {ref, pid, idx, deadline}.
+# Spawn one monitored worker for index `idx`. Returns {ref, pid, idx, deadline, item}.
 # deadline is an absolute ms timestamp; 0 means "no timeout". The worker runs
 # fn(item) inside a try so a panic becomes {'error', reason} (never a hang).
+# item rides along so a timeout or crash can be reported with its item.
 fun _ts_spawn_one(idx, item, fn, tmo, coord) {
     pair = spawn_monitor(fun() {
         tagged = try { {'ok', fn(item)} } catch e { {'error', e} }
         send(coord, {'task_done', idx, tagged})
     })
     deadline = if (tmo > 0) { timestamp() + tmo } else { 0 }
-    {elem(pair, 1), elem(pair, 0), idx, deadline}
+    {elem(pair, 1), elem(pair, 0), idx, deadline, item}
 }
 
 # Stop watching a finished worker and drop its DOWN if it is already queued,
@@ -490,25 +538,34 @@ fun _ts_forget(entry) {
     }
 }
 
-fun _ts_record(results, idx, tagged) {
-    if (map_has_key(results, idx)) { results } else { map_put(results, idx, tagged) }
-}
-
-# The coordinator loop. Returns the results map once all n are recorded.
-#   in_flight : [{ref, pid, idx, deadline}, ...] currently-running workers
+# The coordinator loop. Returns the accumulator once all n cells are emitted.
+#   in_flight : [{ref, pid, idx, deadline, item}, ...] currently-running workers
 #   pending   : undispatched items, the first of which has index next_idx
-fun _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, results) {
-    if (map_size(results) >= n) { results }
+#   left      : cells not yet emitted
+#
+# An item is emitted exactly once. A worker's in_flight entry is removed the
+# moment its cell is emitted, so a message that arrives later for the same
+# index (a task_done queued before a timeout kill, or a DOWN) finds no entry
+# and is dropped. The in_flight entry is therefore the only dedupe state
+# needed, and results never has to be kept just to be checked.
+fun _ts_loop(in_flight, pending, next_idx, left, max_c, fn, tmo, on_tmo, coord, acc, emit) {
+    if (left == 0) { acc }
     else {
         wait = _ts_wait_ms(in_flight, tmo, on_tmo)
         receive {
             {'task_done', idx, tagged} ->
-                _ts_forget(_ts_find_idx(in_flight, idx))
-                recorded = _ts_record(results, idx, tagged)
-                rest = _ts_remove_idx(in_flight, idx, [])
-                refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
-                _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
-                         fn, tmo, on_tmo, coord, recorded)
+                entry = _ts_find_idx(in_flight, idx)
+                case entry {
+                    nil ->
+                        _ts_loop(in_flight, pending, next_idx, left, max_c, fn, tmo, on_tmo, coord, acc, emit)
+                    e ->
+                        _ts_forget(e)
+                        emitted = emit(acc, idx, elem(e, 4), tagged)
+                        rest = _ts_remove_idx(in_flight, idx, [])
+                        refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
+                        _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), left - 1, max_c,
+                                 fn, tmo, on_tmo, coord, emitted, emit)
+                }
 
             {'DOWN', ref, _, _, reason} ->
                 # A worker died. If we already recorded its task_done the ref
@@ -517,24 +574,24 @@ fun _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, res
                 entry = _ts_find_ref(in_flight, ref)
                 case entry {
                     nil ->
-                        _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, results)
+                        _ts_loop(in_flight, pending, next_idx, left, max_c, fn, tmo, on_tmo, coord, acc, emit)
                     e ->
-                        recorded = _ts_record(results, elem(e, 2), {'error', reason})
+                        emitted = emit(acc, elem(e, 2), elem(e, 4), {'error', reason})
                         rest = _ts_remove_ref(in_flight, ref, [])
                         refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
-                        _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
-                                 fn, tmo, on_tmo, coord, recorded)
+                        _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), left - 1, max_c,
+                                 fn, tmo, on_tmo, coord, emitted, emit)
                 }
 
             after wait {
                 # Deadline reached: time out every expired in-flight worker.
                 now = timestamp()
                 expired = _ts_expired(in_flight, now, [])
-                recorded = _ts_timeout_each(expired, results)
+                emitted = _ts_timeout_each(expired, acc, emit)
                 rest = _ts_keep_unexpired(in_flight, now, [])
                 refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
-                _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
-                         fn, tmo, on_tmo, coord, recorded)
+                _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), left - length(expired), max_c,
+                         fn, tmo, on_tmo, coord, emitted, emit)
             }
         }
     }
@@ -561,15 +618,16 @@ fun _ts_soonest_deadline(in_flight, best) {
     }
 }
 
-# Record {'error','timeout'} for each expired worker, kill it, and forget its
-# monitor. Returns the updated results map.
-fun _ts_timeout_each(expired, results) {
-    if (length(expired) == 0) { results }
+# Emit {'error','timeout'} for each expired worker, kill it, and forget its
+# monitor. Returns the updated accumulator.
+fun _ts_timeout_each(expired, acc, emit) {
+    if (length(expired) == 0) { acc }
     else {
         e = hd(expired)
         exit_proc(elem(e, 1), 'kill')
         _ts_forget(e)
-        _ts_timeout_each(tl(expired), _ts_record(results, elem(e, 2), {'error', 'timeout'}))
+        emitted = emit(acc, elem(e, 2), elem(e, 4), {'error', 'timeout'})
+        _ts_timeout_each(tl(expired), emitted, emit)
     }
 }
 
