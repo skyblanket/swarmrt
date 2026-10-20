@@ -320,7 +320,7 @@ static __thread sw_scheduler_t *tls_spawn_override = NULL;
 
 /* === Deadlock watchdog state === */
 static pthread_t        g_watchdog_thread;
-static volatile int     g_watchdog_stop = 0;
+static _Atomic int      g_watchdog_stop = 0;
 static int              g_watchdog_enabled = 1;   /* 0 when SW_DEADLOCK_DETECT=0 */
 /* Shutdown wake for the watchdog. It used to sleep its interval in 100ms
  * nanosleep chunks polling g_watchdog_stop — so EVERY binary paid an avg
@@ -1410,6 +1410,14 @@ sw_process_t *sw_pick_next(sw_scheduler_t *sched) {
     return NULL;
 }
 
+/* Bump a counter that only its owning thread writes. A relaxed load + store
+ * is a plain increment on x86; `++` on an _Atomic would be a locked RMW on
+ * every scheduler iteration. Readers (sw_stats) still see whole values. */
+static inline void sw_counter_bump(_Atomic uint64_t *c) {
+    atomic_store_explicit(c, atomic_load_explicit(c, memory_order_relaxed) + 1,
+                          memory_order_relaxed);
+}
+
 /*
  * Work stealing via global overflow queue.
  * When a scheduler has no local work, it tries to steal from the shared queue.
@@ -1417,7 +1425,7 @@ sw_process_t *sw_pick_next(sw_scheduler_t *sched) {
  */
 sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
     if (!g_swarm) return NULL;
-    sched->steal_attempts++;
+    sw_counter_bump(&sched->steal_attempts);
 
     pthread_mutex_lock(&g_swarm->overflow_rq.lock);
     sw_process_t *proc = g_swarm->overflow_rq.head;
@@ -1570,7 +1578,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
     _sw_gen = &_sw_gen_fallback;  /* valid before the first switch-in sets it */
 
     while (!sched->should_exit && g_swarm && g_swarm->running) {
-        sched->loop_iters++;
+        sw_counter_bump(&sched->loop_iters);
 
         /* Fire expired timers (any scheduler can fire any timer) */
         fire_timers();
@@ -1598,17 +1606,21 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * tests/stress/spin_wedge_hunt.sh. Measured win: cross-scheduler
          * ping-pong 58.4 -> 4.5us/rt. */
         if (!proc) {
-            static int spin_iters = -1;
-            if (spin_iters < 0) {
+            /* Computed lazily by whichever scheduler gets here first. Every
+             * thread derives the same value, so relaxed atomics are enough. */
+            static _Atomic int spin_iters = -1;
+            int spins = atomic_load_explicit(&spin_iters, memory_order_relaxed);
+            if (spins < 0) {
                 const char *e = getenv("SW_SPIN_US");
                 int us = e ? atoi(e) : 60;
                 if (us < 0) us = 0;
                 if (us > 1000) us = 1000;
                 /* ~25 pause-loop iterations per us on contemporary cores
                  * (pause ~25-40ns + two acquire loads). Coarse is fine. */
-                spin_iters = us * 25;
+                spins = us * 25;
+                atomic_store_explicit(&spin_iters, spins, memory_order_relaxed);
             }
-            for (int i = 0; i < spin_iters && !sched->should_exit; i++) {
+            for (int i = 0; i < spins && !sched->should_exit; i++) {
                 proc = sw_pick_next(sched);
                 if (proc) break;
                 if ((i & 63) == 63) {   /* steal probe every ~64 spins */
@@ -1693,7 +1705,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             /* If WAITING: don't re-enqueue. sw_send will re-enqueue when message arrives. */
 
         } else {
-            sched->idle_waits++;
+            sw_counter_bump(&sched->idle_waits);
             /* Mark as idle and sleep until woken by a producer.
              * The idle flag is checked by sw_add_to_runq — if set,
              * it signals the condvar to wake us.
