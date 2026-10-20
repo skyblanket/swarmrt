@@ -519,7 +519,7 @@ Every version is kept as **replayable source** — `tool_history(name)` returns 
 
 Current limits (fast-follow): a tool can't call *another* tool (`tool_call` degrades to `nil` inside a tool — tools are leaf logic for now); each `tool_call` allocates its result without freeing intermediates (fine per turn; a tight 100k-call loop will grow memory); and compose tool source with `++`, not f-string `{{` braces.
 
-The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart (the runtime boots in <10ms).
+The honest boundary: this is reload of an agent's *skills* (its tools), not its *running processes*. A tool you `tool_define` is callable on the next `tool_call`; a process already mid-call finishes on the version it started with. For updating the agent's *prompt/policy* as data, keep it in ETS/SQLite and re-read it each turn; for updating the *binary itself*, that's an operational restart. Boot is about 30 ms on Linux x86_64 with the default process table (minimum of 40 runs, 2026-10-19); with `SW_MAX_PROCS=1024` it drops to about 8 ms, which is where the "<10 ms" figure applies.
 
 ---
 

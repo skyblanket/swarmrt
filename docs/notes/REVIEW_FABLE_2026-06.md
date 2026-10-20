@@ -199,13 +199,28 @@ scheduler idle loop; spawn-time affinity (start a child on its parent's
 scheduler — cheap and BEAM-ish); batching wakes. For agent swarms doing
 request/reply with a coordinator, this is the number that matters.
 
-### O5 (P2) — startup: ~105–145 ms observed vs "<10 ms" in the README
+### O5 (P2) — startup: ~105–145 ms observed vs "<10 ms" in the README — CLOSED (claim qualified)
 
-A C control binary forks+execs in ~3 ms on the same host, so ~100+ ms is
-runtime boot, not the container's exec overhead (SW_MAX_PROCS=1024
-shaves ~35 ms as documented). Maybe it's <10 ms on the daily-driver Mac;
-on this Linux box it is not. Worth profiling arena init + scheduler
-spin-up on Linux before re-stating the claim, or qualifying it.
+Re-measured 2026-10-19 on Linux x86_64 (4 vCPU, shared host, 40 launches per row, timed with `date`
+around each launch). The host load average ran 12–25 during the sampling, so the **minimum** is the
+reliable figure; medians were inflated by contention:
+
+| Case | min | median (loaded) |
+|---|---|---|
+| `swc run hello.sw` (interpreter) | 12 ms | 12–55 ms |
+| compiled `hello` binary, default | 29 ms | 145 ms |
+| compiled `hello` binary, `SW_MAX_PROCS=1024` | 8 ms | 18 ms |
+| `swc --version` | 3 ms | 4–13 ms |
+| `/bin/true` fork+exec baseline | 2 ms | 3 ms |
+
+The original 105–145 ms did not reproduce in a quiet window. The default boot is about 30 ms, not
+under 10 ms, and the cost is the default 100K-slot process table (`src/swarmrt_native.c`, ~L1911–1920);
+`SW_MAX_PROCS=1024` brings the floor to about 8 ms. Those numbers agree with the earlier sweep
+(`swc run` 15 ms, compiled 7 ms).
+
+Resolution: "<10 ms" is qualified in `docs/BUILDING_AGENTS.md` (hot-reload boundary paragraph) to
+state the measured floor and the `SW_MAX_PROCS` condition. Follow-up: `docs/DEPLOYMENT.md` (L9, L131,
+L144) still says "well under 10 ms" without that qualifier.
 
 ### O6 (P3) — diagnostics polish for the LLM story
 
