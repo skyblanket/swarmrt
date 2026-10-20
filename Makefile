@@ -808,7 +808,10 @@ tsan-gate: swc
 	@./bin/swc build --emit-c tests/stress/bn.sw -o $(BIN_DIR)/_tsb_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
 	    tests/stress/bn.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_storm $(LDFLAGS)
-	@rm -f tests/gc/slope_message.gen.c tests/stress/bn.gen.c $(BIN_DIR)/_tsm_emit $(BIN_DIR)/_tsb_emit
+	@./bin/swc build --emit-c tests/sw/test_http_pipeline.sw -o $(BIN_DIR)/_tsh_emit >/dev/null 2>&1 || true
+	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
+	    tests/sw/test_http_pipeline.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_http $(LDFLAGS)
+	@rm -f tests/gc/slope_message.gen.c tests/stress/bn.gen.c tests/sw/test_http_pipeline.gen.c $(BIN_DIR)/_tsm_emit $(BIN_DIR)/_tsb_emit $(BIN_DIR)/_tsh_emit
 	@# phase 2 (GenServer/Supervisor), 4 (Agent/DynSup), 5 (StateMachine/PG) are
 	@# all TSan-clean and gated here.
 	@for p in 2 4 5; do \
@@ -825,11 +828,14 @@ tsan-gate: swc
 	 out3=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
 	         timeout 300 $(BIN_DIR)/tsan_storm 2>&1) || rc=1; \
 	 echo "$$out3" | grep -q "WARNING: ThreadSanitizer" && { echo "$$out3" | head -40; rc=1; }; \
+	 outh=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
+	         timeout 300 $(BIN_DIR)/tsan_http 2>&1) || rc=1; \
+	 echo "$$outh" | grep -q "WARNING: ThreadSanitizer" && { echo "http:"; echo "$$outh" | head -40; rc=1; }; \
 	 for p in 2 4 5; do \
 	   outp=$$(SW_QUIET=1 TSAN_OPTIONS="suppressions=tests/stress/tsan.supp" \
 	           timeout 300 $(BIN_DIR)/tsan_phase$$p 2>&1) || rc=1; \
 	   echo "$$outp" | grep -q "WARNING: ThreadSanitizer" && { echo "phase$$p:"; echo "$$outp" | grep -A6 WARNING | head -28; rc=1; }; \
 	 done; \
-	 rm -f $(BIN_DIR)/tsan_phase2 $(BIN_DIR)/tsan_phase4 $(BIN_DIR)/tsan_phase5; \
-	 [ $$rc -eq 0 ] && echo "tsan-gate: PASS (no unsuppressed races: msg, msg+spin, storm, phase 2/4/5)" \
+	 rm -f $(BIN_DIR)/tsan_http $(BIN_DIR)/tsan_phase2 $(BIN_DIR)/tsan_phase4 $(BIN_DIR)/tsan_phase5; \
+	 [ $$rc -eq 0 ] && echo "tsan-gate: PASS (no unsuppressed races: msg, msg+spin, storm, http, phase 2/4/5)" \
 	                || { echo "tsan-gate: FAIL"; exit 1; }

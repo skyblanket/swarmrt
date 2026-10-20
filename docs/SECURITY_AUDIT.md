@@ -55,5 +55,3 @@ package-manager tests, and an install smoke test run from outside the checkout.
   `shell_sandboxed` contains only the command passed to it.
 - **Durable state** is stored unencrypted in SQLite (`SW_STATE_DB`), in native
   byte order. Treat the file like any application data.
-- **HTTP handler fields** (a connection's mode and handler) are read without the
-  table lock. Pipelined requests are parsed one per incoming chunk.

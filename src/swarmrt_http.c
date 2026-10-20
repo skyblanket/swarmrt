@@ -937,7 +937,18 @@ static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) 
     c->buf[c->buf_len] = '\0'; /* keep the scan buffer C-string safe */
 
     if (c->mode == SW_HTTP_MODE_HTTP) {
-        http_try_parse(cid, port);
+        /* Drain every complete request already buffered. A pipelining client
+         * can send several in one chunk and nothing more may arrive to wake
+         * us, so keep going until a pass consumes nothing (incomplete request)
+         * or the conn was closed or upgraded. */
+        for (;;) {
+            uint32_t before = c->buf_len;
+            c->buf[c->buf_len] = '\0'; /* the parser scans buf as a C string */
+            http_try_parse(cid, port);
+            if (c->closed || c->mode != SW_HTTP_MODE_HTTP ||
+                c->buf_len == before)
+                break;
+        }
         /* After upgrade, parse any remaining data as WS */
         if (c->mode == SW_HTTP_MODE_WS && c->buf_len > 0 && !c->closed)
             ws_try_parse(cid, port);

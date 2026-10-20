@@ -71,8 +71,10 @@ typedef enum {
 typedef struct {
     int                 id;         /* Connection handle (index in table) */
     sw_port_t          *port;       /* Underlying TCP port */
-    sw_http_mode_t      mode;
-    sw_process_t       *handler;    /* .sw process receiving messages */
+    /* mode and handler are read from other threads (sw_ws_send_*, sw_ws_close,
+     * sw_ws_set_handler) without g_http_lock, so both are atomic. */
+    _Atomic sw_http_mode_t mode;
+    _Atomic(sw_process_t *) handler; /* .sw process receiving messages */
 
     /* Receive buffer for partial data */
     uint8_t            *buf;
