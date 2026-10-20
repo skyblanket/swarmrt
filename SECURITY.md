@@ -63,7 +63,12 @@ to contain what it documents.
   clients — are accepted, and the check does not authenticate anyone: a
   handler that needs auth must still check it (e.g. via
   `ws_request_headers`). Same-origin trusts `Host`, so it does not stop DNS
-  rebinding; a server that must resist that should validate `Host` itself.
+  rebinding: a rebinding page sends a `Host` and an `Origin` that match.
+  To resist that, set `SW_HTTP_HOSTS` to the `Host` values the server answers
+  to (e.g. `localhost:4100,app.example.com`). When it is set, every request
+  whose `Host` is not listed gets `403`, upgrades and plain HTTP alike. The
+  match is exact and case-insensitive, port included. Unset, there is no
+  check.
 
 ## Audit summary
 

@@ -1,10 +1,8 @@
 # Swarm.sw — live introspection: see the processes you spawned and how they're
 # supervised. Pure-sw over the process_list / process_info / registered builtins.
 #
-# COMPILED-ONLY: these read the live scheduler's process table, which the
-# tree-walking interpreter doesn't have. Under `swc run` / the REPL the
-# underlying primitives warn and return nil, so Swarm.top()/tree() are only
-# meaningful in a `swc build` binary.
+# Works under `swc run` too, provided the caller does `import Swarm`; without
+# that import, Swarm.top/0 is undefined.
 
 module Swarm
 

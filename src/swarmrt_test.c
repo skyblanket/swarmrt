@@ -88,14 +88,20 @@ int sw_test_run_file(const char *path, const char *lib_dir) {
     }
 
     /* Extract test_* function names from the file's own functions. Before
-     * the merge below, so imported modules' test_* functions don't run. */
+     * the merge below, so imported modules' test_* functions don't run.
+     * Sized by the function count, which bounds the number of tests, so no
+     * test is dropped. */
     node_t *mod = (node_t *)ast;
-    const char *test_names[256];
+    const char **test_names = malloc(sizeof(*test_names) * (mod->v.mod.nfuns + 1));
+    if (!test_names) {
+        fprintf(stderr, "test: out of memory for '%s'\n", path);
+        return 1;
+    }
     int ntest = 0;
 
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
         const char *fname = mod->v.mod.funs[i]->v.fun.name;
-        if (strncmp(fname, "test_", 5) == 0 && ntest < 256)
+        if (strncmp(fname, "test_", 5) == 0)
             test_names[ntest++] = fname;
     }
 
@@ -107,6 +113,7 @@ int sw_test_run_file(const char *path, const char *lib_dir) {
     if (ntest == 0) {
         printf(C_DIM "=== %s ===" C_RESET "\n", path);
         printf(C_DIM "  (no test_* functions found)" C_RESET "\n\n");
+        free(test_names);
         return 0;
     }
 
@@ -164,6 +171,8 @@ int sw_test_run_file(const char *path, const char *lib_dir) {
     if (failed > 0)
         printf(", " C_RED "%d failed" C_RESET, failed);
     printf(C_DIM " (%.1fms)" C_RESET "\n\n", total);
+
+    free(test_names);
 
     /* Free the shared AST now that all tests are done */
     /* node_free is internal to swarmrt_lang.c — we rely on process exit cleanup.
