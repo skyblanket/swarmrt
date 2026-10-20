@@ -16,6 +16,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 cd "$REPO"
+. "$REPO/scripts/gate_common.sh"
+gate_print_limits soak
 
 SOAK_SECONDS="${1:-${SOAK_SECONDS:-60}}"
 RSS_BUDGET_MB="${2:-${RSS_BUDGET_MB:-300}}"   # peak RSS must not exceed this

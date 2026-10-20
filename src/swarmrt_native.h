@@ -160,7 +160,9 @@ typedef struct {
     _Atomic(sw_msg_t *) sig_head;
 
     /* Private queue: process-local doubly-linked FIFO */
-    sw_msg_t *priv_head;
+    /* _Atomic: the owner rewrites it on every drain; the deadlock watchdog
+     * reads it cross-thread to test for an empty mailbox. */
+    _Atomic(sw_msg_t *) priv_head;
     sw_msg_t *priv_tail;
 
     /* Wake-up coordination */
@@ -288,7 +290,10 @@ struct sw_process {
     _Atomic sw_proc_state_t state;
     sw_priority_t priority;
     sw_scheduler_t *scheduler;/* Current scheduler */
-    uint64_t pid;
+    /* _Atomic: slots are reused, so the watchdog can read the pid of a
+     * slot that a spawn is re-initialising (it reads state first, and a
+     * stale state read does not order against the new pid). */
+    _Atomic uint64_t pid;
     
     /* === Context (for preemption) === */
     sw_context_t ctx;         /* Saved registers */
@@ -461,14 +466,16 @@ struct sw_scheduler {
     
     /* Statistics */
     uint64_t context_switches;
-    uint64_t steal_attempts;
+    /* Written only by this scheduler's thread (bumped with a relaxed
+     * load + store, see sw_counter_bump); sw_stats reads them cross-thread. */
+    _Atomic uint64_t steal_attempts;
     uint64_t reductions;
-    volatile uint64_t loop_iters;    /* Debug: total scheduler loop iterations */
+    _Atomic uint64_t loop_iters;     /* Debug: total scheduler loop iterations */
     /* Processes dispatched. Written only by this scheduler's thread; the
      * deadlock watchdog reads it to tell "nothing ran" from "something
      * woke between two of its reads". */
     _Atomic uint64_t procs_run;
-    volatile uint64_t idle_waits;    /* Debug: times entered idle wait */
+    _Atomic uint64_t idle_waits;     /* Debug: times entered idle wait */
 
     /* State */
     /* _Atomic (was volatile): TSan-clean cross-thread flags. volatile is

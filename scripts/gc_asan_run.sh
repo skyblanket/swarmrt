@@ -7,6 +7,7 @@
 #   GC_BUG         baseline runs clean but the ASAN/poison build faults, reads
 #                  0xDE garbage (a content assert FAILs), or exits non-zero
 #   BASELINE_FAIL  doesn't compile/run even normally → test bug or non-GC bug
+#   PREREQ_MISSING the ASAN/UBSAN runtime isn't installed; the message names it
 #
 # CAVEAT (false positive): ASAN cannot track swarmrt's custom swapcontext/asm
 # coroutine stacks (swarmrt_asm.S). In a PANIC-heavy test, a worker's no_return
@@ -22,7 +23,9 @@ set -u
 # Repo root = parent of this script's dir (no hardcoded paths). Override with SWARMRT_REPO.
 REPO="${SWARMRT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
 cd "$REPO" || { echo "VERDICT: BASELINE_FAIL (no repo at $REPO)"; exit 99; }
+. "$REPO/scripts/gate_common.sh"
 SW="${1:?usage: gc_asan_run.sh <test.sw> [tag]}"; TAG="${2:-$$}"
+gate_print_limits "$(basename "$SW")"
 b="/tmp/gctest_${TAG}"
 # Portable timeout: gtimeout (coreutils) if present, else run with no limit.
 if command -v gtimeout >/dev/null 2>&1; then TO() { gtimeout "$@"; }
@@ -30,6 +33,9 @@ elif command -v timeout >/dev/null 2>&1; then TO() { timeout "$@"; }
 else TO() { shift; "$@"; }; fi
 SQ=$(brew --prefix sqlite3 2>/dev/null); OS=$(brew --prefix openssl@3 2>/dev/null)
 RT="src/swarmrt_native.c src/swarmrt_asm.S src/swarmrt_otp.c src/swarmrt_task.c src/swarmrt_ets.c src/swarmrt_phase4.c src/swarmrt_phase5.c src/swarmrt_hotload.c src/swarmrt_io.c src/swarmrt_gc.c src/swarmrt_node.c src/swarmrt_lang.c src/swarmrt_http.c src/swarmrt_pdf.c src/swarmrt_varena.c"
+
+# 0. preflight: the ASAN link must work before anything else runs
+msg=$(gate_need_asan cc) || { echo "VERDICT: PREREQ_MISSING ($msg)"; exit 1; }
 
 # 1. baseline build + run (normal swc build, GC live, no sanitizer)
 if ! ./bin/swc build "$SW" -o "${b}_base" >/dev/null 2>"${b}_base.err"; then
