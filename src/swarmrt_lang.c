@@ -2671,6 +2671,12 @@ sw_val_t *sw_now_iso(void) {
  * only in the single-process interpreter, which has no arena to free). */
 #define SW_COPY_MAX_DEPTH 256
 
+/* Set while the interpreter ETS copies a value (_interp_vets_store/_out): a
+ * stored value must come back whole, so no depth cap. The runtime already
+ * recurses over the same nesting in sw_val_free and equality, so this adds
+ * no new limit. */
+static __thread int g_copy_uncapped = 0;
+
 /* === Deep-copy context ===
  * One per top-level deep copy (thread-local, nestable). `memo` maps a source
  * node to its copy so a graph that shares substructure is copied as a graph:
@@ -2756,10 +2762,12 @@ static sw_val_t *fresh_scalar(sw_val_t *v) {
 }
 
 static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
+static void env_retain(sw_env_t *e);
 
 static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
     if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
-    if (depth > SW_COPY_MAX_DEPTH) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
+    if (depth > SW_COPY_MAX_DEPTH && !g_copy_uncapped)
+        return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
     /* Global-heap graphs are freed node by node (ETS replace/delete, timer
      * and supervisor closures, v1 message fallback), so they must not share
      * immortals; copies into regions/arenas (bulk-freed) may. */
@@ -2810,6 +2818,18 @@ static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
         return r;
     }
     case SW_VAL_FUN: {
+        if (v->v.fun.body) {
+            /* Interpreter closure: share its AST, and hold a ref on its env
+             * so the env outlives the frame that built the closure. */
+            sw_val_t *r = val_alloc(sizeof(sw_val_t));
+            r->type = SW_VAL_FUN;
+            r->v.fun.name = v->v.fun.name;
+            r->v.fun.num_params = v->v.fun.num_params;
+            r->v.fun.body = v->v.fun.body;
+            r->v.fun.closure_env = v->v.fun.closure_env;
+            env_retain(r->v.fun.closure_env);
+            return r;
+        }
         int nc = v->v.fun.ncaptures;
         sw_val_t **caps = (nc > 0) ? malloc(sizeof(sw_val_t *) * nc) : NULL;
         for (int i = 0; i < nc; i++)
@@ -4026,11 +4046,21 @@ static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
 /* The store owns its keys and values as global-heap copies: a tool's region or a
  * process arena can be freed while the entry lives (see tool_call / process_destroy),
  * so a raw pointer into either would dangle. Readers get their own copy. */
-static sw_val_t *_interp_vets_store(sw_val_t *v) { return sw_val_deep_copy_global(v); }
+static sw_val_t *_interp_vets_store(sw_val_t *v) {
+    int save = g_copy_uncapped;
+    g_copy_uncapped = 1;
+    sw_val_t *r = sw_val_deep_copy_global(v);
+    g_copy_uncapped = save;
+    return r;
+}
 static sw_val_t *_interp_vets_out(sw_val_t *v) {
     sw_value_arena_t *target = sw_swap_alloc_target(NULL);
     sw_swap_alloc_target(target);
-    return target ? deep_copy_into(v, target) : sw_val_deep_copy_local(v);
+    int save = g_copy_uncapped;
+    g_copy_uncapped = 1;
+    sw_val_t *r = target ? deep_copy_into(v, target) : sw_val_deep_copy_local(v);
+    g_copy_uncapped = save;
+    return r;
 }
 
 static uint32_t _interp_vets_hash(sw_val_t *v) {
