@@ -25,14 +25,6 @@ under heavy core contention. **Workaround (in `tests/sw/run/test_spawn_value.sw`
 re-spawn the idempotent closure if its effect hasn't appeared. A real fix needs
 a Linux repro host to bisect the interp scheduler's first-fiber enqueue.
 
-### Interpreter non-tail recursion is bounded
-
-The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see
-"Recently cleared"), but a NON-tail call still nests C frames: plain recursion
-like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
-`interpreter recursion depth exceeded` panic after a few hundred frames.
-**Workaround:** write the loop tail-recursively with an accumulator, or `swc build`.
-
 ### A few blocking builtins still occupy their scheduler OS thread
 
 `http_get`, `http_request`, `http_post`, `exec_argv`, `shell_sandboxed` and
@@ -82,6 +74,17 @@ alike (see "Recently cleared"). Map keys are not: `map_get(m, 'nmae')` is a
 runtime `nil`.
 
 ## Recently cleared
+
+### Interpreter non-tail recursion was capped at a few hundred frames (cleared 2026-10-20)
+
+`swc run` ran main on an 8MB fiber at ~12KB of C stack per sw-level call, so plain
+recursion like `fun sum_to(n) { n + sum_to(n - 1) }` hit a clean
+`interpreter recursion depth exceeded` panic around 650 frames, while compiled
+code (128KB fiber) was no deeper. The root process now gets a 256MB lazily-mapped
+stack on both paths (`SW_ROOT_STACK_SIZE`), the interpreter backstop is 50000
+calls, and the panic reports the depth (21.7k frames on this machine). Conform
+`t21_deep_recursion` pins 10,000-deep non-tail recursion to identical output on
+both paths.
 
 ### Building a map one key at a time was quadratic (cleared 2026-09-27)
 

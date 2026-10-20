@@ -634,6 +634,13 @@ int sw_wait_for_exit(volatile int *done_flag, pthread_mutex_t *lock,
  * (`swc run`), which needs a deep C stack. Does NOT affect the compiled path. */
 extern size_t sw_proc_stack_size;
 
+/* Usable stack for the ROOT process only (the program's main). Both `swc run`
+ * (tree-walking interpreter) and the compiled binary spawn main on this, so
+ * ordinary non-tail recursion ~10k deep works on both paths. Lazy mmap: pages
+ * are only committed as the stack is touched, so the reservation is free for
+ * shallow programs. Spawned processes keep their own (smaller) default. */
+#define SW_ROOT_STACK_SIZE (256UL * 1024 * 1024)
+
 /* Process table lookup by PID */
 sw_process_t *sw_find_by_pid(uint64_t pid);
 /* Like sw_find_by_pid but also returns slots for EXITING/dead processes

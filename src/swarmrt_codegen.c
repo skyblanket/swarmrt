@@ -3796,7 +3796,11 @@ static void emit_entry_and_main(cg_ctx_t *ctx,
      * Only from a program's own main() — a library embedder never reaches this
      * codegen path — and it's a no-op under SW_NO_SIGNAL_SHUTDOWN. */
     fprintf(f, "    sw_install_shutdown_signals();\n");
+    /* Only the root process gets the deep stack, so non-tail recursion in
+     * main reaches the same depth as the interpreter (see SW_ROOT_STACK_SIZE). */
+    fprintf(f, "    sw_proc_stack_size = SW_ROOT_STACK_SIZE;\n");
     fprintf(f, "    sw_spawn(_main_entry, NULL);\n");
+    fprintf(f, "    sw_proc_stack_size = 0;\n");
     fprintf(f, "    /* Wait for the user's main() to return OR a SIGTERM/SIGINT to\n");
     fprintf(f, "     * request shutdown, whichever first (off-scheduler, main thread). */\n");
     fprintf(f, "    if (sw_wait_for_exit(&_sw_done_flag, &_sw_done_lock, &_sw_done_cond)) {\n");

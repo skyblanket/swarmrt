@@ -3632,10 +3632,11 @@ static int interp_stack_near_limit(void) {
 #endif
 }
 
-/* Backstop call-depth ceiling for platforms where interp_stack_near_limit()
- * can't introspect the stack. Generous enough not to clip realistic programs,
- * low enough to stay under a small (e.g. 1 MB) stack. */
-#define SW_CALL_DEPTH_MAX 1500
+/* Backstop call-depth ceiling. The real limit is the stack guard above (the
+ * root fiber is SW_ROOT_STACK_SIZE, ~12KB of C stack per sw-level call), so
+ * this only trips first where the stack can't be introspected. Sized so the
+ * ~10k-deep non-tail recursion that compiled binaries handle also works here. */
+#define SW_CALL_DEPTH_MAX 50000
 
 /* Check both guards. Raises a clean panic and returns 1 if recursion must
  * stop; 0 if it is safe to descend one more level. Call sites must NOT
@@ -3644,8 +3645,8 @@ static int interp_recursion_blocked(sw_interp_t *interp) {
     if (interp->error) return 1;
     if (interp->call_depth >= SW_CALL_DEPTH_MAX || interp_stack_near_limit()) {
         interp_raise_panic(interp, 0,
-            "interpreter recursion depth exceeded — compile with swc build "
-            "for tail-call optimisation");
+            "interpreter recursion depth exceeded (depth %d) — compile with "
+            "swc build for tail-call optimisation", interp->call_depth);
         return 1;
     }
     return 0;
