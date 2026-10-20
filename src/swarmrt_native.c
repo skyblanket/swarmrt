@@ -926,6 +926,16 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->my_monitors = NULL;
     proc->kill_flag = 0;
     proc->exit_reason = 0;
+    /* The previous occupant's exit message outlives its destroy (see
+     * process_destroy). Unlocked test: panic_msg is written only by this
+     * slot's own process, and a non-NULL value is freed under link_lock,
+     * where every reader copies it. */
+    if (proc->panic_msg) {
+        pthread_mutex_lock(&g_swarm->link_lock);
+        free(proc->panic_msg);
+        proc->panic_msg = NULL;
+        pthread_mutex_unlock(&g_swarm->link_lock);
+    }
     proc->reg_entry = NULL;
     proc->ets_tables = NULL;
 
@@ -1002,28 +1012,24 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.count = 0;
     atomic_store_explicit(&proc->mb_len, 0, memory_order_relaxed);
 
-    /* Free the panic_msg string set by sw_process_panic. UNDER link_lock:
-     * a late sw_monitor on this (already-EXITING/FREE) process reads
-     * panic_msg in its already-dead delivery path under the same lock, so
-     * the free must serialise with it or the monitor reads freed memory.
-     * NULL-under-lock means the monitor sees either a valid pointer or
-     * NULL, never freed-but-non-NULL. */
-    /* The varena/spawn_region DETACH also happens inside this same critical
-     * section (snapshot-then-NULL under link_lock, free after unlock): the
+    /* panic_msg is deliberately NOT freed here. A link or monitor that lands
+     * after this process died (state stays EXITING until the slot is reused)
+     * still needs its exit message, or it reports reason -1 with no text.
+     * process_init_arena frees it when the slot is reused.
+     *
+     * The varena/spawn_region DETACH happens inside this critical section
+     * (snapshot-then-NULL under link_lock, free after unlock): the
      * process_info builtin reads proc->varena->total_bytes cross-thread for
      * its 'memory' stat, under link_lock. Detaching under the lock gives it
-     * the same guarantee panic_msg has — a reader holding link_lock sees
-     * either a live arena header or NULL, never freed-but-non-NULL. The
-     * frees stay outside the lock (O(chunks), no need to hold it). */
+     * a guarantee — a reader holding link_lock sees either a live arena
+     * header or NULL, never freed-but-non-NULL. The frees stay outside the
+     * lock (O(chunks), no need to hold it). */
     pthread_mutex_lock(&g_swarm->link_lock);
-    char *_pm = proc->panic_msg;
-    proc->panic_msg = NULL;
     struct sw_value_arena *_va = proc->varena;
     proc->varena = NULL;
     struct sw_value_arena *_sr = proc->spawn_region;
     proc->spawn_region = NULL;
     pthread_mutex_unlock(&g_swarm->link_lock);
-    free(_pm);
 
     /* GC v1: reclaim this process's whole value arena in O(chunks). Runs after
      * the fiber has returned, so there are no live sw_val_t* C-stack roots.
@@ -3163,18 +3169,29 @@ static void process_exit(sw_process_t *proc, int reason) {
 int sw_link(sw_process_t *other) {
     sw_process_t *self = tls_current;
     if (!self || !other || self == other) return -1;
-    if (other->state == SW_PROC_EXITING || other->state == SW_PROC_FREE) {
+
+    /* The dead-check and the reason read happen under link_lock, as in
+     * sw_monitor: process_exit finalizes exit_reason/panic_msg under it and
+     * process_destroy frees panic_msg under it. Reading them bare raced that
+     * free — a child that dies before the link lands could hand over reason
+     * -1 with no message (test_stack_overflow, ~1 run in 40). */
+    pthread_mutex_lock(&g_swarm->link_lock);
+
+    sw_proc_state_t st = atomic_load_explicit(&other->state, memory_order_relaxed);
+    if (st == SW_PROC_EXITING || st == SW_PROC_FREE) {
         /* Linking to dead process — deliver exit signal immediately */
+        int reason = atomic_load_explicit(&other->exit_reason, memory_order_relaxed);
+        char *msg = other->panic_msg ? strdup(other->panic_msg) : NULL;
+        pthread_mutex_unlock(&g_swarm->link_lock);
         if (self->flags & SW_FLAG_TRAP_EXIT) {
-            deliver_signal(self, SW_TAG_EXIT, other->pid, 0, other->exit_reason, other->panic_msg);
-        } else if (other->exit_reason != 0) {
+            deliver_signal(self, SW_TAG_EXIT, other->pid, 0, reason, msg);
+        } else if (reason != 0) {
             self->kill_flag = 1;
-            self->exit_reason = other->exit_reason;
+            self->exit_reason = reason;
         }
+        free(msg);
         return 0;
     }
-
-    pthread_mutex_lock(&g_swarm->link_lock);
 
     /* Check if already linked */
     sw_link_t *l = self->links;
