@@ -70,7 +70,7 @@ fun test_timeout_kills_inside(f0) {
     sleep(300)
     top = docker_out(["top", map_get(sb, 'id')])
     f = f0 + check("timeout_exit_124", yes(elem(r, 0) == 124))
-    f = f + check("timeout_leaves_no_process", yes(string_contains(top, "300") == 'false'))
+    f = f + check("timeout_leaves_no_process", yes(string_contains(top, "sleep 300") == 'false'))
     Sandbox.stop(sb)
     f
 }
