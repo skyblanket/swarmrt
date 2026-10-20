@@ -571,6 +571,33 @@ process `ws_set_handler` re-homed the connection to) as one of these messages:
 {'ws_close',     conn}                                 # the WS closed
 ```
 
+`method` is an **atom** (`'GET'`, `'POST'`, `'PUT'`, `'DELETE'`), not a string.
+`'POST' == "POST"` is false, so a route written as `method == "POST"` never
+matches. Match the atom in the message pattern:
+
+```sw
+module RouteDemo
+export [main]
+
+# Match the request method as an atom: 'POST', not "POST".
+fun route(msg) {
+    case msg {
+        {'http_request', _conn, 'POST', path, _headers, body} -> "post " ++ path ++ " " ++ body   # => post /echo x
+        {'http_request', _conn, 'GET', path, _headers, _body} -> "get " ++ path                  # => get /health
+        _ -> "other"
+    }
+}
+
+fun main() {
+    print(route({'http_request', 1, 'POST', "/echo", map_new(), "x"}))
+    print(route({'http_request', 2, 'GET', "/health", map_new(), ""}))
+    print(route({'http_request', 3, 'DELETE', "/x", map_new(), ""}))   # => other
+}
+```
+
+`http_request`'s own `method` option accepts either spelling, so
+`%{method: 'POST'}` and `%{method: "POST"}` send the same request.
+
 `headers` is a **MAP with lowercased keys** — so a bearer-token check or a
 webhook-signature read works in-process, regardless of on-the-wire casing:
 

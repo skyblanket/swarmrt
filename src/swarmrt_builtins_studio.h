@@ -5026,7 +5026,8 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
  *
  *   url   : string (required)
  *   opts  : map (optional) with keys —
- *             method  : string, e.g. "GET"/"POST"/"PUT"/"DELETE" (default GET)
+ *             method  : "GET"/"POST"/"PUT"/"DELETE" — a string OR an atom
+ *                       ('GET'/'POST', the form http_listen delivers) (default GET)
  *             headers : a MAP {name=>value} OR a list of {name, value} tuples
  *             body    : string request body (sent via --data-binary)
  *
@@ -5142,7 +5143,10 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     if (opts && opts->type == SW_VAL_MAP) {
         sw_val_t *km = sw_val_string("method");
         sw_val_t *mv = sw_val_map_get(opts, km);
-        if (mv && mv->type == SW_VAL_STRING && mv->v.str[0]) method = mv->v.str;
+        /* An atom ('POST') is the same verb as a string ("POST"): http_listen
+         * delivers the request method as an atom, so accept both spellings. */
+        if (mv && (mv->type == SW_VAL_STRING || mv->type == SW_VAL_ATOM) && mv->v.str[0])
+            method = mv->v.str;
         sw_val_t *kb = sw_val_string("body");
         sw_val_t *bv = sw_val_map_get(opts, kb);
         if (bv && bv->type == SW_VAL_STRING) body = bv->v.str;

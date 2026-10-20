@@ -4,6 +4,29 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-20 — http_request takes an atom method; the request method is documented as an atom
+
+**fix(http): `http_request(url, %{method: 'POST'})` silently sent a GET.** The
+`method` option accepted only a string, so an atom was ignored and the default
+`"GET"` went out. It now accepts `'POST'` and `"POST"` alike. The server side
+was already an atom: `http_listen` delivers `{'http_request', conn, method, ...}`
+with `method` as `'GET'`, `'POST'` and so on. A handler that matched
+`method == "POST"` never matched, because `'POST' == "POST"` is false.
+
+**docs:** `BUILDING_AGENTS.md` and `API_REFERENCE.md` now say `method` is an
+atom, with a doctested route match on `'POST'`. `SW_LANGUAGE.md` says the same
+in its builtin table.
+
+**Decision: the server keeps delivering the method as an atom.** Changing it to a
+string would break every existing `'GET'` and `'POST'` route match in `lib/`,
+`examples/` and `studio/`, so it is not planned for a MAJOR. The client accepts
+either form, so the two halves now agree on input.
+
+Gate: the atom case in `tests/sw/test_http_request.sw`, which failed with
+`expected POST|<none>, got GET|<none>` before the fix.
+
+---
+
 ## 2026-10-19 — v2.1.0
 
 **release: SwarmRT 2.1.0.** The first archives since 1.0.0: the 2.0.0 tag
