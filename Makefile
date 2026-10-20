@@ -73,7 +73,7 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
+.PHONY: all clean check-sources cmake-smoke v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
         test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
         test-sw benchmark benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
@@ -718,12 +718,22 @@ benchmark: v1
 benchmark-native: native
 	./$(BIN_DIR)/swarmrt-native
 
+# Makefile and CMakeLists.txt must list the same runtime sources (see the script).
+# Runs on every `make swc` / `make libswarmrt`, which CI already executes.
+check-sources:
+	bash scripts/check_source_lists.sh
+
+# Full CMake build (the Windows/MinGW path uses this). Not run by default.
+cmake-smoke:
+	cmake -S . -B $(BUILD_DIR)/cmake
+	cmake --build $(BUILD_DIR)/cmake -j
+
 # SwarmRT static library (for linking compiled .sw programs)
-libswarmrt: core-objs
+libswarmrt: check-sources core-objs
 	ar rcs $(BIN_DIR)/libswarmrt.a $(CORE_OBJS)
 
 # SwarmRT compiler
-swc: core-objs
+swc: check-sources core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
 		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c $(SRC_DIR)/swc_pkg.c \

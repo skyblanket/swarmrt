@@ -54,6 +54,7 @@ set(CORE_SOURCES
     ${SRC_DIR}/swarmrt_lang.c
     ${SRC_DIR}/swarmrt_http.c
     ${SRC_DIR}/swarmrt_pdf.c
+    ${SRC_DIR}/swarmrt_varena.c
 )
 
 # swarmrt_native.c needs -fno-stack-protector (processes migrate between
