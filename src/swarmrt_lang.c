@@ -558,6 +558,7 @@ static void node_free(node_t *n) {
         for (int i = 0; i < n->v.mod.nfuns; i++) node_free(n->v.mod.funs[i]);
         free(n->v.mod.funs);
         for (int i = 0; i < n->v.mod.nglobals; i++) node_free(n->v.mod.globals[i].val);
+        free(n->v.mod.globals);
         break;
     case N_FUN:
         node_free(n->v.fun.body);
@@ -628,7 +629,11 @@ static node_t *node_dup(node_t *n) {
     case N_MODULE:
         out->v.mod.funs = malloc(sizeof(node_t*) * (n->v.mod.nfuns ? n->v.mod.nfuns : 1));
         for (int i = 0; i < n->v.mod.nfuns; i++) out->v.mod.funs[i] = node_dup(n->v.mod.funs[i]);
-        for (int i = 0; i < n->v.mod.nglobals; i++) out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        out->v.mod.globals = malloc(sizeof(*out->v.mod.globals) * (n->v.mod.nglobals ? n->v.mod.nglobals : 1));
+        for (int i = 0; i < n->v.mod.nglobals; i++) {
+            memcpy(out->v.mod.globals[i].name, n->v.mod.globals[i].name, sizeof(out->v.mod.globals[i].name));
+            out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        }
         break;
     case N_FUN:
         out->v.fun.body = node_dup(n->v.fun.body);
@@ -2208,17 +2213,13 @@ static node_t *par_module(par_t *p) {
              * refs) are rejected at eval time since global_env is empty at load. */
             node_t *val = par_expr(p);
             if (p->err) break;
-            if (mod->v.mod.nglobals < 16) {
-                int gi = mod->v.mod.nglobals++;
-                strncpy(mod->v.mod.globals[gi].name, gname.text,
-                        sizeof(mod->v.mod.globals[gi].name)-1);
-                mod->v.mod.globals[gi].val = val;
-            } else {
-                snprintf(p->errmsg, sizeof(p->errmsg),
-                    "line %d: too many module globals (max 16)", gname.line);
-                p->err = 1;
-                node_free(val);
-            }
+            int gi = mod->v.mod.nglobals++;
+            mod->v.mod.globals = realloc(mod->v.mod.globals,
+                sizeof(*mod->v.mod.globals) * mod->v.mod.nglobals);
+            memset(mod->v.mod.globals[gi].name, 0, sizeof(mod->v.mod.globals[gi].name));
+            strncpy(mod->v.mod.globals[gi].name, gname.text,
+                    sizeof(mod->v.mod.globals[gi].name)-1);
+            mod->v.mod.globals[gi].val = val;
         } else {
             mod->v.mod.nfuns++;
             mod->v.mod.funs = realloc(mod->v.mod.funs, sizeof(node_t*) * mod->v.mod.nfuns);
@@ -2661,15 +2662,14 @@ sw_val_t *sw_now_iso(void) {
  * Rebuild the whole value DAG on the global heap so it survives the source
  * process's arena being freed. No memoization: there are no cycles (all
  * constructors build bottom-up) and DAG-shared subvalues copy as a tree, so
- * the result is alias-free and sw_val_free can recurse it safely. A depth
- * cap (matching the marshal/json limits) guards pathological nesting against
- * fiber-stack overflow.
+ * the result is alias-free and sw_val_free can recurse it safely. The walk is
+ * iterative (an explicit frame stack, no depth cap), so nesting depth is
+ * bounded by memory, never by the fiber's C stack, and nothing is truncated.
  *
  * PIDs copy by value (the slab pointer outlives any one process). Compiled
  * closures (cfunc + captures) copy the cfunc and deep-copy each capture;
- * interpreter closures (body AST + closure_env) never reach here (they exist
- * only in the single-process interpreter, which has no arena to free). */
-#define SW_COPY_MAX_DEPTH 256
+ * interpreter closures (body AST + closure_env) share the AST and hold a ref
+ * on the env, so they are never walked. */
 
 /* === Deep-copy context ===
  * One per top-level deep copy (thread-local, nestable). `memo` maps a source
@@ -2755,11 +2755,73 @@ static sw_val_t *fresh_scalar(sw_val_t *v) {
     return r;
 }
 
-static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
+static void env_retain(sw_env_t *e);
 
-static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
+/* Containers have children to walk. An interpreter closure (body set) shares
+ * its AST and has none. */
+static int dc_is_container(const sw_val_t *v) {
+    return v->type == SW_VAL_TUPLE || v->type == SW_VAL_LIST ||
+           v->type == SW_VAL_MAP || (v->type == SW_VAL_FUN && !v->v.fun.body);
+}
+
+/* Leaves (scalars, strings, bytes, pids): nothing to recurse into. */
+static sw_val_t *deep_copy_leaf(sw_val_t *v) {
+    switch (v->type) {
+    case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
+    case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
+    case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
+    case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
+    case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
+    case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
+    case SW_VAL_PID:    return sw_val_pid_id(v->v.pidv.ptr, v->v.pidv.id);
+    case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
+    case SW_VAL_FUN: {
+        /* Interpreter closure: share its AST, and hold a ref on its env so the
+         * env outlives the frame that built the closure. */
+        sw_val_t *r = val_alloc(sizeof(sw_val_t));
+        r->type = SW_VAL_FUN;
+        r->v.fun.name = v->v.fun.name;
+        r->v.fun.num_params = v->v.fun.num_params;
+        r->v.fun.body = v->v.fun.body;
+        r->v.fun.closure_env = v->v.fun.closure_env;
+        env_retain(r->v.fun.closure_env);
+        return r;
+    }
+    default: return sw_val_nil();
+    }
+}
+
+/* A container being copied. `out` collects its children's copies in child
+ * order (a map's keys, then its values); `idx` is the next child to visit. */
+typedef struct {
+    sw_val_t *src;
+    sw_val_t **out;
+    int total, idx;
+} dc_frame_t;
+
+static int dc_child_count(const sw_val_t *v) {
+    switch (v->type) {
+    case SW_VAL_MAP: return 2 * v->v.map.count;
+    case SW_VAL_FUN: return v->v.fun.ncaptures;
+    default:         return v->v.tuple.count;
+    }
+}
+
+static sw_val_t *dc_child(const sw_val_t *v, int i) {
+    switch (v->type) {
+    case SW_VAL_MAP: {
+        int n = v->v.map.count;
+        return i < n ? v->v.map.keys[i] : v->v.map.vals[i - n];
+    }
+    case SW_VAL_FUN: return v->v.fun.captures[i];
+    default:         return v->v.tuple.items[i];
+    }
+}
+
+/* The copy of v when it needs no walk (nil, immortal, kept, memoised, or a
+ * leaf); NULL for a container that still has to be copied. */
+static sw_val_t *dc_try(sw_val_t *v) {
     if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
-    if (depth > SW_COPY_MAX_DEPTH) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
     /* Global-heap graphs are freed node by node (ETS replace/delete, timer
      * and supervisor closures, v1 message fallback), so they must not share
      * immortals; copies into regions/arenas (bulk-freed) may. */
@@ -2770,56 +2832,67 @@ static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
         sw_val_t *seen = dc_lookup(g_dc, v);
         if (seen) return seen;
     }
-    sw_val_t *copy = deep_copy_node(v, depth);
-    if (g_dc && copy && copy != v) dc_insert(g_dc, v, copy);
+    if (dc_is_container(v)) return NULL;
+    sw_val_t *copy = deep_copy_leaf(v);
+    if (g_dc && copy != v) dc_insert(g_dc, v, copy);
     return copy;
 }
 
-static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
-    switch (v->type) {
-    case SW_VAL_NIL:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_nil();
-    case SW_VAL_INT:    return g_alloc_force_global ? fresh_scalar(v) : sw_val_int(v->v.i);
-    case SW_VAL_FLOAT:  return sw_val_float(v->v.f);
-    case SW_VAL_STRING: return sw_val_string(v->v.str ? v->v.str : "");
-    case SW_VAL_ATOM:   return g_alloc_force_global ? fresh_scalar(v) : sw_val_atom(v->v.str ? v->v.str : "");
-    case SW_VAL_BYTES:  return sw_val_bytes(v->v.bytes.data, v->v.bytes.len);
-    case SW_VAL_PID:    return sw_val_pid_id(v->v.pidv.ptr, v->v.pidv.id);
-    case SW_VAL_REMOTE_PID: return sw_val_remote_pid(v->v.rpid.node, v->v.rpid.id);
-    case SW_VAL_TUPLE:
-    case SW_VAL_LIST: {
-        int n = v->v.tuple.count;
-        sw_val_t **items = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
-        for (int i = 0; i < n; i++)
-            items[i] = deep_copy_rec(v->v.tuple.items[i], depth + 1);
-        sw_val_t *r = (v->type == SW_VAL_TUPLE)
-                          ? sw_val_tuple(items, n)
-                          : sw_val_list(items, n);
-        free(items);
-        return r;
-    }
+/* Build the container's copy from its already-copied children. */
+static sw_val_t *dc_build(const sw_val_t *src, sw_val_t **out, int total) {
+    switch (src->type) {
+    case SW_VAL_TUPLE: return sw_val_tuple(out, total);
+    case SW_VAL_LIST:  return sw_val_list(out, total);
     case SW_VAL_MAP: {
-        int n = v->v.map.count;
-        sw_val_t **ks = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
-        sw_val_t **vs = (n > 0) ? malloc(sizeof(sw_val_t *) * n) : NULL;
-        for (int i = 0; i < n; i++) {
-            ks[i] = deep_copy_rec(v->v.map.keys[i], depth + 1);
-            vs[i] = deep_copy_rec(v->v.map.vals[i], depth + 1);
+        int n = total / 2;
+        return sw_val_map_new(out, out ? out + n : NULL, n);
+    }
+    default: return sw_val_fun_native(src->v.fun.cfunc, src->v.fun.num_params, out, total);
+    }
+}
+
+static void dc_push(dc_frame_t **st, size_t *n, size_t *cap, sw_val_t *src) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *st = realloc(*st, *cap * sizeof(**st));
+    }
+    dc_frame_t *f = &(*st)[(*n)++];
+    f->src = src;
+    f->total = dc_child_count(src);
+    f->idx = 0;
+    f->out = f->total ? malloc(sizeof(sw_val_t *) * f->total) : NULL;
+}
+
+/* Deep-copy v's graph with an explicit frame stack rather than recursion, so
+ * nesting depth costs heap, never fiber stack, and no value is truncated.
+ * Children are copied before their parent (post-order); every container is
+ * memoised, so DAG-shared subvalues copy once. */
+static sw_val_t *deep_copy_rec(sw_val_t *v) {
+    sw_val_t *r = dc_try(v);
+    if (r) return r;
+    dc_frame_t *st = NULL;
+    size_t n = 0, cap = 0;
+    sw_val_t *result = NULL;
+    dc_push(&st, &n, &cap, v);
+    while (n) {
+        dc_frame_t *f = &st[n - 1];
+        if (f->idx < f->total) {
+            sw_val_t *child = dc_child(f->src, f->idx);
+            sw_val_t *c = dc_try(child);
+            f->idx++;
+            if (c) f->out[f->idx - 1] = c;
+            else dc_push(&st, &n, &cap, child);   /* may realloc: f is stale */
+        } else {
+            sw_val_t *built = dc_build(f->src, f->out, f->total);
+            free(f->out);
+            if (g_dc) dc_insert(g_dc, f->src, built);
+            n--;
+            if (n == 0) result = built;
+            else st[n - 1].out[st[n - 1].idx - 1] = built;
         }
-        sw_val_t *r = sw_val_map_new(ks, vs, n);
-        free(ks); free(vs);
-        return r;
     }
-    case SW_VAL_FUN: {
-        int nc = v->v.fun.ncaptures;
-        sw_val_t **caps = (nc > 0) ? malloc(sizeof(sw_val_t *) * nc) : NULL;
-        for (int i = 0; i < nc; i++)
-            caps[i] = deep_copy_rec(v->v.fun.captures[i], depth + 1);
-        sw_val_t *r = sw_val_fun_native(v->v.fun.cfunc, v->v.fun.num_params, caps, nc);
-        free(caps);
-        return r;
-    }
-    default: return sw_val_nil();
-    }
+    free(st);
+    return result;
 }
 
 /* Redirect this THREAD's value allocations into `region` (NULL restores the
@@ -2838,7 +2911,7 @@ sw_val_t *sw_val_deep_copy_global(sw_val_t *v) {
     g_alloc_force_global = 1;
     dc_ctx_t dc, *saved;
     dc_begin(&dc, &saved);
-    sw_val_t *r = deep_copy_rec(v, 0);
+    sw_val_t *r = deep_copy_rec(v);
     dc_end(&dc, saved);
     g_alloc_force_global = save;
     return r;
@@ -2856,7 +2929,7 @@ sw_val_t *sw_val_deep_copy_local(sw_val_t *v) {
     g_alloc_force_global = 0;
     dc_ctx_t dc, *saved;
     dc_begin(&dc, &saved);
-    sw_val_t *r = deep_copy_rec(v, 0);
+    sw_val_t *r = deep_copy_rec(v);
     dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
@@ -2875,12 +2948,20 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
     g_alloc_force_global = 0;
     dc_ctx_t dc, *saved;
     dc_begin(&dc, &saved);
-    sw_val_t *r = deep_copy_rec(v, 0);
+    sw_val_t *r = deep_copy_rec(v);
     dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
     return r;
 }
+
+/* Mutual tail-call hop state (see swarmrt_lang.h). The sentinel only needs a
+ * unique address; it is never read as a value. */
+sw_val_t sw_tc_hop_sentinel;
+__thread sw_tc_body_t sw_tc_next_fn;
+__thread int sw_tc_next_n;
+__thread sw_varena_mark_t sw_tc_next_floor;
+__thread sw_val_t *sw_tc_next_args[SW_TC_MAX];
 
 /* Ownership v2 turn checkpoint (called by compiled self-tail-calls once the
  * function has allocated enough above its entry floor). Copies the live
@@ -2914,7 +2995,7 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
     dc_begin(&dc, &saved);
     dc.keep = keep;
     dc.nkeep = nkeep;
-    for (int i = 0; i < n; i++) args[i] = deep_copy_rec(args[i], 0);
+    for (int i = 0; i < n; i++) args[i] = deep_copy_rec(args[i]);
     dc_end(&dc, saved);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
@@ -4023,6 +4104,18 @@ static int _interp_vets_free_ids[_INTERP_VETS_MAX_TABLES];   /* ets_drop'd ids *
 static int _interp_vets_nfree = 0;
 static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
 
+/* The store owns its keys and values as global-heap copies: a tool's region or a
+ * process arena can be freed while the entry lives (see tool_call / process_destroy),
+ * so a raw pointer into either would dangle. Readers get their own copy. */
+static sw_val_t *_interp_vets_store(sw_val_t *v) {
+    return sw_val_deep_copy_global(v);
+}
+static sw_val_t *_interp_vets_out(sw_val_t *v) {
+    sw_value_arena_t *target = sw_swap_alloc_target(NULL);
+    sw_swap_alloc_target(target);
+    return target ? deep_copy_into(v, target) : sw_val_deep_copy_local(v);
+}
+
 static uint32_t _interp_vets_hash(sw_val_t *v) {
     uint64_t h = 14695981039346656037ULL;
     if (!v) return 0;
@@ -4077,21 +4170,27 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
  *
  * This block bridges the gap with minimum-viable implementations of the
  * pure-functional builtins (no per-process scheduler state required).
- * Process-scheduler primitives (link/monitor/exit_proc/etc) print a one-
- * shot hint and return nil instead of silently dropping through.
+ * Process-scheduler primitives (link/monitor/exit_proc/etc) print a hint
+ * (once per name) and return nil instead of silently dropping through.
  * ========================================================================= */
 
 #define _REPL_SQLITE_MAX 32
 static sqlite3 *_repl_sqlite_db[_REPL_SQLITE_MAX];
 
-static int _repl_scheduler_warned = 0;
+/* One note per builtin name: a single shared flag would hide every stub after
+ * the first, so a test could pass on nil without anyone seeing why. */
+#define _REPL_WARNED_MAX 64
+static const char *_repl_warned_names[_REPL_WARNED_MAX];
+static int _repl_warned_count = 0;
 static void _repl_warn_scheduler(const char *name) {
-    if (_repl_scheduler_warned) return;
+    for (int i = 0; i < _repl_warned_count; i++)
+        if (strcmp(_repl_warned_names[i], name) == 0) return;
+    if (_repl_warned_count < _REPL_WARNED_MAX)
+        _repl_warned_names[_repl_warned_count++] = name;
     fprintf(stderr,
-        "note: '%s' (and similar scheduler primitives) return nil in the REPL;\n"
-        "      use `swc build file.sw -o bin/x && bin/x` for full process semantics.\n",
+        "note: '%s' is not available here and returns nil;\n"
+        "      use `swc build file.sw -o bin/x && bin/x` for the full runtime.\n",
         name);
-    _repl_scheduler_warned = 1;
 }
 
 /* ---- spawn(): re-enter the interpreter on a fresh fiber -------------------
@@ -5219,7 +5318,11 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         t->active = 0;
         for (int b = 0; b < _INTERP_VETS_BUCKETS; b++) {
             _interp_vets_entry_t *e = t->buckets[b];
-            while (e) { _interp_vets_entry_t *next = e->next; free(e); e = next; }
+            while (e) {
+                _interp_vets_entry_t *next = e->next;
+                sw_val_free(e->key); sw_val_free(e->value); free(e);
+                e = next;
+            }
             t->buckets[b] = NULL;
         }
         pthread_rwlock_unlock(&t->lock);
@@ -5237,14 +5340,16 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
-                e->value = args[2];
+                sw_val_t *nv = _interp_vets_store(args[2]);
+                sw_val_free(e->value);
+                e->value = nv;
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("ok");
             }
             e = e->next;
         }
         _interp_vets_entry_t *ne = (_interp_vets_entry_t *)malloc(sizeof(_interp_vets_entry_t));
-        ne->key = args[1]; ne->value = args[2]; ne->next = t->buckets[bucket];
+        ne->key = _interp_vets_store(args[1]); ne->value = _interp_vets_store(args[2]); ne->next = t->buckets[bucket];
         t->buckets[bucket] = ne;
         pthread_rwlock_unlock(&t->lock);
         return sw_val_atom("ok");
@@ -5259,7 +5364,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
-                sw_val_t *v = e->value;
+                sw_val_t *v = _interp_vets_out(e->value);
                 pthread_rwlock_unlock(&t->lock);
                 return v ? v : sw_val_nil();
             }
@@ -5278,7 +5383,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         _interp_vets_entry_t **pp = &t->buckets[bucket];
         while (*pp) {
             if (_interp_vets_key_eq((*pp)->key, args[1])) {
-                _interp_vets_entry_t *dead = *pp; *pp = dead->next; free(dead);
+                _interp_vets_entry_t *dead = *pp; *pp = dead->next;
+                sw_val_free(dead->key); sw_val_free(dead->value); free(dead);
                 pthread_rwlock_unlock(&t->lock);
                 return sw_val_atom("ok");
             }
@@ -5298,8 +5404,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         while (*pp) {
             if (_interp_vets_key_eq((*pp)->key, args[1])) {
                 _interp_vets_entry_t *dead = *pp;
-                sw_val_t *val = dead->value;
-                *pp = dead->next; free(dead);
+                sw_val_t *val = _interp_vets_out(dead->value);
+                *pp = dead->next;
+                sw_val_free(dead->key); sw_val_free(dead->value); free(dead);
                 pthread_rwlock_unlock(&t->lock);
                 return val ? val : sw_val_nil();
             }
@@ -5322,7 +5429,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             if (_interp_vets_key_eq(e->key, args[1])) {
                 if (e->value && e->value->type == SW_VAL_INT) {
                     int64_t result = e->value->v.i + delta;
-                    e->value = sw_val_int(result);
+                    sw_val_free(e->value);
+                    e->value = _interp_vets_store(sw_val_int(result));
                     pthread_rwlock_unlock(&t->lock);
                     return sw_val_int(result);
                 }
@@ -5332,9 +5440,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
             e = e->next;
         }
         int64_t seeded = initial + delta;
-        sw_val_t *stored = sw_val_int(seeded);
+        sw_val_t *stored = _interp_vets_store(sw_val_int(seeded));
         _interp_vets_entry_t *ne = (_interp_vets_entry_t *)malloc(sizeof(_interp_vets_entry_t));
-        ne->key = args[1]; ne->value = stored; ne->next = t->buckets[bucket];
+        ne->key = _interp_vets_store(args[1]); ne->value = stored; ne->next = t->buckets[bucket];
         t->buckets[bucket] = ne;
         pthread_rwlock_unlock(&t->lock);
         return sw_val_int(seeded);
@@ -5350,7 +5458,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
                 if (_interp_vets_key_eq(e->value, args[2])) {
-                    e->value = args[3];
+                    sw_val_t *nv = _interp_vets_store(args[3]);
+                    sw_val_free(e->value);
+                    e->value = nv;
                     pthread_rwlock_unlock(&t->lock);
                     return sw_val_atom("true");
                 }
@@ -5385,7 +5495,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *old_val = NULL;
         _interp_vets_entry_t *e = t->buckets[bucket];
         while (e) {
-            if (_interp_vets_key_eq(e->key, args[1])) { old_val = e->value; break; }
+            if (_interp_vets_key_eq(e->key, args[1])) { old_val = _interp_vets_out(e->value); break; }
             e = e->next;
         }
         pthread_rwlock_unlock(&t->lock);
@@ -5410,7 +5520,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         e = t->buckets[bucket];
         while (e) {
             if (_interp_vets_key_eq(e->key, args[1])) {
-                e->value = new_val;
+                sw_val_t *nv = _interp_vets_store(new_val);
+                sw_val_free(e->value);
+                e->value = nv;
                 pthread_rwlock_unlock(&t->lock);
                 return new_val;
             }
@@ -5450,7 +5562,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         for (int bi = 0; bi < _INTERP_VETS_BUCKETS; bi++) {
             for (_interp_vets_entry_t *e = t->buckets[bi]; e; e = e->next) {
                 if (cnt >= cap) { cap *= 2; items = (sw_val_t **)realloc(items, sizeof(sw_val_t *) * cap); }
-                sw_val_t *pair[2] = { e->key, e->value };
+                sw_val_t *pair[2] = { _interp_vets_out(e->key), _interp_vets_out(e->value) };
                 items[cnt++] = sw_val_tuple(pair, 2);
             }
         }
@@ -5935,7 +6047,6 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
      * so a supervised worker would never run. Wiring needs an interpreter-aware
      * child trampoline + closure_env rebind — out of scope for call-the-native. */
     static const char *scheduler_names[] = {
-        "send",
         "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
         "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
         "http_listen", "http_respond", "ws_send", "ws_close",
@@ -5948,7 +6059,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     };
     for (int i = 0; scheduler_names[i]; i++) {
         if (strcmp(fname, scheduler_names[i]) == 0) {
-            _repl_warn_scheduler(fname);
+            _repl_warn_scheduler(scheduler_names[i]);
             return sw_val_nil();
         }
     }
@@ -5967,7 +6078,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
  * innermost interp_eval_body, which rebinds and loops. EVERY site that
  * evaluates a function body goes through interp_eval_body, so a request is
  * always consumed by the body that issued it. This also covers mutual tail
- * recursion, which the compiled path does not yet. */
+ * recursion; the compiled path runs it too, for module functions (hops). */
 static void mark_tail(node_t *n) {
     if (!n) return;
     switch (n->type) {
@@ -7767,6 +7878,67 @@ static void rs_report(rs_ctx_t *c, rs_scope_t *s, const char *name, int line) {
     fprintf(stderr, "\n");
 }
 
+/* Arity of the builtins that may be used as a value (`map(to_string, xs)`).
+ * Each entry is the number of arguments the builtin's dispatch requires. A
+ * builtin not listed here is still rejected when used as a value. */
+static const struct { const char *name; int arity; } k_builtin_value_arity[] = {
+    { "abs", 1 }, { "base64_decode", 1 }, { "base64_encode", 1 },
+    { "byte_size", 1 }, { "bytes_from_base64", 1 }, { "bytes_to_base64", 1 },
+    { "bytes_to_string", 1 }, { "hd", 1 }, { "json_decode", 1 },
+    { "json_encode", 1 }, { "json_escape", 1 }, { "length", 1 },
+    { "map_keys", 1 }, { "map_size", 1 }, { "map_values", 1 },
+    { "math_ceil", 1 }, { "math_cos", 1 }, { "math_exp", 1 },
+    { "math_floor", 1 }, { "math_log", 1 }, { "math_round", 1 },
+    { "math_sin", 1 }, { "math_sqrt", 1 }, { "ord", 1 },
+    { "string_chars", 1 }, { "string_length", 1 }, { "string_lower", 1 },
+    { "string_to_bytes", 1 }, { "string_trim", 1 }, { "string_upper", 1 },
+    { "tl", 1 }, { "to_float", 1 }, { "to_int", 1 }, { "to_string", 1 },
+    { "typeof", 1 },
+    { "bytes_concat", 2 }, { "byte_at", 2 }, { "elem", 2 }, { "filter", 2 },
+    { "json_get", 2 }, { "list_append", 2 }, { "map", 2 }, { "map_get", 2 },
+    { "map_has_key", 2 }, { "map_merge", 2 }, { "map_remove", 2 },
+    { "math_pow", 2 }, { "string_contains", 2 }, { "string_ends_with", 2 },
+    { "string_index_of", 2 }, { "string_split", 2 }, { "string_starts_with", 2 },
+    { "map_put", 3 }, { "reduce", 3 }, { "string_replace", 3 }, { "string_sub", 3 },
+    { NULL, 0 }
+};
+
+static int rs_builtin_value_arity(const char *name) {
+    for (int i = 0; k_builtin_value_arity[i].name; i++)
+        if (strcmp(k_builtin_value_arity[i].name, name) == 0) return k_builtin_value_arity[i].arity;
+    return -1;
+}
+
+/* Rewrite the identifier node `n` (a builtin used as a value) in place into
+ * the anonymous lambda `fun(_p0, ..) { name(_p0, ..) }`. Both backends then
+ * see an ordinary closure, so the interpreter and codegen agree by
+ * construction. The callee name is copied into the new call node before
+ * `n->v` is cleared, since `name` may point into `n->v.sval`. */
+static void rs_wrap_builtin(node_t *n, const char *name, int arity) {
+    node_t *call = mknode(N_CALL, n->line);
+    call->v.call.func = mknode(N_IDENT, n->line);
+    snprintf(call->v.call.func->v.sval, sizeof(call->v.call.func->v.sval), "%s", name);
+    call->v.call.nargs = arity;
+    call->v.call.args = calloc((size_t)arity, sizeof(node_t *));
+
+    node_t *block = mknode(N_BLOCK, n->line);
+    block->v.block.stmts = calloc(1, sizeof(node_t *));
+    block->v.block.stmts[0] = call;
+    block->v.block.nstmts = 1;
+
+    memset(&n->v, 0, sizeof(n->v));
+    n->type = N_FUN;
+    n->v.fun.name[0] = '\0';
+    n->v.fun.nparams = arity;
+    for (int i = 0; i < arity; i++) {
+        snprintf(n->v.fun.params[i], sizeof(n->v.fun.params[i]), "_p%d", i);
+        call->v.call.args[i] = mknode(N_IDENT, n->line);
+        snprintf(call->v.call.args[i]->v.sval, sizeof(call->v.call.args[i]->v.sval),
+                 "_p%d", i);
+    }
+    n->v.fun.body = block;
+}
+
 static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s);
 
 /* ------------------------------------------------------------------
@@ -7848,6 +8020,8 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
         const char *name = n->v.sval;
         if (strchr(name, '.') || strcmp(name, "_") == 0) return;
         if (rs_has(s, name) || rs_is_module_func(c, name) || rs_is_global(c, name)) return;
+        int arity = rs_builtin_value_arity(name);
+        if (arity > 0) { rs_wrap_builtin(n, name, arity); return; }
         rs_report(c, s, name, n->line);
         return;
     }

@@ -14,6 +14,17 @@ make swc libswarmrt
 ./bin/swc build examples/counter.sw -o /tmp/counter && /tmp/counter
 ```
 
+The sanitizer gates (`make gc-stress`, `make alloc-fault`, `make lsan-gate`,
+`make tsan-gate`, `make fuzz`, and `scripts/gc_asan_run.sh`) also need the sanitizer runtime
+that matches your clang. On Ubuntu/Debian install `libclang-rt-<N>-dev`, where
+`<N>` is the major version from `clang --version` (for example
+`libclang-rt-18-dev`); it provides the ASAN, UBSAN and TSan runtimes. With gcc,
+install `libgcc-<N>-dev`, where `<N>` is the major version from `gcc -dumpversion`
+(for example `libgcc-13-dev`); it provides `libasan.a`, `libubsan.a` and `libtsan.a`.
+If the runtime is missing, the gate stops with a message that names the package. The gates
+print their host limits (`vm.max_map_count`, `ulimit -n`, core-dump size) at startup, so
+a failure caused by a host limit can be told apart from a code failure.
+
 ## Running the tests
 
 Before opening a PR, run what CI runs:

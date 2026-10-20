@@ -205,38 +205,55 @@ static int _vets_key_eq(sw_val_t *a, sw_val_t *b) {
     }
 }
 
-/* Fully recursive free of a global-heap value tree that a long-lived owner (an
- * ETS entry, a timer closure) deep-copied via sw_val_deep_copy_global and is now
- * discarding. Mirrors deep_copy_rec's allocations (every node val_alloc'd;
- * strings/atoms and bytes own their buffers; tuple/list/map/fun element arrays
- * are malloc'd). Unlike sw_val_free it recurses into MAP keys/vals and FUN
- * captures, because such a value is a deep_copy_global tree — fully independent,
- * no interned or shared nodes (verified: every sw_val_* constructor allocates
- * fresh) — so the WHOLE graph must go. Caller must ensure no one else holds the
- * pointer (ETS copies values OUT to readers; a one-shot timer frees only after
- * its single apply returns). */
-static void _sw_free_global_val(sw_val_t *v) {
-    if (!v || v->immortal) return;
-    switch (v->type) {
-    case SW_VAL_STRING: case SW_VAL_ATOM:
-        free(v->v.str); break;
-    case SW_VAL_BYTES:
-        free(v->v.bytes.data); break;
-    case SW_VAL_TUPLE: case SW_VAL_LIST:
-        for (int i = 0; i < v->v.tuple.count; i++) _sw_free_global_val(v->v.tuple.items[i]);
-        free(v->v.tuple.items); break;
-    case SW_VAL_MAP:
-        for (int i = 0; i < v->v.map.count; i++) {
-            _sw_free_global_val(v->v.map.keys[i]);
-            _sw_free_global_val(v->v.map.vals[i]);
-        }
-        free(v->v.map.keys); free(v->v.map.vals); break;
-    case SW_VAL_FUN:
-        for (int i = 0; i < v->v.fun.ncaptures; i++) _sw_free_global_val(v->v.fun.captures[i]);
-        free(v->v.fun.captures); break;
-    default: break;
+/* Push a non-immortal child onto the free worklist (growing it as needed). */
+static void _sw_free_push(sw_val_t ***st, size_t *n, size_t *cap, sw_val_t *c) {
+    if (!c || c->immortal) return;
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *st = realloc(*st, *cap * sizeof(**st));
     }
-    free(v);
+    (*st)[(*n)++] = c;
+}
+
+/* Free a global-heap value tree that a long-lived owner (an ETS entry, a timer
+ * closure) deep-copied via sw_val_deep_copy_global and is now discarding.
+ * Mirrors deep_copy_rec's allocations (every node val_alloc'd; strings/atoms and
+ * bytes own their buffers; tuple/list/map/fun element arrays are malloc'd).
+ * Unlike sw_val_free it reaches MAP keys/vals and FUN captures, because such a
+ * value is a deep_copy_global tree — fully independent, no interned or shared
+ * nodes (verified: every sw_val_* constructor allocates fresh) — so the WHOLE
+ * graph must go. The walk uses an explicit worklist, not recursion, so a deeply
+ * nested value (the copy has no depth cap) cannot overflow the fiber stack.
+ * Caller must ensure no one else holds the pointer (ETS copies values OUT to
+ * readers; a one-shot timer frees only after its single apply returns). */
+static void _sw_free_global_val(sw_val_t *root) {
+    sw_val_t **st = NULL;
+    size_t n = 0, cap = 0;
+    _sw_free_push(&st, &n, &cap, root);
+    while (n) {
+        sw_val_t *v = st[--n];
+        switch (v->type) {
+        case SW_VAL_STRING: case SW_VAL_ATOM:
+            free(v->v.str); break;
+        case SW_VAL_BYTES:
+            free(v->v.bytes.data); break;
+        case SW_VAL_TUPLE: case SW_VAL_LIST:
+            for (int i = 0; i < v->v.tuple.count; i++) _sw_free_push(&st, &n, &cap, v->v.tuple.items[i]);
+            free(v->v.tuple.items); break;
+        case SW_VAL_MAP:
+            for (int i = 0; i < v->v.map.count; i++) {
+                _sw_free_push(&st, &n, &cap, v->v.map.keys[i]);
+                _sw_free_push(&st, &n, &cap, v->v.map.vals[i]);
+            }
+            free(v->v.map.keys); free(v->v.map.vals); break;
+        case SW_VAL_FUN:
+            for (int i = 0; i < v->v.fun.ncaptures; i++) _sw_free_push(&st, &n, &cap, v->v.fun.captures[i]);
+            free(v->v.fun.captures); break;
+        default: break;
+        }
+        free(v);
+    }
+    free(st);
 }
 
 static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
@@ -1193,6 +1210,15 @@ static inline sw_process_t *_sw_offl_self(void) {
     return p ? p : _sw_offl_waiter;
 }
 
+/* The process a builtin is waiting for has been killed or is gone. The kill
+ * path frees the slot without resuming the caller, and a new process can
+ * reuse the slot (clearing kill_flag), so also compare the never-reused
+ * numeric pid captured at the start. */
+static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
+    if (!p) return 0;
+    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
+}
+
 typedef struct {
     sw_val_t *(*fn)(sw_val_t **, int);
     sw_val_t **args;
@@ -1689,6 +1715,96 @@ cleaned:
 }
 
 /* ============================================================
+ * Caller-aware HTTP waits
+ * ============================================================
+ *
+ * The blocking HTTP builtins run on an offload worker for a parked caller
+ * (_sw_offl_self). A killed caller frees its slot without resuming, so the
+ * worker polls the caller's identity (the same test exec_managed uses) and
+ * kills its curl child when the caller is gone, rather than waiting out
+ * curl's --max-time. opts.timeout_ms maps to that --max-time. */
+
+#define SW_HTTP_TIMEOUT_ERR "error: timeout"
+
+/* opts.timeout_ms (atom or string key) in milliseconds; 0 = builtin default. */
+static int64_t _sw_http_timeout_ms(sw_val_t *opts) {
+    if (!opts || opts->type != SW_VAL_MAP) return 0;
+    sw_val_t *v = sw_val_map_get(opts, sw_val_atom("timeout_ms"));
+    if (!v || v->type == SW_VAL_NIL) v = sw_val_map_get(opts, sw_val_string("timeout_ms"));
+    return (v && v->type == SW_VAL_INT && v->v.i > 0) ? v->v.i : 0;
+}
+
+/* curl --max-time argument: `ms` as "S.mmm" seconds (curl takes fractions;
+ * integer math keeps it locale-independent), or def_secs when ms is 0. */
+static void _sw_max_time_arg(char *buf, size_t cap, int64_t ms, int def_secs) {
+    if (ms > 0) snprintf(buf, cap, "%lld.%03lld", (long long)(ms / 1000), (long long)(ms % 1000));
+    else snprintf(buf, cap, "%d", def_secs);
+}
+
+static void _sw_http_max_time(char *buf, size_t cap, sw_val_t *opts, int def_secs) {
+    _sw_max_time_arg(buf, cap, _sw_http_timeout_ms(opts), def_secs);
+}
+
+/* curl exit 28 = CURLE_OPERATION_TIMEDOUT (the --max-time elapsed). */
+static int _sw_curl_timed_out(int wstatus) {
+#ifndef _WIN32
+    return WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 28;
+#else
+    (void)wstatus;
+    return 0;
+#endif
+}
+
+/* Sleep ms, waking early (returns 1) once the caller is gone. */
+static int _sw_nap_unless_gone(sw_process_t *p, uint64_t id, uint64_t ms) {
+    uint64_t end = _sw_now_ms() + ms;
+    for (;;) {
+        if (_sw_caller_gone(p, id)) return 1;
+        uint64_t now = _sw_now_ms();
+        if (now >= end) return 0;
+        uint64_t left = end - now;
+        _sw_nap_us((unsigned)((left < 100 ? left : 100) * 1000));
+    }
+}
+
+/* Drain a curl child's stdout to EOF (its own output is tiny: the -w status,
+ * or nothing), then reap it into *wstatus and close ch->fp; returns 1. If the
+ * caller is gone first, kill the child's process group and return 0. `out`
+ * (optional, cap bytes) keeps the bytes read; *out_len gets their count. */
+static int _sw_curl_drain(_sw_popen_pid_t *ch, sw_process_t *p, uint64_t id,
+                          char *out, size_t cap, size_t *out_len, int *wstatus) {
+    int fd = fileno(ch->fp);
+    size_t len = 0;
+    for (;;) {
+        if (_sw_caller_gone(p, id)) {
+            _sw_pkill_close(*ch);
+            ch->fp = NULL;
+            ch->pid = -1;
+            return 0;
+        }
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = {0, 100000};
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (!FD_ISSET(fd, &rfds)) continue;
+        char rb[256];
+        ssize_t rd = read(fd, rb, sizeof(rb));
+        if (rd < 0) { if (errno == EINTR) continue; break; }
+        if (rd == 0) break;
+        for (ssize_t i = 0; out && i < rd && len + 1 < cap; i++) out[len++] = rb[i];
+    }
+    if (out && cap) out[len] = 0;
+    if (out_len) *out_len = len;
+    *wstatus = _sw_popen_pid_close(*ch);
+    ch->fp = NULL;
+    return 1;
+}
+
+/* ============================================================
  * http_post — popen+select implementation with soft interrupt
  * ============================================================
  *
@@ -1713,6 +1829,13 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok))
         SW_OFFLOAD_BUILTIN(_builtin_http_post, a, n);
     const char *url = a[0]->v.str, *body = a[2]->v.str;
+    /* The caller we run for: a killed caller (exit_proc, a task_stream
+     * deadline) takes its curl child down with it. opts (4th arg) may carry
+     * timeout_ms. */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
+    char max_time[32];
+    _sw_http_max_time(max_time, sizeof(max_time), n >= 4 ? a[3] : NULL, 300);
 
     /* Body via temp file — keeps the JSON out of argv entirely (and out
      * of any shell). curl reads it with -d @file. */
@@ -1742,7 +1865,7 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
     argv[argc++] = "--max-time";
-    argv[argc++] = "300";
+    argv[argc++] = max_time;
     if (headers && headers->type == SW_VAL_LIST) {
         for (int i = 0; i < headers->v.tuple.count; i++) {
             sw_val_t *h = headers->v.tuple.items[i];
@@ -1772,14 +1895,18 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     int stdin_fd = -1;
     if (isatty(STDIN_FILENO) && _sw_rl.saved_ok) stdin_fd = STDIN_FILENO;
 
-    int interrupted = 0;
+    int interrupted = 0, gone = 0, timed_out = 0;
     char *resp_buf = NULL;
     size_t resp_len = 0;
     size_t resp_cap_local = 65536;
 
     int delays[] = {0, 5, 15};
     for (int attempt = 0; attempt < 3 && !interrupted; attempt++) {
-        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+        /* Retry sleep (0 on the first try); a dead caller spawns no curl. */
+        if (_sw_nap_unless_gone(caller, caller_id, (uint64_t)delays[attempt] * 1000)) {
+            gone = 1;
+            break;
+        }
 
         if (resp_buf) free(resp_buf);
         resp_buf = (char *)malloc(resp_cap_local);
@@ -1795,6 +1922,13 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
         char readbuf[4096];
         int done = 0;
         while (!done) {
+            /* Caller killed while we wait: kill curl now, not at --max-time. */
+            if (_sw_caller_gone(caller, caller_id)) {
+                gone = 1;
+                _sw_pkill_close(ch);
+                ch.fp = NULL; ch.pid = -1;
+                break;
+            }
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(pipe_fd, &rfds);
@@ -1802,9 +1936,9 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
             int max_fd = pipe_fd;
             if (stdin_fd > max_fd) max_fd = stdin_fd;
 
-            /* 1-second tick — just keeps select from blocking forever
-             * if both fds go quiet. Could be longer; 1s is fine. */
-            struct timeval tv = {1, 0};
+            /* 100 ms tick — bounds how long a killed caller's curl outlives
+             * its kill; the stdin watch and EOF are still handled per tick. */
+            struct timeval tv = {0, 100000};
             int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
             if (ret < 0) {
                 if (errno == EINTR) continue;
@@ -1851,8 +1985,12 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
             }
         }
 
-        if (!interrupted && ch.fp) _sw_popen_pid_close(ch);
-        if (interrupted) break;
+        if (ch.fp) {
+            int wst = _sw_popen_pid_close(ch);
+            /* A timed-out request is final: retrying would just wait again. */
+            if (_sw_curl_timed_out(wst)) { timed_out = 1; break; }
+        }
+        if (interrupted || gone) break;
 
         /* Server error or empty body → retry. Otherwise we're done. */
         if (resp_len > 0 &&
@@ -1870,6 +2008,14 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (interrupted) {
         free(resp_buf);
         return sw_val_string("__INTERRUPTED__");
+    }
+    if (gone) {
+        free(resp_buf);
+        return sw_val_nil();
+    }
+    if (timed_out) {
+        free(resp_buf);
+        return sw_val_string(SW_HTTP_TIMEOUT_ERR);
     }
 
     sw_val_t *r = sw_val_string(resp_buf);
@@ -3870,23 +4016,40 @@ static void *_tool_parse_big_stack(const char *src) {
  * The result is a heap-owned sw_val tree (thread-agnostic), valid after join.
  * On the helper thread sw_self()==NULL, so process primitives degrade to nil
  * (a tool can't send/receive/spawn into the host scheduler). */
-typedef struct { void *ast; const char *fn; sw_val_t **args; int n; sw_val_t *result; } _tool_eval_ctx;
+typedef struct { void *ast; const char *fn; sw_val_t **args; int n; sw_value_arena_t *out; sw_val_t *result; } _tool_eval_ctx;
 static void *_tool_eval_thread(void *arg) {
     _tool_eval_ctx *c = (_tool_eval_ctx *)arg;
+    /* The helper thread has no process arena, so every value the tool builds
+     * (intermediates and the result) lands in `out`, which the caller adopts
+     * or frees. Without this they went to the global heap and were never freed. */
+    sw_swap_alloc_target(c->out);
     c->result = sw_lang_call_fresh(c->ast, c->fn, c->args, c->n);
+    sw_swap_alloc_target(NULL);
     return NULL;
 }
+/* Take over the tool's region: a process adopts it (O(1), reclaimed with the
+ * process and by turn checkpoints); with no process the result is copied to the
+ * global heap and the region is freed. */
+static sw_val_t *_tool_take_region(sw_val_t *r, sw_value_arena_t *out) {
+    if (!out) return r;
+    sw_value_arena_t *mine = sw_self_varena();
+    if (mine) { sw_varena_adopt(mine, out); return r; }
+    sw_val_t *g = r ? sw_val_deep_copy_global(r) : NULL;
+    sw_varena_free_all(out);
+    return g;
+}
 static sw_val_t *_tool_eval_big_stack(void *ast, const char *fn, sw_val_t **args, int n) {
+    sw_value_arena_t *out = sw_varena_create_kind(4096, SW_REGION_MESSAGE);
+    _tool_eval_ctx ctx = { ast, fn, args, n, out, NULL };
     pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) return sw_lang_call_fresh(ast, fn, args, n);
+    if (pthread_attr_init(&attr) != 0) return _tool_take_region(sw_lang_call_fresh(ast, fn, args, n), out);
     pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
-    _tool_eval_ctx ctx = { ast, fn, args, n, NULL };
     pthread_t t;
     int rc = pthread_create(&t, &attr, _tool_eval_thread, &ctx);
     pthread_attr_destroy(&attr);
-    if (rc != 0) return sw_lang_call_fresh(ast, fn, args, n); /* fallback */
+    if (rc != 0) return _tool_take_region(sw_lang_call_fresh(ast, fn, args, n), out); /* fallback */
     pthread_join(t, NULL);
-    return ctx.result;
+    return _tool_take_region(ctx.result, out);
 }
 
 /* tool_define(name, src) -> 'ok' | {'error', reason}
@@ -4892,6 +5055,10 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
         return sw_val_nil();
     SW_OFFLOAD_BUILTIN(_builtin_http_get, a, n);
     const char *url = a[0]->v.str;
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
+    char max_time[32];
+    _sw_http_max_time(max_time, sizeof(max_time), n >= 3 ? a[2] : NULL, 120);
 
     char outf[256];
     snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json",
@@ -4909,8 +5076,7 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
     argv[argc++] = "--max-time";
-    /* note: --max-time value 120 below */
-    argv[argc++] = "120";
+    argv[argc++] = max_time;
     if (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) {
         for (int i = 0; i < a[1]->v.tuple.count; i++) {
             sw_val_t *h = a[1]->v.tuple.items[i];
@@ -4935,11 +5101,19 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     char *resp = NULL;
     size_t resp_len = 0;
     int delays[] = {0, 3, 10};
+    int gone = 0, timed_out = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+        if (_sw_nap_unless_gone(caller, caller_id, (uint64_t)delays[attempt] * 1000)) {
+            gone = 1;
+            break;
+        }
         /* spawn curl (no shell) and wait for it; output lands in outf */
         _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
-        if (ch.fp) _sw_popen_pid_close(ch);
+        if (ch.fp) {
+            int wst = 0;
+            if (!_sw_curl_drain(&ch, caller, caller_id, NULL, 0, NULL, &wst)) { gone = 1; break; }
+            if (_sw_curl_timed_out(wst)) { timed_out = 1; break; }
+        }
         FILE *fp = fopen(outf, "r");
         if (!fp) continue;
         size_t cap = 65536;
@@ -4964,6 +5138,8 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     for (int i = 0; i < nhdr_alloc; i++) free(hdr_strs[i]);
     free(hdr_strs);
     free(argv);
+    if (gone) { free(resp); return sw_val_nil(); }
+    if (timed_out) { free(resp); return sw_val_string(SW_HTTP_TIMEOUT_ERR); }
     if (!resp) return sw_val_string("");
     sw_val_t *r = sw_val_string(resp);
     free(resp);
@@ -4983,7 +5159,8 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
  *
  *   url   : string (required)
  *   opts  : map (optional) with keys —
- *             method  : string, e.g. "GET"/"POST"/"PUT"/"DELETE" (default GET)
+ *             method  : "GET"/"POST"/"PUT"/"DELETE" — a string OR an atom
+ *                       ('GET'/'POST', the form http_listen delivers) (default GET)
  *             headers : a MAP {name=>value} OR a list of {name, value} tuples
  *             body    : string request body (sent via --data-binary)
  *
@@ -5090,6 +5267,8 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
         return _sw_hr_error("http_request: url must be a string");
     SW_OFFLOAD_BUILTIN(_builtin_http_request, a, n);
     const char *url = a[0]->v.str;
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     /* opts (optional map): method / headers / body */
     sw_val_t *opts = (n >= 2) ? a[1] : NULL;
@@ -5099,7 +5278,10 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     if (opts && opts->type == SW_VAL_MAP) {
         sw_val_t *km = sw_val_string("method");
         sw_val_t *mv = sw_val_map_get(opts, km);
-        if (mv && mv->type == SW_VAL_STRING && mv->v.str[0]) method = mv->v.str;
+        /* An atom ('POST') is the same verb as a string ("POST"): http_listen
+         * delivers the request method as an atom, so accept both spellings. */
+        if (mv && (mv->type == SW_VAL_STRING || mv->type == SW_VAL_ATOM) && mv->v.str[0])
+            method = mv->v.str;
         sw_val_t *kb = sw_val_string("body");
         sw_val_t *bv = sw_val_map_get(opts, kb);
         if (bv && bv->type == SW_VAL_STRING) body = bv->v.str;
@@ -5107,6 +5289,9 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
         sw_val_t *hv = sw_val_map_get(opts, kh);
         if (hv && (hv->type == SW_VAL_MAP || hv->type == SW_VAL_LIST)) headers = hv;
     }
+
+    char max_time[32];
+    _sw_http_max_time(max_time, sizeof(max_time), opts, 300);
 
     /* Temp files: request body, response body, response header dump. */
     char body_file[256], out_file[256], hdr_file[256];
@@ -5144,7 +5329,7 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
     argv[argc++] = "--max-time";
-    argv[argc++] = "300";
+    argv[argc++] = max_time;
     argv[argc++] = "-o";
     argv[argc++] = out_file;
     argv[argc++] = "-D";
@@ -5199,16 +5384,10 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     size_t code_len = 0;
     code_buf[0] = 0;
     _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
-    if (ch.fp) {
-        char rb[64];
-        size_t rd;
-        while ((rd = fread(rb, 1, sizeof(rb), ch.fp)) > 0) {
-            for (size_t i = 0; i < rd && code_len + 1 < sizeof(code_buf); i++)
-                code_buf[code_len++] = rb[i];
-        }
-        code_buf[code_len] = 0;
-        _sw_popen_pid_close(ch);
-    }
+    int spawned = ch.fp != NULL, gone = 0, wst = 0;
+    if (spawned &&
+        !_sw_curl_drain(&ch, caller, caller_id, code_buf, sizeof(code_buf), &code_len, &wst))
+        gone = 1;
 
     /* http_code is a decimal int curl prints last (000 == no response). */
     long status = strtol(code_buf, NULL, 10);
@@ -5227,9 +5406,11 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     free(argv);
 
     /* No spawn / no response code → transport failure. */
-    if (!ch.fp || status <= 0) {
+    if (!spawned || gone || status <= 0) {
         free(resp_body);
         free(resp_hdrs);
+        if (gone) return _sw_hr_error("http_request: caller gone");
+        if (_sw_curl_timed_out(wst)) return _sw_hr_error("http_request: timeout");
         return _sw_hr_error(code_buf[0] ? "http_request: transport failure"
                                         : "http_request: curl failed to spawn");
     }
@@ -5448,6 +5629,7 @@ static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_le
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_shell, a, n);
     const char *cmd = a[0]->v.str;
 
     /* Temp files for captured output and exit status */
@@ -5508,8 +5690,14 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
         pgroup + C timeout + killpg). 120s stays well above any legit
         fast/local shell() use. */
     off_t last_size = 0;
+    /* The caller can be killed while we poll: stop waiting for it then, as
+     * the timeout below does (its background command is not killed here). */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     while (!done && waited_us < max_wait_us) {
+        if (_sw_caller_gone(caller, caller_id)) break;
+
         /* Check if command finished — BEFORE sleeping, so an already-done
          * command costs one fopen, not a poll interval. */
         FILE *ef = fopen(exitf, "r");
@@ -5702,12 +5890,15 @@ static sw_val_t *_sw_managed_tuple(int code, const char *msg) {
 }
 
 static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
-    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_managed_tuple(-1, "error: shell_managed needs a string command");
 #ifdef _WIN32
     return _sw_managed_tuple(-1, "error: shell_managed unsupported on this platform");
 #else
+    /* Wait on a worker thread, not this scheduler: a shell_managed that
+     * runs for minutes must not pin the scheduler (N of them froze every
+     * other process). */
+    SW_OFFLOAD_BUILTIN(_builtin_shell_managed, a, n);
     const char *cmd = a[0]->v.str;
     int64_t timeout_ms =
         (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) ? a[1]->v.i : 0;
@@ -5739,16 +5930,23 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
     int timed_out = 0;
     int done = 0;
     int oom = 0;
+    /* The caller can be killed while we wait: treat that like an interrupt
+     * so the child's process group is killed rather than left running. */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     while (!done) {
-        /* Remaining wall-clock budget; tick at least once per second so a
-         * huge timeout still re-checks, and so a quiet child can't wedge us. */
-        int64_t remaining_ms = 1000;
+        if (_sw_caller_gone(caller, caller_id)) { interrupted = 1; break; }
+
+        /* Remaining wall-clock budget; tick at least every 100 ms so a huge
+         * timeout still re-checks, a quiet child can't wedge us, and a killed
+         * caller is noticed promptly (as exec_managed's poll does). */
+        int64_t remaining_ms = 100;
         if (timeout_ms > 0) {
             int64_t elapsed = (int64_t)(_sw_now_ms() - t_start);
             if (elapsed >= timeout_ms) { timed_out = 1; interrupted = 1; break; }
             remaining_ms = timeout_ms - elapsed;
-            if (remaining_ms > 1000) remaining_ms = 1000;
+            if (remaining_ms > 100) remaining_ms = 100;
         }
 
         fd_set rfds;
@@ -5945,15 +6143,6 @@ static const char *_sw_exec_opt_str(sw_val_t *opts, const char *key) {
     return (v && v->type == SW_VAL_STRING) ? v->v.str : NULL;
 }
 
-/* The process exec_managed waits for has been killed or is gone. The kill
- * path frees the slot without resuming the caller, and a new process can
- * reuse the slot (clearing kill_flag), so also compare the never-reused
- * numeric pid captured at the start. */
-static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
-    if (!p) return 0;
-    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
-}
-
 /* environ minus the names in `unset` (an sw list of strings), as a malloc'd
  * array the child can assign to `environ` before exec. NULL = no change.
  * The strings stay owned by environ; only the array is freed. */
@@ -5979,6 +6168,34 @@ static char **_sw_env_without(sw_val_t *unset) {
     }
     out[k] = NULL;
     return out;
+}
+
+/* The file execvp would run for `cmd` under the child's environment `envp`
+ * (NULL = environ), as a malloc'd path; NULL if no PATH entry has it. Runs in
+ * the parent, so the child needs no libc search. As with execvp, a `cmd` with
+ * a slash is used as is, and a missing PATH means "/bin:/usr/bin". */
+static char *_sw_resolve_exec(const char *cmd, char **envp) {
+    if (strchr(cmd, '/')) return strdup(cmd);
+    const char *path = NULL;
+    for (char **e = envp ? envp : environ; *e && !path; e++)
+        if (strncmp(*e, "PATH=", 5) == 0) path = *e + 5;
+    if (!path) path = "/bin:/usr/bin";
+    size_t clen = strlen(cmd);
+    for (const char *p = path;;) {
+        const char *end = strchr(p, ':');
+        size_t dlen = end ? (size_t)(end - p) : strlen(p);
+        /* an empty PATH entry means the current directory */
+        size_t off = dlen ? dlen + 1 : 0;
+        char *cand = (char *)malloc(off + clen + 1);
+        if (!cand) return NULL;
+        memcpy(cand, p, dlen);
+        if (dlen) cand[dlen] = '/';
+        memcpy(cand + off, cmd, clen + 1);
+        if (access(cand, X_OK) == 0) return cand;
+        free(cand);
+        if (!end) return NULL;
+        p = end + 1;
+    }
 }
 
 /* exec_managed(cmd, args_list [, opts]) → {exit_code, stdout}
@@ -6055,8 +6272,8 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
 
     /* env_unset: build the child's environment HERE. Between fork and exec
      * only async-signal-safe calls are allowed (another thread may hold the
-     * malloc or environment lock at fork time), so the child just assigns
-     * `environ`; unsetenv in the child could deadlock it. */
+     * malloc or environment lock at fork time), so the child passes this
+     * array straight to execve; unsetenv in the child could deadlock it. */
     char **envp = _sw_env_without(unset);
 
     int pfd[2] = {-1, -1};
@@ -6067,12 +6284,17 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         return sw_val_nil();
     }
 
+    /* The program path is searched here too, so the child can execve it
+     * without a PATH walk. */
+    char *prog = _sw_resolve_exec(cmd, envp);
+
     fflush(stdout);
     fflush(stderr);
     pid_t pid = sw_fork();
     if (pid < 0) {
         if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
         if (in_fd >= 0) close(in_fd);
+        free(prog);
         free(envp);
         free(argv);
         return sw_val_nil();
@@ -6094,12 +6316,12 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         if (errfd < 0) _exit(127);
         dup2(errfd, STDERR_FILENO);
         if (errfd != STDERR_FILENO) close(errfd);
-        if (envp) environ = envp;
         if (cwd && chdir(cwd) != 0) _exit(127);
-        execvp(argv[0], argv);
+        if (prog) execve(prog, argv, envp ? envp : environ);
         _exit(127);
     }
     setpgid(pid, pid);   /* also set from the parent: closes the race with killpg */
+    free(prog);
     free(envp);
     free(argv);
     if (in_fd >= 0) close(in_fd);
@@ -6860,8 +7082,10 @@ static sw_val_t *_builtin_interval(sw_val_t **a, int n) {
  * llm_complete(prompt)
  * llm_complete(prompt, opts_map)
  *   opts: %{url: "...", provider: "...", model: "...", api_key: "...",
- *           max_tokens: 4096, temperature: 0.7, retries: 0, min_chars: 50}
- * Returns: string (the completion text), or "error: ..." on failure.
+ *           max_tokens: 4096, temperature: 0.7, retries: 0, min_chars: 50,
+ *           timeout_ms: 300000}
+ * Returns: string (the completion text), or "error: ..." on failure. A
+ * request that runs past timeout_ms returns "error: timeout" (not retried).
  *
  * There is no built-in endpoint: a program says where its prompts go (see
  * _sw_llm_resolve). Without one, both LLM builtins fail with a message
@@ -7091,15 +7315,24 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     int attempts = 1 + (retries > 0 ? retries : 0);
     if (attempts > 5) attempts = 5; /* cap at 5 */
     sw_val_t *last_result = sw_val_string("error: no response");
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     for (int attempt = 0; attempt < attempts; attempt++) {
-        if (attempt > 0) sw_sleep(2); /* 2s backoff between retries */
+        /* 2s backoff between retries; a killed caller ends the retries. */
+        if (attempt > 0 && _sw_nap_unless_gone(caller, caller_id, 2000)) break;
 
-        sw_val_t *post_args[3] = { sw_val_string(url), hdr_list, sw_val_string(body) };
-        sw_val_t *resp = _builtin_http_post(post_args, 3);
+        /* The opts map rides along: http_post reads only its timeout_ms. */
+        sw_val_t *post_args[4] = { sw_val_string(url), hdr_list, sw_val_string(body),
+                                   (n >= 2) ? a[1] : NULL };
+        sw_val_t *resp = _builtin_http_post(post_args, 4);
         if (!resp || resp->type != SW_VAL_STRING) {
             last_result = sw_val_string("error: no response");
             continue;
+        }
+        if (strcmp(resp->v.str, SW_HTTP_TIMEOUT_ERR) == 0) {
+            last_result = resp;   /* timed out: final, not retried */
+            break;
         }
 
         /* Extract content from response: choices[0].message.content
@@ -7984,6 +8217,7 @@ typedef struct {
     char *url;
     int max_tokens;
     double temperature;
+    int64_t timeout_ms;   /* opts.timeout_ms; 0 = the default ceiling */
     char error[512];   /* set when no endpoint resolved (url == NULL) */
 } _llm_stream_ctx_t;
 
@@ -8046,7 +8280,9 @@ static void _llm_stream_entry(void *raw) {
     char body_arg[300], hdr_arg[300];
     snprintf(body_arg, sizeof(body_arg), "@%s", tmpf);
     snprintf(hdr_arg, sizeof(hdr_arg), "@%s", hdrf);
-    char *argv[] = { "curl", "-sS", "-N", "--connect-timeout", "30", "--max-time", "300",
+    char max_time[32];
+    _sw_max_time_arg(max_time, sizeof(max_time), ctx->timeout_ms, 300);
+    char *argv[] = { "curl", "-sS", "-N", "--connect-timeout", "30", "--max-time", max_time,
                      "-H", hdr_arg, "-d", body_arg, ctx->url, NULL };
     _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
     FILE *fp = ch.fp;
@@ -8123,15 +8359,15 @@ static void _llm_stream_entry(void *raw) {
         }
     }
 
-    _sw_popen_pid_close(ch);
+    int timed_out = _sw_curl_timed_out(_sw_popen_pid_close(ch));
     swbs_unlink(tmpf);
     swbs_unlink(hdrf);
 
-    /* Send completion message */
+    /* Send completion message (a timeout with no text is reported as such) */
     {
         sw_val_t *items[2];
         items[0] = sw_val_atom("llm_done");
-        items[1] = sw_val_string(full_text);
+        items[1] = sw_val_string(timed_out && full_len == 0 ? SW_HTTP_TIMEOUT_ERR : full_text);
         sw_send_value(ctx->caller, SW_TAG_NONE, sw_val_tuple(items, 2));   /* GC v1: copy off worker arena */
     }
     free(full_text);
@@ -8145,7 +8381,8 @@ cleanup:
 }
 
 /* llm_stream(prompt, opts) → pid
- * Spawns background process that sends {'llm_token', text} and {'llm_done', full_text} */
+ * Spawns background process that sends {'llm_token', text} and {'llm_done', full_text}
+ * (opts.timeout_ms bounds the request; a timeout with no text sends "error: timeout") */
 static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
 
@@ -8167,6 +8404,7 @@ static sw_val_t *_builtin_llm_stream(sw_val_t **a, int n) {
             else if (strcmp(k, "url") == 0 && v->type == SW_VAL_STRING) opt_url = v->v.str;
             else if (strcmp(k, "provider") == 0 && v->type == SW_VAL_STRING) opt_provider = v->v.str;
             else if (strcmp(k, "max_tokens") == 0 && v->type == SW_VAL_INT) ctx->max_tokens = (int)v->v.i;
+            else if (strcmp(k, "timeout_ms") == 0 && v->type == SW_VAL_INT && v->v.i > 0) ctx->timeout_ms = v->v.i;
             else if (strcmp(k, "temperature") == 0) {
                 if (v->type == SW_VAL_FLOAT) ctx->temperature = v->v.f;
                 else if (v->type == SW_VAL_INT) ctx->temperature = (double)v->v.i;

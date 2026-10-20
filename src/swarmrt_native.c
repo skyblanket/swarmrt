@@ -320,7 +320,7 @@ static __thread sw_scheduler_t *tls_spawn_override = NULL;
 
 /* === Deadlock watchdog state === */
 static pthread_t        g_watchdog_thread;
-static volatile int     g_watchdog_stop = 0;
+static _Atomic int      g_watchdog_stop = 0;
 static int              g_watchdog_enabled = 1;   /* 0 when SW_DEADLOCK_DETECT=0 */
 /* Shutdown wake for the watchdog. It used to sleep its interval in 100ms
  * nanosleep chunks polling g_watchdog_stop — so EVERY binary paid an avg
@@ -925,7 +925,15 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->monitors_me = NULL;
     proc->my_monitors = NULL;
     proc->kill_flag = 0;
+    /* Release the previous occupant's panic message (kept past its death
+     * for late link()/monitor()). Swapped out under link_lock so a reader
+     * holding it never sees a freed pointer. */
+    pthread_mutex_lock(&g_swarm->link_lock);
+    char *_old_pm = proc->panic_msg;
+    proc->panic_msg = NULL;
     proc->exit_reason = 0;
+    pthread_mutex_unlock(&g_swarm->link_lock);
+    free(_old_pm);
     proc->reg_entry = NULL;
     proc->ets_tables = NULL;
 
@@ -1002,28 +1010,25 @@ static void process_destroy(sw_process_t *proc) {
     proc->mailbox.count = 0;
     atomic_store_explicit(&proc->mb_len, 0, memory_order_relaxed);
 
-    /* Free the panic_msg string set by sw_process_panic. UNDER link_lock:
-     * a late sw_monitor on this (already-EXITING/FREE) process reads
-     * panic_msg in its already-dead delivery path under the same lock, so
-     * the free must serialise with it or the monitor reads freed memory.
-     * NULL-under-lock means the monitor sees either a valid pointer or
-     * NULL, never freed-but-non-NULL. */
-    /* The varena/spawn_region DETACH also happens inside this same critical
-     * section (snapshot-then-NULL under link_lock, free after unlock): the
-     * process_info builtin reads proc->varena->total_bytes cross-thread for
-     * its 'memory' stat, under link_lock. Detaching under the lock gives it
-     * the same guarantee panic_msg has — a reader holding link_lock sees
-     * either a live arena header or NULL, never freed-but-non-NULL. The
-     * frees stay outside the lock (O(chunks), no need to hold it). */
+    /* panic_msg is deliberately NOT freed here. A link() or monitor() that
+     * lands after this process has died still has to report its reason and
+     * message (the 'stack overflow' text); the message stays with the slot
+     * until the slot is recycled (process_init_arena) or the slab is torn
+     * down. Freeing it here made a late link() see NULL and deliver a bare
+     * -1 reason instead of the panic message.
+     *
+     * The varena/spawn_region DETACH happens under link_lock (snapshot-then-
+     * NULL): the process_info builtin reads proc->varena->total_bytes
+     * cross-thread for its 'memory' stat, under link_lock. Detaching under
+     * the lock gives it a guarantee a reader holding link_lock sees either a
+     * live arena header or NULL, never freed-but-non-NULL. The frees stay
+     * outside the lock (O(chunks), no need to hold it). */
     pthread_mutex_lock(&g_swarm->link_lock);
-    char *_pm = proc->panic_msg;
-    proc->panic_msg = NULL;
     struct sw_value_arena *_va = proc->varena;
     proc->varena = NULL;
     struct sw_value_arena *_sr = proc->spawn_region;
     proc->spawn_region = NULL;
     pthread_mutex_unlock(&g_swarm->link_lock);
-    free(_pm);
 
     /* GC v1: reclaim this process's whole value arena in O(chunks). Runs after
      * the fiber has returned, so there are no live sw_val_t* C-stack roots.
@@ -1410,6 +1415,14 @@ sw_process_t *sw_pick_next(sw_scheduler_t *sched) {
     return NULL;
 }
 
+/* Bump a counter that only its owning thread writes. A relaxed load + store
+ * is a plain increment on x86; `++` on an _Atomic would be a locked RMW on
+ * every scheduler iteration. Readers (sw_stats) still see whole values. */
+static inline void sw_counter_bump(_Atomic uint64_t *c) {
+    atomic_store_explicit(c, atomic_load_explicit(c, memory_order_relaxed) + 1,
+                          memory_order_relaxed);
+}
+
 /*
  * Work stealing via global overflow queue.
  * When a scheduler has no local work, it tries to steal from the shared queue.
@@ -1417,7 +1430,7 @@ sw_process_t *sw_pick_next(sw_scheduler_t *sched) {
  */
 sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
     if (!g_swarm) return NULL;
-    sched->steal_attempts++;
+    sw_counter_bump(&sched->steal_attempts);
 
     pthread_mutex_lock(&g_swarm->overflow_rq.lock);
     sw_process_t *proc = g_swarm->overflow_rq.head;
@@ -1570,7 +1583,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
     _sw_gen = &_sw_gen_fallback;  /* valid before the first switch-in sets it */
 
     while (!sched->should_exit && g_swarm && g_swarm->running) {
-        sched->loop_iters++;
+        sw_counter_bump(&sched->loop_iters);
 
         /* Fire expired timers (any scheduler can fire any timer) */
         fire_timers();
@@ -1598,17 +1611,21 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * tests/stress/spin_wedge_hunt.sh. Measured win: cross-scheduler
          * ping-pong 58.4 -> 4.5us/rt. */
         if (!proc) {
-            static int spin_iters = -1;
-            if (spin_iters < 0) {
+            /* Computed lazily by whichever scheduler gets here first. Every
+             * thread derives the same value, so relaxed atomics are enough. */
+            static _Atomic int spin_iters = -1;
+            int spins = atomic_load_explicit(&spin_iters, memory_order_relaxed);
+            if (spins < 0) {
                 const char *e = getenv("SW_SPIN_US");
                 int us = e ? atoi(e) : 60;
                 if (us < 0) us = 0;
                 if (us > 1000) us = 1000;
                 /* ~25 pause-loop iterations per us on contemporary cores
                  * (pause ~25-40ns + two acquire loads). Coarse is fine. */
-                spin_iters = us * 25;
+                spins = us * 25;
+                atomic_store_explicit(&spin_iters, spins, memory_order_relaxed);
             }
-            for (int i = 0; i < spin_iters && !sched->should_exit; i++) {
+            for (int i = 0; i < spins && !sched->should_exit; i++) {
                 proc = sw_pick_next(sched);
                 if (proc) break;
                 if ((i & 63) == 63) {   /* steal probe every ~64 spins */
@@ -1693,7 +1710,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             /* If WAITING: don't re-enqueue. sw_send will re-enqueue when message arrives. */
 
         } else {
-            sched->idle_waits++;
+            sw_counter_bump(&sched->idle_waits);
             /* Mark as idle and sleep until woken by a producer.
              * The idle flag is checked by sw_add_to_runq — if set,
              * it signals the condvar to wake us.
@@ -1831,8 +1848,9 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
 
     /* Stack overflow detection: a fault inside (or within a page below) the
      * RUNNING process's guard page means its fiber stack overflowed —
-     * almost always deep non-self recursion (mutual tail calls are not
-     * TCO'd; self-tail-calls compile to a flat loop). Say so, instead of
+     * almost always deep non-tail recursion (tail calls between module
+     * functions and self-tail-calls run flat; a tail call through a lambda
+     * does not). Say so, instead of
      * leaving a bare crash banner to be mistaken for a runtime bug.
      *
      * BOTH signals matter: Linux delivers a guard-page hit as SIGSEGV, but
@@ -1850,9 +1868,9 @@ static void _sw_crash_handler(int sig, siginfo_t *info, void *ctx) {
         if (fault < guard_top && fault >= guard_bot) {
             len = snprintf(msg, sizeof(msg),
                 "\n\033[1;31mpanic\033[0m: stack overflow in process #%llu (%zuKB fiber stack)\n"
-                "  likely cause: deep NON-SELF recursion — mutual tail calls are not\n"
-                "  TCO'd (self-tail-calls are). Keep the loop in one function, raise\n"
-                "  SW_PROC_STACK, or see docs/notes/KNOWN_ISSUES.md.\n",
+                "  likely cause: deep NON-TAIL recursion, or a tail call through a lambda\n"
+                "  (module-function and self tail calls are TCO'd). Make the recursive\n"
+                "  call a tail call, raise SW_PROC_STACK, or see docs/notes/KNOWN_ISSUES.md.\n",
                 (unsigned long long)cur->pid, (size_t)(cur->stack_size / 1024));
             write(STDERR_FILENO, msg, len);
             signal(sig, SIG_DFL);
@@ -2206,6 +2224,10 @@ void sw_shutdown(int swarm_id) {
                 free(slab[i].gen_exec);
                 slab[i].gen_exec = NULL;
             }
+            /* Last panic message of the slot's final occupant (see
+             * process_destroy) — freed at slab teardown. */
+            free(slab[i].panic_msg);
+            slab[i].panic_msg = NULL;
         }
     }
 
@@ -3152,13 +3174,21 @@ int sw_link(sw_process_t *other) {
     sw_process_t *self = tls_current;
     if (!self || !other || self == other) return -1;
     if (other->state == SW_PROC_EXITING || other->state == SW_PROC_FREE) {
-        /* Linking to dead process — deliver exit signal immediately */
+        /* Linking to dead process — deliver exit signal immediately. The
+         * reason and message are copied under link_lock (the same lock
+         * process_exit publishes them under); the copy is ours to free. */
+        pthread_mutex_lock(&g_swarm->link_lock);
+        uint64_t pid = other->pid;
+        int reason = other->exit_reason;
+        char *msg = other->panic_msg ? strdup(other->panic_msg) : NULL;
+        pthread_mutex_unlock(&g_swarm->link_lock);
         if (self->flags & SW_FLAG_TRAP_EXIT) {
-            deliver_signal(self, SW_TAG_EXIT, other->pid, 0, other->exit_reason, other->panic_msg);
-        } else if (other->exit_reason != 0) {
+            deliver_signal(self, SW_TAG_EXIT, pid, 0, reason, msg);
+        } else if (reason != 0) {
             self->kill_flag = 1;
-            self->exit_reason = other->exit_reason;
+            self->exit_reason = reason;
         }
+        free(msg);
         return 0;
     }
 
@@ -3311,10 +3341,10 @@ uint64_t sw_monitor(sw_process_t *target) {
     sw_proc_state_t st = atomic_load_explicit(&target->state, memory_order_relaxed);
     if (st == SW_PROC_EXITING || st == SW_PROC_FREE) {
         int reason = atomic_load_explicit(&target->exit_reason, memory_order_relaxed);
-        /* COPY panic_msg under the lock: process_destroy frees it under the
-         * same lock, so capturing the bare pointer and using it after the
-         * unlock (deliver_signal strdups it) would race that free. The
-         * copy is ours; free it after delivery. */
+        /* COPY panic_msg under the lock: process_init_arena releases it under
+         * the same lock when the slot is recycled, so capturing the bare
+         * pointer and using it after the unlock (deliver_signal strdups it)
+         * would race that free. The copy is ours; free it after delivery. */
         char *msg = target->panic_msg ? strdup(target->panic_msg) : NULL;
         pthread_mutex_unlock(&g_swarm->link_lock);
         deliver_signal(self, SW_TAG_DOWN, target->pid, ref, reason, msg);
@@ -3874,7 +3904,7 @@ void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
  *   ref = send_request(server);
  *   reply = sw_receive_tagged(ref, 5000);  // Only get MY reply
  */
-void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
+static void *sw_receive_tagged_impl(uint64_t tag, uint64_t timeout_ms, int adopt) {
     sw_process_t *proc = tls_current;
     if (!proc) return NULL;
 
@@ -3886,7 +3916,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
         mailbox_drain(&proc->mailbox);
         sw_msg_t *m = mailbox_pop_tagged(proc, tag);
         if (m) {
-            void *payload = msg_take_payload(m, 0);
+            void *payload = msg_take_payload(m, adopt);
             msg_free(m);
             proc->messages_recv++;
             return payload;
@@ -3907,7 +3937,7 @@ void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
             int was_waiting = atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_acq_rel);
             if (was_waiting) {
                 atomic_store_explicit(&proc->state, SW_PROC_RUNNING, memory_order_relaxed);
-                void *payload = msg_take_payload(m, 0);
+                void *payload = msg_take_payload(m, adopt);
                 msg_free(m);
                 proc->messages_recv++;
                 return payload;
@@ -4234,6 +4264,16 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag) {
  * switch into another fiber. */
 void *sw_recv_any_adopt(uint64_t timeout_ms, uint64_t *out_tag) {
     return sw_receive_any_impl(timeout_ms, out_tag, 1);
+}
+
+void *sw_receive_tagged(uint64_t tag, uint64_t timeout_ms) {
+    return sw_receive_tagged_impl(tag, timeout_ms, 0);
+}
+
+/* Selective receive with the adopt semantics of sw_recv_any_adopt. For pmap,
+ * which matches its own results by tag and then incorporates the payload. */
+void *sw_recv_tagged_adopt(uint64_t tag, uint64_t timeout_ms) {
+    return sw_receive_tagged_impl(tag, timeout_ms, 1);
 }
 
 /* ============================================================================

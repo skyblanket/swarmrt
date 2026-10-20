@@ -55,7 +55,12 @@
  * list; both lists apply; "*" allows any). An upgrade with NO Origin is
  * accepted: browsers always send one, so its absence means a non-browser
  * client (wsc_connect, curl, a telephony provider), which Origin checks do
- * not constrain anyway. */
+ * not constrain anyway.
+ *
+ * The same-origin rule trusts Host, so a DNS-rebinding page passes it. The
+ * SW_HTTP_HOSTS env var (comma list of Host values, e.g. localhost:4100)
+ * closes that: when set, every request whose Host is not listed gets 403,
+ * upgrades and plain HTTP alike. Unset = no check. */
 typedef struct {
     const char *bind;        /* IPv4 address; NULL/"" = SW_HTTP_BIND or 127.0.0.1 */
     const char *ws_origins;  /* comma-separated allowlist; NULL = none */
@@ -66,6 +71,14 @@ typedef enum {
     SW_HTTP_MODE_HTTP,      /* Awaiting HTTP request */
     SW_HTTP_MODE_WS,        /* WebSocket upgraded */
 } sw_http_mode_t;
+
+/* Chunked request-body decoder states (sw_http_conn_t.chunk_state). */
+typedef enum {
+    SW_HTTP_CHUNK_SIZE,         /* expecting a chunk-size line */
+    SW_HTTP_CHUNK_DATA,         /* inside chunk data */
+    SW_HTTP_CHUNK_DATA_END,     /* expecting the CRLF after chunk data */
+    SW_HTTP_CHUNK_TRAILER,      /* after the 0-size chunk: trailer lines */
+} sw_http_chunk_state_t;
 
 /* Per-connection state */
 typedef struct {
@@ -82,6 +95,16 @@ typedef struct {
     /* HTTP body buffering */
     uint32_t            content_length; /* Content-Length from headers, 0 = none */
     int                 body_pending;   /* 1 = still accumulating body bytes */
+
+    /* Transfer-Encoding: chunked body, decoded as it arrives (see
+     * http_chunked_feed in swarmrt_http.c). The wire bytes are consumed from
+     * buf; the decoded data accumulates in body_acc (NUL-terminated, malloc'd). */
+    int                 chunked;        /* 1 = body is chunked (body_pending set) */
+    sw_http_chunk_state_t chunk_state;
+    uint64_t            chunk_left;     /* data bytes left in the current chunk */
+    char               *body_acc;
+    uint64_t            body_len;
+    uint64_t            body_cap;
 
     /* Connection persistence */
     int                 keep_alive;     /* 1 = keep connection open after response */

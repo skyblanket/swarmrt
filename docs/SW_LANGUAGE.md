@@ -122,7 +122,7 @@ fun summary(path) {
 
 ### Module-level `let` globals
 
-A module may declare up to 16 named constants at the top level using `let`. These are initialized once at compile time and visible to every function in the module.
+A module may declare any number of named constants at the top level using `let`. These are initialized once at startup and visible to every function in the module.
 
 ```sw
 module Config
@@ -133,7 +133,15 @@ let default_timeout = 30000
 let service_name = 'my_service'
 ```
 
-Supported literal types for module globals: `int`, `float`, `string`, and `atom`. Complex expressions, function calls, and list/map literals are **not** supported at module scope — put those inside `fun init()` or a similar startup function.
+Supported values for module globals: `int`, `float`, `string`, `atom`, and collection literals — lists, maps (`%{...}`), and tuples — including nested ones. Keep the right-hand side to constant data; anything that depends on runtime state belongs inside `fun init()` or a similar startup function.
+
+```sw
+module Limits
+
+let RETRY_LIMITS = %{"lo" => 0, "hi" => 100}
+let REGIONS = ["us-east", "eu-west"]
+let DEFAULT_PAIR = {7, "seven"}
+```
 
 Globals are read-only after initialization. Any assignment to a module-global name inside a function creates a local variable that shadows the global for that scope; the global itself is unchanged.
 
@@ -207,7 +215,24 @@ fun main() {
 }
 ```
 
-**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion (`a -> b -> a`, e.g. two state functions calling each other) is NOT yet optimised — each hop costs a C stack frame and deep chains overflow the 128KB process stack. Keep the recursive call in the same function (dispatch on an argument instead of bouncing between functions) for unbounded loops.
+**Folds**: `Std.reduce(lst, init, fn(acc, x))` is a left fold; it returns `init` for an empty list and is tail-recursive, so long lists are fine. `Std.reduce_while` is the same, but `fn` returns `{'cont', acc}` to keep going or `{'halt', acc}` to stop early.
+
+```sw
+module LoopReduce
+import Std
+export [main]
+
+fun main() {
+    nums = [1, 2, 3, 4]
+    print(Std.reduce(nums, 0, fn(acc, x) { acc + x }))    # => 10
+    print(Std.reduce([], 42, fn(acc, x) { acc + x }))     # => 42
+    print(Std.reduce_while(nums, 0, fn(acc, x) {
+        if (acc + x > 4) { {'halt', acc} } else { {'cont', acc + x} }
+    }))                                                   # => 3
+}
+```
+
+**Recursion** is the tool for stateful loops, where each step depends on an accumulator or on the previous step (see `count_down` above). **Self**-tail-calls are detected and optimised by the codegen, so unbounded `f -> f` tail recursion doesn't blow the stack. **Mutual** tail recursion between module functions (`a -> b -> a`, e.g. two state functions calling each other, or a receive loop whose handler calls the loop again) is optimised too: the next call goes back to a small driver loop, so the stack stays flat. Tail calls through a lambda or closure are not — each one costs a C stack frame, and a deep chain raises a recoverable per-process `stack overflow` panic (links, monitors and supervisors see the exit); raise the limit with `SW_PROC_STACK` (e.g. `SW_PROC_STACK=1m`). For unbounded loops, keep the recursion between module functions, or dispatch on an argument inside one function.
 
 Multi-statement function bodies are fine; statements are separated by newlines (no `;` needed):
 
@@ -261,7 +286,7 @@ fun main() {
 }
 ```
 
-Builtins (`to_string`, `string_upper`, …) can be piped into (`xs |> length`) but not yet passed as values — wrap them: `map(fn(x) { to_string(x) }, xs)`.
+Builtins can be piped into (`xs |> length`) and passed as values: `map(to_string, xs)` and `f = string_upper` both work. A builtin used as a value is wrapped in a closure of its arity, so it behaves the same as the explicit `fun(x) { to_string(x) }`. This covers the fixed-arity builtins (`to_string`, `string_upper`, `length`, `map_get`, `reduce`, …). Variadic builtins such as `print` can't be passed as values yet; wrap them: `fun(x) { print(x) }`.
 
 ### Names are checked
 
@@ -715,7 +740,7 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `map(fn, lst)` | apply fn to each, return new list (either arg order accepted) |
 | `filter(lst, pred)` | keep where pred → truthy |
 | `reduce(fn, lst, init)` | foldl; `fn` is called as `fn(acc, item)` |
-| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap) and silently maps a slow item to `nil` on a fixed ~5s wall.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
+| `pmap(fn, lst)` | parallel map (each fn call in own process); either arg order accepted, like `map`. **Fires ALL items at once (no concurrency cap). The whole call shares one 5s deadline; an item with no result by then is `{'error', 'timeout'}`, not `nil`.** For rate-limited fan-out — "run 100 LLM calls, 5 at a time", with tagged per-item results — use `Std.task_stream` (in `lib/Std.sw`) instead. |
 | `a..b` | inclusive integer range as a list: `1..3` is `[1, 2, 3]` (`Std.range(a, b)` is end-exclusive, Python-style) |
 | `[h \| t]` / `list_append(lst, x)` | prepend / append — both O(1) amortized for the accumulator patterns (`build(n - 1, [n \| acc])`, `grow(list_append(acc, x))`); `tl(lst)` is O(1) |
 | `map_new()` | new empty map (same as the `%{}` literal) |
@@ -793,10 +818,10 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 |---|---|
 | `http_get(url, headers?)` | GET → response body string. Auto-grows |
 | `http_post(url, headers, body)` | POST → string. **ESC-interruptible**; returns `"__INTERRUPTED__"` on Ctrl-C |
-| `http_request(url, opts)` | **status-aware** request → `%{status: int, body: string, headers: %{lowercased keys}}` on a completed transport (incl. 4xx/5xx — the status is surfaced, not hidden), or `{'error, reason}` if the request never completed. `opts` is a map: `method` (default `"GET"`), `headers` (a `%{name=>value}` MAP **or** a list of `{name, value}` tuples), `body` (string). Unlike `http_post`/`http_get` (body-or-nil, status hidden) it lets a caller tell a 200 from a 4xx/5xx with a body. `http_post`/`http_get` are unchanged |
+| `http_request(url, opts)` | **status-aware** request → `%{status: int, body: string, headers: %{lowercased keys}}` on a completed transport (incl. 4xx/5xx — the status is surfaced, not hidden), or `{'error, reason}` if the request never completed. `opts` is a map: `method` (default `"GET"`; a string or an atom such as `'POST'`), `headers` (a `%{name=>value}` MAP **or** a list of `{name, value}` tuples), `body` (string). Unlike `http_post`/`http_get` (body-or-nil, status hidden) it lets a caller tell a 200 from a 4xx/5xx with a body. `http_post`/`http_get` are unchanged |
 | `http_post_stream(url, headers, body, [pid, name])` | streams to stdout incrementally; reasoning channel; ESC interrupt. Returns a **tagged** result: `{'ok, openai_json}` on success, `{'error, reason}` on curl-failure / non-2xx / empty-or-unparseable stream. Parses both `data: {...}` and `data:{...}` SSE framing |
 | **HTTP/WS server**: `http_listen`, `http_respond`, `ws_send`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `live_js` |
-| `http_listen(port)` / `http_listen(port, opts)` → `'ok'`/`'error'`; delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. **Binds `127.0.0.1`** unless `opts` has `bind: "0.0.0.0"` (or another IPv4 address) or `SW_HTTP_BIND` is set; the option wins. A WS upgrade whose `Origin` is not same-origin (Origin authority = `Host`), loopback, or listed in `opts.ws_origins` (list of strings) / `SW_WS_ORIGINS` gets `403`; an upgrade with no `Origin` (non-browser client) is accepted. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
+| `http_listen(port)` / `http_listen(port, opts)` → `'ok'`/`'error'`; delivers `{'http_request', conn, method, path, headers, body}` (HTTP) and `{'ws_connect', conn, path}` / `{'ws_message', conn, text}` / `{'ws_close', conn}` (WS) to the handler. **Binds `127.0.0.1`** unless `opts` has `bind: "0.0.0.0"` (or another IPv4 address) or `SW_HTTP_BIND` is set; the option wins. A WS upgrade whose `Origin` is not same-origin (Origin authority = `Host`), loopback, or listed in `opts.ws_origins` (list of strings) / `SW_WS_ORIGINS` gets `403`; an upgrade with no `Origin` (non-browser client) is accepted. Same-origin trusts `Host`, so against DNS rebinding set `SW_HTTP_HOSTS` (comma list of `Host` values): when set, any request (upgrade or plain HTTP) whose `Host` is not listed gets `403`. `method` is an **atom** (`'GET'`, `'POST'`), not a string: match it as `'POST'`, since `'POST' == "POST"` is false. `headers` is a **MAP with lowercased keys** (bearer/signature reads). For a WS connection, `ws_request_headers(conn)` → the UPGRADE request's header MAP and `ws_request_path(conn)` → its path |
 | **WS client** (CDP / external): `wsc_connect(ws_url)` → handle, `wsc_connect_tls(wss_url)` → handle (TLS `wss://`), `wsc_send(h, text)`, `wsc_recv(h, timeout_ms)` → string, `wsc_set_handler(h, pid)` (deliver frames to a process as messages), `wsc_close(h)` |
 
 ### Browser
@@ -817,7 +842,8 @@ Needs `import Chrome` (a battery; see §2).
 | `process_list()` | all live pids |
 | `registered()` | all registered `{name, pid}` pairs |
 | `swarm_stats()` | node-level metrics map: `processes` (live), `schedulers`, `spawns` / `crashes` / `restarts` (monotonic since boot), `mailbox_dropped` / `msgsize_dropped` (cap-drop counters), `overflow_queue`, and `scheduler_stats` — a per-scheduler list of `%{id, procs_run, loop_iters, idle_waits, steals}` |
-| `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Compiled-only (see note below). |
+| `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Works under `swc run` once imported (see note below). |
+| `import Sandbox` → `Sandbox.start(image, opts)` / `Sandbox.exec(sb, cmd, args, opts)` / `Sandbox.stop(sb)` / `Sandbox.sweep()` | a Docker container as the sandbox for one episode. The container carries `swarmrt.sandbox=1` and `swarmrt.owner=<runtime pid>` labels and a cidfile; a detached watcher removes it within about a second of the owner's death, even on SIGKILL. `start` first sweeps containers whose owner is dead, never a live owner's or an unlabelled one. `exec` runs the command as its own process group inside the container, and on `timeout_ms` (exit 124) kills that group there, so nothing it started survives. Needs `docker` and `util-linux` `setsid` in the image. See `lib/Sandbox.sw`. |
 | `import Health` → `Health.start(port)` / `Health.serve(port)` | operator liveness/readiness HTTP endpoint: `/healthz` → 200 `"ok"`, `/readyz` → 200 `swarm_stats()` as JSON, 404 elsewhere. `start` spawns the server (returns its pid); `serve` runs it in the calling process (blocks). See `examples/health_endpoint.sw`. Compiled-only. |
 | `pid_alive(os_pid)` | `'true'` if the OS process (integer pid from `subprocess_spawn`) is still running, `'false'` if it has exited. Uses `kill(pid, 0)` — no signal sent. Does **not** take sw actor pids returned by `spawn()`. |
 | `link(pid)` / `unlink(pid)` | bidirectional link — when either side dies abnormally the other gets an exit signal |
@@ -830,7 +856,7 @@ Needs `import Chrome` (a battery; see §2).
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
-> **Compiled-only.** The process/scheduler primitives (spawn, send, receive, the supervisors, `process_list`/`process_info`/`registered` / `Swarm.*`, and the `tool_*` registry below) need the real scheduler / embedded interpreter, which the REPL path doesn't run. Under `swc run`, `swc test`, and the REPL they print a one-line note and return `nil` — run `swc build file.sw -o bin/x && bin/x` for full semantics.
+> **Process primitives by mode.** `swc run` boots a real single-scheduler runtime, so `spawn`, `send`, `receive`, `self`, `monitor`, `link`, `supervise`, `process_list`, `process_info` and `registered` all work there, and `Swarm` works once imported. Under `swc test` and the REPL no runtime is booted: `spawn` fails with `spawn failed: process table full` under `swc test`, `process_list()` returns `[]`, and `Swarm.top()` (once imported) returns `[]`. Under all three modes these stubbed builtins print a note on stderr (one per builtin name, pointing at `swc build`) and return `nil`: `dyn_supervisor`, `sup_start_child`, `sup_terminate_child`, `sup_count_children`, `tool_define`, `tool_call`, `tool_list`, `tool_rollback`, `tool_history`, `http_listen`, `http_respond`, `ws_send`, `ws_send_binary`, `ws_close`, `ws_set_handler`, `ws_request_headers`, `ws_request_path`, `wsc_connect`, `wsc_connect_tls`, `wsc_send`, `wsc_recv`, `wsc_set_handler`, `wsc_close`, `chrome_launch` (after `import Chrome`), `telemetry_emit`, `telemetry_subscribe`, `pubsub_subscribe` and `pubsub_broadcast`. Other names that look like socket, pubsub or telemetry calls, such as `ws_connect`, `pubsub_publish`, `pubsub_unsubscribe` and `telemetry_unsubscribe`, do not exist in the interpreter and fail with `undefined function`. For full semantics of any of these, run `swc build file.sw -o bin/x && bin/x`.
 
 ### Tool registry — self-defined, hot-loaded tools
 An agent can write a new tool *as `sw` source at runtime* and call it live, with no restart — the source is parsed and run by the interpreter that ships inside every compiled binary. The tool's entry function is `run`.
@@ -897,6 +923,30 @@ returns `result`. `Durable.load(key, init)`, `Durable.save(key, state)`
 (panics if the checkpoint fails) and `Durable.clear(key)` are the pieces.
 A crash inside a step re-runs that step from the previous checkpoint, so keep
 step side effects idempotent.
+
+`Durable.memo(key, fn)` makes one call inside a step durable: it returns the
+result checkpointed under `key` if there is one, otherwise it runs `fn()`,
+checkpoints the result and returns it. Wrap model and tool calls in it. If the
+process dies after the call returned but before the step checkpointed, the
+resumed run gets the saved answer, so the call is not billed again and sampling
+cannot give a different answer. Results are stored as `{'memo', result}`, so a
+`nil` result is memoized too. `loop()` does not clear memo keys; delete them
+with `checkpoint_delete` once the episode ends.
+
+```sw
+import Durable
+
+fun step(s) {
+    answer = Durable.memo("ep:" ++ to_string(map_get(s, "n")) ++ ":llm",
+                          fun() { llm_complete(map_get(s, "prompt")) })
+    {'done', answer}
+}
+
+fun main() {
+    print(Durable.loop("ep", %{"n" => 1, "prompt" => "hi"}, fun(s) { step(s) }))
+    checkpoint_delete("ep:1:llm")   # the memo key outlives loop()'s own clear
+}
+```
 
 ```sw
 module Demo
@@ -1158,7 +1208,7 @@ bin/swc build src/main.sw -o bin/program
 # Optimised + obfuscated build
 bin/swc build src/main.sw -o bin/program -O --obfusc --strip
 
-# Run a .sw file directly without producing a binary (interpret + JIT)
+# Run a .sw file directly without producing a binary (interpreter)
 bin/swc run my_program.sw
 
 # Run sw interpreter tests (point at a file or directory of test_*.sw files)

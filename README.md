@@ -32,11 +32,16 @@ import Std
 
 fun grade(task) {
     out = llm_complete(task.prompt, %{model: "qwen2.5-coder:7b"})
+    if (string_starts_with(out, "error: ")) { panic(out) }
     if (string_contains(out, task.expect)) { 'pass' } else { 'fail' }
 }
 
 fun main() {
     tasks = json_decode(file_read("tasks.json"))
+    if (tasks == nil) {
+        eprint("tasks.json is missing or not valid JSON")
+        sys_exit(1)
+    }
     results = Std.task_stream(tasks, fn(t) { grade(t) },
                               %{max_concurrency: 64, timeout_ms: 30000})
     passed = length(filter(results, fn(r) { r == {'ok', 'pass'} }))
@@ -44,6 +49,8 @@ fun main() {
     print(f"pass {passed} fail {failed} error {length(tasks) - passed - failed}")
 }
 ```
+
+The runner reads `tasks.json`, a list of `{prompt, expect}` objects, not the `tasks.txt` that the agent template fans out. If the file is missing or is not valid JSON, it prints an error to stderr and exits 1 rather than reporting zero tasks.
 
 Against a local mock with 500 ms latency, 200 prompts run in 2.1 s on 4 cores: four waves of 64, so the runtime adds about 0.1 s to the network wait. With one grader made to panic and another to hang forever, the same run prints `pass 100 fail 98 error 2` and finishes at its deadline. One bad grader costs one cell, not the run.
 
@@ -193,10 +200,10 @@ Most languages were designed for humans first; LLM ergonomics are a happy accide
 - **Compile-time "did you mean?"** for unknown function names. `unknown function 'strng_length' — did you mean 'string_length'?` Levenshtein over builtins + module funcs.
 - **Loud runtime failures with full stack traces.** `hd([])`, `elem(t, 99)`, `n / 0` panic with `at src/X.sw:N` and the full call chain (`outer → middle → deep`). `expect(value, msg)` is the idiomatic unwrap. `try/catch` for recoverable cases.
 - **A real stdlib in sw, auto-imported.** `import Std` (list / map / string helpers) just works from any project — swc falls back to `<swarmrt>/lib/`. Same goes for `Mcp`, `Embed`, `Vec`, `Prompt`, `Cron`, `Telemetry`.
-- **Module-level `let` globals.** Top-level constant bindings at module scope — `let base_url = "https://api.example.com"` — shared by all functions in the module without threading them as arguments. *(Interpreter / REPL path only; codegen support is not yet wired — compiled binaries resolve the name as an atom. Use a top-of-function `let` binding or a module function returning the constant in compiled code.)*
+- **Module-level `let` globals.** Top-level constant bindings at module scope — `let base_url = "https://api.example.com"` — shared by all functions in the module without threading them as arguments. *(Works in compiled binaries, including `let` globals from imported modules. `swc run` (the interpreter) does not yet resolve imported-module `let` globals — they read as `nil` — so use a top-of-function `let` binding or a module function returning the constant there.)*
 - **`exec_argv(cmd, args)` builtin.** Fork+exec with no shell — safe for user-supplied arguments, no injection risk. Works in both the interpreter and `swc build` compiled code. (Use `shell_sandboxed` when you need a sandboxed shell for agent tool dispatch.)
 - **`assert_raises(fn, msg)` builtin.** In `swc test` files, assert that a zero-arg lambda panics (or errors) with a message containing `msg`. The test runner intercepts the panic so the suite continues.
-- **The whole language fits in one document.** SW_LANGUAGE.md is ~950 lines including examples — small enough to paste into a system prompt.
+- **The whole language fits in one document.** SW_LANGUAGE.md is ~1200 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
 
@@ -291,7 +298,7 @@ needed.
 | `SW_SCHEDULERS` | CPU count | Number of scheduler threads. `1` for deterministic CLI tools. |
 | `SW_MAX_PROCS` | `100000` | Arena ceiling. Drop to `1024`/`4096` for fast-start CLI binaries — measured ~6 ms total wall (vs ~40 ms at the default ceiling) on Linux x86_64. Floor of 16. |
 | `SW_MAILBOX_MAX` | `1000000` | Mailbox depth cap (pending messages per process). User sends over the cap are dropped — loudly: a global counter (`sw_mailbox_dropped()`) plus a rate-limited stderr warning. EXIT/DOWN signals and timer fires are exempt, so supervision and `receive … after` keep working on a flooded process. `0` disables. |
-| `SW_HTTP_MAX_REQUEST` | `33554432` (32MB) | Max bytes buffered for one HTTP request (headers + body) and max accepted `Content-Length`. Oversized declared bodies get a `413`; connections that outgrow the buffer cap are closed. Min `4096`. |
+| `SW_HTTP_MAX_REQUEST` | `33554432` (32MB) | Max bytes buffered for one HTTP request (headers + body), max accepted `Content-Length`, and max decoded `Transfer-Encoding: chunked` body (chunked bodies are decoded as they arrive and handed to the handler whole). Oversized bodies get a `413`; malformed chunked framing gets a `400`; connections that outgrow the buffer cap are closed. Min `4096`. |
 | `SW_HTTP_IDLE_TIMEOUT_MS` | `30000` | Close an HTTP connection idle (no inbound bytes) this long and free its slot (slow-loris defense). `0` disables; established WebSockets are exempt unless `SW_HTTP_WS_IDLE_TIMEOUT_MS` is set. |
 | `SW_PROC_MEM_MAX` | `0` (off) | Per-process memory cap (bytes). A process over the cap dies loudly; the node + siblings survive. |
 | `SW_MSG_MAX_BYTES` | `0` (off) | Max size of a single local message (bytes). Over-cap sends are dropped loudly, leak-free. |
@@ -440,8 +447,9 @@ The point is to surface real gaps — the first baseline run flagged several qui
 Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
 
 ```bash
-make swc libswarmrt              # compiler + runtime library only (you usually want this)
-make all                         # everything: compiler, library, examples, demos
+make                             # default goal (= make all): bin/swc + bin/libswarmrt.a
+make swc libswarmrt              # the same two targets, spelled out
+make examples                    # also compile the example programs in examples/
 make test-sw                     # sw-language tests
 make test-all                    # backward-compat alias for test-core
 make test-full                   # comprehensive gate (core + OTP + phases + search + tools)
@@ -499,7 +507,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
 - **No static type checking** — `sw` is dynamically typed by design. Names are checked (an undefined variable is a compile error with a did-you-mean, on both the compiled and interpreted paths), but types and map keys are not.
-- **Memory is bounded under fixed concurrency (Ownership v2), with a few owners still on the global heap.** A process's own working set frees on exit; sent messages, spawn args, and pmap captures/results are adopted into receiver/child ownership and reclaimed (incl. pre-start-killed children); long-lived tail loops are bounded by a scoped turn-checkpoint. `make gc-slope` proves spawn / message / 100k-turn / pmap slopes stay flat. **Still global-heap (reclaimed only at OS exit / table destroy — a high-churn loop grows until then):** (1) **ETS** entries; (2) **supervisor child closures** and **timer/cron closures**; (3) the **interpreter** has no arena (fine for short-lived `swc run`/REPL). Values nested deeper than 256 levels are truncated on cross-process copy.
+- **Memory is bounded under fixed concurrency (Ownership v2), with a few owners still on the global heap.** A process's own working set frees on exit; sent messages, spawn args, and pmap captures/results are adopted into receiver/child ownership and reclaimed (incl. pre-start-killed children); long-lived tail loops are bounded by a scoped turn-checkpoint. `make gc-slope` proves spawn / message / 100k-turn / pmap slopes stay flat. **Still global-heap (reclaimed only at OS exit / table destroy — a high-churn loop grows until then):** (1) **ETS** entries; (2) **supervisor child closures** and **timer/cron closures**; (3) the **interpreter** has no arena (fine for short-lived `swc run`/REPL). Values nest to any depth on the local copy path (cross-process sends on this node, spawn args, turn checkpoints): the copy is iterative, so a 300-deep list arrives intact (`tests/sw/test_deep_send.sw`). The one exception is a remote send, whose wire format decodes at most 256 levels: a deeper value panics the sender with `remote send: value nested deeper than 256 levels`, so its links and supervisors see the crash. Nothing is ever silently truncated.
 
 The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
 

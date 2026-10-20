@@ -51,7 +51,7 @@ typedef struct {
     int tmp_counter;
 
     /* module-level globals (let x = expr) */
-    char global_names[16][128];
+    const node_t *globals_src; /* module node owning the global names (outlives ctx) */
     int nglobals;
     int has_globals; /* 1 if nglobals > 0 — used by emit_entry_and_main */
 
@@ -60,6 +60,7 @@ typedef struct {
     char cur_params[16][128];
     int cur_nparams;
     int has_tail;
+    int tc_hop; /* 1 inside a module function body: tail calls may hop (emit_call) */
 
     /* declared local variables in current function */
     char declared[256][128];
@@ -193,7 +194,7 @@ static void declare_var(cg_ctx_t *ctx, const char *name) {
 
 static int is_global(cg_ctx_t *ctx, const char *name) {
     for (int i = 0; i < ctx->nglobals; i++)
-        if (strcmp(ctx->global_names[i], name) == 0) return 1;
+        if (strcmp(ctx->globals_src->v.mod.globals[i].name, name) == 0) return 1;
     return 0;
 }
 
@@ -1018,12 +1019,23 @@ static int find_spawn_id(cg_ctx_t *ctx, node_t *call_node) {
     return -1;
 }
 
-/* Check if function body contains self-recursive tail calls */
+/* A call that emit_call compiles as a hop when it sits in tail position: a
+ * direct call to another function of this module (see the module-function
+ * branch of emit_call). Builtins and qualified calls are never hops. */
+static int is_hop_call(cg_ctx_t *ctx, node_t *n) {
+    if (n->type != N_CALL || n->v.call.func->type != N_IDENT) return 0;
+    const char *fname = n->v.call.func->v.sval;
+    return !is_builtin(fname) && !strchr(fname, '.') && is_module_func(ctx, fname) &&
+           n->v.call.nargs <= SW_TC_MAX;
+}
+
+/* Check if function body contains tail calls that loop back (self-calls) or
+ * hop to another module function. Either one needs the `_gc_floor` checkpoint. */
 static int has_tail_calls(cg_ctx_t *ctx, node_t *n) {
     if (!n) return 0;
     switch (n->type) {
     case N_CALL:
-        return is_self_call(ctx, n);
+        return is_self_call(ctx, n) || is_hop_call(ctx, n);
     case N_BLOCK:
         if (n->v.block.nstmts == 0) return 0;
         return has_tail_calls(ctx, n->v.block.stmts[n->v.block.nstmts - 1]);
@@ -1086,6 +1098,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <unistd.h>\n");
     fprintf(f, "#include <sys/stat.h>\n");
     fprintf(f, "#include <sys/time.h>\n");
+    fprintf(f, "#include <time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
 
     /* Generated execution state — _sw_error, _sw_current_line/_sw_current_file,
@@ -1399,7 +1412,16 @@ static void emit_preamble(cg_ctx_t *ctx) {
 
     /* pmap: parallel map — spawns a process per list item */
     fprintf(f,
-        "typedef struct { sw_val_t *fn; sw_val_t *item; sw_process_t *caller; int idx; } _pmap_w_t;\n"
+        "typedef struct { sw_val_t *fn; sw_val_t *item; sw_process_t *caller; int idx; uint64_t ref; } _pmap_w_t;\n"
+        /* Per-call ref source. Results carry their call's ref, so a late result
+         * from an earlier pmap can't be taken as one of this call's results. */
+        "static uint64_t _pmap_seq;\n"
+        /* Monotonic, so a wall-clock step can't stretch or cut the pmap deadline. */
+        "static uint64_t _pmap_now_ms(void) {\n"
+        "    struct timespec ts;\n"
+        "    clock_gettime(CLOCK_MONOTONIC, &ts);\n"
+        "    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;\n"
+        "}\n"
         "static void _pmap_entry(void *raw) {\n"
         "    _pmap_w_t *w = (_pmap_w_t *)raw;\n"
         /* Ownership v2: take + adopt the SPAWN region holding fn+item into this
@@ -1408,8 +1430,8 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n"
         "    sw_val_t *arg[] = {w->item};\n"
         "    sw_val_t *result = sw_val_apply(w->fn, arg, 1);\n"
-        "    sw_val_t *ti[] = {sw_val_int(w->idx), result};\n"
-        "    sw_val_t *msg = sw_val_tuple(ti, 2);\n"
+        "    sw_val_t *ti[] = {sw_val_int((int64_t)w->ref), sw_val_int(w->idx), result};\n"
+        "    sw_val_t *msg = sw_val_tuple(ti, 3);\n"
         "    sw_send_value(w->caller, 11, msg);\n"  /* result → message region the caller adopts */
         "    free(w);\n"
         "}\n"
@@ -1426,6 +1448,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);\n"
         "    int cnt = lst->v.tuple.count;\n"
         "    if (cnt == 0) return sw_val_list(NULL, 0);\n"
+        "    uint64_t ref = __atomic_add_fetch(&_pmap_seq, 1, __ATOMIC_RELAXED);\n"
         "    sw_process_t *self = sw_self();\n"
         "    sw_val_t **res = calloc(cnt, sizeof(sw_val_t*));\n"
         "    for (int i = 0; i < cnt; i++) {\n"
@@ -1436,26 +1459,32 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "        sw_value_arena_t *_wr = sw_self_varena() ? sw_varena_create_kind(256, SW_REGION_SPAWN) : (sw_value_arena_t*)0;\n"
         "        w->fn = _wr ? deep_copy_into(fn, _wr) : sw_val_deep_copy_global(fn);\n"
         "        w->item = _wr ? deep_copy_into(lst->v.tuple.items[i], _wr) : sw_val_deep_copy_global(lst->v.tuple.items[i]);\n"
-        "        w->caller = self; w->idx = i;\n"
+        "        w->caller = self; w->idx = i; w->ref = ref;\n"
         "        sw_process_t *_wp = sw_spawn_owned(_pmap_entry, w, _wr);\n"
         "        if (!_wp) { if (_wr) sw_varena_free_all(_wr); free(w); }\n"
         "    }\n"
-        "    for (int i = 0; i < cnt; i++) {\n"
-        "        uint64_t tag;\n"
+        /* One 5s deadline for the whole call. Only this call's results count:
+         * a stray message, or a late result from an earlier pmap, is skipped. */
+        "    uint64_t deadline = _pmap_now_ms() + 5000;\n"
+        "    int got = 0;\n"
+        "    while (got < cnt) {\n"
+        "        uint64_t now = _pmap_now_ms();\n"
+        "        if (now >= deadline) break;\n"
         /* Adopt each result region into THIS (caller) arena so the returned list
          * is self-contained in the caller's lifecycle (no leaked global copies). */
-        "        void *raw = sw_recv_any_adopt(5000, &tag);\n"
-        "        if (raw) {\n"
-        "            sw_val_t *m = (sw_val_t *)raw;\n"
-        "            if (m->type == SW_VAL_TUPLE && m->v.tuple.count == 2\n"
-        "                && m->v.tuple.items[0]->type == SW_VAL_INT) {\n"
-        "                int ix = (int)m->v.tuple.items[0]->v.i;\n"
-        "                if (ix >= 0 && ix < cnt) res[ix] = m->v.tuple.items[1];\n"
-        "            }\n"
+        "        sw_val_t *m = (sw_val_t *)sw_recv_tagged_adopt(11, deadline - now);\n"
+        "        if (!m) break;\n"
+        "        if (m->type == SW_VAL_TUPLE && m->v.tuple.count == 3\n"
+        "            && m->v.tuple.items[0]->type == SW_VAL_INT && m->v.tuple.items[0]->v.i == (int64_t)ref\n"
+        "            && m->v.tuple.items[1]->type == SW_VAL_INT) {\n"
+        "            int ix = (int)m->v.tuple.items[1]->v.i;\n"
+        "            if (ix >= 0 && ix < cnt && !res[ix]) { res[ix] = m->v.tuple.items[2]; got++; }\n"
         "        }\n"
         "    }\n"
+        /* A slow item is {'error', 'timeout'}, as in Std.task_stream, not a silent nil. */
         "    for (int i = 0; i < cnt; i++)\n"
-        "        if (!res[i]) res[i] = sw_val_nil();\n"
+        "        if (!res[i]) { sw_val_t *e[] = {sw_val_atom(\"error\"), sw_val_atom(\"timeout\")};\n"
+        "                       res[i] = sw_val_tuple(e, 2); }\n"
         "    sw_val_t *r = sw_val_list(res, cnt);\n"
         "    free(res);\n"
         "    return r;\n"
@@ -1470,6 +1499,8 @@ static void emit_forward_decls(cg_ctx_t *ctx, node_t *mod) {
     FILE *f = ctx->out;
     fprintf(f, "/* === Forward declarations === */\n");
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
+        fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_fl);\n",
+                ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
         fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
     }
@@ -1593,6 +1624,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         int save_nparams = ctx->cur_nparams;
         int save_ndeclared = ctx->ndeclared;
         int save_has_tail = ctx->has_tail;
+        int save_tc_hop = ctx->tc_hop;
         strncpy(save_func, ctx->cur_func, 127);
         for (int j = 0; j < save_nparams; j++)
             strncpy(save_params[j], ctx->cur_params[j], 127);
@@ -1601,6 +1633,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         ctx->cur_nparams = fn->v.fun.nparams;
         ctx->ndeclared = 0;
         ctx->has_tail = 0;
+        ctx->tc_hop = 0; /* a lambda has no driver: its tail calls stay plain calls */
 
         /* Extract explicit parameters */
         for (int j = 0; j < fn->v.fun.nparams; j++) {
@@ -1648,6 +1681,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         ctx->cur_nparams = save_nparams;
         ctx->ndeclared = save_ndeclared;
         ctx->has_tail = save_has_tail;
+        ctx->tc_hop = save_tc_hop;
         for (int j = 0; j < save_nparams; j++)
             strncpy(ctx->cur_params[j], save_params[j], 127);
     }
@@ -2286,13 +2320,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         /* Gleam-style hint for the qualified-builtin reflex. Std.map and
          * Std.filter are REAL module functions now (lib/Std.sw aliases over
          * the global builtins — the Elixir-shaped guess models emit), so
-         * only the names with no Std alias stay on this denylist:
-         * Std.reduce can't exist (Std's own sum/product call the global
-         * `reduce` bare; a same-named module fun would shadow it) and pmap
-         * has no alias either. */
+         * only the names with no Std alias stay on this denylist: pmap
+         * has no alias. Std.reduce is a real module fun now (lib/Std.sw). */
         const char *gf = dot + 1;
-        if ((strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) &&
-            strcmp(mod, "Std") == 0) {
+        if (strcmp(gf, "pmap") == 0 && strcmp(mod, "Std") == 0) {
             fprintf(stderr, "swc: src/%s.sw:%d: %s is a global builtin \xe2\x80\x94 write %s(fn, list, ...), not %s(...)\n",
                     ctx->mod_name, n->line, gf, gf, fname);
             ctx->had_unknown_fn = 1;
@@ -2521,6 +2552,36 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "tool_history") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
+        if (tail && ctx->tc_hop && ctx->has_tail && nargs <= SW_TC_MAX) {
+            /* Mutual tail call: park the args and return SW_TC_HOP, so the
+             * driver (sw_tc_drive) calls the target body after this frame is
+             * gone and the C stack stays flat. Same turn-checkpoint as a
+             * self-call, floor inherited: the target takes `_gc_floor` from the
+             * park (emit_function), so a hop chain keeps the entry floor and
+             * the arena stays bounded. The args are read in the callee's
+             * prologue before any yield or other call can reuse the park. */
+            fprintf(f, "    {\n");
+            if (nargs > 0) {
+                fprintf(f, "      sw_val_t *_gc_v[] = {");
+                for (int i = 0; i < nargs; i++)
+                    fprintf(f, "%s%s", i ? ", " : "", arg_vars[i]);
+                fprintf(f, "};\n");
+            }
+            fprintf(f, "      sw_value_arena_t *_gc_a = sw_self_varena();\n");
+            fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
+            fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", nargs > 0 ? "_gc_v" : "NULL", nargs);
+            fprintf(f, "      if (sw_check_reds()) sw_yield();\n");
+            for (int i = 0; i < nargs; i++)
+                fprintf(f, "      sw_tc_next_args[%d] = _gc_v[%d];\n", i, i);
+            fprintf(f, "    }\n");
+            fprintf(f, "    sw_tc_next_fn = %s_%s__b;\n", ctx->mod_name, fname);
+            fprintf(f, "    sw_tc_next_n = %d;\n", nargs);
+            fprintf(f, "    sw_tc_next_floor = _gc_floor;\n");
+            fprintf(f, "    _sw_trace_pop();\n");
+            fprintf(f, "    return SW_TC_HOP;\n");
+            out[0] = '\0';
+            return;
+        }
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
         else
@@ -3658,6 +3719,7 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         strncpy(ctx->cur_params[i], fn->v.fun.params[i], 127);
     ctx->ndeclared = 0;
     ctx->has_tail = has_tail_calls(ctx, fn->v.fun.body);
+    ctx->tc_hop = 1;
 
     /* Emit a #line directive so any C compiler error inside this
      * function points back to the .sw source instead of the
@@ -3671,8 +3733,9 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         ctx->last_line_emitted = 0;
     }
 
-    fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
+    fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_fl) {\n",
             ctx->mod_name, fn->v.fun.name);
+    fprintf(f, "    (void)_fl;\n");
 
     /* Parameter extraction */
     if (fn->v.fun.nparams > 0) {
@@ -3700,9 +3763,10 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     /* Red-zone stack guard: turn a would-be fiber-stack overflow (native
      * SIGBUS/SIGSEGV on the guard page = whole-OS-process death, no
      * supervision) into a normal per-process panic while there is still
-     * headroom for the panic path. Fires on deep NON-self recursion —
-     * self-tail-calls take the goto below and never re-enter here. */
-    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep recursion? mutual tail calls are not TCO'd (self-tail-calls are); keep the loop in one function or raise SW_PROC_STACK\");\n",
+     * headroom for the panic path. Fires on deep NON-tail recursion —
+     * self-tail-calls take the goto below and module-function tail calls
+     * return to the driver (sw_tc_drive), so neither re-enters here deeper. */
+    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep non-tail recursion? tail calls do not grow the stack; make the recursive call the last thing the function does, or raise SW_PROC_STACK\");\n",
             ctx->mod_name, fn->v.fun.name);
     /* Reduction-counted preemption at every call (BEAM-style): a process
      * yields once it has made SWARM_CONTEXT_REDS calls or loop turns, so a
@@ -3714,9 +3778,11 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
 
     /* Tail call label. Ownership v2: record the arena "floor" at entry — the
      * scoped turn-checkpoint (emit_call) reclaims only what THIS function
-     * allocates above it, never the caller's live values below it. */
+     * allocates above it, never the caller's live values below it. A hop
+     * (emit_call) arrives with the floor of the chain's entry in `_fl`, so the
+     * whole mutual loop shares one floor, as a self-loop does. */
     if (ctx->has_tail) {
-        fprintf(f, "    sw_varena_mark_t _gc_floor = sw_varena_mark(sw_self_varena());\n");
+        fprintf(f, "    sw_varena_mark_t _gc_floor = _fl ? *_fl : sw_varena_mark(sw_self_varena());\n");
         fprintf(f, "    (void)_gc_floor;\n");
         fprintf(f, "_tail:;\n");
     }
@@ -3734,6 +3800,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     else
         fprintf(f, "    return sw_val_nil();\n");
 
+    fprintf(f, "}\n\n");
+
+    /* The public entry: a normal call runs the body and then any hops it
+     * parked, so callers see one ordinary function. */
+    fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
+            ctx->mod_name, fn->v.fun.name);
+    fprintf(f, "    return sw_tc_drive(%s_%s__b(_args, _nargs, NULL));\n",
+            ctx->mod_name, fn->v.fun.name);
     fprintf(f, "}\n\n");
 }
 
@@ -3838,10 +3912,8 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     }
 
     /* Collect module-level global names so is_global() works inside functions. */
-    for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
-        strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
-        ctx.nglobals++;
-    }
+    ctx.globals_src = mod;
+    ctx.nglobals = mod->v.mod.nglobals;
     ctx.has_globals = (ctx.nglobals > 0);
 
     /* Pre-scan for spawn sites and lambdas */
@@ -3911,10 +3983,8 @@ int sw_codegen_module(void *ast, FILE *out) {
         ctx.nfuncs++;
     }
 
-    for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
-        strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
-        ctx.nglobals++;
-    }
+    ctx.globals_src = mod;
+    ctx.nglobals = mod->v.mod.nglobals;
     ctx.has_globals = (ctx.nglobals > 0);
 
     scan_spawns(&ctx, mod);
@@ -3983,10 +4053,8 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
             ctx.nfuncs++;
         }
 
-        for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
-            strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
-            ctx.nglobals++;
-        }
+        ctx.globals_src = mod;
+        ctx.nglobals = mod->v.mod.nglobals;
         ctx.has_globals = (ctx.nglobals > 0);
 
         scan_spawns(&ctx, mod);

@@ -101,6 +101,9 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
  *   0x07  map    (uint16 count + N key-value pairs)
  *   0x08  pid    (8 bytes pid id; receiver annotates it with the sender
  *                 node so replies can route back over distribution)
+ *   0x0A  rpid   (8 bytes pid id + uint8 len + len bytes owner node name;
+ *                 a pid that lives on another node keeps its owner, so a
+ *                 forwarded pid still routes to the node it was made on)
  *
  * Multi-byte fields use native byte order; both nodes are assumed to
  * have the same word size and endianness for v1. A version byte can be
@@ -117,6 +120,7 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
 #define SW_MARSHAL_MAP    0x07
 #define SW_MARSHAL_PID    0x08
 #define SW_MARSHAL_BYTES  0x09   /* [tag][u32 len][len raw bytes] — binary-clean */
+#define SW_MARSHAL_RPID   0x0A   /* [tag][u64 id][u8 len][len bytes owner node] */
 
 /* Thread-local node name used by unmarsh_val to construct
  * SW_VAL_REMOTE_PID values when it decodes a SW_MARSHAL_PID byte.
@@ -133,7 +137,11 @@ static void marsh_grow(uint8_t **buf, uint32_t *cap, uint32_t need) {
     *cap = nc;
 }
 
-static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
+#define SW_UNMARSH_MAX_DEPTH 256
+static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos, int depth) {
+    /* The receiver decodes at most SW_UNMARSH_MAX_DEPTH levels; anything deeper
+     * would arrive truncated, so refuse it here (the sender reports the failure). */
+    if (depth >= SW_UNMARSH_MAX_DEPTH) return -1;
     if (!v || v->type == SW_VAL_NIL) {
         marsh_grow(buf, cap, *pos + 1);
         (*buf)[(*pos)++] = SW_MARSHAL_NIL;
@@ -196,7 +204,7 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
             memcpy(*buf + *pos, &c, 4); *pos += 4;
         }
         for (int i = 0; i < v->v.tuple.count; i++)
-            if (marsh_val(v->v.tuple.items[i], buf, cap, pos) < 0) return -1;
+            if (marsh_val(v->v.tuple.items[i], buf, cap, pos, depth + 1) < 0) return -1;
         return 0;
     }
     case SW_VAL_MAP: {
@@ -205,8 +213,8 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
         (*buf)[(*pos)++] = SW_MARSHAL_MAP;
         memcpy(*buf + *pos, &c, 2); *pos += 2;
         for (int i = 0; i < v->v.map.count; i++) {
-            if (marsh_val(v->v.map.keys[i], buf, cap, pos) < 0) return -1;
-            if (marsh_val(v->v.map.vals[i], buf, cap, pos) < 0) return -1;
+            if (marsh_val(v->v.map.keys[i], buf, cap, pos, depth + 1) < 0) return -1;
+            if (marsh_val(v->v.map.vals[i], buf, cap, pos, depth + 1) < 0) return -1;
         }
         return 0;
     }
@@ -222,16 +230,23 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
         return 0;
     }
     case SW_VAL_REMOTE_PID: {
-        /* Forwarding an already-remote pid: same wire format as a
-         * local pid (id only), but the receiver's default_remote_node
-         * will be the FORWARDER's node, not the original owner. We
-         * encode the owner's node here as a string sentinel to preserve
-         * identity — kept as SW_MARSHAL_PID for now since cross-node
-         * forwarding is a future-iteration feature. */
-        marsh_grow(buf, cap, *pos + 1 + 8);
-        (*buf)[(*pos)++] = SW_MARSHAL_PID;
+        /* Forwarding an already-remote pid: the owner's node name travels
+         * with the id. SW_MARSHAL_PID would be re-annotated with the
+         * FORWARDER's name on decode, sending replies to the wrong node. */
+        const char *owner = v->v.rpid.node;
+        size_t nlen = owner ? strlen(owner) : 0;
+        if (nlen == 0 || nlen >= SW_NODE_NAME_MAX) {
+            /* No owner to route to — same as any other unsendable value. */
+            marsh_grow(buf, cap, *pos + 1);
+            (*buf)[(*pos)++] = SW_MARSHAL_NIL;
+            return 0;
+        }
+        marsh_grow(buf, cap, *pos + 1 + 8 + 1 + (uint32_t)nlen);
+        (*buf)[(*pos)++] = SW_MARSHAL_RPID;
         uint64_t id = v->v.rpid.id;
         memcpy(*buf + *pos, &id, 8); *pos += 8;
+        (*buf)[(*pos)++] = (uint8_t)nlen;
+        memcpy(*buf + *pos, owner, nlen); *pos += (uint32_t)nlen;
         return 0;
     }
     default:
@@ -246,7 +261,7 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
 int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
     uint8_t *buf = NULL;
     uint32_t cap = 0, pos = 0;
-    if (marsh_val(v, &buf, &cap, &pos) < 0) { free(buf); return -1; }
+    if (marsh_val(v, &buf, &cap, &pos, 0) < 0) { free(buf); return -1; }
     *out = buf;
     *out_len = pos;
     return 0;
@@ -259,7 +274,6 @@ int sw_marshal(sw_val_t *v, uint8_t **out, uint32_t *out_len) {
  * count loops are bounded, so the unwind is bounded). */
 static sw_val_t *unmarsh_val_inner(const uint8_t *buf, uint32_t len, uint32_t *pos);
 static __thread int g_unmarsh_depth = 0;
-#define SW_UNMARSH_MAX_DEPTH 256
 static sw_val_t *unmarsh_val(const uint8_t *buf, uint32_t len, uint32_t *pos) {
     if (g_unmarsh_depth >= SW_UNMARSH_MAX_DEPTH) return sw_val_nil();
     g_unmarsh_depth++;
@@ -360,6 +374,23 @@ static sw_val_t *unmarsh_val_inner(const uint8_t *buf, uint32_t len, uint32_t *p
             return sw_val_remote_pid(tls_unmarshal_default_node, id);
         return sw_val_nil();
     }
+    case SW_MARSHAL_RPID: {
+        if (len - *pos < 9) return sw_val_nil();
+        uint64_t id; memcpy(&id, buf + *pos, 8); *pos += 8;
+        uint8_t nlen = buf[(*pos)++];
+        if (len - *pos < nlen) return sw_val_nil();
+        const char *owner = (const char *)(buf + *pos);
+        *pos += nlen;
+        if (nlen == 0 || nlen >= SW_NODE_NAME_MAX) return sw_val_nil();
+        /* The pid came back to the node that made it: resolve it to the
+         * local process, as spawn() handed it out, so it compares equal and
+         * sends locally. */
+        char name[SW_NODE_NAME_MAX];
+        memcpy(name, owner, nlen); name[nlen] = '\0';
+        if (strcmp(name, sw_node_local_name()) == 0)
+            return sw_val_pid_id(sw_find_by_pid_any(id), id);
+        return sw_val_remote_pid(name, id);
+    }
     default:
         return sw_val_nil();
     }
@@ -404,6 +435,15 @@ void sw_send_dispatch(sw_val_t *target, sw_val_t *msg) {
             sw_node_send_pid(target->v.rpid.node, target->v.rpid.id,
                              SW_TAG_NONE, buf, blen);
             free(buf);
+        } else {
+            /* Unmarshalable (nested past the wire depth cap, or over 4 GB):
+             * a loud panic, not a silent drop or a truncated delivery. */
+            static const char msg_err[] =
+                "remote send: value nested deeper than 256 levels (or over 4 GB)";
+            fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg_err);
+            sw_process_t *me = sw_self();
+            if (me) sw_process_panic(me, -1, msg_err);
+            exit(1);
         }
     }
     /* else: silent no-op for nil / wrong type. Same forgiveness as

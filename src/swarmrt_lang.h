@@ -256,6 +256,29 @@ struct sw_value_arena *sw_swap_alloc_target(struct sw_value_arena *region);
  * Returns 1 if rewound (see swarmrt_lang.c). */
 int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor);
 
+/* Mutual tail calls (codegen emit_call). Every module function `M_f` is a
+ * driver over its body `M_f__b`. A body that tail-calls another module
+ * function parks the call here and returns SW_TC_HOP instead of calling it,
+ * so the C stack does not grow; sw_tc_drive runs the parked calls in a loop.
+ * The callee copies its args out of the park first thing in its prologue, and
+ * the park is written only after the caller's last yield point, so no yield can
+ * land between the park and that copy. */
+#define SW_TC_MAX 16
+typedef sw_val_t *(*sw_tc_body_t)(sw_val_t **args, int nargs, sw_varena_mark_t *floor);
+extern sw_val_t sw_tc_hop_sentinel;
+#define SW_TC_HOP (&sw_tc_hop_sentinel)
+extern __thread sw_tc_body_t sw_tc_next_fn;
+extern __thread int sw_tc_next_n;
+extern __thread sw_varena_mark_t sw_tc_next_floor;
+extern __thread sw_val_t *sw_tc_next_args[SW_TC_MAX];
+static inline sw_val_t *sw_tc_drive(sw_val_t *r) {
+    while (r == SW_TC_HOP) {
+        sw_varena_mark_t fl = sw_tc_next_floor;
+        r = sw_tc_next_fn(sw_tc_next_args, sw_tc_next_n, &fl);
+    }
+    return r;
+}
+
 /* Static name resolution: report identifiers in value position that no scope
  * binds (see swarmrt_lang.c). `mods` is the full set being linked (must include
  * mod_ast). Returns the number of errors printed to stderr. */
@@ -334,8 +357,8 @@ typedef struct node {
         /* N_MODULE */
         struct { char name[128]; struct node **funs; int nfuns;
                  char imports[32][128]; int nimports;
-                 /* Module-level immutable globals: let x = literal */
-                 struct { char name[128]; struct node *val; } globals[16];
+                 /* Module-level immutable globals: let x = literal (heap, grows) */
+                 struct { char name[128]; struct node *val; } *globals;
                  int nglobals; } mod;
         /* N_FUN */
         struct { char name[128]; char params[16][128]; int nparams;

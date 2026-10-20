@@ -120,6 +120,13 @@ fun main() {
     r2 = req_retry("http://127.0.0.1:9137/brew", opts_list, 100)
     fails = fails + check_resp(r2, "http_request_list", "POST|Bearer post-tok")
 
-    if (fails == 0) { print("OK test_http_request 6/6") sys_exit(0) }
+    # (3) method as an ATOM ('POST'), the form http_listen delivers. The
+    #     server and client must take the same spelling, so this proves
+    #     %{method: 'POST'} sends exactly what %{method: "POST"} sends.
+    opts_atom = map_put(map_put(map_new(), "method", 'POST'), "body", "x")
+    r3 = req_retry("http://127.0.0.1:9137/brew", opts_atom, 100)
+    fails = fails + check_resp(r3, "http_request_atom", "POST|<none>")
+
+    if (fails == 0) { print("OK test_http_request 9/9") sys_exit(0) }
     else { print(f"FAIL test_http_request {fails} failed") sys_exit(1) }
 }

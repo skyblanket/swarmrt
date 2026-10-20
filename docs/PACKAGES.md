@@ -152,4 +152,3 @@ Fix it by making them agree (usually by changing the project's own entry).
 - One version per name. Conflicts are errors, not resolved.
 - Not supported on Windows yet (`swc add`/`install` say so; imports without a
   project work as before).
-- `swc test` doesn't resolve imports, with or without packages.

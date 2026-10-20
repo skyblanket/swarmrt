@@ -199,13 +199,33 @@ scheduler idle loop; spawn-time affinity (start a child on its parent's
 scheduler — cheap and BEAM-ish); batching wakes. For agent swarms doing
 request/reply with a coordinator, this is the number that matters.
 
-### O5 (P2) — startup: ~105–145 ms observed vs "<10 ms" in the README
+### O5 (P2) — startup: ~105–145 ms observed vs "<10 ms" in the README — CLOSED (claim qualified)
 
-A C control binary forks+execs in ~3 ms on the same host, so ~100+ ms is
-runtime boot, not the container's exec overhead (SW_MAX_PROCS=1024
-shaves ~35 ms as documented). Maybe it's <10 ms on the daily-driver Mac;
-on this Linux box it is not. Worth profiling arena init + scheduler
-spin-up on Linux before re-stating the claim, or qualifying it.
+Re-measured 2026-10-19 on Linux x86_64 (4 vCPU, shared host, 40 launches per row, timed with `date`
+around each launch). The host load average ran 12–25 during the sampling, so the **minimum** is the
+reliable figure; medians were inflated by contention:
+
+| Case | min | median (loaded) |
+|---|---|---|
+| `swc run hello.sw` (interpreter) | 12 ms | 12–55 ms |
+| compiled `hello` binary, default | 29 ms | 145 ms |
+| compiled `hello` binary, `SW_MAX_PROCS=1024` | 8 ms | 18 ms |
+| `swc --version` | 3 ms | 4–13 ms |
+| `/bin/true` fork+exec baseline | 2 ms | 3 ms |
+
+Re-sampled 2026-10-20 at load average ~170 on the same 4 vCPUs (60 launches per row, minimum):
+`swc run hello.sw` 13–15 ms, compiled default 27–44 ms, compiled with `SW_MAX_PROCS=1024`
+23–33 ms, `/bin/true` 2 ms. The 8 ms `SW_MAX_PROCS=1024` minimum did not reproduce under that
+load, so the "<10 ms" figure stands only as a quiet-host number (see BUILDING_AGENTS.md).
+
+The original 105–145 ms did not reproduce in a quiet window. The default boot is about 30 ms, not
+under 10 ms, and the cost is the default 100K-slot process table (`src/swarmrt_native.c`, ~L1911–1920);
+`SW_MAX_PROCS=1024` brings the floor to about 8 ms. Those numbers agree with the earlier sweep
+(`swc run` 15 ms, compiled 7 ms).
+
+Resolution: "<10 ms" is qualified in `docs/BUILDING_AGENTS.md` (hot-reload boundary paragraph) to
+state the measured floor and the `SW_MAX_PROCS` condition. Follow-up: `docs/DEPLOYMENT.md` (L9, L131,
+L144) still says "well under 10 ms" without that qualifier.
 
 ### O6 (P3) — diagnostics polish for the LLM story
 
@@ -328,7 +348,8 @@ Rebased onto the Phase-1 ownership work (`e1a7713`) and executed the
 | O4 cross-scheduler wake cost | **FIXED** — bounded spin-before-park in the scheduler idle loop (`SW_SPIN_US`, default 30µs, 0 disables; producer pays nothing — `idle` stays unset while spinning). Measured on the original repro: 58.4 → 4.5 µs per cross-scheduler ping-pong round trip (13×); spawn cycles −26%; same-sched unchanged at ~920ns. |
 | O6 diagnostics (remainder) | **FIXED** — real source paths registered by swc (diagnostics + #line use the actual file); module-qualified calls validate with did-you-mean ("module Std has no function 'mpa' — did you mean 'Std.map'?"). |
 | O7 codepoint strings | **FIXED** — `string_chars(s)` (UTF-8 codepoint split, both paths, conform-gated). |
-| O5 startup time, O8 gate portability docs | open (unchanged). |
+| O5 startup time | **CLOSED** — re-measured 2026-10-19: compiled boot ~29 ms default, ~8 ms with `SW_MAX_PROCS=1024`; the "<10 ms" claim is qualified (see the O5 section). |
+| O8 gate portability | **FIXED** — gates print their host limits at startup (`scripts/gate_common.sh`); a missing ASAN runtime or GNU `time` fails with the package to install instead of a bare `ld`/`FAIL` line; CONTRIBUTING documents `libclang-rt`. |
 
 **And the structural fix from the assessment section is in:** the
 dual-path conformance gate (`tests/sw/run_conform.sh` + `tests/sw/conform/`,

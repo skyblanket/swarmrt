@@ -49,6 +49,7 @@ noted. **Every one is optional**; the defaults are the product defaults.
 | `SW_HTTP_IDLE_TIMEOUT_MS` | `30000` | Close an HTTP connection with no inbound bytes for this long (slow-loris defense) and free its slot. `0` disables. |
 | `SW_HTTP_BIND` | `127.0.0.1` | Address `http_listen` binds when the call passes no `bind` option. Set `0.0.0.0` to serve other hosts (containers, a load balancer, a public WebSocket endpoint). IPv4 literal or `localhost`; a malformed value makes `http_listen` return `'error'` instead of binding every interface. |
 | `SW_WS_ORIGINS` | unset | Comma-separated extra `Origin`s allowed to open a WebSocket to an `http_listen` server (e.g. `https://app.example.com`), on top of same-origin, loopback, and the call's `ws_origins` option. `*` allows any. Upgrades carrying any other `Origin` get `403`; upgrades with no `Origin` (non-browser clients) are always accepted. |
+| `SW_HTTP_HOSTS` | unset | Comma-separated `Host` values this `http_listen` server answers to (e.g. `localhost:4100,app.example.com`). Opt-in DNS-rebinding defence: when set, any request whose `Host` is not listed gets `403`, WebSocket upgrades and plain HTTP alike. Exact, case-insensitive match, port included; a request with no `Host` is refused. Unset = no check. |
 | `SW_HTTP_WS_IDLE_TIMEOUT_MS` | `0` (never) | Idle timeout for **established** WebSocket connections. Off by default — a quiet LiveView/agent session is legitimate. Inbound client pings count as activity. |
 
 ### Scheduling & runtime

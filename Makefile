@@ -73,13 +73,15 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
-        test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
+.PHONY: all clean v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
+        test test-v2 test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
-        test-sw benchmark benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
+        test-sw benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
         sws mcp mcp-wrap examples
 
-all: v1 v2 proc native
+# Default goal: the compiler and runtime library. The legacy prototypes
+# (swarmrt_simple/swarmrt/swarmrt_proc) live in attic/ and are not built.
+all: swc libswarmrt
 
 # Compile rules for core objects
 $(BUILD_DIR)/swarmrt_asm.o: $(SRC_DIR)/swarmrt_asm.S | dirs
@@ -95,21 +97,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | dirs
 
 core-objs: $(CORE_OBJS)
 
-v1: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_simple.c -o $(BUILD_DIR)/swarmrt_simple.o
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/parser.c -o $(BUILD_DIR)/parser.o
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o $(SRC_DIR)/main.c -o $(BIN_DIR)/swarmrt-v1 $(LDFLAGS)
-
 v2: dirs
 	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_v2.c -o $(BUILD_DIR)/swarmrt_v2.o
 	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_v2.o $(SRC_DIR)/test_v2.c -o $(BIN_DIR)/swarmrt-v2 $(LDFLAGS)
-
-# Process subsystem build (with optional assembly context switching)
-proc: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_proc.c -o $(BUILD_DIR)/swarmrt_proc.o
-	@$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_context.S -o $(BUILD_DIR)/swarmrt_context.o 2>/dev/null || true
-	@$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(BUILD_DIR)/swarmrt_context.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS) 2>/dev/null || \
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS)
 
 # Native runtime (benchmark)
 native: core-objs
@@ -139,14 +129,8 @@ dirs:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR)
 
 # Test targets
-test-v1: v1
-	./$(BIN_DIR)/swarmrt-v1 test
-
 test-v2: v2
 	./$(BIN_DIR)/swarmrt-v2
-
-test-proc: proc
-	./$(BIN_DIR)/swarmrt-proc
 
 test-native: native
 	./$(BIN_DIR)/swarmrt-native
@@ -205,11 +189,11 @@ test-phase10: phase10
 h2h: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/benchmark_h2h.c -o $(BIN_DIR)/bench-h2h $(LDFLAGS)
 
-test: test-v1 test-v2 test-proc
+test: test-v2
 
 # Core test gate (what test-all used to be). Kept as a named alias so
 # callers can depend on it without hard-coding the list.
-test-core: test-v1 test-v2 test-proc test-native test-sw
+test-core: test-v2 test-native test-sw
 
 # Backward-compat alias — contributors/scripts that invoke `make test-all`
 # continue to work unchanged.
@@ -217,7 +201,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection
+test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.
@@ -235,6 +219,8 @@ examples: swc libswarmrt
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
+	@./tests/sw/run_stub_warn.sh
+	@bash ./tests/sw/run_stdin.sh
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.
@@ -304,6 +290,7 @@ FUZZ_ASAN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:quarantine_size_mb
 
 .PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json fuzz-ws fuzz-db isolation-gate
 fuzz-parse: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-parse: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_parse tests/fuzz/corpus/parse
@@ -313,11 +300,13 @@ fuzz-parse: dirs
 # on malformed or adversarially-nested input (the corpus includes a
 # 5000-deep array; g_jd_depth must bound it).
 fuzz-json: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-json: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_json.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_json $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_json tests/fuzz/corpus/json
 
 fuzz-marshal: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-marshal: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_marshal.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_marshal $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_marshal tests/fuzz/corpus/marshal
@@ -326,6 +315,7 @@ fuzz-marshal: dirs
 # -DSW_FUZZ_HTTP exposes sw_http_fuzz_parse() in swarmrt_http.c (built once,
 # in FUZZ_RT, with the flag applied to the whole single-command compile).
 fuzz-http: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-http: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_http.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_http tests/fuzz/corpus/http
@@ -335,6 +325,7 @@ fuzz-http: dirs
 # fragmentation/reassembly realloc path. Reuses -DSW_FUZZ_HTTP (both hooks
 # live in swarmrt_http.c).
 fuzz-ws: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-ws: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_ws.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_ws $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_ws tests/fuzz/corpus/ws
@@ -344,6 +335,7 @@ fuzz-ws: dirs
 # includes swarmrt_builtins_studio.h exactly like generated code, so it
 # drives the real static implementations.
 fuzz-db: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "fuzz-db: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
 	    tests/fuzz/fuzz_db.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_db $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
@@ -363,6 +355,7 @@ fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db
 # expected. tests/stress/isolation_fuzz.sw.
 .PHONY: isolation-gate
 isolation-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits isolation-gate
 	@./bin/swc build tests/stress/isolation_fuzz.sw -o $(BIN_DIR)/isolation_fuzz >/dev/null
 	@$(BIN_DIR)/isolation_fuzz >$(BIN_DIR)/_iso.out 2>/dev/null; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_iso.out; then \
@@ -382,6 +375,8 @@ isolation-gate: swc libswarmrt
 # Emits the generated C, compiles it + the runtime under the sanitizers, runs it.
 .PHONY: gc-stress
 gc-stress: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits gc-stress
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "gc-stress: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/sw/test_uaf_stress.sw -o $(BIN_DIR)/_gc_stress_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
 	    tests/sw/test_uaf_stress.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_stress $(LDFLAGS)
@@ -484,6 +479,7 @@ gc-stress: swc libswarmrt
 # regions (no leak / UAF / double-free on rejection).
 .PHONY: mailbox-flood
 mailbox-flood: dirs
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "mailbox-flood: FAIL (missing prerequisite, see above)"; exit 2; }
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) \
 	    tests/stress/mailbox_flood.c $(FUZZ_RT) -o $(BIN_DIR)/mailbox_flood $(LDFLAGS)
 	@SW_MAILBOX_MAX=1000 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood capped
@@ -499,6 +495,7 @@ mailbox-flood: dirs
 # and the capped run fails — the gate has been proven bidirectionally.
 .PHONY: quota-gate
 quota-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits quota-gate
 	@./bin/swc build tests/gc/quota_kill.sw -o $(BIN_DIR)/quota_kill >/dev/null
 	@SW_PROC_MEM_MAX=2000000 $(BIN_DIR)/quota_kill >$(BIN_DIR)/_qk.out 2>$(BIN_DIR)/_qk.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_qk.out; then \
@@ -527,6 +524,7 @@ quota-gate: swc libswarmrt
 # gate has been proven bidirectionally.
 .PHONY: msgsize-gate
 msgsize-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits msgsize-gate
 	@./bin/swc build tests/gc/msg_size_cap.sw -o $(BIN_DIR)/msg_size_cap >/dev/null
 	@SW_MSG_MAX_BYTES=65536 $(BIN_DIR)/msg_size_cap >$(BIN_DIR)/_mc.out 2>$(BIN_DIR)/_mc.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_mc.out; then \
@@ -544,6 +542,19 @@ msgsize-gate: swc libswarmrt
 	   cat $(BIN_DIR)/_mc.err; rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; exit 1; fi; \
 	 rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; \
 	 echo "msgsize-gate: PASS (bidirectional — big dropped under cap, intact uncapped)"
+
+# ETS entry written through a tool must outlive the writer process. The store
+# owns its value; base kept a raw pointer into the writer's freed tool region and
+# read back garbage (FAIL on base, PROBE_OK with the fix).
+.PHONY: ets-outlive-gate
+ets-outlive-gate: swc libswarmrt
+	@./bin/swc build tests/gc/ets_outlive_repro.sw -o $(BIN_DIR)/ets_outlive >/dev/null
+	@$(BIN_DIR)/ets_outlive >$(BIN_DIR)/_eo.out 2>$(BIN_DIR)/_eo.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_eo.out; then \
+	   echo "ets-outlive-gate: FAIL (rc=$$rc — tool-written ETS value lost its writer's region)"; \
+	   cat $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; \
+	 echo "ets-outlive-gate: PASS"
 
 # HTTP idle-timeout gate (SW_HTTP_IDLE_TIMEOUT_MS, slow-loris) — bidirectional.
 # Phase 1 (timeout 500ms): a full table of idle sockets is swept (slots
@@ -579,6 +590,7 @@ shutdown-gate: swc libswarmrt
 # bidirectionally.
 .PHONY: crashlog-gate
 crashlog-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits crashlog-gate
 	@./bin/swc build tests/obs/crash_json.sw -o $(BIN_DIR)/crash_json >/dev/null
 	@SW_LOG_JSON=1 $(BIN_DIR)/crash_json >$(BIN_DIR)/_cj.out 2>$(BIN_DIR)/_cj.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_cj.out; then \
@@ -625,6 +637,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw     200 2000   80 spawn    || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_message.sw   500 4000   80 msg      || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_turn.sw      5000 100000 80 turn     || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_mutual.sw    5000 100000 80 mutual   || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw      200 2000   80 pmap     || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \
@@ -632,7 +645,8 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  200  2000  10 interval || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
-	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
+	 bash scripts/gc_slope.sh tests/gc/slope_tool.sw      10000 100000 24 tool  || rc=1; \
+	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded, or a probe could not run — see above)"; \
 	 exit $$rc
 
 # LeakSanitizer lifecycle gate (Phase 2.1) — Linux only (macOS Apple-clang
@@ -649,6 +663,8 @@ lsan-gate: swc
 	@if [ "$$(uname)" != "Linux" ]; then \
 	  echo "lsan-gate: SKIP (LeakSanitizer requires Linux clang/gcc ASAN)"; exit 0; \
 	fi
+	@bash scripts/gate_common.sh gate_print_limits lsan-gate
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "lsan-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/lsan_lifecycle.sw -o $(BIN_DIR)/_lsan_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -g -O1 -fno-stack-protector \
 	    tests/gc/lsan_lifecycle.gen.c $(FUZZ_RT) -o $(BIN_DIR)/lsan_gate $(LDFLAGS)
@@ -673,6 +689,8 @@ lsan-gate: swc
 .PHONY: alloc-fault
 alloc-fault: swc
 	@if [ "$$(uname)" != "Linux" ]; then echo "alloc-fault: SKIP (needs Linux ASAN)"; exit 0; fi
+	@bash scripts/gate_common.sh gate_print_limits alloc-fault
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "alloc-fault: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/alloc_fault.sw -o $(BIN_DIR)/_af_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -DSW_ALLOC_FAULT -g -O1 -fno-stack-protector \
 	    tests/gc/alloc_fault.gen.c $(FUZZ_RT) -o $(BIN_DIR)/alloc_fault $(LDFLAGS)
@@ -711,10 +729,6 @@ stress: swc libswarmrt
 	@./tests/stress/run_stress.sh
 
 # Benchmarks
-benchmark: v1
-	$(CC) $(CFLAGS) $(SRC_DIR)/benchmark.c $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o -o $(BIN_DIR)/benchmark $(LDFLAGS)
-	./$(BIN_DIR)/benchmark
-
 benchmark-native: native
 	./$(BIN_DIR)/swarmrt-native
 
@@ -726,7 +740,7 @@ libswarmrt: core-objs
 swc: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
-		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c $(SRC_DIR)/swc_pkg.c \
+		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c $(SRC_DIR)/swc_pkg.c $(SRC_DIR)/swc_imports.c \
 		-o $(BIN_DIR)/swc $(LDFLAGS)
 
 # Example: compile a .sw file
@@ -737,10 +751,6 @@ example-counter: swc libswarmrt
 atelier: swc libswarmrt
 	@mkdir -p studio/output
 	./$(BIN_DIR)/swc build studio/atelier.sw -o $(BIN_DIR)/atelier --emit-c
-
-parse-test: v1
-	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/hello.sw
-	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/counter.sw
 
 # Search module (SIMD fuzzy + vector search)
 search: dirs
@@ -797,11 +807,14 @@ stats:
 # and the 80k spawn storm under -fsanitize=thread and fails on any
 # unsuppressed race. The fiber runtime is TSan-clean because cross-thread
 # fiber migration synchronizes through the runq's C11 atomics — TSan sees
-# the happens-before edges; no fiber annotations needed. Suppressions
-# (tests/stress/tsan.supp) cover only the documented warn-only watchdog
-# scanner. The storm runs its full 80k spawns — ~2 min under TSan.
+# the happens-before edges; no fiber annotations needed. The watchdog
+# scanner and sw_stats are race-free via _Atomic fields, so
+# tests/stress/tsan.supp holds no suppressions. The storm runs its full
+# 80k spawns — ~2 min under TSan.
 .PHONY: tsan-gate
 tsan-gate: swc
+	@bash scripts/gate_common.sh gate_print_limits tsan-gate
+	@bash scripts/gate_common.sh gate_need_tsan "$(FUZZ_CC)" || { echo "tsan-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/slope_message.sw -o $(BIN_DIR)/_tsm_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
 	    tests/gc/slope_message.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_msg $(LDFLAGS)

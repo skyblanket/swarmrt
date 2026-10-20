@@ -61,6 +61,27 @@ fun test_map_filter() {
     assert_eq("map_filter_size", map_size(kept), 2)
 }
 
+# Fold helpers
+fun test_reduce_sum() { assert_eq("reduce_sum", Std.reduce([1, 2, 3, 4], 0, fun(acc, x) { acc + x }), 10) }
+fun test_reduce_map() {
+    m = Std.reduce(["a", "bb", "ccc"], %{}, fun(acc, x) { map_put(acc, x, length(x)) })
+    assert_eq("reduce_map_size", map_size(m), 3)
+}
+fun test_reduce_empty() { assert_eq("reduce_empty", Std.reduce([], 42, fun(acc, x) { acc + x }), 42) }
+fun test_reduce_100k() {
+    assert_eq("reduce_100k", Std.reduce(Std.range(0, 100000), 0, fun(acc, x) { acc + x }), 4999950000)
+}
+fun test_reduce_while_halt() {
+    r = Std.reduce_while([1, 2, 3, 4, 5], 0, fun(acc, x) {
+        if (acc + x > 6) { {'halt', acc} } else { {'cont', acc + x} }
+    })
+    assert_eq("reduce_while_halt", r, 6)
+}
+fun test_reduce_while_done() {
+    r = Std.reduce_while([1, 2], 0, fun(acc, x) { {'cont', acc + x} })
+    assert_eq("reduce_while_done", r, 3)
+}
+
 fun main() {
     fails = 0
     fails = fails + test_range()
@@ -90,6 +111,12 @@ fun main() {
     fails = fails + test_string_pad_left()
     fails = fails + test_string_pad_right()
     fails = fails + test_map_filter()
-    if (fails == 0) { print("OK std 27/27") ; sys_exit(0) }
+    fails = fails + test_reduce_sum()
+    fails = fails + test_reduce_map()
+    fails = fails + test_reduce_empty()
+    fails = fails + test_reduce_100k()
+    fails = fails + test_reduce_while_halt()
+    fails = fails + test_reduce_while_done()
+    if (fails == 0) { print("OK std 33/33") ; sys_exit(0) }
     else { print("FAIL std " ++ to_string(fails)) ; sys_exit(1) }
 }
