@@ -2671,6 +2671,29 @@ static void tool_process_stats(json_node_t *args, jbuf_t *out) {
     jb_append(out, "}");
 }
 
+/* Write `s` into `out` as one POSIX shell word: wrapped in single quotes,
+ * with each embedded ' written as '\'' so nothing in the value is
+ * interpreted by the shell. Returns 0 if the result does not fit. */
+static int sh_quote(char *out, size_t outsz, const char *s) {
+    size_t n = 0;
+    if (outsz < 3) return 0;
+    out[n++] = '\'';
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') {
+            if (n + 5 > outsz) return 0;
+            memcpy(out + n, "'\\''", 4);
+            n += 4;
+        } else {
+            if (n + 2 > outsz) return 0;
+            out[n++] = *p;
+        }
+    }
+    if (n + 2 > outsz) return 0;
+    out[n++] = '\'';
+    out[n] = '\0';
+    return 1;
+}
+
 /* --- Autopilot tool implementations --- */
 
 static void tool_autopilot_start(json_node_t *args, jbuf_t *out) {
@@ -2768,11 +2791,15 @@ static void tool_autopilot_status(json_node_t *args, jbuf_t *out) {
 
     /* Git-aware: show modified + untracked files */
     {
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd),
-                 "cd '%s' && (git diff --name-only; git diff --name-only --cached; git ls-files --others --exclude-standard) 2>/dev/null | sort -u | head -30",
-                 g_project_root);
-        FILE *proc = popen(cmd, "r");
+        char qroot[sizeof(g_project_root) * 4 + 3];
+        char cmd[sizeof(qroot) + 512];
+        FILE *proc = NULL;
+        if (sh_quote(qroot, sizeof(qroot), g_project_root)) {
+            snprintf(cmd, sizeof(cmd),
+                     "cd %s && (git diff --name-only; git diff --name-only --cached; git ls-files --others --exclude-standard) 2>/dev/null | sort -u | head -30",
+                     qroot);
+            proc = popen(cmd, "r");
+        }
         if (proc) {
             jb_append(out, ",\"dirty_files\":[");
             char fbuf[1024];
@@ -2832,10 +2859,14 @@ static void tool_autopilot_step(json_node_t *args, jbuf_t *out) {
 
     /* Capture files changed since autopilot started (git awareness) */
     {
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "cd '%s' && git diff --name-only HEAD 2>/dev/null | head -30",
-                 g_project_root);
-        FILE *proc = popen(cmd, "r");
+        char qroot[sizeof(g_project_root) * 4 + 3];
+        char cmd[sizeof(qroot) + 128];
+        FILE *proc = NULL;
+        if (sh_quote(qroot, sizeof(qroot), g_project_root)) {
+            snprintf(cmd, sizeof(cmd), "cd %s && git diff --name-only HEAD 2>/dev/null | head -30",
+                     qroot);
+            proc = popen(cmd, "r");
+        }
         if (proc) {
             jb_append(out, ",\"files_changed\":[");
             char fbuf[1024];
