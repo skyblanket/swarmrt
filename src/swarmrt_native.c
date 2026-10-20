@@ -2154,7 +2154,11 @@ void sw_shutdown(int swarm_id) {
         g_watchdog_enabled = 0;
     }
 
-    /* Stop all schedulers */
+    /* Quiesce every scheduler before freeing any of them. A scheduler still
+     * running a fiber can wake a peer through wake_one_idle_scheduler, which
+     * scans the whole schedulers[] array, so no struct may be freed or have
+     * its mutex/cond destroyed while another scheduler thread is alive. Signal
+     * all, join all, then tear down. */
     for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
         sw_scheduler_t *sched = g_swarm->schedulers[i];
         sched->should_exit = 1;
@@ -2162,7 +2166,11 @@ void sw_shutdown(int swarm_id) {
         pthread_mutex_lock(&sched->runq.idle_lock);
         pthread_cond_signal(&sched->runq.idle_cond);
         pthread_mutex_unlock(&sched->runq.idle_lock);
-        pthread_join(sched->thread, NULL);
+    }
+    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++)
+        pthread_join(g_swarm->schedulers[i]->thread, NULL);
+    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
+        sw_scheduler_t *sched = g_swarm->schedulers[i];
         pthread_mutex_destroy(&sched->runq.idle_lock);
         pthread_cond_destroy(&sched->runq.idle_cond);
         free(sched);
