@@ -48,7 +48,7 @@ gate_need_asan() {
     elif $cc --version 2>/dev/null | grep -qi clang; then
         echo "missing ASAN/UBSAN runtime for '$cc': install libclang-rt-${ver}-dev (sudo apt-get install libclang-rt-${ver}-dev)"
     else
-        echo "missing ASAN/UBSAN runtime for '$cc': install libasan${ver} and libubsan${ver} (sudo apt-get install libasan${ver} libubsan${ver})"
+        echo "missing ASAN/UBSAN runtime for '$cc': install libgcc-${ver}-dev (sudo apt-get install libgcc-${ver}-dev)"
     fi
     return 1
 }
@@ -64,7 +64,7 @@ gate_need_tsan() {
     elif $cc --version 2>/dev/null | grep -qi clang; then
         echo "missing TSan runtime for '$cc': install libclang-rt-${ver}-dev (sudo apt-get install libclang-rt-${ver}-dev)"
     else
-        echo "missing TSan runtime for '$cc': install libtsan${ver} (sudo apt-get install libtsan${ver})"
+        echo "missing TSan runtime for '$cc': install libgcc-${ver}-dev (sudo apt-get install libgcc-${ver}-dev)"
     fi
     return 1
 }
