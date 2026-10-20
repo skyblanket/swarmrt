@@ -2286,13 +2286,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         /* Gleam-style hint for the qualified-builtin reflex. Std.map and
          * Std.filter are REAL module functions now (lib/Std.sw aliases over
          * the global builtins — the Elixir-shaped guess models emit), so
-         * only the names with no Std alias stay on this denylist:
-         * Std.reduce can't exist (Std's own sum/product call the global
-         * `reduce` bare; a same-named module fun would shadow it) and pmap
-         * has no alias either. */
+         * only the names with no Std alias stay on this denylist: pmap
+         * has no alias. Std.reduce is a real module fun now (lib/Std.sw). */
         const char *gf = dot + 1;
-        if ((strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) &&
-            strcmp(mod, "Std") == 0) {
+        if (strcmp(gf, "pmap") == 0 && strcmp(mod, "Std") == 0) {
             fprintf(stderr, "swc: src/%s.sw:%d: %s is a global builtin \xe2\x80\x94 write %s(fn, list, ...), not %s(...)\n",
                     ctx->mod_name, n->line, gf, gf, fname);
             ctx->had_unknown_fn = 1;
