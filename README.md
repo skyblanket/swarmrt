@@ -37,6 +37,10 @@ fun grade(task) {
 
 fun main() {
     tasks = json_decode(file_read("tasks.json"))
+    if (tasks == nil) {
+        eprint("tasks.json is missing or not valid JSON")
+        sys_exit(1)
+    }
     results = Std.task_stream(tasks, fn(t) { grade(t) },
                               %{max_concurrency: 64, timeout_ms: 30000})
     passed = length(filter(results, fn(r) { r == {'ok', 'pass'} }))
@@ -44,6 +48,8 @@ fun main() {
     print(f"pass {passed} fail {failed} error {length(tasks) - passed - failed}")
 }
 ```
+
+The runner reads `tasks.json`, a list of `{prompt, expect}` objects, not the `tasks.txt` that the agent template fans out. If the file is missing or is not valid JSON, it prints an error to stderr and exits 1 rather than reporting zero tasks.
 
 Against a local mock with 500 ms latency, 200 prompts run in 2.1 s on 4 cores: four waves of 64, so the runtime adds about 0.1 s to the network wait. With one grader made to panic and another to hang forever, the same run prints `pass 100 fail 98 error 2` and finishes at its deadline. One bad grader costs one cell, not the run.
 
