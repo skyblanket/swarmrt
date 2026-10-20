@@ -598,6 +598,29 @@ static int ws_origin_allowed(const sw_http_bridge_t *b, const char *origin,
     return host && strlen(host) == alen && strncasecmp(auth, host, alen) == 0;
 }
 
+/* SW_HTTP_HOSTS (comma list, opt-in): the Host values this server answers
+ * to. Unset or empty = no check. Otherwise the request's Host must match an
+ * entry exactly (case-insensitive, port included, as the client sent it);
+ * a request with no Host fails closed. A DNS-rebinding page controls Host
+ * and Origin together, so the same-origin rule above cannot tell it apart. */
+static int http_host_allowed(const char *host) {
+    const char *p = getenv("SW_HTTP_HOSTS");
+    if (!p || !*p) return 1;
+    size_t hlen = strlen(host);
+    if (!hlen) return 0;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        const char *e = p;
+        while (*e && *e != ',') e++;
+        const char *t = e;
+        while (t > p && (t[-1] == ' ' || t[-1] == '\t')) t--;
+        size_t n = (size_t)(t - p);
+        if (n && n == hlen && strncasecmp(p, host, n) == 0) return 1;
+        p = e;
+    }
+    return 0;
+}
+
 /* Header MAP for a saved raw header block (c->req_hdr: header lines, each
  * CRLF-terminated, NUL after the last), in the CALLING process's heap. NULL
  * → empty map. */
@@ -905,6 +928,14 @@ static void http_try_parse(int cid, sw_port_t *port) {
     if (remaining > 0)
         memmove(c->buf, c->buf + header_len, remaining);
     c->buf_len = remaining;
+
+    /* DNS-rebinding guard (SW_HTTP_HOSTS): applies to every request, not
+     * only upgrades, so a rebound page cannot read plain HTTP responses. */
+    if (!http_host_allowed(host)) {
+        c->keep_alive = 0;
+        sw_http_respond(cid, 403, NULL, "Forbidden: Host not allowed");
+        return;
+    }
 
     if (is_upgrade && ws_key[0]) {
         /* WebSocket upgrade. The upgrade request's headers (Origin,
