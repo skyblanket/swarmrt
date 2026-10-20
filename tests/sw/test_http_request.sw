@@ -20,6 +20,14 @@ module Test_http_request
 #
 # Exits non-zero on any failure so the driver rolls it up.
 
+# Listener port for this test. run_tests.sh gives each run its own
+# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
+# run by hand, the base falls back to 9000.
+fun test_port(offset) {
+    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
+    base + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -35,7 +43,7 @@ fun assert_eq(name, actual, expected) {
 # header surfaces, (c) the body surfaces, AND (d) the opts-supplied request
 # method + headers actually reached the server.
 fun teapot_server() {
-    http_listen(9137)
+    http_listen(test_port(137))
     teapot_loop()
 }
 
@@ -98,7 +106,7 @@ fun main() {
     opts_map = map_put(
         map_put(map_new(), "method", "GET"),
         "headers", map_put(map_new(), "Authorization", "Bearer get-tok"))
-    r1 = req_retry("http://127.0.0.1:9137/brew", opts_map, 100)
+    r1 = req_retry(f"http://127.0.0.1:{test_port(137)}/brew", opts_map, 100)
     fails = fails + check_resp(r1, "http_request_map", "GET|Bearer get-tok")
 
     # (2) POST, headers supplied as a LIST of {name, value} tuples + a body.
@@ -109,14 +117,14 @@ fun main() {
             map_put(map_new(), "method", "POST"),
             "headers", [{"Authorization", "Bearer post-tok"}]),
         "body", "ignored-body")
-    r2 = req_retry("http://127.0.0.1:9137/brew", opts_list, 100)
+    r2 = req_retry(f"http://127.0.0.1:{test_port(137)}/brew", opts_list, 100)
     fails = fails + check_resp(r2, "http_request_list", "POST|Bearer post-tok")
 
     # (3) method as an ATOM ('POST'), the form http_listen delivers. The
     #     server and client must take the same spelling, so this proves
     #     %{method: 'POST'} sends exactly what %{method: "POST"} sends.
     opts_atom = map_put(map_put(map_new(), "method", 'POST'), "body", "x")
-    r3 = req_retry("http://127.0.0.1:9137/brew", opts_atom, 100)
+    r3 = req_retry(f"http://127.0.0.1:{test_port(137)}/brew", opts_atom, 100)
     fails = fails + check_resp(r3, "http_request_atom", "POST|<none>")
 
     if (fails == 0) { print("OK test_http_request 9/9") sys_exit(0) }

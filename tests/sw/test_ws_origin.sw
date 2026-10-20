@@ -18,6 +18,14 @@ module Test_ws_origin
 # body runs in a child with SW_SCHEDULERS=2 (the server keeps one) and with
 # SW_WS_ORIGINS set before the runtime starts.
 
+# Listener port for this test. run_tests.sh gives each run its own
+# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
+# run by hand, the base falls back to 9000.
+fun test_port(offset) {
+    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
+    base + offset
+}
+
 fun serve() {
     receive {
         {'ws_connect', _conn, _path} -> serve()
@@ -32,7 +40,7 @@ fun upgrade(host, origin) {
            " -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='"
     h = if (host == "") { "" } else { " -H 'Host: " ++ host ++ "'" }
     o = if (origin == "") { "" } else { " -H 'Origin: " ++ origin ++ "'" }
-    string_trim(elem(shell(base ++ h ++ o ++ " http://127.0.0.1:9168/ws 2>/dev/null"), 1))
+    string_trim(elem(shell(base ++ h ++ o ++ f" http://127.0.0.1:{test_port(168)}/ws 2>/dev/null"), 1))
 }
 
 fun check(name, host, origin, want) {
@@ -42,7 +50,7 @@ fun check(name, host, origin, want) {
 }
 
 fun wait_up(attempts) {
-    r = http_request("http://127.0.0.1:9168/ping", %{})
+    r = http_request(f"http://127.0.0.1:{test_port(168)}/ping", %{})
     case r {
         {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) }
         _ -> 'up'
@@ -51,7 +59,7 @@ fun wait_up(attempts) {
 
 fun child() {
     spawn(fun() {
-        http_listen(9168, %{ws_origins: ["https://app.example", "https://two.example/"]})
+        http_listen(test_port(168), %{ws_origins: ["https://app.example", "https://two.example/"]})
         serve()
     })
     if (wait_up(100) != 'up') { print("FAIL server_up") ; sys_exit(1) }
@@ -64,8 +72,8 @@ fun child() {
     fails = fails + check("opt_trailing_slash", "", "https://two.example", "101")
     fails = fails + check("env_origin_allowed", "", "https://env.example", "101")
     fails = fails + check("loopback_origin_allowed", "", "http://localhost:3000", "101")
-    fails = fails + check("same_origin_allowed", "chat.example:9168", "https://chat.example:9168", "101")
-    fails = fails + check("cross_port_refused", "chat.example:9168", "https://chat.example:4444", "403")
+    fails = fails + check("same_origin_allowed", f"chat.example:{test_port(168)}", f"https://chat.example:{test_port(168)}", "101")
+    fails = fails + check("cross_port_refused", f"chat.example:{test_port(168)}", "https://chat.example:4444", "403")
     sys_exit(fails)
 }
 

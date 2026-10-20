@@ -13,8 +13,16 @@ module Test_http_port_free
 
 import Std
 
+# Listener port for this test. run_tests.sh gives each run its own
+# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
+# run by hand, the base falls back to 9000.
+fun test_port(offset) {
+    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
+    base + offset
+}
+
 fun server() {
-    http_listen(9161)
+    http_listen(test_port(161))
     serve()
 }
 
@@ -27,7 +35,7 @@ fun serve() {
 }
 
 fun wait_up(attempts) {
-    r = http_request("http://127.0.0.1:9161/ping", %{})
+    r = http_request(f"http://127.0.0.1:{test_port(161)}/ping", %{})
     case r {
         {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) }
         _ -> 'up'
@@ -37,7 +45,7 @@ fun wait_up(attempts) {
 fun hangups(i, n, ok) {
     if (i == n) { ok }
     else {
-        body = http_get("http://127.0.0.1:9161/x")
+        body = http_get(f"http://127.0.0.1:{test_port(161)}/x")
         hangups(i + 1, n, if (body == "ok") { ok + 1 } else { ok })
     }
 }
@@ -45,7 +53,7 @@ fun hangups(i, n, ok) {
 fun server_closes(i, n, ok) {
     if (i == n) { ok }
     else {
-        r = http_request("http://127.0.0.1:9161/c", %{headers: %{"Connection" => "close"}})
+        r = http_request(f"http://127.0.0.1:{test_port(161)}/c", %{headers: %{"Connection" => "close"}})
         good = case r { {'error', _} -> false _ -> true }
         server_closes(i + 1, n, if (good) { ok + 1 } else { ok })
     }
@@ -54,7 +62,7 @@ fun server_closes(i, n, ok) {
 fun ws_rounds(i, n, ok) {
     if (i == n) { ok }
     else {
-        h = wsc_connect("ws://127.0.0.1:9161/ws")
+        h = wsc_connect(f"ws://127.0.0.1:{test_port(161)}/ws")
         good = case h {
             'nil' -> false
             _ -> wsc_send(h, "bye") ; wsc_recv(h, 2000) ; wsc_close(h) ; true

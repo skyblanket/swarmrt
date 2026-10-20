@@ -33,6 +33,27 @@ elif command -v gtimeout >/dev/null 2>&1; then RUN_TO() { gtimeout "$@"; }
 else                                           RUN_TO() { shift; "$@"; }
 fi
 
+# Tests that listen on a TCP port take it from SW_TEST_PORT_BASE + a fixed
+# per-listener offset (see test_port() in each file). A fresh random base per
+# run keeps two suite runs on one host (CI legs, parallel worktrees) off each
+# other's ports. Range 20000-60000 keeps clear of well-known ports.
+new_port_base() { echo $(( 20000 + (RANDOM * 32768 + RANDOM) % 40000 )); }
+
+# Runs one compiled test: <timeout> <binary> <log>. A listener that cannot bind
+# means another run holds the port, so the test is re-run on a fresh base (up
+# to three tries). The log holds the last attempt only.
+run_test_bin() {
+    local tries=0
+    while :; do
+        tries=$((tries + 1))
+        SW_TEST_PORT_BASE=$(new_port_base)
+        export SW_TEST_PORT_BASE
+        RUN_TO "$1" "$2" >"$3" 2>&1 && return 0
+        grep -qE 'cannot listen on [0-9.]+:[0-9]+' "$3" && [ "$tries" -lt 3 ] || return 1
+        echo "${DIM}    $(basename "$2"): port in use, retrying on a new port base${RESET}"
+    done
+}
+
 mkdir -p "$BUILD_DIR"
 
 # Color helpers (skip if not a TTY).
@@ -68,7 +89,7 @@ for sw in "$TESTS_DIR"/test_*.sw; do
     # deadlocking under SW_SCHEDULERS=1 (blocking curl client starves the
     # in-process server fiber on the only scheduler) and the suite sat on
     # it indefinitely. 180s is ~20x the slowest healthy test.
-    if RUN_TO 180 "$bin" >"$log" 2>&1; then
+    if run_test_bin 180 "$bin" "$log"; then
         # Pull the summary line + count any PASS lines for the rollup.
         passes=$(grep -c '^PASS ' "$log" || true)
         total_assertions=$((total_assertions + passes))
@@ -244,7 +265,7 @@ if [ -d "$INVM_DIR" ] && [ "${SW_TEST_INVM:-0}" = "1" ]; then
         # alarm). Pass on the first attempt that exits 0.
         rc=1
         for _attempt in 1 2 3; do
-            SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 60; exec @ARGV or die' \
+            SW_TEST_PORT_BASE=$(new_port_base) SW_QUIET=1 SW_SCHEDULERS=1 perl -e 'alarm 60; exec @ARGV or die' \
                 "$bin" >"$log" 2>&1
             rc=$?
             [ "$rc" -eq 0 ] && break

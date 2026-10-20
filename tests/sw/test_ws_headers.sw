@@ -29,6 +29,14 @@ module Test_ws_headers
 #
 # Exits non-zero on any failure so the driver rolls it up.
 
+# Listener port for this test. run_tests.sh gives each run its own
+# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
+# run by hand, the base falls back to 9000.
+fun test_port(offset) {
+    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
+    base + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -39,7 +47,7 @@ fun assert_eq(name, actual, expected) {
 }
 
 fun ws_header_server() {
-    http_listen(9132)
+    http_listen(test_port(132))
     ws_header_loop()
 }
 
@@ -75,7 +83,7 @@ fun ws_connect_retry(url, attempts) {
 fun main() {
     spawn(fun() { ws_header_server() })
 
-    wh = ws_connect_retry("ws://127.0.0.1:9132/telnyx/media", 100)
+    wh = ws_connect_retry(f"ws://127.0.0.1:{test_port(132)}/telnyx/media", 100)
     fails = 0
     case wh {
         'nil' ->

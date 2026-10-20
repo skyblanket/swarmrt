@@ -12,8 +12,16 @@ module Test_http_offload
 # >= 2.4s; offloaded it is ~0.3s. We allow a generous 1.5s to stay robust
 # on a loaded CI host, and the test must pass even with SW_SCHEDULERS=1.
 
+# Listener port for this test. run_tests.sh gives each run its own
+# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
+# run by hand, the base falls back to 9000.
+fun test_port(offset) {
+    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
+    base + offset
+}
+
 fun slow_server() {
-    http_listen(9151)
+    http_listen(test_port(151))
     slow_loop()
 }
 
@@ -27,7 +35,7 @@ fun slow_loop() {
 }
 
 fun wait_up(attempts) {
-    r = http_request("http://127.0.0.1:9151/ping", %{})
+    r = http_request(f"http://127.0.0.1:{test_port(151)}/ping", %{})
     case r {
         {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) }
         _ -> 'up'
@@ -35,7 +43,7 @@ fun wait_up(attempts) {
 }
 
 fun client(parent, i) {
-    body = http_get("http://127.0.0.1:9151/x")
+    body = http_get(f"http://127.0.0.1:{test_port(151)}/x")
     send(parent, {'got', i, body})
 }
 
