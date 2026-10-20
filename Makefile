@@ -73,13 +73,15 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v1 v2 proc native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
-        test test-v1 test-v2 test-proc test-native test-otp test-phase2 test-phase3 test-phase4 \
+.PHONY: all clean v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
+        test test-v2 test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
-        test-sw benchmark benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
+        test-sw benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
         sws mcp mcp-wrap examples
 
-all: v1 v2 proc native
+# Default goal: the compiler and runtime library. The legacy prototypes
+# (swarmrt_simple/swarmrt/swarmrt_proc) live in attic/ and are not built.
+all: swc libswarmrt
 
 # Compile rules for core objects
 $(BUILD_DIR)/swarmrt_asm.o: $(SRC_DIR)/swarmrt_asm.S | dirs
@@ -95,21 +97,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | dirs
 
 core-objs: $(CORE_OBJS)
 
-v1: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_simple.c -o $(BUILD_DIR)/swarmrt_simple.o
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/parser.c -o $(BUILD_DIR)/parser.o
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o $(SRC_DIR)/main.c -o $(BIN_DIR)/swarmrt-v1 $(LDFLAGS)
-
 v2: dirs
 	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_v2.c -o $(BUILD_DIR)/swarmrt_v2.o
 	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_v2.o $(SRC_DIR)/test_v2.c -o $(BIN_DIR)/swarmrt-v2 $(LDFLAGS)
-
-# Process subsystem build (with optional assembly context switching)
-proc: dirs
-	$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_proc.c -o $(BUILD_DIR)/swarmrt_proc.o
-	@$(CC) $(CFLAGS) -c $(SRC_DIR)/swarmrt_context.S -o $(BUILD_DIR)/swarmrt_context.o 2>/dev/null || true
-	@$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(BUILD_DIR)/swarmrt_context.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS) 2>/dev/null || \
-	$(CC) $(CFLAGS) $(BUILD_DIR)/swarmrt_proc.o $(SRC_DIR)/test_proc.c -o $(BIN_DIR)/swarmrt-proc $(LDFLAGS)
 
 # Native runtime (benchmark)
 native: core-objs
@@ -139,14 +129,8 @@ dirs:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR)
 
 # Test targets
-test-v1: v1
-	./$(BIN_DIR)/swarmrt-v1 test
-
 test-v2: v2
 	./$(BIN_DIR)/swarmrt-v2
-
-test-proc: proc
-	./$(BIN_DIR)/swarmrt-proc
 
 test-native: native
 	./$(BIN_DIR)/swarmrt-native
@@ -205,11 +189,11 @@ test-phase10: phase10
 h2h: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/benchmark_h2h.c -o $(BIN_DIR)/bench-h2h $(LDFLAGS)
 
-test: test-v1 test-v2 test-proc
+test: test-v2
 
 # Core test gate (what test-all used to be). Kept as a named alias so
 # callers can depend on it without hard-coding the list.
-test-core: test-v1 test-v2 test-proc test-native test-sw
+test-core: test-v2 test-native test-sw
 
 # Backward-compat alias — contributors/scripts that invoke `make test-all`
 # continue to work unchanged.
@@ -217,7 +201,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection
+test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.
@@ -235,6 +219,7 @@ examples: swc libswarmrt
 test-sw: swc libswarmrt
 	@./tests/sw/run_tests.sh
 	@./tests/sw/run_conform.sh
+	@./tests/sw/run_stub_warn.sh
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.
@@ -557,6 +542,19 @@ msgsize-gate: swc libswarmrt
 	 rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; \
 	 echo "msgsize-gate: PASS (bidirectional — big dropped under cap, intact uncapped)"
 
+# ETS entry written through a tool must outlive the writer process. The store
+# owns its value; base kept a raw pointer into the writer's freed tool region and
+# read back garbage (FAIL on base, PROBE_OK with the fix).
+.PHONY: ets-outlive-gate
+ets-outlive-gate: swc libswarmrt
+	@./bin/swc build tests/gc/ets_outlive_repro.sw -o $(BIN_DIR)/ets_outlive >/dev/null
+	@$(BIN_DIR)/ets_outlive >$(BIN_DIR)/_eo.out 2>$(BIN_DIR)/_eo.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_eo.out; then \
+	   echo "ets-outlive-gate: FAIL (rc=$$rc — tool-written ETS value lost its writer's region)"; \
+	   cat $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; \
+	 echo "ets-outlive-gate: PASS"
+
 # HTTP idle-timeout gate (SW_HTTP_IDLE_TIMEOUT_MS, slow-loris) — bidirectional.
 # Phase 1 (timeout 500ms): a full table of idle sockets is swept (slots
 # freed), an established-but-quiet WS conn survives (exempt by default), and
@@ -645,6 +643,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  200  2000  10 interval || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_tool.sw      10000 100000 24 tool  || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded, or a probe could not run — see above)"; \
 	 exit $$rc
 
@@ -728,10 +727,6 @@ stress: swc libswarmrt
 	@./tests/stress/run_stress.sh
 
 # Benchmarks
-benchmark: v1
-	$(CC) $(CFLAGS) $(SRC_DIR)/benchmark.c $(BUILD_DIR)/swarmrt_simple.o $(BUILD_DIR)/parser.o -o $(BIN_DIR)/benchmark $(LDFLAGS)
-	./$(BIN_DIR)/benchmark
-
 benchmark-native: native
 	./$(BIN_DIR)/swarmrt-native
 
@@ -754,10 +749,6 @@ example-counter: swc libswarmrt
 atelier: swc libswarmrt
 	@mkdir -p studio/output
 	./$(BIN_DIR)/swc build studio/atelier.sw -o $(BIN_DIR)/atelier --emit-c
-
-parse-test: v1
-	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/hello.sw
-	./$(BIN_DIR)/swarmrt-v1 parse $(EXAMPLES_DIR)/counter.sw
 
 # Search module (SIMD fuzzy + vector search)
 search: dirs

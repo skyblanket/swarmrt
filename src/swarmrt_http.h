@@ -55,7 +55,12 @@
  * list; both lists apply; "*" allows any). An upgrade with NO Origin is
  * accepted: browsers always send one, so its absence means a non-browser
  * client (wsc_connect, curl, a telephony provider), which Origin checks do
- * not constrain anyway. */
+ * not constrain anyway.
+ *
+ * The same-origin rule trusts Host, so a DNS-rebinding page passes it. The
+ * SW_HTTP_HOSTS env var (comma list of Host values, e.g. localhost:4100)
+ * closes that: when set, every request whose Host is not listed gets 403,
+ * upgrades and plain HTTP alike. Unset = no check. */
 typedef struct {
     const char *bind;        /* IPv4 address; NULL/"" = SW_HTTP_BIND or 127.0.0.1 */
     const char *ws_origins;  /* comma-separated allowlist; NULL = none */
