@@ -382,6 +382,8 @@ isolation-gate: swc libswarmrt
 # Emits the generated C, compiles it + the runtime under the sanitizers, runs it.
 .PHONY: gc-stress
 gc-stress: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits gc-stress
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "gc-stress: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/sw/test_uaf_stress.sw -o $(BIN_DIR)/_gc_stress_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) $(SAN) -DSW_ARENA_POISON \
 	    tests/sw/test_uaf_stress.gen.c $(FUZZ_RT) -o $(BIN_DIR)/gc_stress $(LDFLAGS)
@@ -632,7 +634,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  200  2000  10 interval || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
-	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
+	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded, or a probe could not run — see above)"; \
 	 exit $$rc
 
 # LeakSanitizer lifecycle gate (Phase 2.1) — Linux only (macOS Apple-clang
@@ -673,6 +675,7 @@ lsan-gate: swc
 .PHONY: alloc-fault
 alloc-fault: swc
 	@if [ "$$(uname)" != "Linux" ]; then echo "alloc-fault: SKIP (needs Linux ASAN)"; exit 0; fi
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "alloc-fault: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/alloc_fault.sw -o $(BIN_DIR)/_af_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -DSW_ALLOC_FAULT -g -O1 -fno-stack-protector \
 	    tests/gc/alloc_fault.gen.c $(FUZZ_RT) -o $(BIN_DIR)/alloc_fault $(LDFLAGS)

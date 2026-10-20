@@ -14,6 +14,12 @@ make swc libswarmrt
 ./bin/swc build examples/counter.sw -o /tmp/counter && /tmp/counter
 ```
 
+The ASAN gates (`make gc-stress`, `make alloc-fault`, `make isolation-gate`,
+and `scripts/gc_asan_run.sh`) also need the sanitizer runtime that matches
+your clang. On Ubuntu/Debian install `libclang-rt-<N>-dev`, where `<N>` is the
+major version from `clang --version` (for example `libclang-rt-18-dev`). If it
+is missing, the gate stops with a message that names the package.
+
 ## Running the tests
 
 Before opening a PR, run what CI runs:
