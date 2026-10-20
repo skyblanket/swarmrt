@@ -476,7 +476,7 @@ Swarm.print_tree()   # prints an indented tree, returns the root count
 
 `top()` is a flat snapshot; `tree()` reconstructs the hierarchy from each process's parent link (set by `spawn_link` / the supervisors), so a worker started with `sup_start_child` shows up nested under its supervisor. Use it to drive a LiveView dashboard, log a periodic census, or just answer "what's alive and who's supervising it?" while debugging.
 
-It's a thin pure-sw library over the `process_list` / `process_info` builtins. Under `swc run` it works once the program has `import Swarm`; without the import, `Swarm.top()` fails with `undefined function`. Under `swc test` and the REPL no runtime is booted, so there are no live processes to read: `process_list()` returns `[]`, and `Swarm.top()` fails with `undefined function` even with the import. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
+It's a thin pure-sw library over the `process_list` / `process_info` builtins. Under `swc run` it works once the program has `import Swarm`; without the import, `Swarm.top()` fails with `undefined function`. Under `swc test` and the REPL no runtime is booted, so there are no live processes to read: `process_list()` returns `[]`, so `Swarm.top()` (with `import Swarm`) returns `[]` too. The reads are best-effort and lock-free (the same contract as the deadlock watchdog), so `messages` is the drained-mailbox depth, not every byte in flight — fine for observability, don't build control flow on exact counts.
 
 ---
 
@@ -570,6 +570,33 @@ process `ws_set_handler` re-homed the connection to) as one of these messages:
 {'ws_binary',    conn, b64}                            # a WS binary frame (base64)
 {'ws_close',     conn}                                 # the WS closed
 ```
+
+`method` is an **atom** (`'GET'`, `'POST'`, `'PUT'`, `'DELETE'`), not a string.
+`'POST' == "POST"` is false, so a route written as `method == "POST"` never
+matches. Match the atom in the message pattern:
+
+```sw
+module RouteDemo
+export [main]
+
+# Match the request method as an atom: 'POST', not "POST".
+fun route(msg) {
+    case msg {
+        {'http_request', _conn, 'POST', path, _headers, body} -> "post " ++ path ++ " " ++ body   # => post /echo x
+        {'http_request', _conn, 'GET', path, _headers, _body} -> "get " ++ path                  # => get /health
+        _ -> "other"
+    }
+}
+
+fun main() {
+    print(route({'http_request', 1, 'POST', "/echo", map_new(), "x"}))
+    print(route({'http_request', 2, 'GET', "/health", map_new(), ""}))
+    print(route({'http_request', 3, 'DELETE', "/x", map_new(), ""}))   # => other
+}
+```
+
+`http_request`'s own `method` option accepts either spelling, so
+`%{method: 'POST'}` and `%{method: "POST"}` send the same request.
 
 `headers` is a **MAP with lowercased keys** — so a bearer-token check or a
 webhook-signature read works in-process, regardless of on-the-wire casing:

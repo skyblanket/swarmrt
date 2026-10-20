@@ -83,6 +83,7 @@ add_executable(swc
     ${SRC_DIR}/swarmrt_battery_interp.c
     ${SRC_DIR}/swarmrt_new.c
     ${SRC_DIR}/swc_pkg.c
+    ${SRC_DIR}/swc_imports.c
 )
 target_link_libraries(swc swarmrt_lib)
 

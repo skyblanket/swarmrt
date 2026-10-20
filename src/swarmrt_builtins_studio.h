@@ -1210,6 +1210,15 @@ static inline sw_process_t *_sw_offl_self(void) {
     return p ? p : _sw_offl_waiter;
 }
 
+/* The process a builtin is waiting for has been killed or is gone. The kill
+ * path frees the slot without resuming the caller, and a new process can
+ * reuse the slot (clearing kill_flag), so also compare the never-reused
+ * numeric pid captured at the start. */
+static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
+    if (!p) return 0;
+    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
+}
+
 typedef struct {
     sw_val_t *(*fn)(sw_val_t **, int);
     sw_val_t **args;
@@ -5200,7 +5209,8 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
  *
  *   url   : string (required)
  *   opts  : map (optional) with keys —
- *             method  : string, e.g. "GET"/"POST"/"PUT"/"DELETE" (default GET)
+ *             method  : "GET"/"POST"/"PUT"/"DELETE" — a string OR an atom
+ *                       ('GET'/'POST', the form http_listen delivers) (default GET)
  *             headers : a MAP {name=>value} OR a list of {name, value} tuples
  *             body    : string request body (sent via --data-binary)
  *
@@ -5356,7 +5366,10 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     if (opts && opts->type == SW_VAL_MAP) {
         sw_val_t *km = sw_val_string("method");
         sw_val_t *mv = sw_val_map_get(opts, km);
-        if (mv && mv->type == SW_VAL_STRING && mv->v.str[0]) method = mv->v.str;
+        /* An atom ('POST') is the same verb as a string ("POST"): http_listen
+         * delivers the request method as an atom, so accept both spellings. */
+        if (mv && (mv->type == SW_VAL_STRING || mv->type == SW_VAL_ATOM) && mv->v.str[0])
+            method = mv->v.str;
         sw_val_t *kb = sw_val_string("body");
         sw_val_t *bv = sw_val_map_get(opts, kb);
         if (bv && bv->type == SW_VAL_STRING) body = bv->v.str;
@@ -5715,6 +5728,7 @@ static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_le
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_shell, a, n);
     const char *cmd = a[0]->v.str;
 
     /* Temp files for captured output and exit status */
@@ -5775,8 +5789,14 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
         pgroup + C timeout + killpg). 120s stays well above any legit
         fast/local shell() use. */
     off_t last_size = 0;
+    /* The caller can be killed while we poll: stop waiting for it then, as
+     * the timeout below does (its background command is not killed here). */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     while (!done && waited_us < max_wait_us) {
+        if (_sw_caller_gone(caller, caller_id)) break;
+
         /* Check if command finished — BEFORE sleeping, so an already-done
          * command costs one fopen, not a poll interval. */
         FILE *ef = fopen(exitf, "r");
@@ -5969,12 +5989,15 @@ static sw_val_t *_sw_managed_tuple(int code, const char *msg) {
 }
 
 static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
-    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_managed_tuple(-1, "error: shell_managed needs a string command");
 #ifdef _WIN32
     return _sw_managed_tuple(-1, "error: shell_managed unsupported on this platform");
 #else
+    /* Wait on a worker thread, not this scheduler: a shell_managed that
+     * runs for minutes must not pin the scheduler (N of them froze every
+     * other process). */
+    SW_OFFLOAD_BUILTIN(_builtin_shell_managed, a, n);
     const char *cmd = a[0]->v.str;
     int64_t timeout_ms =
         (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) ? a[1]->v.i : 0;
@@ -6006,16 +6029,23 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
     int timed_out = 0;
     int done = 0;
     int oom = 0;
+    /* The caller can be killed while we wait: treat that like an interrupt
+     * so the child's process group is killed rather than left running. */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     while (!done) {
-        /* Remaining wall-clock budget; tick at least once per second so a
-         * huge timeout still re-checks, and so a quiet child can't wedge us. */
-        int64_t remaining_ms = 1000;
+        if (_sw_caller_gone(caller, caller_id)) { interrupted = 1; break; }
+
+        /* Remaining wall-clock budget; tick at least every 100 ms so a huge
+         * timeout still re-checks, a quiet child can't wedge us, and a killed
+         * caller is noticed promptly (as exec_managed's poll does). */
+        int64_t remaining_ms = 100;
         if (timeout_ms > 0) {
             int64_t elapsed = (int64_t)(_sw_now_ms() - t_start);
             if (elapsed >= timeout_ms) { timed_out = 1; interrupted = 1; break; }
             remaining_ms = timeout_ms - elapsed;
-            if (remaining_ms > 1000) remaining_ms = 1000;
+            if (remaining_ms > 100) remaining_ms = 100;
         }
 
         fd_set rfds;
@@ -6212,15 +6242,6 @@ static const char *_sw_exec_opt_str(sw_val_t *opts, const char *key) {
     return (v && v->type == SW_VAL_STRING) ? v->v.str : NULL;
 }
 
-/* The process exec_managed waits for has been killed or is gone. The kill
- * path frees the slot without resuming the caller, and a new process can
- * reuse the slot (clearing kill_flag), so also compare the never-reused
- * numeric pid captured at the start. */
-static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
-    if (!p) return 0;
-    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
-}
-
 /* environ minus the names in `unset` (an sw list of strings), as a malloc'd
  * array the child can assign to `environ` before exec. NULL = no change.
  * The strings stay owned by environ; only the array is freed. */
@@ -6246,6 +6267,34 @@ static char **_sw_env_without(sw_val_t *unset) {
     }
     out[k] = NULL;
     return out;
+}
+
+/* The file execvp would run for `cmd` under the child's environment `envp`
+ * (NULL = environ), as a malloc'd path; NULL if no PATH entry has it. Runs in
+ * the parent, so the child needs no libc search. As with execvp, a `cmd` with
+ * a slash is used as is, and a missing PATH means "/bin:/usr/bin". */
+static char *_sw_resolve_exec(const char *cmd, char **envp) {
+    if (strchr(cmd, '/')) return strdup(cmd);
+    const char *path = NULL;
+    for (char **e = envp ? envp : environ; *e && !path; e++)
+        if (strncmp(*e, "PATH=", 5) == 0) path = *e + 5;
+    if (!path) path = "/bin:/usr/bin";
+    size_t clen = strlen(cmd);
+    for (const char *p = path;;) {
+        const char *end = strchr(p, ':');
+        size_t dlen = end ? (size_t)(end - p) : strlen(p);
+        /* an empty PATH entry means the current directory */
+        size_t off = dlen ? dlen + 1 : 0;
+        char *cand = (char *)malloc(off + clen + 1);
+        if (!cand) return NULL;
+        memcpy(cand, p, dlen);
+        if (dlen) cand[dlen] = '/';
+        memcpy(cand + off, cmd, clen + 1);
+        if (access(cand, X_OK) == 0) return cand;
+        free(cand);
+        if (!end) return NULL;
+        p = end + 1;
+    }
 }
 
 /* exec_managed(cmd, args_list [, opts]) → {exit_code, stdout}
@@ -6322,8 +6371,8 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
 
     /* env_unset: build the child's environment HERE. Between fork and exec
      * only async-signal-safe calls are allowed (another thread may hold the
-     * malloc or environment lock at fork time), so the child just assigns
-     * `environ`; unsetenv in the child could deadlock it. */
+     * malloc or environment lock at fork time), so the child passes this
+     * array straight to execve; unsetenv in the child could deadlock it. */
     char **envp = _sw_env_without(unset);
 
     int pfd[2] = {-1, -1};
@@ -6334,12 +6383,17 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         return sw_val_nil();
     }
 
+    /* The program path is searched here too, so the child can execve it
+     * without a PATH walk. */
+    char *prog = _sw_resolve_exec(cmd, envp);
+
     fflush(stdout);
     fflush(stderr);
     pid_t pid = sw_fork();
     if (pid < 0) {
         if (pfd[0] >= 0) { close(pfd[0]); close(pfd[1]); }
         if (in_fd >= 0) close(in_fd);
+        free(prog);
         free(envp);
         free(argv);
         return sw_val_nil();
@@ -6361,12 +6415,12 @@ static sw_val_t *_builtin_exec_managed(sw_val_t **a, int n) {
         if (errfd < 0) _exit(127);
         dup2(errfd, STDERR_FILENO);
         if (errfd != STDERR_FILENO) close(errfd);
-        if (envp) environ = envp;
         if (cwd && chdir(cwd) != 0) _exit(127);
-        execvp(argv[0], argv);
+        if (prog) execve(prog, argv, envp ? envp : environ);
         _exit(127);
     }
     setpgid(pid, pid);   /* also set from the parent: closes the race with killpg */
+    free(prog);
     free(envp);
     free(argv);
     if (in_fd >= 0) close(in_fd);

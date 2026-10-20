@@ -33,9 +33,16 @@ fun main() {
     gc = string_trim(file_read(pidf))
     sleep(100)
     # an orphan nobody reaps (no init in a container) lingers as a zombie: only
-    # a live, non-zombie process counts as having survived
-    # (`ps` rather than /proc so this also checks on macOS)
-    alive = shell("st=$(ps -o stat= -p " ++ gc ++ " 2>/dev/null); case \"$st\" in \"\"|Z*) echo dead;; *) echo alive;; esac")
+    # a live, non-zombie process counts as having survived. `kill -0` and `ps`
+    # rather than /proc so this also checks on macOS. Only an explicit "dead"
+    # passes: a missing ps or pid file must fail the test, not pass it.
+    # (No `exit` in the command: shell() wraps it in a group that writes its
+    # exit status afterwards, so an `exit` leaves shell() waiting forever.)
+    alive = shell("case '" ++ gc ++ "' in ''|*[!0-9]*) echo bad-pid;; " ++
+                  "*) if ! command -v ps >/dev/null 2>&1; then echo no-ps; " ++
+                  "elif ! kill -0 '" ++ gc ++ "' 2>/dev/null; then echo dead; " ++
+                  "else st=$(ps -o stat= -p '" ++ gc ++ "' 2>/dev/null); " ++
+                  "case \"$st\" in \"\"|Z*) echo dead;; *) echo alive;; esac; fi;; esac")
     f = f + check("timeout_kills_grandchild", yes(string_trim(elem(alive, 1)) == "dead"))
 
     # a command that finishes inside the timeout is untouched
@@ -87,6 +94,25 @@ fun main() {
     f = f + check("killed_caller_kills_child", yes(hd(rs) == {'error', 'timeout'} && string_trim(elem(left, 1)) == "gone"))
     shell("pkill -f 'sleep [7][.]25'")
 
+    # exit_proc on a caller inside exec_managed (with a long timeout_ms) kills
+    # the child and its backgrounded grandchild. Liveness via `ps`, not /proc.
+    cpid = dir ++ "/c.pid"
+    gpid = dir ++ "/g.pid"
+    shell("rm -f " ++ cpid ++ " " ++ gpid)
+    victim = spawn(fun() {
+        exec_managed("sh", ["-c", "echo $$ > " ++ cpid ++ "; sleep 8.5 & echo $! > " ++ gpid ++ "; wait"],
+                     %{timeout_ms: 60000})
+    })
+    sleep(700)
+    exit_proc(victim, 'kill')
+    sleep(800)
+    c = string_trim(file_read(cpid))
+    g = string_trim(file_read(gpid))
+    live = "for p in " ++ c ++ " " ++ g ++ "; do st=$(ps -o stat= -p $p 2>/dev/null); case \"$st\" in \"\"|Z*) ;; *) echo alive;; esac; done; echo done"
+    r = shell(live)
+    f = f + check("exit_proc_kills_group", yes(string_trim(elem(r, 1)) == "done"))
+    shell("kill -9 " ++ c ++ " " ++ g ++ " 2>/dev/null")
+
     shell("rm -rf " ++ dir)
-    if (f == 0) { print("OK exec_managed 15/15") ; sys_exit(0) } else { print("FAIL exec_managed") ; sys_exit(1) }
+    if (f == 0) { print("OK exec_managed 16/16") ; sys_exit(0) } else { print("FAIL exec_managed") ; sys_exit(1) }
 }
