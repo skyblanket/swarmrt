@@ -37,20 +37,31 @@ fun pipeline_loop() {
 
 # Both requests in one write; the bodies come back on the same socket.
 fun pipelined_bodies() {
-    reqs = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+    pipelined_out("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n")
+}
+
+# /a asks to close, so /b must not be served on that connection.
+fun pipelined_close_bodies() {
+    pipelined_out("GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" ++
+                  "GET /b HTTP/1.1\r\nHost: x\r\n\r\n")
+}
+
+fun pipelined_out(reqs) {
     cmd = "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9471; printf '%s' '" ++ reqs ++
           "' >&3; perl -e 'alarm 3; exec @ARGV' cat <&3 | grep -o 'ok:/[ab]'\""
-    shell(cmd)
+    elem(shell(cmd), 1)
 }
 
 fun main() {
     spawn(fun() { pipeline_server() })
     sleep(300)
 
-    out = elem(pipelined_bodies(), 1)
+    out = pipelined_bodies()
+    close_out = pipelined_close_bodies()
     f = 0
     f = f + assert_eq("pipelined_both_responses", out, "ok:/a\nok:/b\n")
+    f = f + assert_eq("close_stops_pipeline", close_out, "ok:/a\n")
 
-    if (f == 0) { print("OK test_http_pipeline 1/1") sys_exit(0) }
+    if (f == 0) { print("OK test_http_pipeline 2/2") sys_exit(0) }
     else { print(f"FAIL test_http_pipeline {f} failed") sys_exit(1) }
 }

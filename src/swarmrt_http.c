@@ -624,8 +624,9 @@ static sw_val_t *http_hdr_map(const char *raw) {
 }
 
 /* `port` is the conn's (pinned) port, for the WS handshake write; NULL
- * from the fuzz harness. */
-static void http_try_parse(int cid, sw_port_t *port) {
+ * from the fuzz harness. `pipelined` = an earlier request in this drain was
+ * already delivered, so its response may still be pending (see below). */
+static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     /* If we're waiting for body bytes, check if we have enough */
@@ -725,6 +726,19 @@ static void http_try_parse(int cid, sw_port_t *port) {
 
         line = line_end + 2;
     }
+
+    /* Nothing follows a request that asked to close: its response closes
+     * the conn, so later bytes are never answered, even when they arrive in
+     * a later read. A pipelined request that closes the conn, upgrades it, or
+     * would get a 413 must also wait. Those paths act on the whole slot
+     * (keep_alive, the synchronous close in sw_http_respond, the WS mode)
+     * while an earlier request's response is still pending, and would cut it
+     * off or send its response with the wrong Connection header. The request
+     * stays buffered and is parsed once more bytes arrive. */
+    if (!c->keep_alive ||
+        (pipelined && (!keep_alive || is_upgrade ||
+                       (has_content_length && content_length > http_max_request()))))
+        return;
 
     /* Reject oversized declared bodies up front with a 413 instead of
      * buffering toward the conn_on_data cap: strtoul gave the client a
@@ -972,10 +986,10 @@ static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) 
          * can send several in one chunk and nothing more may arrive to wake
          * us, so keep going until a pass consumes nothing (incomplete request)
          * or the conn was closed or upgraded. */
-        for (;;) {
+        for (int n = 0;; n++) {
             uint32_t before = c->buf_len;
             c->buf[c->buf_len] = '\0'; /* the parser scans buf as a C string */
-            http_try_parse(cid, port);
+            http_try_parse(cid, port, n > 0);
             if (c->closed || c->mode != SW_HTTP_MODE_HTTP ||
                 c->buf_len == before)
                 break;
