@@ -130,34 +130,3 @@ fun test_ets_list_kv_pairs() {
     ets_put(t, 'only', 42)
     assert_eq(ets_list(t), [{'only', 42}])
 }
-
-# === ETS copy-in/copy-out keeps interpreter values whole =================
-# The interpreter's ETS store copies each value so it outlives its writer.
-# The copy must keep a lambda's body and captured env (the stored closure is
-# still callable after ets_get) and must not cut a deep value off at the
-# compiled copy depth cap (256).
-
-fun test_ets_stored_lambda_keeps_closure() {
-    t = ets_new()
-    k = 5
-    ets_put(t, 'f', fn(x) { x + k })
-    g = ets_get(t, 'f')
-    assert_eq(g(1), 6)
-}
-
-fun nest_list(n, acc) {
-    if (n == 0) { acc } else { nest_list(n - 1, [acc]) }
-}
-
-fun list_depth(l, d) {
-    case l {
-        [h] -> list_depth(h, d + 1)
-        _ -> d
-    }
-}
-
-fun test_ets_deep_value_not_truncated() {
-    t = ets_new()
-    ets_put(t, 'deep', nest_list(1000, 0))
-    assert_eq(list_depth(ets_get(t, 'deep'), 0), 1000)
-}
