@@ -94,6 +94,12 @@ typedef struct {
      * sw_http_respond reads it on another thread, so it is atomic. */
     _Atomic int         keep_alive;     /* 1 = keep connection open after response */
 
+    /* Pipelining: requests delivered to the handler whose response has not
+     * been sent yet (bumped by the bridge, dropped by the responder), and a
+     * flag saying the parser is holding a buffered request until it hits 0. */
+    _Atomic int         pending;
+    _Atomic int         held;
+
     /* WebSocket state */
     char                ws_key[128]; /* Sec-WebSocket-Key from upgrade */
     int                 active;      /* 1 = in use, 0 = free slot */

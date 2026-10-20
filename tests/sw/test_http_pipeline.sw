@@ -28,6 +28,7 @@ fun pipeline_server() {
 fun pipeline_loop() {
     receive {
         {'http_request', conn, _method, path, _headers, _body} ->
+            if (path == "/slow") { sleep(300) } else { 0 }
             http_respond(conn, 200, "Content-Type: text/plain\r\n", "ok:" ++ path)
             pipeline_loop()
         _other ->
@@ -46,9 +47,17 @@ fun pipelined_close_bodies() {
                   "GET /b HTTP/1.1\r\nHost: x\r\n\r\n")
 }
 
+# Keep-alive /slow followed by a closing /b: /b must wait for /slow's response
+# (not cut it off) and still be answered once it is out.
+
+fun pipelined_slow_close_bodies_slow() {
+    pipelined_out("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n" ++
+                  "GET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+}
+
 fun pipelined_out(reqs) {
     cmd = "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9471; printf '%s' '" ++ reqs ++
-          "' >&3; perl -e 'alarm 3; exec @ARGV' cat <&3 | grep -o 'ok:/[ab]'\""
+          "' >&3; perl -e 'alarm 3; exec @ARGV' cat <&3 | grep -o 'ok:/[a-z]*'\""
     elem(shell(cmd), 1)
 }
 
@@ -58,10 +67,13 @@ fun main() {
 
     out = pipelined_bodies()
     close_out = pipelined_close_bodies()
+    slow_out = pipelined_slow_close_bodies_slow()
     f = 0
     f = f + assert_eq("pipelined_both_responses", out, "ok:/a\nok:/b\n")
     f = f + assert_eq("close_stops_pipeline", close_out, "ok:/a\n")
 
-    if (f == 0) { print("OK test_http_pipeline 2/2") sys_exit(0) }
+    f = f + assert_eq("held_close_after_slow", slow_out, "ok:/slow\nok:/b\n")
+
+    if (f == 0) { print("OK test_http_pipeline 3/3") sys_exit(0) }
     else { print(f"FAIL test_http_pipeline {f} failed") sys_exit(1) }
 }

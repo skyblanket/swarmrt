@@ -124,6 +124,8 @@ static int conn_alloc(sw_port_t *port, sw_http_bridge_t *bridge) {
             c->content_length = 0;
             c->body_pending = 0;
             c->keep_alive = 1; /* HTTP/1.1 default */
+            atomic_store(&c->pending, 0);
+            atomic_store(&c->held, 0);
             c->req_hdr = NULL;
             c->req_path = NULL;
             /* Idle-timeout bookkeeping: stamp the accept, and record the
@@ -623,22 +625,42 @@ static sw_val_t *http_hdr_map(const char *raw) {
     return http_parse_headers(raw, n >= 2 ? raw + n - 2 : raw);
 }
 
+/* A response went out on `c`. Once none is outstanding, wake the bridge if
+ * the parser is holding a buffered request, so it re-parses without waiting
+ * for more bytes. Called with the port pinned. */
+static void http_response_done(sw_http_conn_t *c, sw_port_t *port) {
+    int p = atomic_load(&c->pending);
+    while (p > 0 && !atomic_compare_exchange_weak(&c->pending, &p, p - 1)) {}
+    if (p != 1 || !atomic_exchange(&c->held, 0)) return;
+    pthread_mutex_lock(&g_http_lock);
+    sw_process_t *owner = c->port == port ? c->owner : NULL;
+    pthread_mutex_unlock(&g_http_lock);
+    sw_port_data_t *msg = (sw_port_data_t *)malloc(sizeof(sw_port_data_t));
+    if (!msg) return;
+    msg->port = port;
+    msg->data = (uint8_t *)malloc(1);
+    msg->len = 0;
+    if (!msg->data || !owner) { free(msg->data); free(msg); return; }
+    sw_send_tagged(owner, SW_TAG_PORT_DATA, msg);
+}
+
 /* `port` is the conn's (pinned) port, for the WS handshake write; NULL
- * from the fuzz harness. `pipelined` = an earlier request in this drain was
- * already delivered, so its response may still be pending (see below). */
-static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
+ * from the fuzz harness. Returns 1 when a held request became parseable
+ * during the call (its earlier response went out meanwhile) and the caller
+ * should parse again. */
+static int http_try_parse(int cid, sw_port_t *port) {
     sw_http_conn_t *c = &g_http_conns[cid];
 
     /* If we're waiting for body bytes, check if we have enough */
     if (c->body_pending) {
-        if (c->buf_len < c->content_length) return; /* still incomplete */
+        if (c->buf_len < c->content_length) return 0; /* still incomplete */
         /* Body complete — fall through to deliver below */
         goto deliver_body;
     }
 
     {
     uint8_t *end = find_header_end(c->buf, c->buf_len);
-    if (!end) return; /* incomplete headers */
+    if (!end) return 0; /* incomplete headers */
 
     uint32_t header_len = (uint32_t)(end - c->buf) + 4;
 
@@ -729,16 +751,21 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
 
     /* Nothing follows a request that asked to close: its response closes
      * the conn, so later bytes are never answered, even when they arrive in
-     * a later read. A pipelined request that closes the conn, upgrades it, or
-     * would get a 413 must also wait. Those paths act on the whole slot
-     * (keep_alive, the synchronous close in sw_http_respond, the WS mode)
-     * while an earlier request's response is still pending, and would cut it
-     * off or send its response with the wrong Connection header. The request
-     * stays buffered and is parsed once more bytes arrive. */
-    if (!c->keep_alive ||
-        (pipelined && (!keep_alive || is_upgrade ||
-                       (has_content_length && content_length > http_max_request()))))
-        return;
+     * a later read. */
+    if (!c->keep_alive) return 0;
+
+    /* While an earlier response is outstanding, a request that closes the
+     * conn, upgrades it, is refused (413 / disallowed Host) or otherwise acts
+     * on the whole slot would cut that response off or send it with the wrong
+     * Connection header. Hold it in the buffer; http_response_done wakes the
+     * bridge when the earlier response is out. */
+    if (atomic_load(&c->pending) > 0 &&
+        (!keep_alive || is_upgrade || !http_host_allowed(host) ||
+         (has_content_length && content_length > http_max_request()))) {
+        atomic_store(&c->held, 1);
+        /* The response may have gone out before the flag was visible. */
+        return atomic_load(&c->pending) == 0 && atomic_exchange(&c->held, 0);
+    }
 
     /* Reject oversized declared bodies up front with a 413 instead of
      * buffering toward the conn_on_data cap: strtoul gave the client a
@@ -751,7 +778,7 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
             method, path, content_length, http_max_request());
         c->keep_alive = 0;
         sw_http_respond(cid, 413, NULL, "Payload Too Large");
-        return;
+        return 0;
     }
 
     /* Save the raw header block now, while c->buf is still intact (the
@@ -811,7 +838,7 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
     if (!http_host_allowed(host)) {
         c->keep_alive = 0;
         sw_http_respond(cid, 403, NULL, "Forbidden: Host not allowed");
-        return;
+        return 0;
     }
 
     if (is_upgrade && ws_key[0]) {
@@ -839,7 +866,7 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
             }
             c->keep_alive = 0;
             sw_http_respond(cid, 403, NULL, "Forbidden: WebSocket Origin not allowed");
-            return;
+            return 0;
         }
         strncpy(c->ws_key, ws_key, sizeof(c->ws_key) - 1);
         ws_do_handshake(cid, port);
@@ -851,7 +878,7 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
         items[1] = sw_val_int(cid);
         items[2] = sw_val_string(path);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 3));
-        return;
+        return 0;
     }
 
     /* If body expected but not yet fully received, buffer it */
@@ -861,7 +888,7 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
         /* Store method/path for later delivery */
         /* We re-parse on delivery, so stash in ws_key temporarily */
         snprintf(c->ws_key, sizeof(c->ws_key), "%s\x01%s", method, path);
-        return;
+        return 0;
     }
 
     /* Regular HTTP request — deliver immediately */
@@ -888,12 +915,13 @@ static void http_try_parse(int cid, sw_port_t *port, int pipelined) {
          * block saved above. */
         items[4] = http_hdr_map(c->req_hdr);
         items[5] = sw_val_string(body_str);
+        atomic_fetch_add(&c->pending, 1);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
         if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         if (body_buf) free(body_buf);
     }
-    return;
+    return 0;
     }
 
 deliver_body:
@@ -929,11 +957,13 @@ deliver_body:
          * arrived (before the body was buffered). */
         items[4] = http_hdr_map(c->req_hdr);
         items[5] = sw_val_string(body_buf);
+        atomic_fetch_add(&c->pending, 1);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
         if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
         free(body_buf);
     }
+    return 0;
 }
 
 /* === Connection Data Handler === */
@@ -986,12 +1016,13 @@ static void conn_on_data(int cid, sw_port_t *port, uint8_t *data, uint32_t len) 
          * can send several in one chunk and nothing more may arrive to wake
          * us, so keep going until a pass consumes nothing (incomplete request)
          * or the conn was closed or upgraded. */
-        for (int n = 0;; n++) {
+        for (;;) {
             uint32_t before = c->buf_len;
             c->buf[c->buf_len] = '\0'; /* the parser scans buf as a C string */
-            http_try_parse(cid, port, n > 0);
-            if (c->closed || c->mode != SW_HTTP_MODE_HTTP ||
-                c->buf_len == before)
+            int again = http_try_parse(cid, port);
+            if (c->closed || c->mode != SW_HTTP_MODE_HTTP)
+                break;
+            if (!again && c->buf_len == before)
                 break;
         }
         /* After upgrade, parse any remaining data as WS */
@@ -1242,6 +1273,7 @@ int sw_http_respond(int conn_id, int status, const char *headers, const char *bo
 
     /* Close connection if not keep-alive */
     if (!c->keep_alive) conn_close(conn_id, port);
+    else http_response_done(c, port);
     sw_port_unref(port);
     return 0;
 }
@@ -1276,6 +1308,7 @@ int sw_http_respond_raw(int conn_id, int status, const char *headers, const void
         sw_tcp_send(port, data, data_len);
 
     if (!c->keep_alive) conn_close(conn_id, port);
+    else http_response_done(c, port);
     sw_port_unref(port);
     return 0;
 }
