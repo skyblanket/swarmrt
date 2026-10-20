@@ -15,6 +15,9 @@ fun churn_junk(n, acc) {
 # A process that writes through a tool, then exits (freeing its region).
 fun put_entry(tid) { tool_call("stash", tid, "payload") ; send(self(), 'done') }
 
+# The same, with a closure that captures the writer's per-call value.
+fun put_fn(tid, tag, parent) { tool_call("stash_fn", tid, tag) ; send(parent, 'done') }
+
 fun warm(calls, acc) {
     if (calls <= 0) { acc }
     else { warm(calls - 1, acc + tool_call("churn", calls, 3)) }
@@ -25,6 +28,8 @@ fun main() {
     tool_define("mk", "module T\nfun run() { ets_new() }")
     tool_define("stash", "module T\nfun run(t, tag) { ets_put(t, 7, %{\"tag\" => tag, \"body\" => tag ++ tag}); 'ok' }")
     tool_define("fetch", "module T\nfun run(t) { ets_get(t, 7) }")
+    tool_define("stash_fn", "module T\nfun run(t, tag) { k = tag ++ \"-\"; ets_put(t, 1, fn(x) { x ++ k }); 'ok' }")
+    tool_define("call_fn", "module T\nfun run(t, a) { g = ets_get(t, 1); g(a) }")
     warm(2000, 0)
     tid = tool_call("mk")
     spawn(put_entry(tid))
@@ -32,6 +37,16 @@ fun main() {
     sleep(50)
     churn_junk(2000, 0)
     got = tool_call("fetch", tid)
-    if (got == %{"tag" => "payload", "body" => "payloadpayload"}) { print("PROBE_OK") }
-    else { print("FAIL ets entry lost its writer's value: " ++ to_string(got)) ; sys_exit(1) }
+    if (got != %{"tag" => "payload", "body" => "payloadpayload"}) {
+        print("FAIL ets entry lost its writer's value: " ++ to_string(got)) ; sys_exit(1)
+    }
+    fid = tool_call("mk")
+    me = self()
+    spawn(put_fn(fid, "K", me))
+    receive { 'done' -> { 0 } after 5000 { 0 } }
+    sleep(50)
+    churn_junk(2000, 0)
+    called = tool_call("call_fn", fid, "x")
+    if (called == "xK-") { print("PROBE_OK") }
+    else { print("FAIL ets closure lost its writer's env: " ++ to_string(called)) ; sys_exit(1) }
 }

@@ -551,7 +551,7 @@ msgsize-gate: swc libswarmrt
 .PHONY: ets-outlive-gate
 ets-outlive-gate: swc libswarmrt
 	@./bin/swc build tests/gc/ets_outlive_repro.sw -o $(BIN_DIR)/ets_outlive >/dev/null
-	@$(BIN_DIR)/ets_outlive >$(BIN_DIR)/_eo.out 2>$(BIN_DIR)/_eo.err; rc=$$?; \
+	@MALLOC_PERTURB_=165 $(BIN_DIR)/ets_outlive >$(BIN_DIR)/_eo.out 2>$(BIN_DIR)/_eo.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_eo.out; then \
 	   echo "ets-outlive-gate: FAIL (rc=$$rc — tool-written ETS value lost its writer's region)"; \
 	   cat $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; exit 1; fi; \

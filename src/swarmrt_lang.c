@@ -2677,6 +2677,16 @@ sw_val_t *sw_now_iso(void) {
  * no new limit. */
 static __thread int g_copy_uncapped = 0;
 
+/* Set while the interpreter ETS stores a value: an interpreted closure's
+ * captured frames are snapshotted (copied into the store), not shared. The
+ * frames hold values in the writer's region or arena, which is freed when the
+ * writer exits. Copy-out leaves this NULL and shares the stored snapshot. */
+typedef struct {
+    sw_env_t **src, **dst;
+    int n, cap;
+} env_snap_t;
+static __thread env_snap_t *g_env_snap = NULL;
+
 /* === Deep-copy context ===
  * One per top-level deep copy (thread-local, nestable). `memo` maps a source
  * node to its copy so a graph that shares substructure is copied as a graph:
@@ -2763,6 +2773,7 @@ static sw_val_t *fresh_scalar(sw_val_t *v) {
 
 static sw_val_t *deep_copy_node(sw_val_t *v, int depth);
 static void env_retain(sw_env_t *e);
+static sw_env_t *env_snapshot(sw_env_t *e);
 
 static sw_val_t *deep_copy_rec(sw_val_t *v, int depth) {
     if (!v) return g_alloc_force_global ? fresh_scalar(&g_imm_nil) : sw_val_nil();
@@ -2826,8 +2837,12 @@ static sw_val_t *deep_copy_node(sw_val_t *v, int depth) {
             r->v.fun.name = v->v.fun.name;
             r->v.fun.num_params = v->v.fun.num_params;
             r->v.fun.body = v->v.fun.body;
-            r->v.fun.closure_env = v->v.fun.closure_env;
-            env_retain(r->v.fun.closure_env);
+            if (g_env_snap) {
+                r->v.fun.closure_env = env_snapshot(v->v.fun.closure_env);
+            } else {
+                r->v.fun.closure_env = v->v.fun.closure_env;
+                env_retain(r->v.fun.closure_env);
+            }
             return r;
         }
         int nc = v->v.fun.ncaptures;
@@ -3414,6 +3429,34 @@ static void env_free(sw_env_t *e) {
         free(e);
         e = parent;                         /* loop instead of recursing */
     }
+}
+
+/* Copy of an env chain for an interpreter ETS store, owned by the store: every
+ * frame's bindings are deep-copied to the global heap. Each frame is memoised
+ * before its bindings are copied, so a closure bound in its own frame (a local
+ * recursive helper) terminates. The caller gets one ref on the result. */
+static sw_env_t *env_snapshot(sw_env_t *e) {
+    if (!e) return NULL;
+    env_snap_t *s = g_env_snap;
+    for (int i = 0; i < s->n; i++) {
+        if (s->src[i] == e) { env_retain(s->dst[i]); return s->dst[i]; }
+    }
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 8;
+        s->src = realloc(s->src, sizeof(*s->src) * s->cap);
+        s->dst = realloc(s->dst, sizeof(*s->dst) * s->cap);
+    }
+    sw_env_t *n = calloc(1, sizeof(sw_env_t));
+    n->refcount = 1;
+    s->src[s->n] = e;
+    s->dst[s->n] = n;
+    s->n++;
+    n->parent = env_snapshot(e->parent);   /* hands its ref to n */
+    for (int i = 0; i < SW_ENV_SLOTS; i++) {
+        for (sw_env_entry_t *ent = e->buckets[i]; ent; ent = ent->next)
+            env_set(n, ent->name, deep_copy_rec(ent->val, 0));
+    }
+    return n;
 }
 
 /* =========================================================================
@@ -4048,9 +4091,15 @@ static pthread_mutex_t _interp_vets_meta = PTHREAD_MUTEX_INITIALIZER;
  * so a raw pointer into either would dangle. Readers get their own copy. */
 static sw_val_t *_interp_vets_store(sw_val_t *v) {
     int save = g_copy_uncapped;
+    env_snap_t snap = {0};
+    env_snap_t *save_snap = g_env_snap;
     g_copy_uncapped = 1;
+    g_env_snap = &snap;
     sw_val_t *r = sw_val_deep_copy_global(v);
+    g_env_snap = save_snap;
     g_copy_uncapped = save;
+    free(snap.src);
+    free(snap.dst);
     return r;
 }
 static sw_val_t *_interp_vets_out(sw_val_t *v) {
