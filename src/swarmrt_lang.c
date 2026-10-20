@@ -4077,21 +4077,27 @@ static int _interp_vets_key_eq(sw_val_t *a, sw_val_t *b) {
  *
  * This block bridges the gap with minimum-viable implementations of the
  * pure-functional builtins (no per-process scheduler state required).
- * Process-scheduler primitives (link/monitor/exit_proc/etc) print a one-
- * shot hint and return nil instead of silently dropping through.
+ * Process-scheduler primitives (link/monitor/exit_proc/etc) print a hint
+ * (once per name) and return nil instead of silently dropping through.
  * ========================================================================= */
 
 #define _REPL_SQLITE_MAX 32
 static sqlite3 *_repl_sqlite_db[_REPL_SQLITE_MAX];
 
-static int _repl_scheduler_warned = 0;
+/* One note per builtin name: a single shared flag would hide every stub after
+ * the first, so a test could pass on nil without anyone seeing why. */
+#define _REPL_WARNED_MAX 64
+static const char *_repl_warned_names[_REPL_WARNED_MAX];
+static int _repl_warned_count = 0;
 static void _repl_warn_scheduler(const char *name) {
-    if (_repl_scheduler_warned) return;
+    for (int i = 0; i < _repl_warned_count; i++)
+        if (strcmp(_repl_warned_names[i], name) == 0) return;
+    if (_repl_warned_count < _REPL_WARNED_MAX)
+        _repl_warned_names[_repl_warned_count++] = name;
     fprintf(stderr,
-        "note: '%s' (and similar scheduler primitives) return nil in the REPL;\n"
-        "      use `swc build file.sw -o bin/x && bin/x` for full process semantics.\n",
+        "note: '%s' is not available here and returns nil;\n"
+        "      use `swc build file.sw -o bin/x && bin/x` for the full runtime.\n",
         name);
-    _repl_scheduler_warned = 1;
 }
 
 /* ---- spawn(): re-enter the interpreter on a fresh fiber -------------------
@@ -5935,7 +5941,6 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
      * so a supervised worker would never run. Wiring needs an interpreter-aware
      * child trampoline + closure_env rebind — out of scope for call-the-native. */
     static const char *scheduler_names[] = {
-        "send",
         "dyn_supervisor", "sup_start_child", "sup_terminate_child", "sup_count_children",
         "tool_define", "tool_call", "tool_list", "tool_rollback", "tool_history",
         "http_listen", "http_respond", "ws_send", "ws_close",
@@ -5948,7 +5953,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     };
     for (int i = 0; scheduler_names[i]; i++) {
         if (strcmp(fname, scheduler_names[i]) == 0) {
-            _repl_warn_scheduler(fname);
+            _repl_warn_scheduler(scheduler_names[i]);
             return sw_val_nil();
         }
     }
