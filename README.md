@@ -32,6 +32,7 @@ import Std
 
 fun grade(task) {
     out = llm_complete(task.prompt, %{model: "qwen2.5-coder:7b"})
+    if (string_starts_with(out, "error: ")) { panic(out) }
     if (string_contains(out, task.expect)) { 'pass' } else { 'fail' }
 }
 
