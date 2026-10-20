@@ -364,10 +364,14 @@ What's NOT shipped but flagged by reviewers as future work:
   studio builtins, coder). Sanitisation exists; the recommendation
   is `posix_spawn` + strict allowlists + command-injection regression
   tests.
-- Module-level globals — real architectural change, not a bug fix.
-- Deadlock detection for silent hangs.
 - Fixnum / immediate-tag small ints (R2-#10, deferred by reviewer
   as not worth blocking on for now).
+
+Shipped since this review (previously listed above as not shipped):
+- Module-level `let` globals — 2026-05-31; `docs/SW_LANGUAGE.md` §"Module-level `let` globals"
+  and the 2026-05-31 entry in `docs/CHANGELOG.md`.
+- Deadlock detection for silent hangs — watchdog thread in `src/swarmrt_native.c` (on by default;
+  `SW_DEADLOCK_DETECT=0` disables it, `SW_DEADLOCK_MS` sets the threshold); `README.md` documents it.
 
 ---
 
