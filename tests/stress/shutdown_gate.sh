@@ -18,6 +18,9 @@
 set -u
 REPO="${SWARMRT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
 cd "$REPO" || { echo "shutdown-gate: FAIL (no repo)"; exit 99; }
+. "$REPO/scripts/gate_common.sh"
+gate_print_limits shutdown-gate
+gate_need_cmd python3 "sudo apt-get install python3" || { echo "shutdown-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 
 SRV=bin/shutdown_server
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
