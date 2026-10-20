@@ -201,7 +201,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection
+test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.
@@ -530,6 +530,19 @@ msgsize-gate: swc libswarmrt
 	 rm -f $(BIN_DIR)/_mc.out $(BIN_DIR)/_mc.err; \
 	 echo "msgsize-gate: PASS (bidirectional — big dropped under cap, intact uncapped)"
 
+# ETS entry written through a tool must outlive the writer process. The store
+# owns its value; base kept a raw pointer into the writer's freed tool region and
+# read back garbage (FAIL on base, PROBE_OK with the fix).
+.PHONY: ets-outlive-gate
+ets-outlive-gate: swc libswarmrt
+	@./bin/swc build tests/gc/ets_outlive_repro.sw -o $(BIN_DIR)/ets_outlive >/dev/null
+	@$(BIN_DIR)/ets_outlive >$(BIN_DIR)/_eo.out 2>$(BIN_DIR)/_eo.err; rc=$$?; \
+	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_eo.out; then \
+	   echo "ets-outlive-gate: FAIL (rc=$$rc — tool-written ETS value lost its writer's region)"; \
+	   cat $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; exit 1; fi; \
+	 rm -f $(BIN_DIR)/_eo.out $(BIN_DIR)/_eo.err; \
+	 echo "ets-outlive-gate: PASS"
+
 # HTTP idle-timeout gate (SW_HTTP_IDLE_TIMEOUT_MS, slow-loris) — bidirectional.
 # Phase 1 (timeout 500ms): a full table of idle sockets is swept (slots
 # freed), an established-but-quiet WS conn survives (exempt by default), and
@@ -617,6 +630,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_interval.sw  200  2000  10 interval || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_dynsup_churn.sw 2000 20000 8 dynsup || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_sup_kill.sw  200  1500 12 supkill  || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_tool.sw      10000 100000 24 tool  || rc=1; \
 	 [ $$rc -eq 0 ] && echo "gc-slope: PASS (bounded)" || echo "gc-slope: FAIL (unbounded)"; \
 	 exit $$rc
 
