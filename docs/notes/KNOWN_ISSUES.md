@@ -48,14 +48,18 @@ the duration. With every scheduler thread inside one, nothing else runs.
 **Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
 
-### Compiled mutual tail recursion is not TCO'd — but overflow is a recoverable panic
+### Tail calls through lambdas are not TCO'd — but overflow is a recoverable panic
 
-Only **self** tail calls are optimised (including, since 2026-07-05, self
-tail calls inside a `receive ... after` body — previously those stacked a
-real C frame per tick and killed long-lived heartbeat loops; swarm-code died
-this way after 154s of a slow tool call). Two functions tail-calling each
-other (the natural state-machine shape) still consume a C stack frame per
-hop. See [REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O2.
+Self tail calls are optimised (including, since 2026-07-05, self tail calls
+inside a `receive ... after` body — previously those stacked a real C frame
+per tick and killed long-lived heartbeat loops; swarm-code died this way
+after 154s of a slow tool call). Tail calls between **module functions** are
+optimised too (`a -> b -> a`, receive loop → handler → loop): a body parks
+the next call and returns to a driver loop (`sw_tc_drive`), so the stack stays
+flat and the arena is reclaimed on the same floor as a self-loop. Gate:
+`tests/sw/test_mutual_tail.sw`. Still not optimised: a tail call made through
+a lambda or closure, which costs a C stack frame per hop. See
+[REVIEW_FABLE_2026-06.md](REVIEW_FABLE_2026-06.md), O2.
 
 Since 2026-07-05 the failure mode is contained: every generated function
 entry runs a red-zone stack guard (`sw_stack_low()`, 32KB margin), so a
@@ -67,11 +71,10 @@ both SIGSEGV (Linux) and SIGBUS (macOS maps guard-page hits to
 KERN_PROTECTION_FAILURE → SIGBUS) and prints the stack-overflow banner
 instead of a generic crash. Gate: `tests/sw/test_stack_overflow.sw`.
 
-**Impact:** mutually recursive FSMs panic (recoverably) at depth instead of
-killing the binary. **Workaround for the depth itself:** keep the loop in
-one function and dispatch on an argument (`fun fsm(state, n) { case state
-{ ... } }`), or raise the per-process stack with `SW_PROC_STACK` (bytes,
-`k`/`m` suffixes; e.g. `SW_PROC_STACK=1m`).
+**Impact:** a closure-driven state cycle panics (recoverably) at depth instead
+of killing the binary. **Workaround for the depth itself:** call the next
+state as a module function, or raise the per-process stack with
+`SW_PROC_STACK` (bytes, `k`/`m` suffixes; e.g. `SW_PROC_STACK=1m`).
 
 ### No static type checking
 
