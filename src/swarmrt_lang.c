@@ -2955,6 +2955,14 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
     return r;
 }
 
+/* Mutual tail-call hop state (see swarmrt_lang.h). The sentinel only needs a
+ * unique address; it is never read as a value. */
+sw_val_t sw_tc_hop_sentinel;
+__thread sw_tc_body_t sw_tc_next_fn;
+__thread int sw_tc_next_n;
+__thread sw_varena_mark_t sw_tc_next_floor;
+__thread sw_val_t *sw_tc_next_args[SW_TC_MAX];
+
 /* Ownership v2 turn checkpoint (called by compiled self-tail-calls once the
  * function has allocated enough above its entry floor). Copies the live
  * recursion arguments into a fresh region, rewinds the process arena to
@@ -6070,7 +6078,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
  * innermost interp_eval_body, which rebinds and loops. EVERY site that
  * evaluates a function body goes through interp_eval_body, so a request is
  * always consumed by the body that issued it. This also covers mutual tail
- * recursion, which the compiled path does not yet. */
+ * recursion; the compiled path runs it too, for module functions (hops). */
 static void mark_tail(node_t *n) {
     if (!n) return;
     switch (n->type) {

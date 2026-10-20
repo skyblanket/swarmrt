@@ -637,6 +637,7 @@ gc-slope: swc
 	 bash scripts/gc_slope.sh tests/gc/slope_spawn.sw     200 2000   80 spawn    || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_message.sw   500 4000   80 msg      || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_turn.sw      5000 100000 80 turn     || rc=1; \
+	 bash scripts/gc_slope.sh tests/gc/slope_mutual.sw    5000 100000 80 mutual   || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_pmap.sw      200 2000   80 pmap     || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_prestart.sw  500 3000   60 prestart || rc=1; \
 	 bash scripts/gc_slope.sh tests/gc/slope_ets.sw       2000 20000 10 ets      || rc=1; \

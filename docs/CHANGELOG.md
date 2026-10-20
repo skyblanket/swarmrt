@@ -4,6 +4,28 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-20 — HTTP server refuses ambiguous body framing (request smuggling)
+
+**fix(http, security): requests whose body framing a front proxy could read
+differently now get 400 and a closed connection.** Chunked request bodies
+(#110) were framed by a prefix/suffix match on `Transfer-Encoding`, and a
+request carrying both `Content-Length` and `Transfer-Encoding` kept its
+connection alive. Behind a proxy that frames by the other header, either one
+lets a client hide a second request inside the first, and pipelining serves
+it. Now `Transfer-Encoding` is parsed by token across all its header lines,
+and only a lone `chunked` is accepted. Refused: other or extra codings
+(`xchunked`, `chunked, gzip`, `gzip, chunked`), CL together with TE,
+conflicting or non-numeric `Content-Length`, and a chunk-size line with a
+stray CR.
+
+Gate: 8 raw-socket cases in `tests/sw/test_http_chunked.sw` (via
+`tests/sw/http_raw.py`); 6 fail on the old parser. `fuzz-http`: 20000
+mutations, no crash.
+
+**test:** `test_stack_overflow_stress` was red on main after #121 made mutual
+tail calls flat, because its runaway was a ping/pong tail cycle. It now
+overflows with non-tail recursion, like `test_stack_overflow`.
+
 ## 2026-10-20 — http_request takes an atom method; the request method is documented as an atom
 
 **fix(http): `http_request(url, %{method: 'POST'})` silently sent a GET.** The
