@@ -51,7 +51,7 @@ typedef struct {
     int tmp_counter;
 
     /* module-level globals (let x = expr) */
-    char global_names[16][128];
+    const node_t *globals_src; /* module node owning the global names (outlives ctx) */
     int nglobals;
     int has_globals; /* 1 if nglobals > 0 — used by emit_entry_and_main */
 
@@ -193,7 +193,7 @@ static void declare_var(cg_ctx_t *ctx, const char *name) {
 
 static int is_global(cg_ctx_t *ctx, const char *name) {
     for (int i = 0; i < ctx->nglobals; i++)
-        if (strcmp(ctx->global_names[i], name) == 0) return 1;
+        if (strcmp(ctx->globals_src->v.mod.globals[i].name, name) == 0) return 1;
     return 0;
 }
 
@@ -3838,10 +3838,8 @@ int sw_codegen(void *ast, FILE *out, int obfuscate) {
     }
 
     /* Collect module-level global names so is_global() works inside functions. */
-    for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
-        strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
-        ctx.nglobals++;
-    }
+    ctx.globals_src = mod;
+    ctx.nglobals = mod->v.mod.nglobals;
     ctx.has_globals = (ctx.nglobals > 0);
 
     /* Pre-scan for spawn sites and lambdas */
@@ -3911,10 +3909,8 @@ int sw_codegen_module(void *ast, FILE *out) {
         ctx.nfuncs++;
     }
 
-    for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
-        strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
-        ctx.nglobals++;
-    }
+    ctx.globals_src = mod;
+    ctx.nglobals = mod->v.mod.nglobals;
     ctx.has_globals = (ctx.nglobals > 0);
 
     scan_spawns(&ctx, mod);
@@ -3983,10 +3979,8 @@ int sw_codegen_multi(void **modules, int nmodules, int main_idx, FILE *out) {
             ctx.nfuncs++;
         }
 
-        for (int i = 0; i < mod->v.mod.nglobals && i < 16; i++) {
-            strncpy(ctx.global_names[i], mod->v.mod.globals[i].name, 127);
-            ctx.nglobals++;
-        }
+        ctx.globals_src = mod;
+        ctx.nglobals = mod->v.mod.nglobals;
         ctx.has_globals = (ctx.nglobals > 0);
 
         scan_spawns(&ctx, mod);

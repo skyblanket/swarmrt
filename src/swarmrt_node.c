@@ -101,6 +101,9 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
  *   0x07  map    (uint16 count + N key-value pairs)
  *   0x08  pid    (8 bytes pid id; receiver annotates it with the sender
  *                 node so replies can route back over distribution)
+ *   0x0A  rpid   (8 bytes pid id + uint8 len + len bytes owner node name;
+ *                 a pid that lives on another node keeps its owner, so a
+ *                 forwarded pid still routes to the node it was made on)
  *
  * Multi-byte fields use native byte order; both nodes are assumed to
  * have the same word size and endianness for v1. A version byte can be
@@ -117,6 +120,7 @@ static sw_process_t *g_dist_proc = NULL; /* Distribution handler process */
 #define SW_MARSHAL_MAP    0x07
 #define SW_MARSHAL_PID    0x08
 #define SW_MARSHAL_BYTES  0x09   /* [tag][u32 len][len raw bytes] — binary-clean */
+#define SW_MARSHAL_RPID   0x0A   /* [tag][u64 id][u8 len][len bytes owner node] */
 
 /* Thread-local node name used by unmarsh_val to construct
  * SW_VAL_REMOTE_PID values when it decodes a SW_MARSHAL_PID byte.
@@ -222,16 +226,23 @@ static int marsh_val(sw_val_t *v, uint8_t **buf, uint32_t *cap, uint32_t *pos) {
         return 0;
     }
     case SW_VAL_REMOTE_PID: {
-        /* Forwarding an already-remote pid: same wire format as a
-         * local pid (id only), but the receiver's default_remote_node
-         * will be the FORWARDER's node, not the original owner. We
-         * encode the owner's node here as a string sentinel to preserve
-         * identity — kept as SW_MARSHAL_PID for now since cross-node
-         * forwarding is a future-iteration feature. */
-        marsh_grow(buf, cap, *pos + 1 + 8);
-        (*buf)[(*pos)++] = SW_MARSHAL_PID;
+        /* Forwarding an already-remote pid: the owner's node name travels
+         * with the id. SW_MARSHAL_PID would be re-annotated with the
+         * FORWARDER's name on decode, sending replies to the wrong node. */
+        const char *owner = v->v.rpid.node;
+        size_t nlen = owner ? strlen(owner) : 0;
+        if (nlen == 0 || nlen >= SW_NODE_NAME_MAX) {
+            /* No owner to route to — same as any other unsendable value. */
+            marsh_grow(buf, cap, *pos + 1);
+            (*buf)[(*pos)++] = SW_MARSHAL_NIL;
+            return 0;
+        }
+        marsh_grow(buf, cap, *pos + 1 + 8 + 1 + (uint32_t)nlen);
+        (*buf)[(*pos)++] = SW_MARSHAL_RPID;
         uint64_t id = v->v.rpid.id;
         memcpy(*buf + *pos, &id, 8); *pos += 8;
+        (*buf)[(*pos)++] = (uint8_t)nlen;
+        memcpy(*buf + *pos, owner, nlen); *pos += (uint32_t)nlen;
         return 0;
     }
     default:
@@ -359,6 +370,23 @@ static sw_val_t *unmarsh_val_inner(const uint8_t *buf, uint32_t len, uint32_t *p
         if (tls_unmarshal_default_node && tls_unmarshal_default_node[0])
             return sw_val_remote_pid(tls_unmarshal_default_node, id);
         return sw_val_nil();
+    }
+    case SW_MARSHAL_RPID: {
+        if (len - *pos < 9) return sw_val_nil();
+        uint64_t id; memcpy(&id, buf + *pos, 8); *pos += 8;
+        uint8_t nlen = buf[(*pos)++];
+        if (len - *pos < nlen) return sw_val_nil();
+        const char *owner = (const char *)(buf + *pos);
+        *pos += nlen;
+        if (nlen == 0 || nlen >= SW_NODE_NAME_MAX) return sw_val_nil();
+        /* The pid came back to the node that made it: resolve it to the
+         * local process, as spawn() handed it out, so it compares equal and
+         * sends locally. */
+        char name[SW_NODE_NAME_MAX];
+        memcpy(name, owner, nlen); name[nlen] = '\0';
+        if (strcmp(name, sw_node_local_name()) == 0)
+            return sw_val_pid_id(sw_find_by_pid_any(id), id);
+        return sw_val_remote_pid(name, id);
     }
     default:
         return sw_val_nil();

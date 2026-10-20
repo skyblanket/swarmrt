@@ -47,8 +47,10 @@ package-manager tests, and an install smoke test run from outside the checkout.
 
 ## Known limits
 
-- **DNS rebinding.** The WebSocket same-origin rule trusts `Host`. A server that
-  must resist rebinding should validate `Host` itself.
+- **DNS rebinding.** The WebSocket same-origin rule trusts `Host`, so it does not
+  stop rebinding. Opt-in: set `SW_HTTP_HOSTS` to the `Host` values the server
+  answers to, and any request with another `Host` gets `403`. Gate:
+  `tests/sw/test_http_hosts.sw`. Unset, the server has no rebinding defence.
 - **Distribution is authenticated, not encrypted,** and not replay-protected.
   Run clusters on a private network or through a tunnel.
 - **No code sandbox.** A compiled program can do anything its user can;
