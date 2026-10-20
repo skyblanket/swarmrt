@@ -7768,6 +7768,67 @@ static void rs_report(rs_ctx_t *c, rs_scope_t *s, const char *name, int line) {
     fprintf(stderr, "\n");
 }
 
+/* Arity of the builtins that may be used as a value (`map(to_string, xs)`).
+ * Each entry is the number of arguments the builtin's dispatch requires. A
+ * builtin not listed here is still rejected when used as a value. */
+static const struct { const char *name; int arity; } k_builtin_value_arity[] = {
+    { "abs", 1 }, { "base64_decode", 1 }, { "base64_encode", 1 },
+    { "byte_size", 1 }, { "bytes_from_base64", 1 }, { "bytes_to_base64", 1 },
+    { "bytes_to_string", 1 }, { "hd", 1 }, { "json_decode", 1 },
+    { "json_encode", 1 }, { "json_escape", 1 }, { "length", 1 },
+    { "map_keys", 1 }, { "map_size", 1 }, { "map_values", 1 },
+    { "math_ceil", 1 }, { "math_cos", 1 }, { "math_exp", 1 },
+    { "math_floor", 1 }, { "math_log", 1 }, { "math_round", 1 },
+    { "math_sin", 1 }, { "math_sqrt", 1 }, { "ord", 1 },
+    { "string_chars", 1 }, { "string_length", 1 }, { "string_lower", 1 },
+    { "string_to_bytes", 1 }, { "string_trim", 1 }, { "string_upper", 1 },
+    { "tl", 1 }, { "to_float", 1 }, { "to_int", 1 }, { "to_string", 1 },
+    { "typeof", 1 },
+    { "bytes_concat", 2 }, { "byte_at", 2 }, { "elem", 2 }, { "filter", 2 },
+    { "json_get", 2 }, { "list_append", 2 }, { "map", 2 }, { "map_get", 2 },
+    { "map_has_key", 2 }, { "map_merge", 2 }, { "map_remove", 2 },
+    { "math_pow", 2 }, { "string_contains", 2 }, { "string_ends_with", 2 },
+    { "string_index_of", 2 }, { "string_split", 2 }, { "string_starts_with", 2 },
+    { "map_put", 3 }, { "reduce", 3 }, { "string_replace", 3 }, { "string_sub", 3 },
+    { NULL, 0 }
+};
+
+static int rs_builtin_value_arity(const char *name) {
+    for (int i = 0; k_builtin_value_arity[i].name; i++)
+        if (strcmp(k_builtin_value_arity[i].name, name) == 0) return k_builtin_value_arity[i].arity;
+    return -1;
+}
+
+/* Rewrite the identifier node `n` (a builtin used as a value) in place into
+ * the anonymous lambda `fun(_p0, ..) { name(_p0, ..) }`. Both backends then
+ * see an ordinary closure, so the interpreter and codegen agree by
+ * construction. The callee name is copied into the new call node before
+ * `n->v` is cleared, since `name` may point into `n->v.sval`. */
+static void rs_wrap_builtin(node_t *n, const char *name, int arity) {
+    node_t *call = mknode(N_CALL, n->line);
+    call->v.call.func = mknode(N_IDENT, n->line);
+    snprintf(call->v.call.func->v.sval, sizeof(call->v.call.func->v.sval), "%s", name);
+    call->v.call.nargs = arity;
+    call->v.call.args = calloc((size_t)arity, sizeof(node_t *));
+
+    node_t *block = mknode(N_BLOCK, n->line);
+    block->v.block.stmts = calloc(1, sizeof(node_t *));
+    block->v.block.stmts[0] = call;
+    block->v.block.nstmts = 1;
+
+    memset(&n->v, 0, sizeof(n->v));
+    n->type = N_FUN;
+    n->v.fun.name[0] = '\0';
+    n->v.fun.nparams = arity;
+    for (int i = 0; i < arity; i++) {
+        snprintf(n->v.fun.params[i], sizeof(n->v.fun.params[i]), "_p%d", i);
+        call->v.call.args[i] = mknode(N_IDENT, n->line);
+        snprintf(call->v.call.args[i]->v.sval, sizeof(call->v.call.args[i]->v.sval),
+                 "_p%d", i);
+    }
+    n->v.fun.body = block;
+}
+
 static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s);
 
 /* ------------------------------------------------------------------
@@ -7849,6 +7910,8 @@ static void rs_check(rs_ctx_t *c, node_t *n, rs_scope_t *s) {
         const char *name = n->v.sval;
         if (strchr(name, '.') || strcmp(name, "_") == 0) return;
         if (rs_has(s, name) || rs_is_module_func(c, name) || rs_is_global(c, name)) return;
+        int arity = rs_builtin_value_arity(name);
+        if (arity > 0) { rs_wrap_builtin(n, name, arity); return; }
         rs_report(c, s, name, n->line);
         return;
     }

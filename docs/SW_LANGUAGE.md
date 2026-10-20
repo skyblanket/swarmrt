@@ -269,7 +269,7 @@ fun main() {
 }
 ```
 
-Builtins (`to_string`, `string_upper`, …) can be piped into (`xs |> length`) but not yet passed as values — wrap them: `map(fn(x) { to_string(x) }, xs)`.
+Builtins can be piped into (`xs |> length`) and passed as values: `map(to_string, xs)` and `f = string_upper` both work. A builtin used as a value is wrapped in a closure of its arity, so it behaves the same as the explicit `fun(x) { to_string(x) }`. This covers the fixed-arity builtins (`to_string`, `string_upper`, `length`, `map_get`, `reduce`, …). Variadic builtins such as `print` can't be passed as values yet; wrap them: `fun(x) { print(x) }`.
 
 ### Names are checked
 
