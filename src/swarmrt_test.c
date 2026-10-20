@@ -20,6 +20,7 @@
 #include <time.h>
 #include "swarmrt_test.h"
 #include "swarmrt_lang.h"
+#include "swarmrt_readfile.h"
 
 /* ANSI colors for terminal output */
 #define C_GREEN  "\033[32m"
@@ -27,26 +28,13 @@
 #define C_DIM    "\033[2m"
 #define C_RESET  "\033[0m"
 
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
-    size_t n = fread(buf, 1, len, f);
-    buf[n] = '\0';
-    fclose(f);
-    return buf;
-}
-
 static double time_ms(struct timespec *start, struct timespec *end) {
     return (end->tv_sec - start->tv_sec) * 1000.0 +
            (end->tv_nsec - start->tv_nsec) / 1e6;
 }
 
 int sw_test_run_file(const char *path) {
-    char *source = read_file(path);
+    char *source = sw_read_file_all(path);
     if (!source) {
         fprintf(stderr, "test: cannot open '%s'\n", path);
         return 1;
