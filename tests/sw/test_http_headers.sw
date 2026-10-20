@@ -61,17 +61,9 @@ fun get_retry(url, hdrs, attempts) {
 }
 
 fun main() {
-    # Self-loopback test: an in-process HTTP server fiber + a BLOCKING
-    # curl-backed client on the same runtime. The client call occupies its
-    # scheduler OS THREAD (not just the fiber), so with one scheduler the
-    # server can never run -> deadlock/timeout (found by the Phase-2.2
-    # scheduler matrix). Needs >=2 schedulers until blocking builtins are
-    # moved off the scheduler thread (see KNOWN_ISSUES).
-    nsched = getenv("SW_SCHEDULERS")
-    if (nsched == "1" || nsched == "2") {
-        print("OK test_http_headers 0/0 (SKIP: needs >=3 schedulers — blocking client + in-process server)")
-        sys_exit(0)
-    }
+    # In-process HTTP server fiber + blocking-free curl client: the HTTP
+    # client builtins run on the offload pool, so the caller parks instead of
+    # pinning its scheduler (see KNOWN_ISSUES).
     spawn(fun() { header_server() })
 
     # Bearer token + a custom header. Only the header NAME is lowercased by
