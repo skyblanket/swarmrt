@@ -1591,16 +1591,22 @@ static void root_exit_check(sw_process_t *proc, int reason) {
 /* Longest an idle scheduler sleeps with no timer due. Producers and timer
  * inserts signal parked schedulers directly, so this is only a backstop.
  * Env-tunable: SW_IDLE_PARK_MS (default 500, clamped to 1..60000). */
+static uint64_t g_idle_park_cap_ns;
+static pthread_once_t g_idle_park_once = PTHREAD_ONCE_INIT;
+
+static void sw_idle_park_init(void) {
+    const char *e = getenv("SW_IDLE_PARK_MS");
+    long ms = e ? atol(e) : 500;
+    if (ms < 1) ms = 1;
+    if (ms > 60000) ms = 60000;
+    g_idle_park_cap_ns = (uint64_t)ms * 1000000ULL;
+}
+
 static uint64_t sw_idle_park_ns(void) {
-    static uint64_t cap_ns = 0;
-    if (!cap_ns) {
-        const char *e = getenv("SW_IDLE_PARK_MS");
-        long ms = e ? atol(e) : 500;
-        if (ms < 1) ms = 1;
-        if (ms > 60000) ms = 60000;
-        cap_ns = (uint64_t)ms * 1000000ULL;
-    }
-    return cap_ns;
+    /* Initialised once under pthread_once: schedulers call this
+     * concurrently, so a lazy static would be a data race. */
+    pthread_once(&g_idle_park_once, sw_idle_park_init);
+    return g_idle_park_cap_ns;
 }
 
 /* Earliest pending timer deadline (now_ns() clock), UINT64_MAX if none. */
