@@ -40,8 +40,10 @@ typedef enum {
 typedef struct sw_port {
     int fd;
     sw_port_type_t type;
-    sw_port_state_t state;
-    sw_process_t *owner;
+    /* _Atomic: the deadlock watchdog counts open ports from its own thread
+     * while the I/O thread and process exits change them. */
+    _Atomic(sw_port_state_t) state;
+    _Atomic(sw_process_t *) owner;
     uint32_t id;
 
     /* Read buffer */

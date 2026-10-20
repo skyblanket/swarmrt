@@ -1083,6 +1083,20 @@ typedef struct {
 } sw_http_conn_t;
 ```
 
+### Request Messages
+
+An `http_listen` handler receives each HTTP request as:
+
+```
+{'http_request', conn, method, path, headers, body}
+```
+
+`method` is an **atom** (`'GET'`, `'POST'`, ...), not a string, so match it
+with an atom: `'POST'`, not `"POST"`. `'POST' == "POST"` is false. The
+`http_request(url, opts)` client accepts the method as either an atom or a
+string. See [BUILDING_AGENTS.md](BUILDING_AGENTS.md#request-shapes--and-reading-request-headers)
+for a doctested route match.
+
 ### Functions
 
 ```c

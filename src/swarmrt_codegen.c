@@ -1086,6 +1086,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <unistd.h>\n");
     fprintf(f, "#include <sys/stat.h>\n");
     fprintf(f, "#include <sys/time.h>\n");
+    fprintf(f, "#include <time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
 
     /* Generated execution state — _sw_error, _sw_current_line/_sw_current_file,
@@ -1399,7 +1400,16 @@ static void emit_preamble(cg_ctx_t *ctx) {
 
     /* pmap: parallel map — spawns a process per list item */
     fprintf(f,
-        "typedef struct { sw_val_t *fn; sw_val_t *item; sw_process_t *caller; int idx; } _pmap_w_t;\n"
+        "typedef struct { sw_val_t *fn; sw_val_t *item; sw_process_t *caller; int idx; uint64_t ref; } _pmap_w_t;\n"
+        /* Per-call ref source. Results carry their call's ref, so a late result
+         * from an earlier pmap can't be taken as one of this call's results. */
+        "static uint64_t _pmap_seq;\n"
+        /* Monotonic, so a wall-clock step can't stretch or cut the pmap deadline. */
+        "static uint64_t _pmap_now_ms(void) {\n"
+        "    struct timespec ts;\n"
+        "    clock_gettime(CLOCK_MONOTONIC, &ts);\n"
+        "    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;\n"
+        "}\n"
         "static void _pmap_entry(void *raw) {\n"
         "    _pmap_w_t *w = (_pmap_w_t *)raw;\n"
         /* Ownership v2: take + adopt the SPAWN region holding fn+item into this
@@ -1408,8 +1418,8 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n"
         "    sw_val_t *arg[] = {w->item};\n"
         "    sw_val_t *result = sw_val_apply(w->fn, arg, 1);\n"
-        "    sw_val_t *ti[] = {sw_val_int(w->idx), result};\n"
-        "    sw_val_t *msg = sw_val_tuple(ti, 2);\n"
+        "    sw_val_t *ti[] = {sw_val_int((int64_t)w->ref), sw_val_int(w->idx), result};\n"
+        "    sw_val_t *msg = sw_val_tuple(ti, 3);\n"
         "    sw_send_value(w->caller, 11, msg);\n"  /* result → message region the caller adopts */
         "    free(w);\n"
         "}\n"
@@ -1426,6 +1436,7 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "    if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);\n"
         "    int cnt = lst->v.tuple.count;\n"
         "    if (cnt == 0) return sw_val_list(NULL, 0);\n"
+        "    uint64_t ref = __atomic_add_fetch(&_pmap_seq, 1, __ATOMIC_RELAXED);\n"
         "    sw_process_t *self = sw_self();\n"
         "    sw_val_t **res = calloc(cnt, sizeof(sw_val_t*));\n"
         "    for (int i = 0; i < cnt; i++) {\n"
@@ -1436,26 +1447,32 @@ static void emit_preamble(cg_ctx_t *ctx) {
         "        sw_value_arena_t *_wr = sw_self_varena() ? sw_varena_create_kind(256, SW_REGION_SPAWN) : (sw_value_arena_t*)0;\n"
         "        w->fn = _wr ? deep_copy_into(fn, _wr) : sw_val_deep_copy_global(fn);\n"
         "        w->item = _wr ? deep_copy_into(lst->v.tuple.items[i], _wr) : sw_val_deep_copy_global(lst->v.tuple.items[i]);\n"
-        "        w->caller = self; w->idx = i;\n"
+        "        w->caller = self; w->idx = i; w->ref = ref;\n"
         "        sw_process_t *_wp = sw_spawn_owned(_pmap_entry, w, _wr);\n"
         "        if (!_wp) { if (_wr) sw_varena_free_all(_wr); free(w); }\n"
         "    }\n"
-        "    for (int i = 0; i < cnt; i++) {\n"
-        "        uint64_t tag;\n"
+        /* One 5s deadline for the whole call. Only this call's results count:
+         * a stray message, or a late result from an earlier pmap, is skipped. */
+        "    uint64_t deadline = _pmap_now_ms() + 5000;\n"
+        "    int got = 0;\n"
+        "    while (got < cnt) {\n"
+        "        uint64_t now = _pmap_now_ms();\n"
+        "        if (now >= deadline) break;\n"
         /* Adopt each result region into THIS (caller) arena so the returned list
          * is self-contained in the caller's lifecycle (no leaked global copies). */
-        "        void *raw = sw_recv_any_adopt(5000, &tag);\n"
-        "        if (raw) {\n"
-        "            sw_val_t *m = (sw_val_t *)raw;\n"
-        "            if (m->type == SW_VAL_TUPLE && m->v.tuple.count == 2\n"
-        "                && m->v.tuple.items[0]->type == SW_VAL_INT) {\n"
-        "                int ix = (int)m->v.tuple.items[0]->v.i;\n"
-        "                if (ix >= 0 && ix < cnt) res[ix] = m->v.tuple.items[1];\n"
-        "            }\n"
+        "        sw_val_t *m = (sw_val_t *)sw_recv_tagged_adopt(11, deadline - now);\n"
+        "        if (!m) break;\n"
+        "        if (m->type == SW_VAL_TUPLE && m->v.tuple.count == 3\n"
+        "            && m->v.tuple.items[0]->type == SW_VAL_INT && m->v.tuple.items[0]->v.i == (int64_t)ref\n"
+        "            && m->v.tuple.items[1]->type == SW_VAL_INT) {\n"
+        "            int ix = (int)m->v.tuple.items[1]->v.i;\n"
+        "            if (ix >= 0 && ix < cnt && !res[ix]) { res[ix] = m->v.tuple.items[2]; got++; }\n"
         "        }\n"
         "    }\n"
+        /* A slow item is {'error', 'timeout'}, as in Std.task_stream, not a silent nil. */
         "    for (int i = 0; i < cnt; i++)\n"
-        "        if (!res[i]) res[i] = sw_val_nil();\n"
+        "        if (!res[i]) { sw_val_t *e[] = {sw_val_atom(\"error\"), sw_val_atom(\"timeout\")};\n"
+        "                       res[i] = sw_val_tuple(e, 2); }\n"
         "    sw_val_t *r = sw_val_list(res, cnt);\n"
         "    free(res);\n"
         "    return r;\n"
@@ -2286,13 +2303,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         /* Gleam-style hint for the qualified-builtin reflex. Std.map and
          * Std.filter are REAL module functions now (lib/Std.sw aliases over
          * the global builtins — the Elixir-shaped guess models emit), so
-         * only the names with no Std alias stay on this denylist:
-         * Std.reduce can't exist (Std's own sum/product call the global
-         * `reduce` bare; a same-named module fun would shadow it) and pmap
-         * has no alias either. */
+         * only the names with no Std alias stay on this denylist: pmap
+         * has no alias. Std.reduce is a real module fun now (lib/Std.sw). */
         const char *gf = dot + 1;
-        if ((strcmp(gf, "reduce") == 0 || strcmp(gf, "pmap") == 0) &&
-            strcmp(mod, "Std") == 0) {
+        if (strcmp(gf, "pmap") == 0 && strcmp(mod, "Std") == 0) {
             fprintf(stderr, "swc: src/%s.sw:%d: %s is a global builtin \xe2\x80\x94 write %s(fn, list, ...), not %s(...)\n",
                     ctx->mod_name, n->line, gf, gf, fname);
             ctx->had_unknown_fn = 1;

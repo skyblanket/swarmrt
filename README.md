@@ -32,11 +32,16 @@ import Std
 
 fun grade(task) {
     out = llm_complete(task.prompt, %{model: "qwen2.5-coder:7b"})
+    if (string_starts_with(out, "error: ")) { panic(out) }
     if (string_contains(out, task.expect)) { 'pass' } else { 'fail' }
 }
 
 fun main() {
     tasks = json_decode(file_read("tasks.json"))
+    if (tasks == nil) {
+        eprint("tasks.json is missing or not valid JSON")
+        sys_exit(1)
+    }
     results = Std.task_stream(tasks, fn(t) { grade(t) },
                               %{max_concurrency: 64, timeout_ms: 30000})
     passed = length(filter(results, fn(r) { r == {'ok', 'pass'} }))
@@ -44,6 +49,8 @@ fun main() {
     print(f"pass {passed} fail {failed} error {length(tasks) - passed - failed}")
 }
 ```
+
+The runner reads `tasks.json`, a list of `{prompt, expect}` objects, not the `tasks.txt` that the agent template fans out. If the file is missing or is not valid JSON, it prints an error to stderr and exits 1 rather than reporting zero tasks.
 
 Against a local mock with 500 ms latency, 200 prompts run in 2.1 s on 4 cores: four waves of 64, so the runtime adds about 0.1 s to the network wait. With one grader made to panic and another to hang forever, the same run prints `pass 100 fail 98 error 2` and finishes at its deadline. One bad grader costs one cell, not the run.
 
@@ -500,7 +507,7 @@ Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket
 
 **Known limitations** (honest list — see [docs/notes/KNOWN_ISSUES.md](docs/notes/KNOWN_ISSUES.md) for repros):
 - **No static type checking** — `sw` is dynamically typed by design. Names are checked (an undefined variable is a compile error with a did-you-mean, on both the compiled and interpreted paths), but types and map keys are not.
-- **Memory is bounded under fixed concurrency (Ownership v2), with a few owners still on the global heap.** A process's own working set frees on exit; sent messages, spawn args, and pmap captures/results are adopted into receiver/child ownership and reclaimed (incl. pre-start-killed children); long-lived tail loops are bounded by a scoped turn-checkpoint. `make gc-slope` proves spawn / message / 100k-turn / pmap slopes stay flat. **Still global-heap (reclaimed only at OS exit / table destroy — a high-churn loop grows until then):** (1) **ETS** entries; (2) **supervisor child closures** and **timer/cron closures**; (3) the **interpreter** has no arena (fine for short-lived `swc run`/REPL). Values nested deeper than 256 levels are truncated on cross-process copy.
+- **Memory is bounded under fixed concurrency (Ownership v2), with a few owners still on the global heap.** A process's own working set frees on exit; sent messages, spawn args, and pmap captures/results are adopted into receiver/child ownership and reclaimed (incl. pre-start-killed children); long-lived tail loops are bounded by a scoped turn-checkpoint. `make gc-slope` proves spawn / message / 100k-turn / pmap slopes stay flat. **Still global-heap (reclaimed only at OS exit / table destroy — a high-churn loop grows until then):** (1) **ETS** entries; (2) **supervisor child closures** and **timer/cron closures**; (3) the **interpreter** has no arena (fine for short-lived `swc run`/REPL). Values nest to any depth on the local copy path (cross-process sends on this node, spawn args, turn checkpoints): the copy is iterative, so a 300-deep list arrives intact (`tests/sw/test_deep_send.sw`). The one exception is a remote send, whose wire format decodes at most 256 levels: a deeper value panics the sender with `remote send: value nested deeper than 256 levels`, so its links and supervisors see the crash. Nothing is ever silently truncated.
 
 The previous Linux x86_64 spawn-storm race is closed as of the May 29 sushi re-test: 50/50 multi-scheduler and 50/50 single-scheduler runs completed with zero crashes. Any future miss in `make stress` should be treated as a regression.
 

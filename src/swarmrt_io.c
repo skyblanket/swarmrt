@@ -62,7 +62,7 @@
 static int g_kq = -1;
 #endif
 static pthread_t g_io_thread;
-static volatile int g_io_running = 0;
+static _Atomic int g_io_running = 0;
 
 static sw_port_t *g_ports = NULL;           /* Global port list */
 static pthread_mutex_t g_ports_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -123,6 +123,12 @@ static sw_port_t *port_alloc(sw_fd_t fd, sw_port_type_t type, sw_process_t *owne
     if (type == SW_PORT_TCP_CONN) {
         p->recv_buf = (uint8_t *)malloc(SW_IO_RECV_BUF);
         p->recv_buf_size = SW_IO_RECV_BUF;
+#ifdef SO_NOSIGPIPE
+        /* macOS has no MSG_NOSIGNAL: a send to a peer that closed raises
+         * SIGPIPE unless the socket itself opts out. */
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     }
 
     /* Add to global list */
@@ -261,7 +267,7 @@ static void handle_accept(sw_port_t *listener) {
 
     /* owner is handed over by sw_port_controlling_process on another thread
      * (http_listen transfers its listener to the bridge after creating it). */
-    sw_process_t *owner = __atomic_load_n(&listener->owner, __ATOMIC_ACQUIRE);
+    sw_process_t *owner = atomic_load_explicit(&listener->owner, memory_order_acquire);
     sw_port_t *conn = port_alloc(fd, SW_PORT_TCP_CONN, owner);
     ev_register_read(fd, conn);
 
@@ -274,7 +280,7 @@ static void handle_accept(sw_port_t *listener) {
 static void handle_read(sw_port_t *port) {
     /* Acquire: a port closed (and maybe retired) on another thread while it
      * sat in this batch reads as not-OPEN here and is left alone. */
-    if (__atomic_load_n(&port->state, __ATOMIC_ACQUIRE) != SW_PORT_OPEN ||
+    if (atomic_load_explicit(&port->state, memory_order_acquire) != SW_PORT_OPEN ||
         !port->owner) return;
 
 #ifdef _WIN32
@@ -300,7 +306,7 @@ static void handle_read(sw_port_t *port) {
 #endif
     )) {
         ev_deregister(port->fd);
-        __atomic_store_n(&port->state, SW_PORT_CLOSING, __ATOMIC_RELEASE);
+        atomic_store_explicit(&port->state, SW_PORT_CLOSING, memory_order_release);
 
         sw_port_event_t *msg = (sw_port_event_t *)malloc(sizeof(sw_port_event_t));
         msg->port = port;
@@ -686,13 +692,18 @@ pid_t sw_fork(void) {
 #endif
 
 int sw_tcp_send(sw_port_t *port, const void *data, uint32_t len) {
-    if (!port || __atomic_load_n(&port->state, __ATOMIC_ACQUIRE) != SW_PORT_OPEN ||
+    if (!port || atomic_load_explicit(&port->state, memory_order_acquire) != SW_PORT_OPEN ||
         port->type != SW_PORT_TCP_CONN)
         return -1;
 
 #ifdef _WIN32
     int sent = send(port->fd, (const char *)data, len, 0);
+#elif defined(MSG_NOSIGNAL)
+    /* A peer that closed mid-send must come back as EPIPE, not SIGPIPE:
+     * the default action kills the whole node. */
+    ssize_t sent = send(port->fd, data, len, MSG_NOSIGNAL);
 #else
+    /* macOS: SO_NOSIGPIPE is set on the socket in port_alloc. */
     ssize_t sent = write(port->fd, data, len);
 #endif
     if (sent < 0) return -1;
@@ -713,7 +724,7 @@ void sw_port_close(sw_port_t *port) {
     if (!port || port->state == SW_PORT_CLOSED) return;
 
     ev_deregister(port->fd);
-    __atomic_store_n(&port->state, SW_PORT_CLOSING, __ATOMIC_RELEASE);
+    atomic_store_explicit(&port->state, SW_PORT_CLOSING, memory_order_release);
     close_fd(port->fd);
     port->fd = SW_INVALID_FD;
 
@@ -727,13 +738,13 @@ void sw_port_close(sw_port_t *port) {
     port_remove(port);
     if (port->recv_buf) free(port->recv_buf);
     port->recv_buf = NULL;
-    __atomic_store_n(&port->state, SW_PORT_CLOSED, __ATOMIC_RELEASE);
+    atomic_store_explicit(&port->state, SW_PORT_CLOSED, memory_order_release);
 }
 
 void sw_port_close_free(sw_port_t *port) {
     if (!port) return;
     ev_deregister(port->fd);
-    __atomic_store_n(&port->state, SW_PORT_CLOSING, __ATOMIC_RELEASE);
+    atomic_store_explicit(&port->state, SW_PORT_CLOSING, memory_order_release);
     /* shutdown, not close: the peer gets its FIN now, but the fd NUMBER stays
      * ours until the reaper closes it, so a read the IO thread already has in
      * flight on it can't land on a freshly accepted socket reusing the
@@ -767,7 +778,7 @@ int64_t sw_io_ports_live(void) {
 }
 
 void sw_port_controlling_process(sw_port_t *port, sw_process_t *new_owner) {
-    if (port) __atomic_store_n(&port->owner, new_owner, __ATOMIC_RELEASE);
+    if (port) atomic_store_explicit(&port->owner, new_owner, memory_order_release);
 }
 
 void sw_io_cleanup_owner(sw_process_t *proc) {
