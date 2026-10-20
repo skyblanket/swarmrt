@@ -22,7 +22,7 @@ that matches your clang. On Ubuntu/Debian install `libclang-rt-<N>-dev`, where
 install `libgcc-<N>-dev`, where `<N>` is the major version from `gcc -dumpversion`
 (for example `libgcc-13-dev`); it provides `libasan.a`, `libubsan.a` and `libtsan.a`.
 If the runtime is missing, the gate stops with a message that names the package. The gates
-print their host limits (`vm.max_map_count`, `ulimit -n`, cores) at startup, so
+print their host limits (`vm.max_map_count`, `ulimit -n`, core-dump size) at startup, so
 a failure caused by a host limit can be told apart from a code failure.
 
 ## Running the tests

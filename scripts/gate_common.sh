@@ -14,7 +14,7 @@ gate_print_limits() {
     local label="${1:-gate}" mmap="n/a"
     [ "$(uname)" = "Linux" ] && mmap=$(sysctl -n vm.max_map_count 2>/dev/null || echo '?')
     echo "[$label] host limits: vm.max_map_count=$mmap nofile=$(ulimit -n)" \
-         "cores=$(ulimit -c) ulimit-v=$(ulimit -v)" \
+         "core_size=$(ulimit -c) ulimit-v=$(ulimit -v)" \
          "cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
 }
 
