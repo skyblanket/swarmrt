@@ -569,7 +569,10 @@ void sw_io_shutdown(void) {
 #endif
 }
 
-sw_port_t *sw_tcp_listen(const char *addr, uint16_t port) {
+/* Bind and listen, with `owner` as the listener's owner. The fd is not yet
+ * registered for accept: that is the caller's job, so the owner can be set
+ * first (see sw_tcp_listen_start). */
+static sw_port_t *tcp_listen_bound(const char *addr, uint16_t port, sw_process_t *owner) {
     sw_fd_t fd = socket(AF_INET, SOCK_STREAM, 0);
 #ifdef _WIN32
     if (fd == INVALID_SOCKET) return NULL;
@@ -616,11 +619,26 @@ sw_port_t *sw_tcp_listen(const char *addr, uint16_t port) {
         return NULL;
     }
 
-    sw_port_t *p = port_alloc(fd, SW_PORT_TCP_LISTEN, sw_self());
-    ev_register_read(fd, p);
-    io_wake();
+    return port_alloc(fd, SW_PORT_TCP_LISTEN, owner);
+}
 
+sw_port_t *sw_tcp_listen(const char *addr, uint16_t port) {
+    sw_port_t *p = tcp_listen_bound(addr, port, sw_self());
+    if (p) {
+        ev_register_read(p->fd, p);
+        io_wake();
+    }
     return p;
+}
+
+sw_port_t *sw_tcp_listen_deferred(const char *addr, uint16_t port) {
+    return tcp_listen_bound(addr, port, NULL);
+}
+
+void sw_tcp_listen_start(sw_port_t *listener, sw_process_t *owner) {
+    sw_port_controlling_process(listener, owner);
+    ev_register_read(listener->fd, listener);
+    io_wake();
 }
 
 sw_port_t *sw_tcp_connect(const char *addr, uint16_t port) {
@@ -670,6 +688,20 @@ int sw_pipe_cloexec(int fds[2]) {
     }
     pthread_mutex_unlock(&g_spawn_lock);
     return rc;
+#endif
+}
+
+/* Socket counterpart of sw_pipe_cloexec: close-on-exec from creation, so a
+ * concurrent fork on another worker cannot inherit the descriptor. */
+int sw_socket_cloexec(int domain, int type, int protocol) {
+#if defined(__linux__)
+    return socket(domain, type | SOCK_CLOEXEC, protocol);
+#else
+    pthread_mutex_lock(&g_spawn_lock);
+    int fd = socket(domain, type, protocol);
+    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    pthread_mutex_unlock(&g_spawn_lock);
+    return fd;
 #endif
 }
 

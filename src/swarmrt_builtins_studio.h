@@ -1722,6 +1722,180 @@ cleaned:
  * defined just above this section, so the implementation can only
  * follow them in source order.
  * ============================================================ */
+/* === Native HTTP client glue (SW_HTTP_NATIVE=1) =============
+ * http_post, http_get and http_request try the native client first.
+ * sw_http_native_accepts() is false unless the env gate is set, the URL is
+ * plain http:// and no proxy is configured; then the curl code below runs
+ * exactly as before. Retry counts, delays and the ESC/Ctrl-C interrupt
+ * behave as the curl paths do. */
+#include "swarmrt_http_native.h"
+
+static char *_sw_native_hdr_line(const char *k, const char *v) {
+    size_t hl = strlen(k) + strlen(v) + 3;
+    char *hs = (char *)malloc(hl);
+    if (hs) snprintf(hs, hl, "%s: %s", k, v);
+    return hs;
+}
+
+/* Request headers as "Name: value" strings, from a LIST of {name, value}
+ * tuples or a MAP name=>value. Entries that are not string pairs are skipped,
+ * as the curl paths skip them. Release with _sw_native_free_headers. */
+static int _sw_native_collect_headers(sw_val_t *hv, char ***out) {
+    int cap = 0;
+    if (hv && hv->type == SW_VAL_MAP) cap = hv->v.map.count;
+    else if (hv && hv->type == SW_VAL_LIST) cap = hv->v.tuple.count;
+    char **hs = (char **)calloc(cap > 0 ? (size_t)cap : 1, sizeof(char *));
+    int n = 0;
+    if (hs && hv && hv->type == SW_VAL_MAP) {
+        for (int i = 0; i < hv->v.map.count; i++) {
+            sw_val_t *k = hv->v.map.keys[i], *v = hv->v.map.vals[i];
+            if (k && k->type == SW_VAL_STRING && v && v->type == SW_VAL_STRING)
+                hs[n++] = _sw_native_hdr_line(k->v.str, v->v.str);
+        }
+    } else if (hs && hv && hv->type == SW_VAL_LIST) {
+        for (int i = 0; i < hv->v.tuple.count; i++) {
+            sw_val_t *h = hv->v.tuple.items[i];
+            if (h && h->type == SW_VAL_TUPLE && h->v.tuple.count >= 2 &&
+                h->v.tuple.items[0]->type == SW_VAL_STRING &&
+                h->v.tuple.items[1]->type == SW_VAL_STRING)
+                hs[n++] = _sw_native_hdr_line(h->v.tuple.items[0]->v.str,
+                                              h->v.tuple.items[1]->v.str);
+        }
+    }
+    *out = hs;
+    return n;
+}
+
+static void _sw_native_free_headers(char **hs, int n) {
+    for (int i = 0; i < n; i++) free(hs[i]);
+    free(hs);
+}
+
+/* Interrupt watcher for the native client on a raw-mode TTY: same rules as
+ * the curl path's select loop in _builtin_http_post. */
+static int _sw_native_stdin_abort(void *ctx) {
+    int fd = *(int *)ctx;
+    unsigned char ib;
+    ssize_t nb = read(fd, &ib, 1);
+    if (nb <= 0) return -1;   /* EOF or error: stop watching */
+    if (nb == 1 && _sw_stdin_is_interrupt(fd, ib)) {
+        _sw_stdin_flush_pending_interrupts(fd);
+        fputs("\n  \x1b[38;5;208m⏸ interrupted by user\x1b[0m\n", stdout);
+        fflush(stdout);
+        return 1;
+    }
+    if (nb == 1) _sw_pending_push_bytes(&ib, 1);
+    return 0;
+}
+
+/* The process a native request runs for: the parked caller when on an offload
+ * worker. Its death aborts the request, as the curl path's select loop does
+ * through _sw_caller_gone. */
+static int _sw_caller_gone(sw_process_t *p, uint64_t id);
+typedef struct { sw_process_t *p; uint64_t id; } _sw_native_caller_t;
+
+static void _sw_native_caller_init(_sw_native_caller_t *c) {
+    c->p = _sw_offl_self();
+    c->id = c->p ? c->p->pid : 0;
+}
+
+static int _sw_native_caller_dead(void *ctx) {
+    const _sw_native_caller_t *c = (const _sw_native_caller_t *)ctx;
+    return _sw_caller_gone(c->p, c->id);
+}
+
+/* http_post over the native client: same three attempts, delays and retry
+ * test (empty / "Internal Server Error" / "error" body) as the curl path. */
+static sw_val_t *_sw_http_post_native(const char *url, sw_val_t *headers, const char *body,
+                                      int stdin_fd) {
+    char **hs = NULL;
+    int nh = _sw_native_collect_headers(headers, &hs);
+    _sw_native_caller_t caller;
+    _sw_native_caller_init(&caller);
+    int interrupted = 0;
+    char *resp_body = NULL;
+    size_t resp_len = 0;
+    int delays[] = {0, 5, 15};
+    for (int attempt = 0; attempt < 3 && !interrupted; attempt++) {
+        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+        sw_http_native_req_t rq;
+        memset(&rq, 0, sizeof(rq));
+        rq.method = "POST";
+        rq.url = url;
+        rq.headers = (const char *const *)hs;
+        rq.nheaders = nh;
+        rq.body = body;
+        rq.body_len = strlen(body);
+        rq.interrupt_fd = stdin_fd;
+        rq.on_interrupt = _sw_native_stdin_abort;
+        rq.ctx = &stdin_fd;
+        rq.cancelled = _sw_native_caller_dead;
+        rq.cancel_ctx = &caller;
+        sw_http_native_resp_t rs;
+        sw_http_native_request(&rq, &rs);
+        if (rs.interrupted) {
+            interrupted = 1;
+            sw_http_native_resp_free(&rs);
+            break;
+        }
+        free(resp_body);
+        resp_body = rs.body;
+        rs.body = NULL;
+        resp_len = rs.body_len;
+        sw_http_native_resp_free(&rs);
+        if (resp_len > 0 &&
+            strstr(resp_body, "Internal Server Error") == NULL &&
+            strstr(resp_body, "\"error\"") == NULL)
+            break;
+    }
+    _sw_native_free_headers(hs, nh);
+    if (interrupted) {
+        free(resp_body);
+        return sw_val_string("__INTERRUPTED__");
+    }
+    sw_val_t *r = sw_val_string(resp_body ? resp_body : "");
+    free(resp_body);
+    return r;
+}
+
+/* http_get over the native client: three attempts with the curl path's
+ * delays, retried while the body is empty. */
+static sw_val_t *_sw_http_get_native(const char *url, sw_val_t *headers) {
+    char **hs = NULL;
+    int nh = _sw_native_collect_headers(headers, &hs);
+    _sw_native_caller_t caller;
+    _sw_native_caller_init(&caller);
+    char *resp = NULL;
+    size_t resp_len = 0;
+    int delays[] = {0, 3, 10};
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (delays[attempt] > 0) sw_sleep(delays[attempt]);
+        sw_http_native_req_t rq;
+        memset(&rq, 0, sizeof(rq));
+        rq.method = "GET";
+        rq.url = url;
+        rq.headers = (const char *const *)hs;
+        rq.nheaders = nh;
+        rq.timeout_ms = 120000;
+        rq.interrupt_fd = -1;
+        rq.cancelled = _sw_native_caller_dead;
+        rq.cancel_ctx = &caller;
+        sw_http_native_resp_t rs;
+        sw_http_native_request(&rq, &rs);
+        free(resp);
+        resp = rs.body;
+        rs.body = NULL;
+        resp_len = rs.body_len;
+        int aborted = rs.interrupted;
+        sw_http_native_resp_free(&rs);
+        if (resp_len > 0 || aborted) break;
+    }
+    _sw_native_free_headers(hs, nh);
+    sw_val_t *r = sw_val_string(resp ? resp : "");
+    free(resp);
+    return r;
+}
+
 static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING || a[2]->type != SW_VAL_STRING)
         return sw_val_nil();
@@ -1730,6 +1904,12 @@ static sw_val_t *_builtin_http_post(sw_val_t **a, int n) {
     if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok))
         SW_OFFLOAD_BUILTIN(_builtin_http_post, a, n);
     const char *url = a[0]->v.str, *body = a[2]->v.str;
+
+    /* Native client (SW_HTTP_NATIVE=1): body straight from memory, no temp file. */
+    if (sw_http_native_accepts(url)) {
+        int native_stdin = (isatty(STDIN_FILENO) && _sw_rl.saved_ok) ? STDIN_FILENO : -1;
+        return _sw_http_post_native(url, a[1], body, native_stdin);
+    }
 
     /* Body via temp file — keeps the JSON out of argv entirely (and out
      * of any shell). curl reads it with -d @file. */
@@ -4927,6 +5107,9 @@ static sw_val_t *_builtin_http_get(sw_val_t **a, int n) {
     SW_OFFLOAD_BUILTIN(_builtin_http_get, a, n);
     const char *url = a[0]->v.str;
 
+    if (sw_http_native_accepts(url))
+        return _sw_http_get_native(url, (n >= 2 && a[1] && a[1]->type == SW_VAL_LIST) ? a[1] : NULL);
+
     char outf[256];
     snprintf(outf, sizeof(outf), "%s/sw_http_out_%d_%u.json",
              sw_tmpdir(), sw_getpid_os(), sw_random_u32());
@@ -5119,17 +5302,57 @@ static sw_val_t *_sw_hr_error(const char *reason) {
     return sw_val_tuple(items, 2);
 }
 
+/* http_request over the native client: one attempt (as the curl path has no
+ * retry), status, headers and body surfaced the same way. */
+static sw_val_t *_sw_http_request_native(const char *url, const char *method,
+                                         const char *body, sw_val_t *headers,
+                                         uint64_t timeout_ms) {
+    char **hs = NULL;
+    int nh = _sw_native_collect_headers(headers, &hs);
+    _sw_native_caller_t caller;
+    _sw_native_caller_init(&caller);
+    sw_http_native_req_t rq;
+    memset(&rq, 0, sizeof(rq));
+    rq.method = method;
+    rq.url = url;
+    rq.headers = (const char *const *)hs;
+    rq.nheaders = nh;
+    rq.body = body;
+    rq.body_len = body ? strlen(body) : 0;
+    rq.timeout_ms = timeout_ms;
+    rq.interrupt_fd = -1;
+    rq.cancelled = _sw_native_caller_dead;
+    rq.cancel_ctx = &caller;
+    sw_http_native_resp_t rs;
+    int status = sw_http_native_request(&rq, &rs);
+    _sw_native_free_headers(hs, nh);
+    if (status <= 0) {
+        char reason[448];
+        snprintf(reason, sizeof(reason), "http_request: %s", rs.err);
+        sw_http_native_resp_free(&rs);
+        return _sw_hr_error(reason);
+    }
+    sw_val_t *keys[3], *vals[3];
+    keys[0] = sw_val_string("status");  vals[0] = sw_val_int((int64_t)rs.status);
+    keys[1] = sw_val_string("body");    vals[1] = sw_val_string(rs.body ? rs.body : "");
+    keys[2] = sw_val_string("headers"); vals[2] = _sw_hr_parse_headers(rs.headers);
+    sw_val_t *r = sw_val_map_new(keys, vals, 3);
+    sw_http_native_resp_free(&rs);
+    return r;
+}
+
 static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_hr_error("http_request: url must be a string");
     SW_OFFLOAD_BUILTIN(_builtin_http_request, a, n);
     const char *url = a[0]->v.str;
 
-    /* opts (optional map): method / headers / body */
+    /* opts (optional map): method / headers / body / timeout_ms */
     sw_val_t *opts = (n >= 2) ? a[1] : NULL;
     const char *method = "GET";
     const char *body = NULL;
     sw_val_t *headers = NULL;   /* MAP or LIST of {k,v} */
+    int64_t timeout_ms = 0;     /* whole-request budget; 0 = the 300 s default */
     if (opts && opts->type == SW_VAL_MAP) {
         sw_val_t *km = sw_val_string("method");
         sw_val_t *mv = sw_val_map_get(opts, km);
@@ -5140,7 +5363,13 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
         sw_val_t *kh = sw_val_string("headers");
         sw_val_t *hv = sw_val_map_get(opts, kh);
         if (hv && (hv->type == SW_VAL_MAP || hv->type == SW_VAL_LIST)) headers = hv;
+        sw_val_t *kt = sw_val_string("timeout_ms");
+        sw_val_t *tv = sw_val_map_get(opts, kt);
+        if (tv && tv->type == SW_VAL_INT && tv->v.i > 0) timeout_ms = tv->v.i;
     }
+
+    if (sw_http_native_accepts(url))
+        return _sw_http_request_native(url, method, body, headers, (uint64_t)timeout_ms);
 
     /* Temp files: request body, response body, response header dump. */
     char body_file[256], out_file[256], hdr_file[256];
@@ -5177,8 +5406,12 @@ static sw_val_t *_builtin_http_request(sw_val_t **a, int n) {
     argv[argc++] = (char *)method;
     argv[argc++] = "--connect-timeout";
     argv[argc++] = "30";
+    /* --max-time in whole seconds (rounded up); the 300 s default when unset. */
+    char max_time[24];
+    snprintf(max_time, sizeof(max_time), "%lld",
+             (long long)(timeout_ms > 0 ? (timeout_ms + 999) / 1000 : 300));
     argv[argc++] = "--max-time";
-    argv[argc++] = "300";
+    argv[argc++] = max_time;
     argv[argc++] = "-o";
     argv[argc++] = out_file;
     argv[argc++] = "-D";

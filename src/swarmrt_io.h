@@ -88,6 +88,12 @@ void sw_io_shutdown(void);
  * Accepted connections are sent as SW_TAG_PORT_ACCEPT messages. */
 sw_port_t *sw_tcp_listen(const char *addr, uint16_t port);
 
+/* Two-step listen for a caller that must set the owner before accepts start:
+ * sw_tcp_listen_deferred binds and listens without accepting; then
+ * sw_tcp_listen_start makes `owner` the owner and begins accepting. */
+sw_port_t *sw_tcp_listen_deferred(const char *addr, uint16_t port);
+void sw_tcp_listen_start(sw_port_t *listener, sw_process_t *owner);
+
 /* Connect to addr:port. Returns connection port owned by caller. */
 sw_port_t *sw_tcp_connect(const char *addr, uint16_t port);
 

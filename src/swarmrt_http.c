@@ -1154,8 +1154,8 @@ sw_process_t *sw_http_listen_opts(uint16_t port, sw_process_t *handler,
     if (!bind_addr || !*bind_addr || strcasecmp(bind_addr, "localhost") == 0)
         bind_addr = "127.0.0.1";
 
-    /* Create TCP listener (owned by caller initially) */
-    sw_port_t *listener = sw_tcp_listen(bind_addr, port);
+    /* Bind and listen without accepting yet */
+    sw_port_t *listener = sw_tcp_listen_deferred(bind_addr, port);
     if (!listener) {
         fprintf(stderr, "swarmrt_http: cannot listen on %s:%u\n", bind_addr, port);
         return NULL;
@@ -1172,8 +1172,11 @@ sw_process_t *sw_http_listen_opts(uint16_t port, sw_process_t *handler,
     /* Spawn bridge process */
     sw_process_t *bp = sw_spawn(http_bridge_entry, bridge);
 
-    /* Transfer listener ownership to bridge */
-    sw_port_controlling_process(listener, bp);
+    /* Hand the listener to the bridge, then start accepting. Accepting first
+     * would let a connection arrive while the caller still owned the port:
+     * its accept and data would go to a process that never reads them, and
+     * the request would hang (seen as a stall under SW_HTTP_NATIVE=1). */
+    sw_tcp_listen_start(listener, bp);
 
     return bp;
 }

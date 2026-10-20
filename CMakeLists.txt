@@ -53,6 +53,7 @@ set(CORE_SOURCES
     ${SRC_DIR}/swarmrt_node.c
     ${SRC_DIR}/swarmrt_lang.c
     ${SRC_DIR}/swarmrt_http.c
+    ${SRC_DIR}/swarmrt_http_native.c
     ${SRC_DIR}/swarmrt_pdf.c
 )
 

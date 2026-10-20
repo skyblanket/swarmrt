@@ -267,6 +267,7 @@ static inline int sw_wake_pipe_create(sw_fd_t fds[2]) {
  * held a finished one's output open). dup2 onto the child's stdio clears the
  * flag, so the child's own redirections still work. */
 int sw_pipe_cloexec(int fds[2]);
+int sw_socket_cloexec(int domain, int type, int protocol);
 pid_t sw_fork(void);
 #endif
 

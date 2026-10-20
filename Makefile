@@ -69,7 +69,7 @@ endif
 # Core object files (needed by all native targets since process_exit hooks into all modules)
 CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
             swarmrt_phase4 swarmrt_phase5 swarmrt_hotload swarmrt_io swarmrt_gc swarmrt_node \
-            swarmrt_lang swarmrt_http swarmrt_pdf swarmrt_varena
+            swarmrt_lang swarmrt_http swarmrt_http_native swarmrt_pdf swarmrt_varena
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
@@ -149,6 +149,13 @@ test-phase4: phase4
 
 test-phase5: phase5
 	./$(BIN_DIR)/test-phase5
+
+# Native HTTP client (SW_HTTP_NATIVE): C-level cases against raw loopback
+# servers (chunked, 1 MB each way, mid-reply close, timeout, interrupt).
+.PHONY: test-http-native
+test-http-native: core-objs
+	$(CC) $(CFLAGS) -I$(SRC_DIR) $(CORE_OBJS) tests/native/test_http_native.c -o $(BIN_DIR)/test_http_native $(LDFLAGS)
+	./$(BIN_DIR)/test_http_native
 
 # Phase 6 tests (IO/Port system)
 phase6: core-objs
@@ -275,7 +282,7 @@ FUZZ_RT := $(SRC_DIR)/swarmrt_native.c $(SRC_DIR)/swarmrt_asm.S $(SRC_DIR)/swarm
            $(SRC_DIR)/swarmrt_task.c $(SRC_DIR)/swarmrt_ets.c $(SRC_DIR)/swarmrt_phase4.c \
            $(SRC_DIR)/swarmrt_phase5.c $(SRC_DIR)/swarmrt_hotload.c $(SRC_DIR)/swarmrt_io.c \
            $(SRC_DIR)/swarmrt_gc.c $(SRC_DIR)/swarmrt_node.c $(SRC_DIR)/swarmrt_lang.c \
-           $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
+           $(SRC_DIR)/swarmrt_http.c $(SRC_DIR)/swarmrt_http_native.c $(SRC_DIR)/swarmrt_pdf.c $(SRC_DIR)/swarmrt_varena.c
 ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 # Memory-bounded ASAN env for the fuzz-* targets ONLY. The fuzz harness replays
 # thousands of mutations; on the no-swap 16 GB GitHub runner, ASAN's default
@@ -288,7 +295,7 @@ ASAN_FUZZ_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
 # use-after-free detection window.
 FUZZ_ASAN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:quarantine_size_mb=64:max_redzone=256:malloc_context_size=10
 
-.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-json fuzz-ws fuzz-db isolation-gate
+.PHONY: fuzz fuzz-parse fuzz-marshal fuzz-http fuzz-http-resp fuzz-json fuzz-ws fuzz-db isolation-gate
 fuzz-parse: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz \
 	    tests/fuzz/fuzz_parse.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_parse $(LDFLAGS)
@@ -320,6 +327,13 @@ fuzz-http: dirs
 # (7/16/64-bit lengths), masking, the 16MB caps, control frames, and the
 # fragmentation/reassembly realloc path. Reuses -DSW_FUZZ_HTTP (both hooks
 # live in swarmrt_http.c).
+# Native HTTP client response parser (src/swarmrt_http_native.c) — framing,
+# chunk sizes and header scanning over untrusted reply bytes.
+fuzz-http-resp: dirs
+	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -Itests/fuzz -I$(SRC_DIR) \
+	    tests/fuzz/fuzz_http_resp.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_http_resp $(LDFLAGS)
+	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_http_resp tests/fuzz/corpus/http_resp
+
 fuzz-ws: dirs
 	$(FUZZ_CC) $(CFLAGS) $(SAN) -DSW_FUZZ_STANDALONE -DSW_FUZZ_HTTP -Itests/fuzz \
 	    tests/fuzz/fuzz_ws.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_ws $(LDFLAGS)
@@ -334,7 +348,7 @@ fuzz-db: dirs
 	    tests/fuzz/fuzz_db.c $(FUZZ_RT) -o $(BIN_DIR)/fuzz_db $(LDFLAGS)
 	@$(FUZZ_ASAN_ENV) $(BIN_DIR)/fuzz_db tests/fuzz/corpus/db
 
-fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db
+fuzz: fuzz-parse fuzz-json fuzz-marshal fuzz-http fuzz-ws fuzz-db fuzz-http-resp
 
 # Cross-process isolation under malformed input (Phase 3 exit criterion:
 # "malformed input cannot crash another process"). The decoder fuzz targets
