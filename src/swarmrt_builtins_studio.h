@@ -1193,6 +1193,15 @@ static inline sw_process_t *_sw_offl_self(void) {
     return p ? p : _sw_offl_waiter;
 }
 
+/* The process a builtin is waiting for has been killed or is gone. The kill
+ * path frees the slot without resuming the caller, and a new process can
+ * reuse the slot (clearing kill_flag), so also compare the never-reused
+ * numeric pid captured at the start. */
+static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
+    if (!p) return 0;
+    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
+}
+
 typedef struct {
     sw_val_t *(*fn)(sw_val_t **, int);
     sw_val_t **args;
@@ -5465,6 +5474,7 @@ static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_le
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
+    SW_OFFLOAD_BUILTIN(_builtin_shell, a, n);
     const char *cmd = a[0]->v.str;
 
     /* Temp files for captured output and exit status */
@@ -5525,8 +5535,14 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
         pgroup + C timeout + killpg). 120s stays well above any legit
         fast/local shell() use. */
     off_t last_size = 0;
+    /* The caller can be killed while we poll: stop waiting for it then, as
+     * the timeout below does (its background command is not killed here). */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     while (!done && waited_us < max_wait_us) {
+        if (_sw_caller_gone(caller, caller_id)) break;
+
         /* Check if command finished — BEFORE sleeping, so an already-done
          * command costs one fopen, not a poll interval. */
         FILE *ef = fopen(exitf, "r");
@@ -5719,12 +5735,15 @@ static sw_val_t *_sw_managed_tuple(int code, const char *msg) {
 }
 
 static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
-    SW_BLOCKING_SCOPE();
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return _sw_managed_tuple(-1, "error: shell_managed needs a string command");
 #ifdef _WIN32
     return _sw_managed_tuple(-1, "error: shell_managed unsupported on this platform");
 #else
+    /* Wait on a worker thread, not this scheduler: a shell_managed that
+     * runs for minutes must not pin the scheduler (N of them froze every
+     * other process). */
+    SW_OFFLOAD_BUILTIN(_builtin_shell_managed, a, n);
     const char *cmd = a[0]->v.str;
     int64_t timeout_ms =
         (n >= 2 && a[1] && a[1]->type == SW_VAL_INT) ? a[1]->v.i : 0;
@@ -5756,16 +5775,23 @@ static sw_val_t *_builtin_shell_managed(sw_val_t **a, int n) {
     int timed_out = 0;
     int done = 0;
     int oom = 0;
+    /* The caller can be killed while we wait: treat that like an interrupt
+     * so the child's process group is killed rather than left running. */
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
 
     while (!done) {
-        /* Remaining wall-clock budget; tick at least once per second so a
-         * huge timeout still re-checks, and so a quiet child can't wedge us. */
-        int64_t remaining_ms = 1000;
+        if (_sw_caller_gone(caller, caller_id)) { interrupted = 1; break; }
+
+        /* Remaining wall-clock budget; tick at least every 100 ms so a huge
+         * timeout still re-checks, a quiet child can't wedge us, and a killed
+         * caller is noticed promptly (as exec_managed's poll does). */
+        int64_t remaining_ms = 100;
         if (timeout_ms > 0) {
             int64_t elapsed = (int64_t)(_sw_now_ms() - t_start);
             if (elapsed >= timeout_ms) { timed_out = 1; interrupted = 1; break; }
             remaining_ms = timeout_ms - elapsed;
-            if (remaining_ms > 1000) remaining_ms = 1000;
+            if (remaining_ms > 100) remaining_ms = 100;
         }
 
         fd_set rfds;
@@ -5960,15 +5986,6 @@ static sw_val_t *_sw_exec_opt(sw_val_t *opts, const char *key) {
 static const char *_sw_exec_opt_str(sw_val_t *opts, const char *key) {
     sw_val_t *v = _sw_exec_opt(opts, key);
     return (v && v->type == SW_VAL_STRING) ? v->v.str : NULL;
-}
-
-/* The process exec_managed waits for has been killed or is gone. The kill
- * path frees the slot without resuming the caller, and a new process can
- * reuse the slot (clearing kill_flag), so also compare the never-reused
- * numeric pid captured at the start. */
-static int _sw_caller_gone(sw_process_t *p, uint64_t id) {
-    if (!p) return 0;
-    return p->kill_flag || p->pid != id || p->state == SW_PROC_FREE;
 }
 
 /* environ minus the names in `unset` (an sw list of strings), as a malloc'd
