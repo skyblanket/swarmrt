@@ -193,10 +193,10 @@ Most languages were designed for humans first; LLM ergonomics are a happy accide
 - **Compile-time "did you mean?"** for unknown function names. `unknown function 'strng_length' — did you mean 'string_length'?` Levenshtein over builtins + module funcs.
 - **Loud runtime failures with full stack traces.** `hd([])`, `elem(t, 99)`, `n / 0` panic with `at src/X.sw:N` and the full call chain (`outer → middle → deep`). `expect(value, msg)` is the idiomatic unwrap. `try/catch` for recoverable cases.
 - **A real stdlib in sw, auto-imported.** `import Std` (list / map / string helpers) just works from any project — swc falls back to `<swarmrt>/lib/`. Same goes for `Mcp`, `Embed`, `Vec`, `Prompt`, `Cron`, `Telemetry`.
-- **Module-level `let` globals.** Top-level constant bindings at module scope — `let base_url = "https://api.example.com"` — shared by all functions in the module without threading them as arguments. *(Interpreter / REPL path only; codegen support is not yet wired — compiled binaries resolve the name as an atom. Use a top-of-function `let` binding or a module function returning the constant in compiled code.)*
+- **Module-level `let` globals.** Top-level constant bindings at module scope — `let base_url = "https://api.example.com"` — shared by all functions in the module without threading them as arguments. *(Works in compiled binaries, including `let` globals from imported modules. `swc run` (the interpreter) does not yet resolve imported-module `let` globals — they read as `nil` — so use a top-of-function `let` binding or a module function returning the constant there.)*
 - **`exec_argv(cmd, args)` builtin.** Fork+exec with no shell — safe for user-supplied arguments, no injection risk. Works in both the interpreter and `swc build` compiled code. (Use `shell_sandboxed` when you need a sandboxed shell for agent tool dispatch.)
 - **`assert_raises(fn, msg)` builtin.** In `swc test` files, assert that a zero-arg lambda panics (or errors) with a message containing `msg`. The test runner intercepts the panic so the suite continues.
-- **The whole language fits in one document.** SW_LANGUAGE.md is ~950 lines including examples — small enough to paste into a system prompt.
+- **The whole language fits in one document.** SW_LANGUAGE.md is ~1200 lines including examples — small enough to paste into a system prompt.
 
 If you've watched an LLM struggle with Erlang's `case ... of -> ;`, with Rust's lifetimes, or with Python's import-vs-from-import-vs-as ceremony, `sw` is the reaction.
 
