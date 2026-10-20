@@ -63,9 +63,13 @@ fun test_past_cap_panics() {
 }
 
 fun main() {
-    test_within_cap()
-    test_past_cap_panics()
-    print("PROBE_OK")
-    sys_exit(0)
+    fails = test_within_cap() + test_past_cap_panics()
+    if (fails == 0) {
+        print("OK test_deep_send 2/2")
+        sys_exit(0)
+    } else {
+        print("FAIL test_deep_send")
+        sys_exit(1)
+    }
 }
 main()
