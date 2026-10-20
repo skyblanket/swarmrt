@@ -604,6 +604,7 @@ static void scheduler_loop(sw_scheduler_t *sched);
 static void process_exit(sw_process_t *proc, int reason);
 static void process_destroy(sw_process_t *proc);
 static void fire_timers(void);
+static uint64_t now_ns(void);
 static void registry_remove_proc(sw_process_t *proc);
 #ifdef _WIN32
 static VOID CALLBACK preempt_handler(PVOID param, BOOLEAN fired);
@@ -1582,6 +1583,32 @@ static void root_exit_check(sw_process_t *proc, int reason) {
     }
 }
 
+/* Longest an idle scheduler sleeps with no timer due. Producers and timer
+ * inserts signal parked schedulers directly, so this is only a backstop.
+ * Env-tunable: SW_IDLE_PARK_MS (default 500, clamped to 1..60000). */
+static uint64_t sw_idle_park_ns(void) {
+    static uint64_t cap_ns = 0;
+    if (!cap_ns) {
+        const char *e = getenv("SW_IDLE_PARK_MS");
+        long ms = e ? atol(e) : 500;
+        if (ms < 1) ms = 1;
+        if (ms > 60000) ms = 60000;
+        cap_ns = (uint64_t)ms * 1000000ULL;
+    }
+    return cap_ns;
+}
+
+/* Earliest pending timer deadline (now_ns() clock), UINT64_MAX if none. */
+static uint64_t next_timer_deadline_ns(void) {
+    if (!g_swarm) return UINT64_MAX;
+    sw_timer_list_t *tl = &g_swarm->timers;
+    uint64_t dl = UINT64_MAX;
+    pthread_mutex_lock(&tl->lock);
+    if (tl->head) dl = tl->head->fire_at_ns;
+    pthread_mutex_unlock(&tl->lock);
+    return dl;
+}
+
 static void scheduler_loop(sw_scheduler_t *sched) {
     tls_scheduler = sched;
     _sw_gen = &_sw_gen_fallback;  /* valid before the first switch-in sets it */
@@ -1606,8 +1633,8 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * so the producer's sw_add_to_runq pays NOTHING (no lock, no
          * signal) and the consumer picks the work up within ~ns.
          * Budget is per-idle-transition, env-tunable: SW_SPIN_US
-         * (default 60, 0 disables, capped 1000); the 0.5ms park below is
-         * the safety net. Default ON since the deadlock that briefly
+         * (default 60, 0 disables, capped 1000); the deadline-aware park
+         * below is the fallback. Default ON since the deadlock that briefly
          * forced it opt-in was root-caused to the Dekker StoreLoad bug
          * in the receive waiting-flag handshake (see sw_receive_any) and
          * fixed with seq_cst — 0/200 wedge-hunt runs post-fix vs ~15%
@@ -1728,7 +1755,14 @@ static void scheduler_loop(sw_scheduler_t *sched) {
              * MINUTES (each hop eating a 0.5ms park). Publish idle=1
              * first, then RE-POLL once; only park if still empty. The
              * producer now either sees idle=1 (and signals) or its
-             * enqueue happens-before our re-poll (and we find it). */
+             * enqueue happens-before our re-poll (and we find it).
+             *
+             * Park length: until the earliest timer is due, capped at
+             * sw_idle_park_ns(). No periodic poll — an idle scheduler
+             * sleeps instead of waking ~2000x/s. Timers are the only
+             * thing that becomes runnable without a signal, and a timer
+             * insert that becomes the new head signals a parked
+             * scheduler (sw_send_after). */
             sw_runq_t *rq = &sched->runq;
             pthread_mutex_lock(&rq->idle_lock);
             atomic_store_explicit(&rq->idle, 1, memory_order_release);
@@ -1744,11 +1778,30 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 sw_add_to_runq(rq, late);
                 continue;
             }
+            /* Shutdown sets should_exit, then signals idle_cond under this
+             * lock. Checking it here, under the same lock, means that signal
+             * cannot land between the loop-top check and our wait. */
+            if (sched->should_exit) {
+                atomic_store_explicit(&rq->idle, 0, memory_order_release);
+                pthread_mutex_unlock(&rq->idle_lock);
+                continue;
+            }
             if (g_sched_trace >= 1)
                 atomic_fetch_add_explicit(&g_tr_park, 1, memory_order_relaxed);
+            /* Peek the timer head under idle_lock and after idle=1. An insert
+             * that lands before this peek is seen here; one that lands after
+             * sees idle=1 and signals us. */
+            uint64_t now = now_ns();
+            uint64_t wake = now + sw_idle_park_ns();
+            uint64_t dl = next_timer_deadline_ns();
+            if (dl < wake) wake = dl;
+            uint64_t rem = wake > now ? wake - now : 0;
+            /* pthread_cond_timedwait takes CLOCK_REALTIME, timers use
+             * CLOCK_MONOTONIC: convert the remaining interval. */
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 500000;  /* +0.5ms (safety net; signals do the work) */
+            ts.tv_sec += (time_t)(rem / 1000000000ULL);
+            ts.tv_nsec += (long)(rem % 1000000000ULL);
             if (ts.tv_nsec >= 1000000000) {
                 ts.tv_sec++;
                 ts.tv_nsec -= 1000000000;
@@ -3597,10 +3650,17 @@ uint64_t sw_send_after(uint64_t delay_ms, sw_process_t *dest, uint64_t tag, void
     while (*pp && (*pp)->fire_at_ns <= t->fire_at_ns) {
         pp = &(*pp)->next;
     }
+    int new_head = (pp == &tl->head);
     t->next = *pp;
     *pp = t;
 
     pthread_mutex_unlock(&tl->lock);
+
+    /* A new earliest deadline shortens the parked schedulers' sleep: wake
+     * one so it re-parks against it. Signalled after the unlock because the
+     * park path takes idle_lock before tl->lock; nesting them the other way
+     * here would invert that order. */
+    if (new_head) wake_one_idle_scheduler();
     return ref;
 }
 

@@ -58,6 +58,7 @@ noted. **Every one is optional**; the defaults are the product defaults.
 |----------|---------|---------|
 | `SW_SCHEDULERS` | # online CPUs | Number of scheduler OS threads (BEAM-style, one per core). Compiled binaries only; `swc run` is always single-scheduler. |
 | `SW_SPIN_US` | on (seq_cst) | Bounded spin-before-park in the scheduler idle loop (cross-scheduler wake latency). Advanced tuning; leave default. |
+| `SW_IDLE_PARK_MS` | `500` | Longest an idle scheduler sleeps with no timer due (clamped 1..60000). Idle schedulers wake at the next timer deadline, or at this cap, whichever is first; a sleeping scheduler is woken by work or timer signals, so the cap only bounds how long a missed signal can wait. |
 | `SW_TURN_RESET_BYTES` | `262144` | Tail-call/turn checkpoint threshold for per-process arena reclaim. Advanced GC tuning; leave default. |
 | `SW_GC_OFF` | off | Reverts to the pre-GC global-heap allocation model (A/B/debug escape hatch). Do not use in production — memory then grows until the OS process exits. |
 
