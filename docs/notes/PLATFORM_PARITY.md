@@ -19,10 +19,10 @@
 | Search/SIMD | **Works** (SSE + NEON) | **Works** (MinGW uses same intrinsics) |
 | Compiler (swc) | **Works** | **FIXED** — temp paths, platform macros |
 | FS Index (sws) | **Works** | **FIXED** — HOME dir, signal, fnmatch |
-| Build system | **Works** (Makefile) | **TODO** — CMakeLists.txt needed |
+| Build system | **Works** (Makefile) | **Works** (`CMakeLists.txt` + `mingw-w64.cmake` exist; MinGW cross-build not yet run) |
 
 **Linux: Fully functional.**
-**Windows: All code-level blockers FIXED. Needs CMakeLists.txt and MinGW cross-compilation test.**
+**Windows: All code-level blockers FIXED. `CMakeLists.txt` and `mingw-w64.cmake` exist (CMake configure verified on Linux, 2026-10-19); MinGW cross-compilation test still needed.**
 
 ---
 
@@ -100,11 +100,11 @@ Cross-platform header providing unified API:
 
 ## Remaining TODO
 
-### T1. CMakeLists.txt for Cross-Platform Build
-Currently only has a GNU Makefile. Need CMake for MinGW-w64 cross-compilation:
-- MinGW-w64 toolchain file
-- `.S` assembly support (GAS syntax)
-- Link flags (-lws2_32 on Windows, -lpthread -lz on all)
+### T1. CMakeLists.txt for Cross-Platform Build — files exist
+Done: `CMakeLists.txt` and `mingw-w64.cmake` are in the repo. `cmake -S . -B <build>` configures on
+Linux (checked 2026-10-19). Covers the MinGW-w64 toolchain file, `.S` assembly support (GAS), and
+platform link flags (`ws2_32` on Windows, pthread/zlib elsewhere). The cross-compile itself is
+unverified until T2 runs.
 
 ### T2. Windows Cross-Compile Verification
 - Install MinGW-w64 cross-compiler (x86_64-w64-mingw32-gcc)
@@ -138,6 +138,7 @@ make swc sws  # needs: gcc, libz-dev, libssl-dev
 
 ### Windows (MinGW-w64 cross-compile from macOS/Linux)
 ```bash
-# TODO: cmake -DCMAKE_TOOLCHAIN_FILE=mingw-w64.cmake ..
-# For now: x86_64-w64-mingw32-gcc with manual flags
+cmake -DCMAKE_TOOLCHAIN_FILE=mingw-w64.cmake -B build-win .
+cmake --build build-win
+# Manual fallback: x86_64-w64-mingw32-gcc with explicit flags
 ```
