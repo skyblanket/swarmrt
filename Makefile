@@ -502,6 +502,7 @@ mailbox-flood: dirs
 # and the capped run fails — the gate has been proven bidirectionally.
 .PHONY: quota-gate
 quota-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits quota-gate
 	@./bin/swc build tests/gc/quota_kill.sw -o $(BIN_DIR)/quota_kill >/dev/null
 	@SW_PROC_MEM_MAX=2000000 $(BIN_DIR)/quota_kill >$(BIN_DIR)/_qk.out 2>$(BIN_DIR)/_qk.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_qk.out; then \
@@ -530,6 +531,7 @@ quota-gate: swc libswarmrt
 # gate has been proven bidirectionally.
 .PHONY: msgsize-gate
 msgsize-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits msgsize-gate
 	@./bin/swc build tests/gc/msg_size_cap.sw -o $(BIN_DIR)/msg_size_cap >/dev/null
 	@SW_MSG_MAX_BYTES=65536 $(BIN_DIR)/msg_size_cap >$(BIN_DIR)/_mc.out 2>$(BIN_DIR)/_mc.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_mc.out; then \
@@ -582,6 +584,7 @@ shutdown-gate: swc libswarmrt
 # bidirectionally.
 .PHONY: crashlog-gate
 crashlog-gate: swc libswarmrt
+	@bash scripts/gate_common.sh gate_print_limits crashlog-gate
 	@./bin/swc build tests/obs/crash_json.sw -o $(BIN_DIR)/crash_json >/dev/null
 	@SW_LOG_JSON=1 $(BIN_DIR)/crash_json >$(BIN_DIR)/_cj.out 2>$(BIN_DIR)/_cj.err; rc=$$?; \
 	 if [ $$rc -ne 0 ] || ! grep -q "PROBE_OK" $(BIN_DIR)/_cj.out; then \
@@ -652,6 +655,8 @@ lsan-gate: swc
 	@if [ "$$(uname)" != "Linux" ]; then \
 	  echo "lsan-gate: SKIP (LeakSanitizer requires Linux clang/gcc ASAN)"; exit 0; \
 	fi
+	@bash scripts/gate_common.sh gate_print_limits lsan-gate
+	@bash scripts/gate_common.sh gate_need_asan "$(FUZZ_CC)" || { echo "lsan-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/lsan_lifecycle.sw -o $(BIN_DIR)/_lsan_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=address -g -O1 -fno-stack-protector \
 	    tests/gc/lsan_lifecycle.gen.c $(FUZZ_RT) -o $(BIN_DIR)/lsan_gate $(LDFLAGS)
@@ -807,6 +812,8 @@ stats:
 # scanner. The storm runs its full 80k spawns — ~2 min under TSan.
 .PHONY: tsan-gate
 tsan-gate: swc
+	@bash scripts/gate_common.sh gate_print_limits tsan-gate
+	@bash scripts/gate_common.sh gate_need_tsan "$(FUZZ_CC)" || { echo "tsan-gate: FAIL (missing prerequisite, see above)"; exit 2; }
 	@./bin/swc build --emit-c tests/gc/slope_message.sw -o $(BIN_DIR)/_tsm_emit >/dev/null 2>&1 || true
 	$(FUZZ_CC) $(CFLAGS) -I$(SRC_DIR) -fsanitize=thread -g -O1 \
 	    tests/gc/slope_message.gen.c $(FUZZ_RT) -o $(BIN_DIR)/tsan_msg $(LDFLAGS)

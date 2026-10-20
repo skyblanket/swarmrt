@@ -25,17 +25,23 @@ gate_need_cmd() {
     return 1
 }
 
+# Return 0 if <cc> links a program built with -fsanitize=<flags>.
+gate_probe_san() {
+    local cc="$1" flags="$2" dir rc
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/gate_san.XXXXXX") || return 1
+    printf 'int main(void) { return 0; }\n' > "$dir/probe.c"
+    $cc -fsanitize="$flags" "$dir/probe.c" -o "$dir/probe" >/dev/null 2>&1
+    rc=$?
+    rm -rf "$dir"
+    return $rc
+}
+
 # Require a working ASAN+UBSAN link with <cc> (may be a multi-word command).
 # On Linux a missing runtime only shows up as an ld "cannot find *.a" error
 # that names no package, so probe once and name the package instead.
 gate_need_asan() {
-    local cc="$1" dir ver
-    dir=$(mktemp -d "${TMPDIR:-/tmp}/gate_asan.XXXXXX") || return 1
-    printf 'int main(void) { return 0; }\n' > "$dir/probe.c"
-    if $cc -fsanitize=address,undefined "$dir/probe.c" -o "$dir/probe" >/dev/null 2>&1; then
-        rm -rf "$dir"; return 0
-    fi
-    rm -rf "$dir"
+    local cc="$1" ver
+    gate_probe_san "$cc" address,undefined && return 0
     ver=$($cc -dumpversion 2>/dev/null | cut -d. -f1)
     if [ "$(uname)" != "Linux" ]; then
         echo "missing ASAN/UBSAN runtime for '$cc' (macOS: install the Xcode command-line tools, or brew install llvm)"
@@ -43,6 +49,22 @@ gate_need_asan() {
         echo "missing ASAN/UBSAN runtime for '$cc': install libclang-rt-${ver}-dev (sudo apt-get install libclang-rt-${ver}-dev)"
     else
         echo "missing ASAN/UBSAN runtime for '$cc': install libasan${ver} and libubsan${ver} (sudo apt-get install libasan${ver} libubsan${ver})"
+    fi
+    return 1
+}
+
+# Require a working TSan link with <cc>. Same probe-and-name-the-package
+# approach as gate_need_asan.
+gate_need_tsan() {
+    local cc="$1" ver
+    gate_probe_san "$cc" thread && return 0
+    ver=$($cc -dumpversion 2>/dev/null | cut -d. -f1)
+    if [ "$(uname)" != "Linux" ]; then
+        echo "missing TSan runtime for '$cc' (macOS: install the Xcode command-line tools, or brew install llvm)"
+    elif $cc --version 2>/dev/null | grep -qi clang; then
+        echo "missing TSan runtime for '$cc': install libclang-rt-${ver}-dev (sudo apt-get install libclang-rt-${ver}-dev)"
+    else
+        echo "missing TSan runtime for '$cc': install libtsan${ver} (sudo apt-get install libtsan${ver})"
     fi
     return 1
 }
