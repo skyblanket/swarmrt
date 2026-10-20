@@ -558,6 +558,7 @@ static void node_free(node_t *n) {
         for (int i = 0; i < n->v.mod.nfuns; i++) node_free(n->v.mod.funs[i]);
         free(n->v.mod.funs);
         for (int i = 0; i < n->v.mod.nglobals; i++) node_free(n->v.mod.globals[i].val);
+        free(n->v.mod.globals);
         break;
     case N_FUN:
         node_free(n->v.fun.body);
@@ -628,7 +629,11 @@ static node_t *node_dup(node_t *n) {
     case N_MODULE:
         out->v.mod.funs = malloc(sizeof(node_t*) * (n->v.mod.nfuns ? n->v.mod.nfuns : 1));
         for (int i = 0; i < n->v.mod.nfuns; i++) out->v.mod.funs[i] = node_dup(n->v.mod.funs[i]);
-        for (int i = 0; i < n->v.mod.nglobals; i++) out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        out->v.mod.globals = malloc(sizeof(*out->v.mod.globals) * (n->v.mod.nglobals ? n->v.mod.nglobals : 1));
+        for (int i = 0; i < n->v.mod.nglobals; i++) {
+            memcpy(out->v.mod.globals[i].name, n->v.mod.globals[i].name, sizeof(out->v.mod.globals[i].name));
+            out->v.mod.globals[i].val = node_dup(n->v.mod.globals[i].val);
+        }
         break;
     case N_FUN:
         out->v.fun.body = node_dup(n->v.fun.body);
@@ -2208,17 +2213,13 @@ static node_t *par_module(par_t *p) {
              * refs) are rejected at eval time since global_env is empty at load. */
             node_t *val = par_expr(p);
             if (p->err) break;
-            if (mod->v.mod.nglobals < 16) {
-                int gi = mod->v.mod.nglobals++;
-                strncpy(mod->v.mod.globals[gi].name, gname.text,
-                        sizeof(mod->v.mod.globals[gi].name)-1);
-                mod->v.mod.globals[gi].val = val;
-            } else {
-                snprintf(p->errmsg, sizeof(p->errmsg),
-                    "line %d: too many module globals (max 16)", gname.line);
-                p->err = 1;
-                node_free(val);
-            }
+            int gi = mod->v.mod.nglobals++;
+            mod->v.mod.globals = realloc(mod->v.mod.globals,
+                sizeof(*mod->v.mod.globals) * mod->v.mod.nglobals);
+            memset(mod->v.mod.globals[gi].name, 0, sizeof(mod->v.mod.globals[gi].name));
+            strncpy(mod->v.mod.globals[gi].name, gname.text,
+                    sizeof(mod->v.mod.globals[gi].name)-1);
+            mod->v.mod.globals[gi].val = val;
         } else {
             mod->v.mod.nfuns++;
             mod->v.mod.funs = realloc(mod->v.mod.funs, sizeof(node_t*) * mod->v.mod.nfuns);

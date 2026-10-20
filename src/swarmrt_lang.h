@@ -334,8 +334,8 @@ typedef struct node {
         /* N_MODULE */
         struct { char name[128]; struct node **funs; int nfuns;
                  char imports[32][128]; int nimports;
-                 /* Module-level immutable globals: let x = literal */
-                 struct { char name[128]; struct node *val; } globals[16];
+                 /* Module-level immutable globals: let x = literal (heap, grows) */
+                 struct { char name[128]; struct node *val; } *globals;
                  int nglobals; } mod;
         /* N_FUN */
         struct { char name[128]; char params[16][128]; int nparams;

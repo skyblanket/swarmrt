@@ -122,7 +122,7 @@ fun summary(path) {
 
 ### Module-level `let` globals
 
-A module may declare up to 16 named constants at the top level using `let`. These are initialized once at compile time and visible to every function in the module.
+A module may declare any number of named constants at the top level using `let`. These are initialized once at startup and visible to every function in the module.
 
 ```sw
 module Config
@@ -133,7 +133,15 @@ let default_timeout = 30000
 let service_name = 'my_service'
 ```
 
-Supported literal types for module globals: `int`, `float`, `string`, and `atom`. Complex expressions, function calls, and list/map literals are **not** supported at module scope — put those inside `fun init()` or a similar startup function.
+Supported values for module globals: `int`, `float`, `string`, `atom`, and collection literals — lists, maps (`%{...}`), and tuples — including nested ones. Keep the right-hand side to constant data; anything that depends on runtime state belongs inside `fun init()` or a similar startup function.
+
+```sw
+module Limits
+
+let RETRY_LIMITS = %{"lo" => 0, "hi" => 100}
+let REGIONS = ["us-east", "eu-west"]
+let DEFAULT_PAIR = {7, "seven"}
+```
 
 Globals are read-only after initialization. Any assignment to a module-global name inside a function creates a local variable that shadows the global for that scope; the global itself is unchanged.
 
