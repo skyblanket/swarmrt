@@ -20,6 +20,8 @@ cd "$REPO" || { echo "slowloris-gate: FAIL (no repo)"; exit 99; }
 PORT=9351
 MAX_CONNS=256           # keep in sync with SW_HTTP_MAX_CONNS
 ulimit -n 4096 2>/dev/null || true
+. "$REPO/scripts/gate_common.sh"
+gate_print_limits slowloris-gate
 
 SERVER_PID=""
 cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; wait 2>/dev/null; }
