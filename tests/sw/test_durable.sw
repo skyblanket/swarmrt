@@ -13,6 +13,9 @@ module Test_durable
 #   loop       — Durable.loop killed mid-run, re-run finishes the job.
 #   supervised — a dyn_supervisor child that panics restores its state
 #                after the in-process restart.
+#   memo       — Durable.memo around a counting fake model; killed in step 2
+#                after the model answered, the resumed run must not call it
+#                again for that step.
 
 import Durable
 import Std
@@ -143,6 +146,32 @@ fun ask(name) {
     }
 }
 
+# Durable.memo: a three-step job whose model call is a fake that appends a line
+# to <db>.calls every time it really runs. Step 2 dies after its memoized answer
+# was written but before the step checkpointed. The resumed run must reuse that
+# answer, so the model runs once per step.
+fun fake_model(n) {
+    shell("echo call " ++ to_string(n) ++ " >> '" ++ getenv("SW_STATE_DB") ++ ".calls'")
+    "answer-" ++ to_string(n)
+}
+
+fun memo_step(s, crash_at) {
+    n = map_get(s, "n")
+    ans = Durable.memo("memo:step:" ++ to_string(n) ++ ":llm", fun() { fake_model(n) })
+    if (n == crash_at) { shell("kill -9 $PPID") ; sleep(5000) }
+    {'next', %{"n" => n + 1, "out" => map_get(s, "out") ++ ans}}
+}
+
+fun memo_child() {
+    crash_at = env_int("SW_CRASH_AT", 0 - 1)
+    r = Durable.loop("memo:job", %{"n" => 1, "out" => ""}, fun(s) {
+        if (map_get(s, "n") > 3) { {'done', map_get(s, "out")} } else { memo_step(s, crash_at) }
+    })
+    calls = string_trim(elem(shell("cat '" ++ getenv("SW_STATE_DB") ++ ".calls' 2>/dev/null"), 1))
+    print("MEMO " ++ r ++ " calls=" ++ to_string(length(string_split(calls, "\n"))))
+    sys_exit(0)
+}
+
 fun supervised_child() {
     sup = dyn_supervisor()
     c = sup_start_child(sup, {'dur_worker', fun() { sup_worker() }, 'permanent'})
@@ -191,13 +220,20 @@ fun driver() {
     l2 = run_child(me, db, "loop", "")
     fails = fails + assert_eq("loop_resumed_and_cleared", elem(l2, 1), "LOOP {55, 2} nil")
 
+    # Durable.memo: step 2 dies after its model answer was memoized. The resumed
+    # run reuses that answer and the model runs exactly once per step.
+    m1 = run_child(me, db, "memo", "2")
+    fails = fails + assert_eq("memo_child_killed", elem(m1, 0) != 0, true)
+    m2 = run_child(me, db, "memo", "")
+    fails = fails + assert_eq("memo_resumed_once", elem(m2, 1), "MEMO answer-1answer-2answer-3 calls=3")
+
     s = run_child(me, db, "supervised", "")
     # {count before crash, restarted as a new pid, count after restart, +1}.
     # (The panic banner goes to stderr, merged ahead of the result line.)
     fails = fails + assert_eq("supervised_restore", last_line(elem(s, 1)), "SUP {3, :true, 3, 4}")
 
-    shell("rm -f '" ++ db ++ "' '" ++ db ++ "-wal' '" ++ db ++ "-shm'")
-    total = 36   # 28 in the roundtrip child + 8 here
+    shell("rm -f '" ++ db ++ "' '" ++ db ++ "-wal' '" ++ db ++ "-shm' '" ++ db ++ ".calls'")
+    total = 39   # 28 in the roundtrip child + 11 here
     if (fails == 0) { print("OK durable " ++ to_string(total) ++ "/" ++ to_string(total)) ; sys_exit(0) }
     else { print("FAIL durable " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }
@@ -215,6 +251,7 @@ fun main() {
         "roundtrip"  -> roundtrip()
         "crash"      -> crash_child()
         "loop"       -> loop_child()
+        "memo"       -> memo_child()
         "supervised" -> supervised_child()
         "peek"       -> print("VAL " ++ to_string(restore(getenv("SW_KEY"))))
         _            -> driver()
