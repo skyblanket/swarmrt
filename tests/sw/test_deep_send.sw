@@ -1,10 +1,9 @@
 module Test_deep_send
 
 # Regression: a value nested deeper than 256 levels must never arrive
-# truncated. The copy on send used to return nil past depth 256, so a
-# 300-deep list reached the receiver as a 256-deep one with no error. Now a
-# value that cannot be copied faithfully panics the sending process: the
-# receiver never sees a 'deep' message, and the sender's DOWN arrives.
+# truncated. The local copy on send used to return nil past depth 256, so a
+# 300-deep list reached the receiver as a 256-deep one with no error. The copy
+# is now iterative with no depth cap, so every depth arrives intact.
 
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
@@ -33,12 +32,7 @@ fun receiver(parent) {
     0
 }
 
-fun sender(parent, n) {
-    send(parent, {'deep', nest('leaf', n)})
-    0
-}
-
-# 200 levels is within the cap: it must arrive intact.
+# 200 levels is within the old cap: it must arrive intact.
 fun test_within_cap() {
     me = self()
     r = spawn(receiver(me))
@@ -49,21 +43,19 @@ fun test_within_cap() {
     }
 }
 
-# 300 levels is past the cap: the sender panics, so the receiver gets no
-# truncated copy — only the sender's DOWN.
-fun test_past_cap_panics() {
+# 300 levels is past the old cap: it must still arrive intact, not truncated.
+fun test_past_cap() {
     me = self()
-    res = spawn_monitor(sender(me, 300))
-    ref = elem(res, 1)
+    r = spawn(receiver(me))
+    send(r, {'deep', nest('leaf', 300)})
     receive {
-        {'deep', _} -> assert_eq("deep_past_cap_no_truncated_copy", "DELIVERED", "NONE")
-        {'DOWN', dref, _, _, _} -> assert_eq("deep_past_cap_panics", dref == ref, true)
-        after 5000 { assert_eq("deep_past_cap_panics", "TIMEOUT", "MATCH") }
+        {'depth', d} -> assert_eq("deep_past_cap_intact", d, 300)
+        after 5000 { assert_eq("deep_past_cap_intact", "TIMEOUT", "MATCH") }
     }
 }
 
 fun main() {
-    fails = test_within_cap() + test_past_cap_panics()
+    fails = test_within_cap() + test_past_cap()
     if (fails == 0) {
         print("OK test_deep_send 2/2")
         sys_exit(0)
