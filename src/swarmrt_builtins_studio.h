@@ -5642,14 +5642,19 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     /* Launch command in background, writing exit code to a file when done.
      * This lets us poll the output file while the command runs. */
     size_t cmdlen = strlen(cmd);
-    size_t wrapcap = cmdlen + 1024;
+    size_t wrapcap = cmdlen + 2048;
     char *wrapped = (char *)malloc(wrapcap);
     if (!wrapped) return sw_val_nil();
     /* The newline (not "; ") ends cmd: a trailing `# comment` or heredoc
      * terminator used to swallow the rest of the wrapper, and a trailing
-     * `&` made "& ;" a syntax error. */
+     * `&` made "& ;" a syntax error. The status is written to a temp name
+     * and renamed into place: `>` creates exitf before echo fills it, and
+     * the poller treats the file's existence as "done", so a bare redirect
+     * let it read an empty file (atoi("") == 0 — a failed command reported
+     * as success under load). rename() makes exitf appear already complete. */
     snprintf(wrapped, wrapcap,
-        "{ %s\necho $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
+        "{ %s\necho $? > %s.tmp && mv -f %s.tmp %s ; } > %s 2>&1 &",
+        cmd, exitf, exitf, exitf, outf);
     int launch = system(wrapped);
     free(wrapped);
     /* The launching sh backgrounds the group and exits 0. Anything else
