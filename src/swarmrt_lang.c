@@ -3012,10 +3012,16 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
 /* Mutual tail-call hop state (see swarmrt_lang.h). The sentinel only needs a
  * unique address; it is never read as a value. */
 sw_val_t sw_tc_hop_sentinel;
-__thread sw_tc_body_t sw_tc_next_fn;
-__thread int sw_tc_next_n;
-__thread sw_varena_mark_t sw_tc_next_floor;
-__thread sw_val_t *sw_tc_next_args[SW_TC_MAX];
+static __thread sw_tc_park_t sw_tc_park_tls;
+
+sw_tc_park_t *sw_tc_park(void) {
+    sw_process_t *p = sw_self();
+    if (p) {
+        if (!p->tc_park) p->tc_park = (sw_tc_park_t *)calloc(1, sizeof(sw_tc_park_t));
+        if (p->tc_park) return p->tc_park;
+    }
+    return &sw_tc_park_tls;
+}
 
 /* Ownership v2 turn checkpoint (called by compiled self-tail-calls once the
  * function has allocated enough above its entry floor). Copies the live

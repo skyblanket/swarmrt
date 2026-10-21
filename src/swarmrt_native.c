@@ -2450,6 +2450,8 @@ void sw_shutdown(int swarm_id) {
                 free(slab[i].gen_exec);
                 slab[i].gen_exec = NULL;
             }
+            free(slab[i].tc_park);
+            slab[i].tc_park = NULL;
             /* Last panic message of the slot's final occupant (see
              * process_destroy) — freed at slab teardown. */
             free(slab[i].panic_msg);

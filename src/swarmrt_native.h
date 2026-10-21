@@ -439,6 +439,10 @@ struct sw_process {
      * stack_mem/stack_size above describe the carrier's stack. At struct END
      * so it shifts no asm-pinned offset. */
     struct sw_carrier *carrier;
+
+    /* Mutual-tail-call park (sw_tc_park in swarmrt_lang.c), allocated on the
+     * process's first hop and kept with the slab slot like gen_exec. */
+    struct sw_tc_park *tc_park;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
