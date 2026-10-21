@@ -850,7 +850,7 @@ Needs `import Chrome` (a battery; see §2).
 | `monitor(pid)` → ref | one-way watch; watcher receives `{'DOWN', ref, 'process', pid, reason}` (5-tuple, Erlang-shaped) on death. `demonitor(ref)` to cancel |
 | `exit_proc(pid, reason)` | targeted exit signal — `'normal'` / `'killed'` / other atom |
 | `trap_exit('true' \| 'false')` | toggle exit-signal trapping; on, exit signals arrive as `{'EXIT', from, reason}` messages |
-| `supervise(strategy, [{name, fn, restart}, …])` | restart-tree supervisor (`'one_for_one'` / `'one_for_all'` / `'rest_for_one'`) — children fixed at start |
+| `supervise(strategy, [{name, fn, restart}, …])` | restart-tree supervisor (`'one_for_one'` / `'one_for_all'` / `'rest_for_one'`) — children fixed at start. `restart` is `'permanent'` (always restart), `'transient'` (only on abnormal exit) or `'temporary'` (never); a restarted child re-runs its `fn` from scratch, so its state starts fresh (siblings keep theirs under `one_for_one`). See BUILDING_AGENTS.md |
 | `dyn_supervisor()` / `dyn_supervisor(max_restarts, max_seconds)` → pid | dynamic supervisor — starts empty, always `one_for_one`, add children at runtime |
 | `sup_start_child(sup, {name, fn, restart})` → pid | add+start one supervised child at runtime (`name` may be `nil` for anonymous); `nil` on failure |
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |

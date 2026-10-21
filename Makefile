@@ -5,7 +5,7 @@ CC = cc
 # so -D_GNU_SOURCE is no longer needed on the command line. Kept the
 # define on Darwin only because some macOS-specific APIs (kqueue, etc.)
 # still want _DARWIN_C_SOURCE visible early. The Linux build uses neither.
-CFLAGS = -Wall -Wextra -Wno-unused-function -g -O2 -pthread
+CFLAGS = -Wall -Wextra -Wno-unused-function -Wno-stringop-truncation -Wno-format-truncation -g -O2 -pthread
 ifeq ($(shell uname),Darwin)
 CFLAGS += -D_DARWIN_C_SOURCE
 endif

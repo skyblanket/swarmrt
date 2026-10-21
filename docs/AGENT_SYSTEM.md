@@ -23,7 +23,7 @@ fun main() {
 - Files live at `src/<ModuleName>.sw` (or `src/main.sw` for `module Main`).
 - Imports are auto-resolved — write `import OtherModule` and the compiler finds `src/OtherModule.sw`.
 
-To compile: `swc build src/main.sw -o myprog && ./myprog`.
+To get `swc`, run `make swc libswarmrt && export PATH="$PWD/bin:$PATH"` in the SwarmRT checkout (see README.md > Install). To compile: `swc build src/main.sw -o myprog && ./myprog`.
 
 ---
 
