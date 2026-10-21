@@ -4,6 +4,33 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-21 — Busy processes use ~20× less memory; spawning past the mapping limit fails cleanly
+
+**fix(memory): a message-passing process holds about 12.6 KB, not about 250 KB.**
+The turn-checkpoint threshold was a fixed 256 KB, so every busy process carried up to
+256 KB of dead values, and resident memory settled near that peak. It is now 4 KB by
+default and a runtime setting, `SW_TURN_RESET_BYTES` (bytes or k/m; the 2×-live
+adaptive rule stays). The first arena chunk is 1 KB instead of 8 KB. The panic-trace
+buffer is a 16-entry ring indexed by depth instead of a 64-entry array, which also
+fixes deep traces: past 64 frames it used to show the outermost frames labelled as
+the innermost. Atoms are interned, so `'tok'` in a hot loop no longer allocates. A
+message region starts at its payload's size instead of 256 B.
+
+Measured with `bench/memory` (#161 ring, 4 schedulers, Linux x86-64): busy 161 KB per
+process at N=10K and still climbing toward ~250 KB → a flat 12.5 KB (12.1 KB at N=30K;
+`SW_TURN_RESET_BYTES=2k` gives 10.1 KB); idle 10.7 KB → 6.4 KB. `bench/actor` got faster too:
+fanout 11.25 → 5.73 s, parallel 11.64 → 4.74 s, pingpong 8.92 → 6.39 s, spawn
+8.31 → 7.45 s.
+
+**fix(spawn): a refused stack mapping no longer crashes the node.** Every process
+owns a stack mapping plus a guard page, so stock Linux (`vm.max_map_count` 65530)
+runs out near 32,700 processes. `process_init_arena`'s failure was ignored and the
+half-built process SIGSEGV'd. Now the slot is handed back, stderr says why, and the
+spawning process gets the `spawn failed` panic. Gate: `tests/sw/run_spawn_limit.sh`
+(fails with SIGSEGV on the old code).
+
+Unblocked: Phase 1 of `docs/design/PROCESS_WEIGHT.md`.
+
 ## 2026-10-20 — HTTP server refuses ambiguous body framing (request smuggling)
 
 **fix(http, security): requests whose body framing a front proxy could read

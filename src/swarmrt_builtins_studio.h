@@ -4708,19 +4708,24 @@ static sw_val_t *_builtin_error(sw_val_t **a, int n) {
 static void _sw_print_trace(void) {
     int top = _sw_trace_top;
     if (top <= 0) return;
-    if (top > 64) top = 64;
+    int lo = top > SW_TRACE_MAX ? top - SW_TRACE_MAX : 0;
     fprintf(stderr, "  call chain (innermost first):\n");
     /* The innermost frame's "current line" lives in _sw_current_line —
-     * the frame's stored `line` is the function's *entry* line. */
-    for (int i = top - 1; i >= 0; i--) {
-        const char *m = _sw_trace[i].module_name ? _sw_trace[i].module_name : "?";
-        const char *fn = _sw_trace[i].fn_name ? _sw_trace[i].fn_name : "?";
-        int line = (i == top - 1 && _sw_current_line > 0)
-                       ? _sw_current_line : _sw_trace[i].line;
+     * the frame's stored `line` is the function's *entry* line. A slot whose
+     * depth doesn't match was overwritten by a deeper call that has since
+     * returned: the frames below it weren't kept. */
+    int shown = 0;
+    for (int i = top - 1; i >= lo; i--) {
+        const _sw_frame_t *e = &_sw_trace[i & (SW_TRACE_MAX - 1)];
+        if (e->depth != i) break;
+        const char *m = e->module_name ? e->module_name : "?";
+        const char *fn = e->fn_name ? e->fn_name : "?";
+        int line = (i == top - 1 && _sw_current_line > 0) ? _sw_current_line : e->line;
         fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", top - 1 - i, m, fn, m, line);
+        shown++;
     }
-    if (_sw_trace_overflowed)
-        fprintf(stderr, "    ... (truncated; %d frames omitted)\n", _sw_trace_top - 64);
+    if (shown < top)
+        fprintf(stderr, "    ... (%d outer frames not kept)\n", top - shown);
 }
 
 /* C-level panic helper for builtins. Takes a printf-style format so

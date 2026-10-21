@@ -5,6 +5,8 @@
 
 #define SW_VARENA_ALIGN 16
 
+size_t sw_turn_reset_bytes = SW_TURN_RESET_DEFAULT;
+
 /* Allocation-failure injection (Phase 2.5). Compiled in ONLY under
  * -DSW_ALLOC_FAULT (the `make alloc-fault` gate); zero cost otherwise.
  * `sw_alloc_fault_tick()` (swarmrt_native.c) counts down from SW_FAIL_ALLOC_AT
@@ -53,14 +55,14 @@ static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
 }
 
 sw_value_arena_t *sw_varena_create(size_t first_chunk) {
-    if (first_chunk < 1024) first_chunk = 8192;   /* process arena: 8KB floor */
+    if (first_chunk < 1024) first_chunk = 1024;   /* process arena: 1KB floor (chunks double as it grows) */
     return varena_new(first_chunk, SW_REGION_PROCESS);
 }
 
 /* Right-sized region: clamp(hint, 256B, 64KB), NO 8KB floor — a tiny message
  * costs a 256B chunk, the 32KB spawn arg one ~right-sized chunk. */
 sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind) {
-    if (hint < 256) hint = 256;
+    if (hint < 64) hint = 64;   /* message regions are sized to their payload (#161) */
     else if (hint > 64 * 1024) hint = 64 * 1024;
     return varena_new(hint, kind);
 }

@@ -8,6 +8,20 @@ a repro, impact, and current hypothesis.
 These are genuine limitations, not crashes. Each is reproducible with the
 shipped `bin/swc`.
 
+### Every live process owns a stack mapping (memory floor and a Linux process ceiling)
+
+Each process has its own mmap'd stack plus a guard page. A parked process costs at
+least one page for it (4 KB on Linux x86-64, 16 KB on Apple Silicon), and two kernel
+mappings, so stock Linux (`vm.max_map_count` 65530) runs out near 32,700 live
+processes. Past that, spawn now fails with a clear `spawn failed` panic and a stderr
+line naming the cause (it used to SIGSEGV the node). Busy message-passing processes
+cost about 12.5 KB resident each with the default `SW_TURN_RESET_BYTES` (4 KB; was
+about 250 KB at steady state with the old fixed 256 KB threshold), idle ones about
+6.4 KB (measured with `bench/memory`, Linux x86-64).
+**Workaround:** raise `vm.max_map_count` for more than ~30K live processes. The fix
+(processes that don't own a stack while parked) is designed in
+`docs/design/PROCESS_WEIGHT.md`, Phase 2.
+
 ### Interpreter non-tail recursion is bounded
 
 The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see

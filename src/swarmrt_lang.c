@@ -2401,9 +2401,51 @@ sw_val_t *sw_val_string(const char *s) {
     return v;
 }
 
+/* Atom interning: every atom text gets ONE immortal value, so `'tok'` in a
+ * hot receive loop is a table lookup, not a 72-byte allocation plus a string
+ * copy per use (#161). Open addressing with lock-free CAS insert; entries are
+ * never removed. Capped: a full table (or a long probe) falls back to the old
+ * per-use allocation, so a program minting atoms from data degrades instead
+ * of growing this table without bound. */
+#define SW_ATOM_TABLE_BITS 16
+#define SW_ATOM_TABLE_SIZE (1u << SW_ATOM_TABLE_BITS)
+#define SW_ATOM_PROBE_MAX  64
+static _Atomic(sw_val_t *) g_atom_table[SW_ATOM_TABLE_SIZE];
+
+static sw_val_t *atom_intern(const char *s) {
+    uint32_t h = 2166136261u;                       /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) h = (h ^ *p) * 16777619u;
+    sw_val_t *mine = NULL;
+    for (uint32_t i = 0; i < SW_ATOM_PROBE_MAX; i++) {
+        _Atomic(sw_val_t *) *slot = &g_atom_table[(h + i) & (SW_ATOM_TABLE_SIZE - 1)];
+        sw_val_t *cur = atomic_load_explicit(slot, memory_order_acquire);
+        if (!cur) {
+            if (!mine) {
+                mine = (sw_val_t *)calloc(1, sizeof(sw_val_t));
+                char *text = mine ? strdup(s) : NULL;
+                if (!text) { free(mine); return NULL; }
+                mine->type = SW_VAL_ATOM;
+                mine->immortal = 1;
+                mine->v.str = text;
+            }
+            if (atomic_compare_exchange_strong_explicit(slot, &cur, mine,
+                    memory_order_acq_rel, memory_order_acquire))
+                return mine;
+            /* lost the race: `cur` is what the winner stored */
+        }
+        if (strcmp(cur->v.str, s) == 0) {
+            if (mine) { free(mine->v.str); free(mine); }
+            return cur;
+        }
+    }
+    if (mine) { free(mine->v.str); free(mine); }
+    return NULL;
+}
+
 sw_val_t *sw_val_atom(const char *s) {
     sw_val_t *imm = imm_atom(s);
     if (imm) return imm;
+    if (s && (imm = atom_intern(s))) return imm;
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_ATOM; v->v.str = val_strdup(s);
     return v;
@@ -3027,6 +3069,35 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
  * Runs in the sender's context; the copy lands on the global heap regardless
  * of which process is current. NULL payload passes through unchanged (matches
  * the prior sw_send_tagged contract). */
+/* Bytes deep_copy_into will need for v (16-byte-rounded nodes, arrays and
+ * strings; immortals are shared, not copied), so a message region starts at
+ * the payload's size instead of a fixed 256B chunk. An estimate: a short count
+ * just means the region grows a chunk; big or deep payloads stop early. */
+static size_t msg_bytes_rec(const sw_val_t *v, int depth, int *budget) {
+#define MSG_RND(n) (((size_t)(n) + 15) & ~(size_t)15)
+    if (!v || v->immortal) return 0;
+    if (--*budget < 0 || depth > 32) return 4096;
+    size_t n = MSG_RND(sizeof(sw_val_t));
+    switch (v->type) {
+    case SW_VAL_STRING: case SW_VAL_ATOM:
+        return n + (v->v.str ? MSG_RND(strlen(v->v.str) + 1) : 0);
+    case SW_VAL_TUPLE: case SW_VAL_LIST:
+        n += MSG_RND(sizeof(sw_val_t *) * (size_t)(v->v.tuple.count > 0 ? v->v.tuple.count : 1));
+        for (int i = 0; i < v->v.tuple.count; i++) n += msg_bytes_rec(v->v.tuple.items[i], depth + 1, budget);
+        return n;
+    case SW_VAL_MAP:
+        n += 2 * MSG_RND(sizeof(sw_val_t *) * (size_t)(v->v.map.cap > 0 ? v->v.map.cap : 1));
+        for (int i = 0; i < v->v.map.count; i++)
+            n += msg_bytes_rec(v->v.map.keys[i], depth + 1, budget) + msg_bytes_rec(v->v.map.vals[i], depth + 1, budget);
+        return n;
+    case SW_VAL_BYTES: return n + MSG_RND(v->v.bytes.len ? v->v.bytes.len : 1);
+    case SW_VAL_REMOTE_PID: return n + (v->v.rpid.node ? MSG_RND(strlen(v->v.rpid.node) + 1) : 0);
+    case SW_VAL_FUN: return n + 256;   /* captures etc.: a rough allowance */
+    default: return n;
+    }
+#undef MSG_RND
+}
+
 void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v) {
     if (!to) return;
     if (!v) { sw_send_tagged(to, tag, NULL); return; }
@@ -3037,7 +3108,8 @@ void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v) {
     /* g_alloc_target: sending from an offload worker (a builtin running for a
      * parked process) — the receiver has an arena, so use a region too. */
     if (sw_self_varena() || g_alloc_target) {
-        sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_MESSAGE);
+        int budget = 256;
+        sw_value_arena_t *r = sw_varena_create_kind(msg_bytes_rec(v, 0, &budget), SW_REGION_MESSAGE);
         if (r) { sw_send_tagged_msg(to, tag, deep_copy_into(v, r), r); return; }
     }
     sw_send_tagged(to, tag, sw_val_deep_copy_global(v));
