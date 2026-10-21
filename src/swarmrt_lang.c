@@ -4482,7 +4482,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         args[0]->type == SW_VAL_INT && args[1]->type == SW_VAL_INT) {
         int64_t lo = args[0]->v.i, hi = args[1]->v.i;
         if (hi <= lo) return sw_val_int(lo);
-        return sw_val_int(lo + (rand() % (int)(hi - lo + 1)));
+        /* Same source as the compiled path (arc4random), not the unseeded rand(). */
+        return sw_val_int(lo + (int64_t)sw_random_uniform((uint32_t)(hi - lo + 1)));
     }
 
     /* === Error model =========================================== */

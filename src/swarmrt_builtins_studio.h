@@ -626,6 +626,7 @@ static sw_val_t *_builtin_random_int(sw_val_t **a, int n) {
     if (n < 2 || a[0]->type != SW_VAL_INT || a[1]->type != SW_VAL_INT)
         return sw_val_int(0);
     int64_t lo = a[0]->v.i, hi = a[1]->v.i;
+    if (hi <= lo) return sw_val_int(lo);   /* matches the interpreter */
     return sw_val_int(lo + (int64_t)(sw_random_uniform((uint32_t)(hi - lo + 1))));
 }
 
