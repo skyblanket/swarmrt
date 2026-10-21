@@ -1605,6 +1605,443 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz);
 static void emit_ident_value(cg_ctx_t *ctx, const char *name, char *out, int osz);
 static void hoist_assigned(cg_ctx_t *ctx, node_t *body);
 
+/* =========================================================================
+ * Local hoisting (PROCESS_WEIGHT.md §3.3 rule 1, Phase 2b)
+ *
+ * A function body is emitted into a temporary file and then rewritten here.
+ * Every scalar local moves to function scope, initialised to zero, and its
+ * original declaration becomes a plain assignment. A binding that shadows a
+ * visible one gets a unique C name (`k__1`). Arrays (argument vectors,
+ * scratch) stay where they are, since none of them lives across a call.
+ * Labels can then be placed anywhere at statement level, which the resume
+ * dispatch of Phase 2c needs.
+ *
+ * The rewrite runs twice. The first run collects every identifier the body
+ * uses without a local binding (parameters, globals, functions, type names),
+ * so the second never picks one of those as a hoisted name. Any construct
+ * it doesn't recognise (a multi-declarator, a brace-less for body with a
+ * declaration) makes it emit the function unchanged. SW_NO_HOIST=1 turns the
+ * pass off, for A/B comparisons.
+ * ========================================================================= */
+
+typedef struct { char *orig, *cname; } hz_bind_t;
+typedef struct { char *cname, *type; int had_init; } hz_hoist_t;
+typedef struct { int start; int close_parent; } hz_scope_t;
+
+typedef struct {
+    const char *t;
+    size_t n;
+    int pass;                           /* 1 = collect free names, 2 = emit */
+    int failed;
+    hz_bind_t *b; int nb, capb;         /* bindings of the open scopes */
+    hz_scope_t *sc; int nsc, capsc;
+    hz_hoist_t *h; int nh, caph;
+    char **freen; int nfree, capfree;   /* referenced with no binding */
+    char **orig; int norig, caporig;    /* every bound source name */
+    char *o; size_t olen, ocap;
+} hz_t;
+
+static void hz_put(hz_t *z, const char *s, size_t len) {
+    if (z->pass != 2) return;
+    if (z->olen + len + 1 > z->ocap) {
+        size_t nc = z->ocap ? z->ocap * 2 : 4096;
+        while (nc < z->olen + len + 1) nc *= 2;
+        z->o = (char *)realloc(z->o, nc);
+        z->ocap = nc;
+    }
+    memcpy(z->o + z->olen, s, len);
+    z->olen += len;
+    z->o[z->olen] = '\0';
+}
+
+#define HZ_GROW(arr, num, cap) do { if ((num) >= (cap)) { \
+    (cap) = (cap) ? (cap) * 2 : 64; \
+    (arr) = realloc((arr), sizeof(*(arr)) * (size_t)(cap)); } } while (0)
+
+static int hz_in(char **set, int n, const char *s) {
+    for (int i = 0; i < n; i++) if (strcmp(set[i], s) == 0) return 1;
+    return 0;
+}
+
+static int hz_idstart(int c) { return isalpha(c) || c == '_'; }
+static int hz_idchar(int c) { return isalnum(c) || c == '_'; }
+
+static const char *hz_keywords[] = {
+    "return", "goto", "if", "else", "while", "for", "do", "switch", "case",
+    "default", "break", "continue", "sizeof", NULL
+};
+
+static int hz_is_kw(const char *s, size_t len) {
+    for (int i = 0; hz_keywords[i]; i++)
+        if (strlen(hz_keywords[i]) == len && strncmp(hz_keywords[i], s, len) == 0) return 1;
+    return 0;
+}
+
+static const char *hz_lookup(hz_t *z, const char *name) {
+    for (int i = z->nb - 1; i >= 0; i--)
+        if (strcmp(z->b[i].orig, name) == 0) return z->b[i].cname;
+    return NULL;
+}
+
+static int hz_cname_visible(hz_t *z, const char *c) {
+    for (int i = 0; i < z->nb; i++)
+        if (strcmp(z->b[i].cname, c) == 0) return 1;
+    return 0;
+}
+
+static void hz_bind(hz_t *z, const char *orig, const char *cname) {
+    HZ_GROW(z->b, z->nb, z->capb);
+    z->b[z->nb].orig = strdup(orig);
+    z->b[z->nb].cname = strdup(cname);
+    z->nb++;
+    if (!hz_in(z->orig, z->norig, orig)) {
+        HZ_GROW(z->orig, z->norig, z->caporig);
+        z->orig[z->norig++] = strdup(orig);
+    }
+}
+
+static void hz_push(hz_t *z, int close_parent) {
+    HZ_GROW(z->sc, z->nsc, z->capsc);
+    z->sc[z->nsc].start = z->nb;
+    z->sc[z->nsc].close_parent = close_parent;
+    z->nsc++;
+}
+
+static void hz_pop(hz_t *z) {
+    if (z->nsc <= 1) { z->failed = 1; return; }   /* unbalanced: give up */
+    int close_parent = z->sc[z->nsc - 1].close_parent;
+    int start = z->sc[--z->nsc].start;
+    while (z->nb > start) { z->nb--; free(z->b[z->nb].orig); free(z->b[z->nb].cname); }
+    if (close_parent) hz_pop(z);
+}
+
+/* The C name for a new hoisted binding of `name` with C type `type`: the
+ * source name when that is free to use, else `name__k`. A hoisted slot of
+ * the same name and type that no open scope can see is reused. */
+static const char *hz_choose(hz_t *z, const char *name, const char *type) {
+    static char buf[256];
+    for (int k = 0; k < 100000; k++) {
+        if (k == 0) snprintf(buf, sizeof(buf), "%s", name);
+        else snprintf(buf, sizeof(buf), "%s__%d", name, k);
+        if (hz_cname_visible(z, buf)) continue;
+        if (hz_in(z->freen, z->nfree, buf)) continue;
+        if (k > 0 && hz_in(z->orig, z->norig, buf)) continue;
+        int clash = 0;
+        for (int i = 0; i < z->nh; i++)
+            if (strcmp(z->h[i].cname, buf) == 0) {
+                clash = strcmp(z->h[i].type, type) != 0;
+                break;
+            }
+        if (clash) continue;
+        return buf;
+    }
+    z->failed = 1;
+    return name;
+}
+
+static void hz_hoist(hz_t *z, const char *cname, const char *type, int had_init) {
+    for (int i = 0; i < z->nh; i++)
+        if (strcmp(z->h[i].cname, cname) == 0) { z->h[i].had_init |= had_init; return; }
+    HZ_GROW(z->h, z->nh, z->caph);
+    z->h[z->nh].cname = strdup(cname);
+    z->h[z->nh].type = strdup(type);
+    z->h[z->nh].had_init = had_init;
+    z->nh++;
+}
+
+/* Try to read a declaration at t[i] (a statement start, or just inside a
+ * for header). Returns the number of bytes consumed (the type and the
+ * declarator name; the initializer is left to the main loop), or 0 if it
+ * isn't a declaration. */
+static size_t hz_decl(hz_t *z, size_t i) {
+    const char *t = z->t;
+    size_t j = i, n = z->n;
+    int nohoist = 0;
+    for (;;) {
+        size_t w = j;
+        while (w < n && hz_idchar((unsigned char)t[w])) w++;
+        size_t len = w - j;
+        if (len == 0) return 0;
+#define HZ_IS(s) (len == sizeof(s) - 1 && strncmp(t + j, s, len) == 0)
+        if (HZ_IS("static") || HZ_IS("volatile") || HZ_IS("extern") ||
+            HZ_IS("typedef") || HZ_IS("register")) {
+            nohoist = 1;
+        } else if (HZ_IS("const") || HZ_IS("unsigned") || HZ_IS("signed") ||
+                   HZ_IS("struct") || HZ_IS("union") || HZ_IS("enum")) {
+            /* part of the type */
+        } else {
+            if (hz_is_kw(t + j, len)) return 0;
+            j = w;
+            break;
+        }
+#undef HZ_IS
+        j = w;
+        while (j < n && (t[j] == ' ' || t[j] == '\t')) j++;
+        if (j >= n || !hz_idstart((unsigned char)t[j])) return 0;
+    }
+    /* j is just past the base type name */
+    size_t k = j;
+    int spaces = 0, stars = 0;
+    while (k < n && (t[k] == ' ' || t[k] == '\t' || t[k] == '*')) {
+        if (t[k] == '*') stars++; else spaces++;
+        k++;
+    }
+    if (!spaces && !stars) return 0;
+    if (k >= n || !hz_idstart((unsigned char)t[k])) return 0;
+    size_t ns = k;
+    while (k < n && hz_idchar((unsigned char)t[k])) k++;
+    size_t ne = k;
+    if (hz_is_kw(t + ns, ne - ns)) return 0;
+    size_t d = k;
+    while (d < n && (t[d] == ' ' || t[d] == '\t')) d++;
+    if (d >= n) return 0;
+    char dc = t[d];
+    if (dc != '=' && dc != ';' && dc != '[' && dc != ',') return 0;
+    if (dc == ',') { z->failed = 1; return 0; }
+
+    char name[192], type[256];
+    size_t nl = ne - ns, tl = ns - i;
+    if (nl >= sizeof(name) || tl >= sizeof(type)) { z->failed = 1; return 0; }
+    memcpy(name, t + ns, nl); name[nl] = '\0';
+    memcpy(type, t + i, tl); type[tl] = '\0';
+    /* normalise "sw_val_t  *" -> "sw_val_t *", "int " -> "int" */
+    size_t te = strlen(type);
+    while (te > 0 && (type[te - 1] == ' ' || type[te - 1] == '\t')) type[--te] = '\0';
+
+    if (dc == '[' || nohoist) {
+        hz_bind(z, name, name);
+        hz_put(z, t + i, ne - i);
+        return ne - i;
+    }
+    const char *c = hz_choose(z, name, type);
+    char cname[256];
+    snprintf(cname, sizeof(cname), "%s", c);
+    hz_hoist(z, cname, type, dc == '=');
+    hz_bind(z, name, cname);
+    /* `T x = e;` becomes `x = e;`, and `T x;` the empty statement `;` */
+    if (dc == '=') hz_put(z, cname, strlen(cname));
+    return ne - i;
+}
+
+static void hz_run(hz_t *z) {
+    const char *t = z->t;
+    size_t n = z->n, i = 0;
+    int paren = 0, stmt = 1, after_goto = 0, for_paren = -1, for_had_decl = 0;
+    int pending_for_body = 0;
+    z->nb = 0; z->nsc = 0; z->nh = 0; z->olen = 0;
+    hz_push(z, 0);
+    int line_start = 1;
+    while (i < n && !z->failed) {
+        char c = t[i];
+        if (line_start) {
+            size_t w = i;
+            while (w < n && (t[w] == ' ' || t[w] == '\t')) w++;
+            if (w < n && t[w] == '#') {          /* #line: copy verbatim */
+                size_t e = w;
+                while (e < n && t[e] != '\n') e++;
+                if (e < n) e++;
+                hz_put(z, t + i, e - i);
+                i = e;
+                continue;
+            }
+            line_start = 0;
+        }
+        if (c == '\n') { hz_put(z, t + i, 1); i++; line_start = 1; continue; }
+        if (c == ' ' || c == '\t' || c == '\r') { hz_put(z, t + i, 1); i++; continue; }
+        if (c == '/' && i + 1 < n && t[i + 1] == '*') {
+            size_t e = i + 2;
+            while (e + 1 < n && !(t[e] == '*' && t[e + 1] == '/')) e++;
+            e = e + 2 > n ? n : e + 2;
+            hz_put(z, t + i, e - i);
+            i = e;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && t[i + 1] == '/') {
+            size_t e = i;
+            while (e < n && t[e] != '\n') e++;
+            hz_put(z, t + i, e - i);
+            i = e;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            size_t e = i + 1;
+            while (e < n && t[e] != c) { if (t[e] == '\\') e++; e++; }
+            if (e < n) e++;
+            hz_put(z, t + i, e - i);
+            i = e;
+            stmt = 0;
+            continue;
+        }
+        if (isdigit((unsigned char)c) ||
+            (c == '.' && i + 1 < n && isdigit((unsigned char)t[i + 1]))) {
+            /* a number, suffixes and exponents included (0LL, 1e-5, 0x1F) */
+            size_t e = i + 1;
+            while (e < n && (hz_idchar((unsigned char)t[e]) || t[e] == '.' ||
+                   ((t[e] == '+' || t[e] == '-') &&
+                    strchr("eEpP", t[e - 1])))) e++;
+            hz_put(z, t + i, e - i);
+            i = e;
+            stmt = 0;
+            continue;
+        }
+        if (hz_idstart((unsigned char)c)) {
+            if (stmt && paren == 0) {
+                size_t used = hz_decl(z, i);
+                if (z->failed) break;
+                if (used) { i += used; stmt = 0; continue; }
+            }
+            size_t e = i;
+            while (e < n && hz_idchar((unsigned char)t[e])) e++;
+            size_t len = e - i;
+            char word[192];
+            if (len >= sizeof(word)) { z->failed = 1; break; }
+            memcpy(word, t + i, len); word[len] = '\0';
+            /* what precedes / follows decides whether this is a variable */
+            size_t p = i;
+            while (p > 0 && (t[p - 1] == ' ' || t[p - 1] == '\t')) p--;
+            int member = (p > 0 && t[p - 1] == '.') ||
+                         (p > 1 && t[p - 1] == '>' && t[p - 2] == '-');
+            size_t q = e;
+            while (q < n && (t[q] == ' ' || t[q] == '\t')) q++;
+            int label = stmt && paren == 0 && q < n && t[q] == ':' &&
+                        !(q + 1 < n && t[q + 1] == ':') && !hz_is_kw(word, len);
+            const char *cn = NULL;
+            if (!member && !label && !after_goto && !hz_is_kw(word, len)) {
+                cn = hz_lookup(z, word);
+                if (!cn && z->pass == 1 && !hz_in(z->freen, z->nfree, word)) {
+                    HZ_GROW(z->freen, z->nfree, z->capfree);
+                    z->freen[z->nfree++] = strdup(word);
+                }
+            }
+            if (cn) hz_put(z, cn, strlen(cn)); else hz_put(z, word, len);
+            after_goto = (len == 4 && strncmp(word, "goto", 4) == 0);
+            if (len == 3 && strncmp(word, "for", 3) == 0) for_paren = paren;
+            stmt = (len == 4 && strncmp(word, "else", 4) == 0) ||
+                   (len == 2 && strncmp(word, "do", 2) == 0) || label;
+            if (label) {                        /* copy through the colon */
+                hz_put(z, t + e, q + 1 - e);
+                i = q + 1;
+                continue;
+            }
+            i = e;
+            continue;
+        }
+        hz_put(z, t + i, 1);
+        i++;
+        after_goto = 0;
+        switch (c) {
+        case '(':
+            paren++;
+            if (for_paren >= 0 && paren == for_paren + 1) {
+                /* a declaration in a for header belongs to the loop */
+                size_t w = i;
+                while (w < n && (t[w] == ' ' || t[w] == '\t')) { hz_put(z, t + w, 1); w++; }
+                i = w;
+                hz_push(z, 0);
+                size_t used = hz_decl(z, i);
+                if (z->failed) break;
+                if (used) { i += used; for_had_decl = 1; }
+                else hz_pop(z);
+            }
+            stmt = 0;
+            break;
+        case ')':
+            paren--;
+            if (for_paren >= 0 && paren == for_paren) {
+                for_paren = -1;
+                if (for_had_decl) { pending_for_body = 1; for_had_decl = 0; }
+            }
+            stmt = 0;
+            break;
+        case '{':
+            if (pending_for_body) { hz_push(z, 1); pending_for_body = 0; }
+            else hz_push(z, 0);
+            stmt = 1;
+            break;
+        case '}':
+            hz_pop(z);
+            stmt = 1;
+            break;
+        case ';':
+            if (paren == 0) stmt = 1;
+            if (pending_for_body) { z->failed = 1; }   /* brace-less for body */
+            break;
+        default:
+            stmt = 0;
+            break;
+        }
+    }
+    while (z->nb > 0) { z->nb--; free(z->b[z->nb].orig); free(z->b[z->nb].cname); }
+    if (paren != 0) z->failed = 1;
+}
+
+static int hz_scalar(const char *type) {
+    static const char *s[] = { "int", "long", "short", "char", "double", "float",
+        "size_t", "int64_t", "uint64_t", "int32_t", "uint32_t", "uint8_t",
+        "unsigned", "unsigned int", "unsigned long", "_Bool", "bool", NULL };
+    for (int i = 0; s[i]; i++) if (strcmp(type, s[i]) == 0) return 1;
+    return 0;
+}
+
+/* Rewrite one function body (the text between its braces) to `out`. */
+static void hz_emit_body(const char *body, size_t len, FILE *out) {
+    static int off = -1;
+    if (off < 0) off = getenv("SW_NO_HOIST") ? 1 : 0;
+    hz_t z;
+    memset(&z, 0, sizeof(z));
+    z.t = body; z.n = len;
+    if (!off) {
+        z.pass = 1;
+        hz_run(&z);
+        if (!z.failed) {
+            for (int i = 0; i < z.nh; i++) { free(z.h[i].cname); free(z.h[i].type); }
+            z.pass = 2;
+            hz_run(&z);
+        }
+    }
+    if (off || z.failed) {
+        if (!off && getenv("SW_HOIST_DEBUG"))
+            fprintf(stderr, "swc: hoisting skipped for a function (unrecognised construct)\n");
+        fwrite(body, 1, len, out);
+    } else {
+        for (int i = 0; i < z.nh; i++) {
+            const char *ty = z.h[i].type;
+            size_t tl = strlen(ty);
+            int ptr = tl > 0 && ty[tl - 1] == '*';
+            const char *init = ptr ? " = NULL" : hz_scalar(ty) ? " = 0" :
+                               z.h[i].had_init ? " = {0}" : "";
+            fprintf(out, "    %s%s%s%s;\n", ty, ptr ? "" : " ", z.h[i].cname, init);
+        }
+        fwrite(z.o, 1, z.olen, out);
+    }
+    for (int i = 0; i < z.nh; i++) { free(z.h[i].cname); free(z.h[i].type); }
+    for (int i = 0; i < z.nfree; i++) free(z.freen[i]);
+    for (int i = 0; i < z.norig; i++) free(z.orig[i]);
+    free(z.h); free(z.freen); free(z.orig); free(z.b); free(z.sc); free(z.o);
+}
+
+/* Redirect ctx->out to a temporary file for one function body; the caller
+ * emits the body, then hz_end rewrites it into the real output. */
+static FILE *hz_begin(cg_ctx_t *ctx) {
+    FILE *real = ctx->out;
+    FILE *tmp = tmpfile();
+    if (tmp) ctx->out = tmp;
+    return real;
+}
+
+static void hz_end(cg_ctx_t *ctx, FILE *real) {
+    FILE *tmp = ctx->out;
+    if (tmp == real) return;
+    ctx->out = real;
+    long len = ftell(tmp);
+    char *buf = (char *)malloc(len > 0 ? (size_t)len + 1 : 1);
+    rewind(tmp);
+    size_t got = len > 0 ? fread(buf, 1, (size_t)len, tmp) : 0;
+    fclose(tmp);
+    hz_emit_body(buf, got, real);
+    free(buf);
+}
+
 static void emit_lambda_functions(cg_ctx_t *ctx) {
     FILE *f = ctx->out;
     if (ctx->nlambdas == 0) return;
@@ -1618,6 +2055,8 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
 
         /* Lambda function signature: same as regular functions */
         fprintf(f, "static sw_val_t *%s(sw_val_t **_args, int _nargs) {\n", li->gen_name);
+        FILE *real = hz_begin(ctx);
+        f = ctx->out;
 
         /* Save/restore codegen context */
         char save_func[128];
@@ -1675,6 +2114,8 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
             fprintf(f, "    return %s;\n", result);
         else
             fprintf(f, "    return sw_val_nil();\n");
+        hz_end(ctx, real);
+        f = ctx->out;
         fprintf(f, "}\n\n");
 
         /* Restore context */
@@ -3736,6 +4177,9 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
 
     fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl) {\n",
             ctx->mod_name, fn->v.fun.name);
+    /* The body goes through the hoisting pass (hz_end). */
+    FILE *real = hz_begin(ctx);
+    f = ctx->out;
     fprintf(f, "    (void)_sw_tc_fl;\n");
 
     /* Parameter extraction */
@@ -3801,6 +4245,8 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     else
         fprintf(f, "    return sw_val_nil();\n");
 
+    hz_end(ctx, real);
+    f = ctx->out;
     fprintf(f, "}\n\n");
 
     /* The public entry: a normal call runs the body and then any hops it

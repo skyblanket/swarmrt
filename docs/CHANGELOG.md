@@ -4,6 +4,18 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-21 — The codegen hoists every local to function scope
+
+**refactor(codegen): locals are declared once, at the top of each generated function
+(PROCESS_WEIGHT.md Phase 2b).** Each function and lambda body is emitted into a temporary
+file and rewritten: every scalar local moves to function scope, initialised to zero, and its
+declaration becomes an assignment. A binding that shadows a visible one (a case arm, catch or
+receive variable, a comprehension variable) gets its own C name, such as `x__1`. Argument
+arrays stay block-local. This changes declarations only; Phase 2c needs it to place resume
+labels anywhere. `SW_NO_HOIST=1` turns it off for A/B comparisons. Gate:
+`tests/sw/test_hoist_shadow.sw`. Compiler warnings at `-O2` are identical across `tests/`,
+`examples/` and swarm-code.
+
 ## 2026-10-21 — Processes run on pooled carrier stacks; a kill can no longer be lost
 
 **refactor(scheduler): a process no longer owns a stack (PROCESS_WEIGHT.md Phase 2a).**
