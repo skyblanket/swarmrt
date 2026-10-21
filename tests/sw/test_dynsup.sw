@@ -37,6 +37,14 @@ fun cb_crasher() {
     panic("cb boom")
 }
 
+# An anonymous child ({nil, ...}) must not report the string "nil" as its name.
+fun test_anonymous_child_has_no_name() {
+    sup = dyn_supervisor(10, 1)
+    c = sup_start_child(sup, {nil, fun() { pinger() }, 'permanent'})
+    sleep(50)
+    assert_eq("anon_child_no_name", map_get(process_info(c), 'name'), nil)
+}
+
 # Happy path: empty supervisor, add a child at runtime, it works, count tracks it.
 fun test_start_child_and_count() {
     sup = dyn_supervisor()
@@ -140,10 +148,11 @@ fun test_circuit_breaker_shutdown() {
 fun main() {
     fails = 0
     fails = fails + test_start_child_and_count()
+    fails = fails + test_anonymous_child_has_no_name()
     fails = fails + test_terminate_child()
     fails = fails + test_permanent_child_restarts()
     fails = fails + test_bad_inputs_degrade()
     fails = fails + test_circuit_breaker_shutdown()
-    if (fails == 0) { print("OK dynsup 16/16") ; sys_exit(0) }
+    if (fails == 0) { print("OK dynsup 17/17") ; sys_exit(0) }
     else { print("FAIL dynsup " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }
