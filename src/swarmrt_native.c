@@ -1311,6 +1311,18 @@ static void sched_trace_maybe_start(void) {
 static void overflow_rq_push(sw_process_t *proc);
 static void wake_one_idle_scheduler(void);
 
+/* Number of schedulers parked (idle==1). Lets an enqueue onto a busy
+ * scheduler's queue know cheaply whether an idle one could steal it: with no
+ * periodic wake, parked schedulers never probe other run queues on their own. */
+static _Atomic int g_parked_scheds;
+
+/* Clear rq->idle; returns nonzero if this call did (keeps the counter exact
+ * when a waker's claim and the parker's own wake-up both clear the flag). */
+static inline void sched_clear_idle(sw_runq_t *rq) {
+    if (atomic_exchange_explicit(&rq->idle, 0, memory_order_acq_rel))
+        atomic_fetch_sub_explicit(&g_parked_scheds, 1, memory_order_relaxed);
+}
+
 void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     uint32_t prio = proc->priority;
     if (prio >= SW_PRIO_NUM) prio = SW_PRIO_NORMAL;
@@ -1344,6 +1356,10 @@ void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
         pthread_cond_signal(&rq->idle_cond);
         pthread_mutex_unlock(&rq->idle_lock);
         if (g_sched_trace >= 1) atomic_fetch_add_explicit(&g_tr_sig, 1, memory_order_relaxed);
+    } else if (prev != &rq->stubs[prio] &&
+               atomic_load_explicit(&g_parked_scheds, memory_order_relaxed) > 0) {
+        /* Backlog on a busy scheduler: wake a parked one to steal it. */
+        wake_one_idle_scheduler();
     }
 }
 
@@ -1467,7 +1483,7 @@ static void wake_one_idle_scheduler(void) {
         if (atomic_load_explicit(&rq->idle, memory_order_relaxed) &&
             !atomic_load_explicit(&rq->blocking, memory_order_relaxed)) {
             pthread_mutex_lock(&rq->idle_lock);
-            atomic_store_explicit(&rq->idle, 0, memory_order_release);
+            sched_clear_idle(rq);
             pthread_cond_signal(&rq->idle_cond);
             pthread_mutex_unlock(&rq->idle_lock);
             return;
@@ -1777,10 +1793,11 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             sw_runq_t *rq = &sched->runq;
             pthread_mutex_lock(&rq->idle_lock);
             atomic_store_explicit(&rq->idle, 1, memory_order_release);
+            atomic_fetch_add_explicit(&g_parked_scheds, 1, memory_order_relaxed);
             sw_process_t *late = sw_pick_next(sched);
             if (!late) late = sw_steal_work(sched);
             if (late) {
-                atomic_store_explicit(&rq->idle, 0, memory_order_release);
+                sched_clear_idle(rq);
                 pthread_mutex_unlock(&rq->idle_lock);
                 if (g_sched_trace >= 1)
                     atomic_fetch_add_explicit(&g_tr_guard_hit, 1, memory_order_relaxed);
@@ -1793,7 +1810,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
              * lock. Checking it here, under the same lock, means that signal
              * cannot land between the loop-top check and our wait. */
             if (sched->should_exit) {
-                atomic_store_explicit(&rq->idle, 0, memory_order_release);
+                sched_clear_idle(rq);
                 pthread_mutex_unlock(&rq->idle_lock);
                 continue;
             }
@@ -1821,7 +1838,7 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             if (g_sched_trace >= 1)
                 atomic_fetch_add_explicit(_twrc == 0 ? &g_tr_park_signal : &g_tr_park_timeout,
                                           1, memory_order_relaxed);
-            atomic_store_explicit(&rq->idle, 0, memory_order_release);
+            sched_clear_idle(rq);
             pthread_mutex_unlock(&rq->idle_lock);
         }
     }
