@@ -761,7 +761,14 @@ static sw_val_t *_builtin_string_sub(sw_val_t **a, int n) {
     if (start >= slen) return sw_val_string("");
     if (len <= 0) return sw_val_string("");
     int end = (len > slen - start) ? slen : start + len;
-    end = _utf8_cut_end(s, end);
+    int cut = _utf8_cut_end(s, end);
+    if (cut <= start && (((unsigned char)s[start]) & 0xC0) != 0x80) {
+        /* Window narrower than the char at a boundary start (byte-walk with
+         * len 1): return that whole char so walkers lose no text. */
+        cut = start + 1;
+        while (cut < slen && (((unsigned char)s[cut]) & 0xC0) == 0x80) cut++;
+    }
+    end = cut;
     start = _utf8_cut_start(s, start, slen);
     if (end <= start) return sw_val_string("");
     len = end - start;
