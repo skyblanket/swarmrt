@@ -140,7 +140,7 @@ The compiler emits C code that calls the runtime API directly:
 | Context switch | ~100-200ns |
 | Message send | ~10ns enqueue + payload deep-copy (O(message size), no shared heap) |
 | Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
-| Max processes | `SW_MAX_PROCS` (default 100K slots); live processes are capped near 30K on stock Linux by `vm.max_map_count` (one stack mmap each) |
+| Max processes | `SW_MAX_PROCS` (default 100K slots); live idle processes are capped near 30K on stock Linux by `vm.max_map_count` (one stack mmap each); active message-passing processes cost ~100–220 KB resident each vs ~1 KB idle ([#161](https://github.com/skyblanket/swarmrt/issues/161)) |
 | Compute | boxed dynamic values — roughly CPython speed on arithmetic-heavy code (fib(35) ≈ 0.7 s) |
 
 ---
