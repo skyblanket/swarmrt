@@ -23,11 +23,12 @@ like `fun sum_to(n) { n + sum_to(n - 1) }` raises a clean
 the runtime's offload pool (see "Recently cleared"), and so does `llm_complete`, whose
 request goes through `http_post` (200 completions against a 500ms mock endpoint, 64 in
 flight, finish in 2.1s on 4 cores). Still on the calling scheduler's thread:
-`read_line`/`read_key`/`read_choice`, `shell_managed`, TTY-mode `http_post_stream`,
+`read_line`/`read_key`/`read_choice`, TTY-mode `http_post_stream`,
 `subprocess_recv_line`, `checkpoint` and `restore`. Those run inside a blocking
 section, so the processes queued behind them move to idle schedulers (see "Recently
 cleared"); what they cost is one OS thread each for the duration. With every scheduler
-thread inside one, nothing else runs.
+thread inside one, nothing else runs. `checkpoint` and `restore` share one SQLite
+connection behind a single lock, so offloading them would not add any overlap.
 
 **Workaround:** `SW_SCHEDULERS` above the number of concurrent blocking calls.
 
@@ -89,7 +90,7 @@ keys: adding a key is amortised O(1) and `map_get` is a hash probe (20,000 keys:
 100,000: 137ms). Replacing an existing key still copies the map (other values keep the
 old one). The interpreter keeps plain arrays. Gate: `tests/sw/test_map_store.sw`.
 
-### `db_exec` and `db_query` pinned their scheduler thread (cleared 2026-10-20)
+### `db_exec`, `db_query` and `shell_managed` pinned their scheduler thread (cleared 2026-10-21)
 
 `db_exec` and `db_query` ran their whole call inside a blocking section. They now run on
 the offload pool, so a slow query no longer holds a scheduler. Offloading exposed a
@@ -98,10 +99,10 @@ slot, which crashed the process. Each slot is now guarded by its own lock, so tw
 on different connections still run in parallel. Gate: `tests/sw/test_db_offload.sw`
 (8 readers waiting on a lock: ~1.0s on 2 schedulers, ~2.0s before).
 
-`shell_managed` is not moved yet. Its blocking section already lets queued processes
-run on extra threads: 64 concurrent `shell_managed("sleep 1", 5000)` finish in ~1.4s
-on 1 to 4 schedulers, not the ~32s this entry used to claim. Moving it to the offload
-pool made 256 concurrent calls slower (~8s against ~5s), and the cause is not yet known.
+`shell_managed` runs on the offload pool too. It keeps the ESC/Ctrl-C interrupt and the
+process-group kill, and a killed caller kills its command (the same identity check
+`exec_managed` uses). 64 concurrent `shell_managed("sleep 1", 5000)` on 2 schedulers
+finish in ~1.4s, not ~32s. Gate: `tests/sw/test_shell_offload.sw`.
 
 ### The HTTP server leaked memory per connection and per request (cleared 2026-09-27)
 
