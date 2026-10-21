@@ -3895,7 +3895,8 @@ static sw_val_t *_builtin_sup_start_child(sw_val_t **a, int n) {
     sw_child_spec_t spec;
     memset(&spec, 0, sizeof(spec));
 
-    if (name_v && (name_v->type == SW_VAL_ATOM || name_v->type == SW_VAL_STRING) && name_v->v.str)
+    if (name_v && (name_v->type == SW_VAL_ATOM || name_v->type == SW_VAL_STRING) && name_v->v.str
+        && strcmp(name_v->v.str, "nil") != 0) /* nil == anonymous */
         strncpy(spec.name, name_v->v.str, sizeof(spec.name) - 1);
     else
         spec.name[0] = '\0'; /* anonymous */
