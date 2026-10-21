@@ -160,6 +160,7 @@ typedef struct {
     const char *src_file;            /* path given to `swc run`, or NULL */
     int panic_line;                  /* line where the panic was raised */
     int panic_pending_line;          /* line the next-recorded frame was at */
+    int panic_recorded;              /* panic_line/frames belong to the in-flight panic */
     int panic_nframes;
     struct { const char *name; int line; } panic_frames[64];
 } sw_interp_t;

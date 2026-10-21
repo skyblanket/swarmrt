@@ -3646,6 +3646,7 @@ static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, .
     snprintf(interp->error_msg, sizeof(interp->error_msg), "panic: %s", msg);
     interp->panic_line = interp->panic_pending_line = line;
     interp->panic_nframes = 0;
+    interp->panic_recorded = 1;
     interp->error = 1;
     interp->panicking = 1;   /* uncatchable — N_TRY must not absorb a panic */
 }
@@ -4051,6 +4052,8 @@ static sw_val_t *builtin_assert_raises(sw_interp_t *interp, sw_val_t **args, int
     /* Restore outer error state (panic interception included). */
     interp->error = saved_error;
     interp->panicking = saved_panicking;
+    interp->panic_recorded = 0;   /* intercepted panic: its trace is spent */
+    interp->panic_nframes = 0;
     memcpy(interp->error_msg, saved_error_msg, sizeof(interp->error_msg));
 
     if (!did_error) {
@@ -4218,13 +4221,13 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env);
  * was running when the panic hit (at panic_pending_line); the call site then
  * moves panic_pending_line to the line in the caller that made the call. */
 static void interp_panic_frame(sw_interp_t *interp, const char *name) {
-    if (!interp->panicking || interp->panic_nframes >= 64) return;
+    if (!interp->panic_recorded || interp->panic_nframes >= 64) return;
     interp->panic_frames[interp->panic_nframes].name = name;
     interp->panic_frames[interp->panic_nframes].line = interp->panic_pending_line;
     interp->panic_nframes++;
 }
 static void interp_panic_caller_line(sw_interp_t *interp, int call_line) {
-    if (interp->panicking && call_line > 0) interp->panic_pending_line = call_line;
+    if (interp->panic_recorded && call_line > 0) interp->panic_pending_line = call_line;
 }
 
 /* Child-fiber panic propagation, shared by every interpreter fiber that runs a
@@ -4244,9 +4247,9 @@ static void interp_fiber_propagate_panic(sw_interp_t *interp) {
     snprintf(reason, sizeof(reason), "%s", m);
     /* Same loud report the compiled _sw_runtime_panic prints. */
     fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", reason);
-    if (interp->src_file && interp->panic_line > 0)
+    if (interp->panic_recorded && interp->src_file && interp->panic_line > 0)
         fprintf(stderr, "  at %s:%d\n", interp->src_file, interp->panic_line);
-    if (interp->panic_nframes > 0) {
+    if (interp->panic_recorded && interp->panic_nframes > 0) {
         const char *root_mod = interp->module_ast
             ? ((node_t *)interp->module_ast)->v.mod.name : "?";
         fprintf(stderr, "  call chain (innermost first):\n");
@@ -4264,6 +4267,7 @@ static void interp_fiber_propagate_panic(sw_interp_t *interp) {
     }
     fflush(stderr);
     interp->panic_nframes = 0;
+    interp->panic_recorded = 0;
     interp->error = 0;
     interp->panicking = 0;
     interp->error_msg[0] = '\0';
@@ -4538,6 +4542,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         free(buf);
         interp->panic_line = interp->panic_pending_line = line;
         interp->panic_nframes = 0;
+        interp->panic_recorded = 1;
         interp->error = 1;
         interp->panicking = 1;
         return sw_val_nil();
@@ -6205,7 +6210,7 @@ static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fen
         sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
         if (own) { env_free(own); own = NULL; }
         if (!interp->tail_pending) {
-            if (interp->panicking) {
+            if (interp->panic_recorded) {
                 interp_panic_frame(interp, fn->v.fun.name);
                 if (fn != first_fn && first_tail_line > 0) {
                     interp->panic_pending_line = first_tail_line;
