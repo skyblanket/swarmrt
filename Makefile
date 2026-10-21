@@ -777,6 +777,12 @@ mcp: search dirs
 	$(CC) $(CFLAGS) -march=native $(BUILD_DIR)/swarmrt_search.o \
 		mcp/swarmrt_mcp.c -o $(BIN_DIR)/swarmrt-mcp $(LDFLAGS) -lm
 
+# MCP server regression tests: shell quoting of the project root, and git
+# arguments that must not be read as options.
+test-mcp: mcp
+	@sh tests/mcp/project_root_quoting.sh $(BIN_DIR)/swarmrt-mcp && echo "OK project_root_quoting"
+	@sh tests/mcp/git_option_injection.sh $(BIN_DIR)/swarmrt-mcp
+
 # PTY wrapper that injects scheduled wakes into a Claude Code session.
 # On Linux, forkpty() requires -lutil; on macOS it's in libc (libutil is a stub).
 WRAP_LDFLAGS = -pthread
