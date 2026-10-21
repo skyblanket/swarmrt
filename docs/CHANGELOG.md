@@ -4,6 +4,25 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-21 — Processes run on pooled carrier stacks; a kill can no longer be lost
+
+**refactor(scheduler): a process no longer owns a stack (PROCESS_WEIGHT.md Phase 2a).**
+Schedulers run processes on carriers: pooled 128 KB stacks with a guard page. A
+process that finishes, panics or is killed hands its carrier back. One that blocks in
+a C primitive (receive, sleep, park) stays pinned to its carrier until it next
+finishes, so in this step a parked process still costs one mapping. Later Phase 2
+steps stop parked processes from pinning. Spawn no longer maps anything, so it can't
+fail for lack of mappings. A blocked process that can't get a carrier fails with a
+`carrier stack` message, and the node keeps running. Gate: `tests/sw/test_carrier_pin.sw`
+(10K processes through return, receive, sleep, panic and kill).
+
+**fix(kill): a kill that raced a process parking could be lost.** `sw_process_kill`
+sets `kill_flag` and wakes the process only if it was already waiting. A process
+parking at that moment slept forever with the flag set, leaking its slot. On the
+carrier runtime it also leaked a carrier: `gc-slope`'s dynsup probe grew ~0.4 KB per
+child. The scheduler now re-checks `kill_flag` after every park (Dekker with the
+killer's `waiting` exchange). The probe now grows 0.04 KB per child, below main's 0.06.
+
 ## 2026-10-21 — Busy processes use ~20× less memory; spawning past the mapping limit fails cleanly
 
 **fix(memory): a message-passing process holds about 12.6 KB, not about 250 KB.**
