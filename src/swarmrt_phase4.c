@@ -302,6 +302,7 @@ typedef struct {
     uint32_t restart_times[64];
     uint32_t restart_idx;
     uint32_t restart_count;
+    int limit_warned;
 } sw_dynsup_state_t;
 
 static uint32_t dynsup_now_seconds(void) {
@@ -463,8 +464,20 @@ static void dynsup_entry(void *arg) {
             case SW_DYNSUP_OP_START_CHILD: {
                 /* Check max children */
                 uint32_t max = st->spec.max_children;
-                if (max == 0) max = SW_DYNSUP_MAX_CHILDREN;
+                if (max == 0) {
+                    max = SW_DYNSUP_MAX_CHILDREN;
+                    const char *e = getenv("SW_DYNSUP_MAX_CHILDREN");
+                    if (e && *e) {
+                        long v = strtol(e, NULL, 10);
+                        if (v > 0 && v <= 0x7fffffffL) max = (uint32_t)v;
+                    }
+                }
                 if (st->child_count >= max) {
+                    if (!st->limit_warned) {
+                        st->limit_warned = 1;
+                        fprintf(stderr, "dyn_supervisor: child limit (%u) reached; "
+                                "start_child refused (raise with SW_DYNSUP_MAX_CHILDREN)\n", max);
+                    }
                     sw_send_tagged(call->from, call->ref, NULL);
                     break;
                 }
