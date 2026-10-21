@@ -4426,6 +4426,10 @@ static sw_val_t *_builtin_registered(sw_val_t **a, int n) {
  *                    idle_waits, steals} — best-effort lock-free reads of the
  *                    scheduler debug counters (the watchdog contract; a stale
  *                    value is fine, a lock on the hot path is not)
+ *   llm_endpoints    one %{url, rpm, tpm, max_concurrency, cap, in_flight,
+ *                    requests, ok, rate_limited, retries, server_errors,
+ *                    timeouts, transport_errors, bad_requests, avg_latency_ms}
+ *                    per endpoint llm_request / llm_limit has seen
  * NOT exposed because the runtime does not track them: per-scheduler
  * run-queue depth (the Vyukov MPSC has no length counter), scheduler
  * utilization %, node-total reductions, and node-total sends
@@ -4433,6 +4437,7 @@ static sw_val_t *_builtin_registered(sw_val_t **a, int n) {
  * runtime — only the unlinked legacy swarmrt_proc.c bumps them; wiring
  * total_sends would put a shared-cacheline atomic on the send hot path.
  * Per-process reductions / messages_sent in process_info cover both). */
+static sw_val_t *_sw_llm_endpoint_stats(void);
 static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
     (void)a; (void)n;
     extern sw_swarm_t *g_swarm;
@@ -4465,7 +4470,7 @@ static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
     sw_val_t *sched_list = sw_val_list(scheds, (int)nsched);
     free(scheds);
 
-    sw_val_t *keys[11], *vals[11];
+    sw_val_t *keys[12], *vals[12];
     int c = 0;
     keys[c] = sw_val_atom("processes");       vals[c] = sw_val_int(live); c++;
     keys[c] = sw_val_atom("schedulers");      vals[c] = sw_val_int((int64_t)nsched); c++;
@@ -4482,6 +4487,9 @@ static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
      * (/readyz) fails on this so a load balancer stops routing here. */
     keys[c] = sw_val_atom("draining");        vals[c] = sw_val_atom(sw_is_draining() ? "true" : "false"); c++;
     keys[c] = sw_val_atom("scheduler_stats"); vals[c] = sched_list; c++;
+    /* llm_endpoints: per-endpoint limiter state and request telemetry
+     * (llm_request / llm_limit; see _sw_llm_endpoint_stats). */
+    keys[c] = sw_val_atom("llm_endpoints");   vals[c] = _sw_llm_endpoint_stats(); c++;
     return sw_val_map_new(keys, vals, c);
 }
 
@@ -7169,6 +7177,42 @@ static void _sw_llm_report_once(const char *msg) {
  *
  * On success fills url_out/model_out (malloc'd; model may be NULL) and
  * returns 0. Otherwise writes "error: ..." into err and returns -1. */
+/* The chat-completions URL of a known provider name ("openai", "otonomy",
+ * "ollama"), or NULL for any other name. The ollama URL is built into
+ * `ollama_buf`. pmodel_out (optional) gets the provider's default model. */
+static const char *_sw_llm_provider_url(const char *provider, char *ollama_buf, size_t ollama_sz,
+                                        const char **pmodel_out) {
+    const char *purl = NULL, *pmodel = NULL;
+    if (strcmp(provider, "openai") == 0) {
+        purl = "https://api.openai.com/v1/chat/completions"; pmodel = "gpt-4o-mini";
+    } else if (strcmp(provider, "otonomy") == 0) {
+        purl = "https://" _SW_OTONOMY_HOST "/v1/chat/completions"; pmodel = "otonomy-orc";
+    } else if (strcmp(provider, "ollama") == 0) {
+        /* OLLAMA_HOST is a base ("http://host:11434", or a bare
+         * "host:port" as ollama itself accepts); 0.0.0.0 is a bind
+         * address, so dial loopback instead. */
+        const char *oh = getenv("OLLAMA_HOST");
+        const char *scheme = (oh && strstr(oh, "://")) ? "" : "http://";
+        char oh_buf[256];
+        if (!oh || !*oh) { oh = "127.0.0.1:11434"; scheme = "http://"; }
+        else {
+            /* 0.0.0.0 (bare or http://) → loopback, keeping a configured port. */
+            const char *bind = strncmp(oh, "0.0.0.0", 7) == 0 ? oh + 7
+                             : strncmp(oh, "http://0.0.0.0", 14) == 0 ? oh + 14 : NULL;
+            if (bind) {
+                snprintf(oh_buf, sizeof(oh_buf), "127.0.0.1%s", *bind ? bind : ":11434");
+                oh = oh_buf; scheme = "http://";
+            }
+        }
+        size_t ol = strlen(oh);
+        while (ol > 0 && oh[ol - 1] == '/') ol--;
+        snprintf(ollama_buf, ollama_sz, "%s%.*s/v1/chat/completions", scheme, (int)ol, oh);
+        purl = ollama_buf;
+    }
+    if (pmodel_out) *pmodel_out = pmodel;
+    return purl;
+}
+
 static int _sw_llm_resolve(const char *who, const char *opt_url, const char *opt_provider,
                            const char *opt_model, char **url_out, char **model_out,
                            char *err, size_t errsz) {
@@ -7177,34 +7221,7 @@ static int _sw_llm_resolve(const char *who, const char *opt_url, const char *opt
     if (provider && !*provider) provider = NULL;
     const char *purl = NULL, *pmodel = NULL;
     char ollama_url[512];
-    if (provider) {
-        if (strcmp(provider, "openai") == 0) {
-            purl = "https://api.openai.com/v1/chat/completions"; pmodel = "gpt-4o-mini";
-        } else if (strcmp(provider, "otonomy") == 0) {
-            purl = "https://" _SW_OTONOMY_HOST "/v1/chat/completions"; pmodel = "otonomy-orc";
-        } else if (strcmp(provider, "ollama") == 0) {
-            /* OLLAMA_HOST is a base ("http://host:11434", or a bare
-             * "host:port" as ollama itself accepts); 0.0.0.0 is a bind
-             * address, so dial loopback instead. */
-            const char *oh = getenv("OLLAMA_HOST");
-            const char *scheme = (oh && strstr(oh, "://")) ? "" : "http://";
-            char oh_buf[256];
-            if (!oh || !*oh) { oh = "127.0.0.1:11434"; scheme = "http://"; }
-            else {
-                /* 0.0.0.0 (bare or http://) → loopback, keeping a configured port. */
-                const char *bind = strncmp(oh, "0.0.0.0", 7) == 0 ? oh + 7
-                                 : strncmp(oh, "http://0.0.0.0", 14) == 0 ? oh + 14 : NULL;
-                if (bind) {
-                    snprintf(oh_buf, sizeof(oh_buf), "127.0.0.1%s", *bind ? bind : ":11434");
-                    oh = oh_buf; scheme = "http://";
-                }
-            }
-            size_t ol = strlen(oh);
-            while (ol > 0 && oh[ol - 1] == '/') ol--;
-            snprintf(ollama_url, sizeof(ollama_url), "%s%.*s/v1/chat/completions", scheme, (int)ol, oh);
-            purl = ollama_url;
-        }
-    }
+    if (provider) purl = _sw_llm_provider_url(provider, ollama_url, sizeof(ollama_url), &pmodel);
     const char *url = (opt_url && *opt_url) ? opt_url : getenv("LLM_URL");
     if (url && !*url) url = NULL;
     /* An explicit URL wins, so an unknown provider only matters without one. */
@@ -7382,6 +7399,592 @@ static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     free(body);
     free(url);
     return last_result;
+}
+
+/* === Structured LLM requests: llm_request / llm_limit ======================
+ *
+ * llm_request(prompt, opts) → {'ok', %{content, finish_reason, usage, latency_ms, attempts}}
+ *                           | {'error', %{kind, status, retry_after_ms, body, attempts}}
+ *   prompt  a string (one user message) or a list of %{role:, content:} maps.
+ *   opts    model, url, provider, api_key, max_tokens (4096), temperature (0.7),
+ *           retries (3, at most 10: the retries after the first attempt),
+ *           backoff_ms (1000), max_backoff_ms (30000), timeout_ms (0 = none:
+ *           the budget for the whole call, retries and waits included).
+ *   kind    'rate_limited' (429) | 'server' (5xx) | 'timeout' (408, or curl's
+ *           timeout) | 'transport' (no HTTP response) | 'bad_request' (other 4xx)
+ *           | 'auth' (401, 403) | 'bad_response' (no completion in the body) |
+ *           'config' (no endpoint configured).
+ *
+ * Retried: rate_limited, server, timeout, transport. A Retry-After header is
+ * honoured exactly (its seconds, not the backoff). Any other retry waits
+ * backoff_ms * 2^attempt, capped at max_backoff_ms, with jitter in its upper
+ * half. Nothing else is retried. A retry whose wait would end past timeout_ms
+ * is not made: the last error is returned instead.
+ *
+ * llm_limit(url_or_provider, opts) → 'ok' | 'error'
+ *   opts    rpm (requests per minute), tpm (tokens per minute), max_concurrency.
+ *           0 or absent means no limit for that field. Limits are per endpoint
+ *           URL (a provider name stands for its URL) and shared by every process
+ *           on the node: one table, one lock.
+ *   rpm     attempts start 60000/rpm ms apart, with no burst.
+ *   tpm     a token bucket of tpm tokens, charged before each attempt with the
+ *           estimate (request bytes / 4) + max_tokens. The server's real usage
+ *           is not fed back.
+ *   max_concurrency  adaptive, Inspect style: a 429 cuts the in-flight cap to
+ *           0.8x (at most once per 15 s), and each success adds one back, up to
+ *           max_concurrency.
+ *
+ * llm_complete is unchanged: it keeps its string result and its own retries,
+ * and it does not go through the limiter.
+ * ============================================================================ */
+
+#define _SW_LLM_MAX_ENDPOINTS 64
+#define _SW_LLM_URL_MAX 512
+#define _SW_LLM_CUT_COOLDOWN_MS 15000
+
+typedef struct {
+    int used;
+    char url[_SW_LLM_URL_MAX];
+    int64_t rpm, tpm, max_conc;      /* configured limits; 0 = none */
+    int64_t cap;                     /* in-flight gate: max_conc, cut on 429 */
+    int64_t in_flight;
+    double next_slot_ms;             /* rpm: earliest start of the next attempt */
+    double tokens;                   /* tpm bucket; negative = queued debt */
+    double tokens_at_ms;
+    uint64_t cut_ok_at_ms;           /* no further 429 cut before this */
+    int64_t requests, ok, rate_limited, retries, server_errors, timeouts,
+            transport_errors, bad_requests;
+    double latency_sum_ms;           /* successful attempts only */
+    int64_t latency_n;
+} _sw_llm_ep_t;
+
+enum { _SW_LLM_OUT_OK, _SW_LLM_OUT_RATE, _SW_LLM_OUT_SERVER, _SW_LLM_OUT_TIMEOUT,
+       _SW_LLM_OUT_TRANSPORT, _SW_LLM_OUT_OTHER };
+
+static pthread_mutex_t _sw_llm_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t _sw_llm_cond = PTHREAD_COND_INITIALIZER;
+static _sw_llm_ep_t _sw_llm_eps[_SW_LLM_MAX_ENDPOINTS];
+
+/* Caller holds _sw_llm_lock. NULL when the URL is too long or the table is full:
+ * that endpoint then runs unlimited and untracked. */
+static _sw_llm_ep_t *_sw_llm_ep_for(const char *url) {
+    if (strlen(url) >= _SW_LLM_URL_MAX) return NULL;
+    _sw_llm_ep_t *free_slot = NULL;
+    for (int i = 0; i < _SW_LLM_MAX_ENDPOINTS; i++) {
+        _sw_llm_ep_t *ep = &_sw_llm_eps[i];
+        if (!ep->used) { if (!free_slot) free_slot = ep; continue; }
+        if (strcmp(ep->url, url) == 0) return ep;
+    }
+    if (!free_slot) return NULL;
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->used = 1;
+    free_slot->cap = INT64_MAX;
+    snprintf(free_slot->url, sizeof(free_slot->url), "%s", url);
+    return free_slot;
+}
+
+/* Caller holds _sw_llm_lock. Sleeps on the limiter condition for at most ms,
+ * or until a release wakes it. */
+static void _sw_llm_cond_wait(uint64_t ms) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t t = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000) + ms;
+    struct timespec ts;
+    ts.tv_sec = (time_t)(t / 1000);
+    ts.tv_nsec = (long)(t % 1000) * 1000000L;
+    pthread_cond_timedwait(&_sw_llm_cond, &_sw_llm_lock, &ts);
+}
+
+/* Sleeps ms in 100 ms ticks so a killed caller is noticed promptly. Returns 1
+ * when the caller is gone (the sleep is cut short), else 0. */
+static int _sw_llm_nap(double ms, sw_process_t *caller, uint64_t caller_id) {
+    double left = ms;
+    while (left > 0) {
+        if (_sw_caller_gone(caller, caller_id)) return 1;
+        double step = left > 100.0 ? 100.0 : left;
+        _sw_nap_us((unsigned)(step * 1000.0));
+        left -= step;
+    }
+    return _sw_caller_gone(caller, caller_id);
+}
+
+/* Blocks until `ep` may send one attempt that costs `tokens` (ep NULL: no
+ * limits). Returns 0 with an in-flight slot taken, to be returned by
+ * _sw_llm_release; or -1 when the wait would pass deadline_ms (0 = none), in
+ * which case nothing is reserved; or -2 when the caller was killed meanwhile
+ * (nothing stays reserved). The pacing sleep happens outside the lock. */
+static int _sw_llm_acquire(_sw_llm_ep_t *ep, double tokens, uint64_t deadline_ms,
+                           sw_process_t *caller, uint64_t caller_id) {
+    if (!ep) return _sw_caller_gone(caller, caller_id) ? -2 : 0;
+    pthread_mutex_lock(&_sw_llm_lock);
+    while (ep->in_flight >= ep->cap) {
+        if (_sw_caller_gone(caller, caller_id)) {
+            pthread_mutex_unlock(&_sw_llm_lock);
+            return -2;
+        }
+        if (deadline_ms && _sw_now_ms() >= deadline_ms) {
+            pthread_mutex_unlock(&_sw_llm_lock);
+            return -1;
+        }
+        _sw_llm_cond_wait(1000);
+    }
+    double now = (double)_sw_now_ms();
+    double wait_ms = 0, slot = now;
+    if (ep->rpm > 0) {
+        slot = ep->next_slot_ms > now ? ep->next_slot_ms : now;
+        wait_ms = slot - now;
+    }
+    double tokens_left = 0;
+    if (ep->tpm > 0) {
+        double cost = tokens > (double)ep->tpm ? (double)ep->tpm : tokens;
+        double refilled = ep->tokens + (now - ep->tokens_at_ms) * (double)ep->tpm / 60000.0;
+        if (refilled > (double)ep->tpm) refilled = (double)ep->tpm;
+        tokens_left = refilled - cost;
+        if (tokens_left < 0) {
+            double tok_wait = -tokens_left * 60000.0 / (double)ep->tpm;
+            if (tok_wait > wait_ms) wait_ms = tok_wait;
+        }
+    }
+    if (deadline_ms && now + wait_ms >= (double)deadline_ms) {
+        pthread_mutex_unlock(&_sw_llm_lock);
+        return -1;
+    }
+    if (ep->rpm > 0) ep->next_slot_ms = slot + 60000.0 / (double)ep->rpm;
+    if (ep->tpm > 0) { ep->tokens = tokens_left; ep->tokens_at_ms = now; }
+    ep->in_flight++;
+    ep->requests++;
+    pthread_mutex_unlock(&_sw_llm_lock);
+    if (wait_ms >= 1.0 && _sw_llm_nap(wait_ms, caller, caller_id)) {
+        pthread_mutex_lock(&_sw_llm_lock);
+        ep->in_flight--;
+        ep->requests--;
+        pthread_cond_broadcast(&_sw_llm_cond);
+        pthread_mutex_unlock(&_sw_llm_lock);
+        return -2;
+    }
+    return 0;
+}
+
+/* Returns the slot taken by _sw_llm_acquire and records the attempt's outcome.
+ * `retried` marks an attempt that will be followed by a retry. */
+static void _sw_llm_release(_sw_llm_ep_t *ep, int outcome, double latency_ms, int retried) {
+    if (!ep) return;
+    pthread_mutex_lock(&_sw_llm_lock);
+    ep->in_flight--;
+    if (retried) ep->retries++;
+    uint64_t now = _sw_now_ms();
+    switch (outcome) {
+    case _SW_LLM_OUT_OK:
+        ep->ok++;
+        ep->latency_sum_ms += latency_ms;
+        ep->latency_n++;
+        if (ep->max_conc > 0 && ep->cap < ep->max_conc) ep->cap++;
+        break;
+    case _SW_LLM_OUT_RATE:
+        ep->rate_limited++;
+        if (ep->max_conc > 0 && now >= ep->cut_ok_at_ms) {
+            int64_t c = ep->cap * 4 / 5;
+            ep->cap = c < 1 ? 1 : c;
+            ep->cut_ok_at_ms = now + _SW_LLM_CUT_COOLDOWN_MS;
+        }
+        break;
+    case _SW_LLM_OUT_SERVER:    ep->server_errors++; break;
+    case _SW_LLM_OUT_TIMEOUT:   ep->timeouts++; break;
+    case _SW_LLM_OUT_TRANSPORT: ep->transport_errors++; break;
+    default:                    ep->bad_requests++; break;
+    }
+    pthread_cond_broadcast(&_sw_llm_cond);
+    pthread_mutex_unlock(&_sw_llm_lock);
+}
+
+/* An integer / number option from an opts map; *out is left alone when the
+ * key is absent or the value has another type. */
+static void _sw_llm_opt_int(sw_val_t *m, const char *key, int64_t *out) {
+    sw_val_t *v = sw_val_map_get(m, sw_val_string(key));
+    if (v->type == SW_VAL_INT) *out = v->v.i;
+}
+static void _sw_llm_opt_num(sw_val_t *m, const char *key, double *out) {
+    sw_val_t *v = sw_val_map_get(m, sw_val_string(key));
+    if (v->type == SW_VAL_FLOAT) *out = v->v.f;
+    else if (v->type == SW_VAL_INT) *out = (double)v->v.i;
+}
+
+/* llm_limit(url_or_provider, opts) → 'ok' | 'error' */
+static sw_val_t *_builtin_llm_limit(sw_val_t **a, int n) {
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_atom("error");
+    const char *key = a[0]->v.str;
+    char ollama_buf[512];
+    const char *purl = _sw_llm_provider_url(key, ollama_buf, sizeof(ollama_buf), NULL);
+    const char *url = purl ? purl : key;
+
+    int64_t rpm = 0, tpm = 0, conc = 0;
+    if (n >= 2 && a[1] && a[1]->type == SW_VAL_MAP) {
+        _sw_llm_opt_int(a[1], "rpm", &rpm);
+        _sw_llm_opt_int(a[1], "tpm", &tpm);
+        _sw_llm_opt_int(a[1], "max_concurrency", &conc);
+    }
+    if (rpm < 0 || tpm < 0 || conc < 0) return sw_val_atom("error");
+
+    pthread_mutex_lock(&_sw_llm_lock);
+    _sw_llm_ep_t *ep = _sw_llm_ep_for(url);
+    if (ep) {
+        uint64_t now = _sw_now_ms();
+        ep->rpm = rpm;
+        ep->tpm = tpm;
+        ep->max_conc = conc;
+        ep->cap = conc > 0 ? conc : INT64_MAX;
+        if (tpm > 0) { ep->tokens = (double)tpm; ep->tokens_at_ms = (double)now; }
+    }
+    pthread_mutex_unlock(&_sw_llm_lock);
+    return sw_val_atom(ep ? "ok" : "error");
+}
+
+/* One %{url, rpm, ...} map per endpoint the limiter knows, for swarm_stats(). */
+static sw_val_t *_sw_llm_endpoint_stats(void) {
+    pthread_mutex_lock(&_sw_llm_lock);
+    int cnt = 0;
+    for (int i = 0; i < _SW_LLM_MAX_ENDPOINTS; i++) if (_sw_llm_eps[i].used) cnt++;
+    sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * (cnt ? cnt : 1));
+    int k = 0;
+    for (int i = 0; i < _SW_LLM_MAX_ENDPOINTS; i++) {
+        _sw_llm_ep_t *ep = &_sw_llm_eps[i];
+        if (!ep->used) continue;
+        sw_val_t *keys[15], *vals[15];
+        int c = 0;
+        keys[c] = sw_val_atom("url");              vals[c++] = sw_val_string(ep->url);
+        keys[c] = sw_val_atom("rpm");              vals[c++] = sw_val_int(ep->rpm);
+        keys[c] = sw_val_atom("tpm");              vals[c++] = sw_val_int(ep->tpm);
+        keys[c] = sw_val_atom("max_concurrency");  vals[c++] = sw_val_int(ep->max_conc);
+        keys[c] = sw_val_atom("cap");              vals[c++] = ep->max_conc > 0 ? sw_val_int(ep->cap) : sw_val_nil();
+        keys[c] = sw_val_atom("in_flight");        vals[c++] = sw_val_int(ep->in_flight);
+        keys[c] = sw_val_atom("requests");         vals[c++] = sw_val_int(ep->requests);
+        keys[c] = sw_val_atom("ok");               vals[c++] = sw_val_int(ep->ok);
+        keys[c] = sw_val_atom("rate_limited");     vals[c++] = sw_val_int(ep->rate_limited);
+        keys[c] = sw_val_atom("retries");          vals[c++] = sw_val_int(ep->retries);
+        keys[c] = sw_val_atom("server_errors");    vals[c++] = sw_val_int(ep->server_errors);
+        keys[c] = sw_val_atom("timeouts");         vals[c++] = sw_val_int(ep->timeouts);
+        keys[c] = sw_val_atom("transport_errors"); vals[c++] = sw_val_int(ep->transport_errors);
+        keys[c] = sw_val_atom("bad_requests");     vals[c++] = sw_val_int(ep->bad_requests);
+        keys[c] = sw_val_atom("avg_latency_ms");
+        vals[c++] = ep->latency_n > 0 ? sw_val_float(ep->latency_sum_ms / (double)ep->latency_n) : sw_val_nil();
+        items[k++] = sw_val_map_new(keys, vals, c);
+    }
+    pthread_mutex_unlock(&_sw_llm_lock);
+    sw_val_t *lst = sw_val_list(items, cnt);
+    free(items);
+    return lst;
+}
+
+/* Delay before retry number `attempt` (0-based): exponential, capped, with
+ * jitter in the upper half of the window. */
+static double _sw_llm_backoff_ms(int64_t base_ms, int64_t max_ms, int attempt) {
+    double d = (double)base_ms * (double)(1u << (attempt < 20 ? attempt : 20));
+    if (d > (double)max_ms) d = (double)max_ms;
+    double half = d / 2.0;
+    return half + (double)(sw_random_u32() % (uint32_t)(half + 1.0));
+}
+
+/* Retry-After in ms: the delta-seconds form, or -1 when the header is absent
+ * or not a number (an HTTP-date falls back to the backoff). */
+static double _sw_llm_retry_after_ms(sw_val_t *headers) {
+    sw_val_t *v = sw_val_map_get(headers, sw_val_string("retry-after"));
+    if (v->type != SW_VAL_STRING) return -1;
+    char *end = NULL;
+    double s = strtod(v->v.str, &end);
+    if (end == v->v.str || s < 0) return -1;
+    while (*end == ' ' || *end == '\t') end++;
+    return *end ? -1 : s * 1000.0;
+}
+
+typedef struct {
+    int status;          /* HTTP status; 0 when no response came back */
+    int curl_exit;       /* curl's exit code (28 = timed out); -1 if unknown */
+    int gone;            /* the caller was killed while the request ran */
+    char *body;          /* malloc'd, never NULL */
+    sw_val_t *headers;   /* response headers, lowercased keys */
+} _sw_llm_resp_t;
+
+/* One POST of `body` to `url`, with the same curl argv discipline as
+ * http_request (no shell; the URL and values are literal argv elements).
+ * max_time_s bounds the attempt, so it cannot outlive the caller's budget. */
+static void _sw_llm_send(const char *url, const char *api_key, const char *body,
+                         int max_time_s, sw_process_t *caller, uint64_t caller_id,
+                         _sw_llm_resp_t *out) {
+    unsigned rnd = sw_random_u32();
+    char body_file[256], out_file[256], hdr_file[256];
+    snprintf(body_file, sizeof(body_file), "%s/sw_llm_b_%d_%u", sw_tmpdir(), sw_getpid_os(), rnd);
+    snprintf(out_file, sizeof(out_file), "%s/sw_llm_o_%d_%u", sw_tmpdir(), sw_getpid_os(), rnd);
+    snprintf(hdr_file, sizeof(hdr_file), "%s/sw_llm_h_%d_%u", sw_tmpdir(), sw_getpid_os(), rnd);
+    FILE *bf = fopen(body_file, "wb");
+    if (bf) { fwrite(body, 1, strlen(body), bf); fclose(bf); }
+    char body_arg[512];
+    snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
+    char *auth_hdr = (char *)malloc(strlen(api_key) + 32);
+    sprintf(auth_hdr, "Authorization: Bearer %s", api_key);
+    char max_time[16];
+    snprintf(max_time, sizeof(max_time), "%d", max_time_s);
+
+    char *argv[] = {
+        "curl", "-sS", "-X", "POST",
+        "--connect-timeout", "30", "--max-time", max_time,
+        "-o", out_file, "-D", hdr_file, "-w", "%{http_code}",
+        "-H", "Content-Type: application/json", "-H", auth_hdr,
+        "--data-binary", body_arg, (char *)url, NULL
+    };
+    /* Flush before fork, as http_request does, so the child's exec does not
+     * replay a buffered byte of ours. */
+    fflush(stdout);
+    char code_buf[64];
+    size_t code_len = 0;
+    code_buf[0] = 0;
+    _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
+    int st = -1, gone = 0;
+    if (ch.fp) {
+        int fd = fileno(ch.fp);
+        char rb[64];
+        for (;;) {
+            /* A killed caller takes its curl with it, within one tick. */
+            if (_sw_caller_gone(caller, caller_id)) { gone = 1; break; }
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv = {0, 100000};
+            int sr = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (sr < 0) { if (errno == EINTR) continue; break; }
+            if (sr == 0) continue;
+            ssize_t rd = read(fd, rb, sizeof(rb));
+            if (rd < 0 && errno == EINTR) continue;
+            if (rd <= 0) break;
+            for (ssize_t i = 0; i < rd && code_len + 1 < sizeof(code_buf); i++)
+                code_buf[code_len++] = rb[i];
+        }
+        code_buf[code_len] = 0;
+        if (gone) _sw_pkill_close(ch);
+        else st = _sw_popen_pid_close(ch);
+    }
+    out->gone = gone;
+    out->curl_exit = (st >= 0 && (st & 0x7f) == 0) ? ((st >> 8) & 0xff) : -1;
+    out->status = (int)strtol(code_buf, NULL, 10);
+    char *b = _sw_hr_slurp(out_file, NULL);
+    char *h = _sw_hr_slurp(hdr_file, NULL);
+    out->body = b ? b : strdup("");
+    out->headers = _sw_hr_parse_headers(h);
+    free(h);
+    swbs_unlink(body_file);
+    swbs_unlink(out_file);
+    swbs_unlink(hdr_file);
+    free(auth_hdr);
+}
+
+/* The 'ok' map for a 2xx chat-completions body, or NULL when the body holds no
+ * completion text (the caller reports that as bad_response). */
+static sw_val_t *_sw_llm_ok_map(const char *body, int64_t attempts, int64_t latency_ms) {
+    sw_val_t *arg[1] = { sw_val_string(body) };
+    sw_val_t *doc = _builtin_json_decode(arg, 1);
+    sw_val_t *choices = sw_val_map_get(doc, sw_val_string("choices"));
+    if (choices->type != SW_VAL_LIST || choices->v.tuple.count < 1) return NULL;
+    sw_val_t *first = choices->v.tuple.items[0];
+    sw_val_t *msg = sw_val_map_get(first, sw_val_string("message"));
+    sw_val_t *content = sw_val_map_get(msg, sw_val_string("content"));
+    /* Reasoning models answer in "reasoning" when "content" is empty. */
+    if (content->type != SW_VAL_STRING || content->v.str[0] == 0)
+        content = sw_val_map_get(msg, sw_val_string("reasoning"));
+    if (content->type != SW_VAL_STRING || content->v.str[0] == 0) return NULL;
+    sw_val_t *finish = sw_val_map_get(first, sw_val_string("finish_reason"));
+    sw_val_t *usage = sw_val_map_get(doc, sw_val_string("usage"));
+    sw_val_t *uk[2] = { sw_val_atom("prompt_tokens"), sw_val_atom("completion_tokens") };
+    sw_val_t *uv[2] = {
+        sw_val_map_get(usage, sw_val_string("prompt_tokens")),
+        sw_val_map_get(usage, sw_val_string("completion_tokens")),
+    };
+    sw_val_t *keys[5], *vals[5];
+    keys[0] = sw_val_atom("content");       vals[0] = content;
+    keys[1] = sw_val_atom("finish_reason"); vals[1] = finish->type == SW_VAL_STRING ? finish : sw_val_nil();
+    keys[2] = sw_val_atom("usage");         vals[2] = sw_val_map_new(uk, uv, 2);
+    keys[3] = sw_val_atom("latency_ms");    vals[3] = sw_val_int(latency_ms);
+    keys[4] = sw_val_atom("attempts");      vals[4] = sw_val_int(attempts);
+    return sw_val_map_new(keys, vals, 5);
+}
+
+/* {'error', %{kind, status, retry_after_ms, body, attempts}}; status 0 and
+ * retry_after_ms < 0 are reported as nil. */
+static sw_val_t *_sw_llm_error(const char *kind, int status, double retry_after_ms,
+                               const char *body, int64_t attempts) {
+    sw_val_t *k[5], *v[5];
+    k[0] = sw_val_atom("kind");           v[0] = sw_val_atom(kind);
+    k[1] = sw_val_atom("status");         v[1] = status > 0 ? sw_val_int(status) : sw_val_nil();
+    k[2] = sw_val_atom("retry_after_ms"); v[2] = retry_after_ms >= 0 ? sw_val_int((int64_t)retry_after_ms) : sw_val_nil();
+    k[3] = sw_val_atom("body");           v[3] = sw_val_string(body ? body : "");
+    k[4] = sw_val_atom("attempts");       v[4] = sw_val_int(attempts);
+    sw_val_t *items[2] = { sw_val_atom("error"), sw_val_map_new(k, v, 5) };
+    return sw_val_tuple(items, 2);
+}
+
+/* llm_request(prompt, opts) → {'ok', map} | {'error', map}. See the section
+ * comment above for the contract. Runs on an offload worker, so the waits
+ * (pacing, backoff) park no scheduler thread. */
+static sw_val_t *_builtin_llm_request(sw_val_t **a, int n) {
+    SW_OFFLOAD_BUILTIN(_builtin_llm_request, a, n);
+    uint64_t t_start = _sw_now_ms();
+    sw_val_t *in = (n >= 1) ? a[0] : NULL;
+    if (!in || (in->type != SW_VAL_STRING && in->type != SW_VAL_LIST))
+        return _sw_llm_error("bad_request", 0, -1,
+            "llm_request: the prompt must be a string or a list of messages", 0);
+
+    const char *opt_model = NULL, *opt_url = NULL, *opt_provider = NULL, *api_key = NULL;
+    int64_t max_tokens = 4096, retries = 3, backoff_ms = 1000, max_backoff_ms = 30000;
+    int64_t timeout_ms = 0;
+    double temperature = 0.7;
+    sw_val_t *opts = (n >= 2) ? a[1] : NULL;
+    if (opts && opts->type == SW_VAL_MAP) {
+        sw_val_t *v;
+        v = sw_val_map_get(opts, sw_val_string("model"));
+        if (v->type == SW_VAL_STRING) opt_model = v->v.str;
+        v = sw_val_map_get(opts, sw_val_string("url"));
+        if (v->type == SW_VAL_STRING) opt_url = v->v.str;
+        v = sw_val_map_get(opts, sw_val_string("provider"));
+        if (v->type == SW_VAL_STRING) opt_provider = v->v.str;
+        v = sw_val_map_get(opts, sw_val_string("api_key"));
+        if (v->type == SW_VAL_STRING) api_key = v->v.str;
+        _sw_llm_opt_int(opts, "max_tokens", &max_tokens);
+        _sw_llm_opt_int(opts, "retries", &retries);
+        _sw_llm_opt_int(opts, "backoff_ms", &backoff_ms);
+        _sw_llm_opt_int(opts, "max_backoff_ms", &max_backoff_ms);
+        _sw_llm_opt_int(opts, "timeout_ms", &timeout_ms);
+        _sw_llm_opt_num(opts, "temperature", &temperature);
+    }
+    if (retries < 0) retries = 0;
+    if (retries > 10) retries = 10;
+    if (backoff_ms < 1) backoff_ms = 1;
+    if (max_backoff_ms < backoff_ms) max_backoff_ms = backoff_ms;
+
+    char *url = NULL, *model = NULL, err[512];
+    if (_sw_llm_resolve("llm_request", opt_url, opt_provider, opt_model, &url, &model,
+                        err, sizeof(err)) != 0)
+        return _sw_llm_error("config", 0, -1, err, 0);
+    if (!api_key) api_key = _sw_llm_env_key(url);
+    if (!api_key) api_key = "ollama";
+
+    sw_val_t *messages = in;
+    if (in->type == SW_VAL_STRING) {
+        sw_val_t *mk[2] = { sw_val_atom("role"), sw_val_atom("content") };
+        sw_val_t *mv[2] = { sw_val_string("user"), in };
+        sw_val_t *one[1] = { sw_val_map_new(mk, mv, 2) };
+        messages = sw_val_list(one, 1);
+    }
+    sw_val_t *bk[4], *bv[4];
+    int nb = 0;
+    if (model) { bk[nb] = sw_val_atom("model"); bv[nb++] = sw_val_string(model); }
+    bk[nb] = sw_val_atom("max_tokens");  bv[nb++] = sw_val_int(max_tokens);
+    bk[nb] = sw_val_atom("temperature"); bv[nb++] = sw_val_float(temperature);
+    bk[nb] = sw_val_atom("messages");    bv[nb++] = messages;
+    sw_val_t *enc_arg[1] = { sw_val_map_new(bk, bv, nb) };
+    sw_val_t *enc = _builtin_json_encode(enc_arg, 1);
+    char *body = strdup((enc && enc->type == SW_VAL_STRING) ? enc->v.str : "{}");
+    free(model);
+    double est_tokens = (double)strlen(body) / 4.0 + (double)max_tokens;
+
+    pthread_mutex_lock(&_sw_llm_lock);
+    _sw_llm_ep_t *ep = _sw_llm_ep_for(url);
+    pthread_mutex_unlock(&_sw_llm_lock);
+
+    uint64_t deadline = timeout_ms > 0 ? t_start + (uint64_t)timeout_ms : 0;
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
+    int64_t attempts = 0;
+    sw_val_t *result = NULL;
+    for (int64_t attempt = 0; !result; attempt++) {
+        int acq = _sw_llm_acquire(ep, est_tokens, deadline, caller, caller_id);
+        if (acq == -2) {
+            result = _sw_llm_error("cancelled", 0, -1,
+                "llm_request: the caller was killed", attempts);
+            break;
+        }
+        if (acq != 0) {
+            result = _sw_llm_error("timeout", 0, -1,
+                "llm_request: the deadline passed before the request was sent", attempts);
+            break;
+        }
+        attempts++;
+        uint64_t t_try = _sw_now_ms();
+        /* curl's --max-time: the attempt ends with the caller's budget. */
+        int max_time_s = 300;
+        if (deadline) {
+            uint64_t left = deadline > t_try ? deadline - t_try : 0;
+            max_time_s = (int)(left / 1000) + 1;
+            if (max_time_s > 300) max_time_s = 300;
+        }
+        _sw_llm_resp_t r;
+        _sw_llm_send(url, api_key, body, max_time_s, caller, caller_id, &r);
+        double latency_ms = (double)(_sw_now_ms() - t_try);
+        if (r.gone) {
+            _sw_llm_release(ep, _SW_LLM_OUT_OTHER, latency_ms, 0);
+            free(r.body);
+            result = _sw_llm_error("cancelled", 0, -1,
+                "llm_request: the caller was killed", attempts);
+            break;
+        }
+
+        const char *kind = "bad_response";
+        int outcome = _SW_LLM_OUT_OTHER, retryable = 0, is_ok = 0;
+        double retry_after = -1;
+        if (r.status == 0) {
+            retryable = 1;
+            kind = r.curl_exit == 28 ? "timeout" : "transport";
+            outcome = r.curl_exit == 28 ? _SW_LLM_OUT_TIMEOUT : _SW_LLM_OUT_TRANSPORT;
+        } else if (r.status == 429) {
+            kind = "rate_limited"; outcome = _SW_LLM_OUT_RATE; retryable = 1;
+            retry_after = _sw_llm_retry_after_ms(r.headers);
+        } else if (r.status == 408) {
+            kind = "timeout"; outcome = _SW_LLM_OUT_TIMEOUT; retryable = 1;
+            retry_after = _sw_llm_retry_after_ms(r.headers);
+        } else if (r.status >= 500 && r.status < 600) {
+            kind = "server"; outcome = _SW_LLM_OUT_SERVER; retryable = 1;
+            retry_after = _sw_llm_retry_after_ms(r.headers);
+        } else if (r.status == 401 || r.status == 403) {
+            kind = "auth";
+        } else if (r.status >= 400 && r.status < 500) {
+            kind = "bad_request";
+        } else if (r.status >= 200 && r.status < 300) {
+            sw_val_t *okm = _sw_llm_ok_map(r.body, attempts,
+                                           (int64_t)(_sw_now_ms() - t_start));
+            if (okm) {
+                is_ok = 1;
+                sw_val_t *items[2] = { sw_val_atom("ok"), okm };
+                result = sw_val_tuple(items, 2);
+            }
+        }
+
+        if (is_ok) {
+            _sw_llm_release(ep, _SW_LLM_OUT_OK, latency_ms, 0);
+            free(r.body);
+            break;
+        }
+        if (!retryable || attempt >= retries) {
+            _sw_llm_release(ep, outcome, latency_ms, 0);
+            result = _sw_llm_error(kind, r.status, retry_after, r.body, attempts);
+            free(r.body);
+            break;
+        }
+        double delay = retry_after >= 0 ? retry_after
+                     : _sw_llm_backoff_ms(backoff_ms, max_backoff_ms, (int)attempt);
+        if (deadline && (double)_sw_now_ms() + delay >= (double)deadline) {
+            _sw_llm_release(ep, outcome, latency_ms, 0);
+            result = _sw_llm_error(kind, r.status, retry_after, r.body, attempts);
+            free(r.body);
+            break;
+        }
+        _sw_llm_release(ep, outcome, latency_ms, 1);
+        free(r.body);
+        if (_sw_llm_nap(delay, caller, caller_id)) {
+            result = _sw_llm_error("cancelled", 0, -1,
+                "llm_request: the caller was killed", attempts);
+            break;
+        }
+    }
+    free(body);
+    free(url);
+    return result;
 }
 
 /* === Extra String Utilities === */
