@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -91,6 +92,12 @@ static void set_nonblocking(sw_fd_t fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 #endif
+}
+
+static uint64_t io_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
 static void set_nodelay(sw_fd_t fd) {
@@ -290,6 +297,7 @@ static void handle_read(sw_port_t *port) {
 #endif
 
     if (n > 0) {
+        atomic_store_explicit(&port->last_rx_ms, io_now_ms(), memory_order_relaxed);
         uint8_t *copy = (uint8_t *)malloc(n);
         memcpy(copy, port->recv_buf, n);
 

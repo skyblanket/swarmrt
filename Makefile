@@ -201,7 +201,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
+test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate http-keepalive-gate
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.
@@ -567,6 +567,17 @@ slowloris-gate: swc libswarmrt
 	@./bin/swc build tests/stress/slowloris_server.sw -o $(BIN_DIR)/slowloris_server >/dev/null
 	$(CC) $(CFLAGS) tests/stress/slowloris_client.c -o $(BIN_DIR)/slowloris_client
 	@bash tests/stress/slowloris_gate.sh
+
+# HTTP keep-alive response gate: 50 concurrent keep-alive clients x 100 POSTs
+# at SW_SCHEDULERS 2/4/8 must each get exactly one correct reply, and a reply
+# owed longer than the idle timeout must not drop its client.
+# See tests/stress/http_keepalive_gate.sh.
+.PHONY: http-keepalive-gate
+http-keepalive-gate: swc libswarmrt
+	@./bin/swc build tests/stress/http_keepalive_server.sw -o $(BIN_DIR)/http_keepalive_server >/dev/null
+	@./bin/swc build tests/stress/http_keepalive_slow_server.sw -o $(BIN_DIR)/http_keepalive_slow_server >/dev/null
+	$(CC) $(CFLAGS) tests/stress/http_keepalive_client.c -o $(BIN_DIR)/http_keepalive_client
+	@bash tests/stress/http_keepalive_gate.sh
 
 # Graceful-shutdown gate (SW_SHUTDOWN_GRACE_MS, SIGTERM/SIGINT) — bidirectional.
 # Drives the real path: long-lived sw server → SIGTERM → async-signal-safe

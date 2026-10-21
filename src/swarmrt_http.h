@@ -44,6 +44,8 @@
  * SW_HTTP_WS_IDLE_TIMEOUT_MS (env, default 0 = never; inbound client pings
  * count as activity since conn_on_data timestamps every inbound byte). */
 #define SW_HTTP_IDLE_TIMEOUT_MS_DEFAULT 30000u
+/* A conn with a reply owed is exempt from the idle timeout for this long. */
+#define SW_HTTP_REPLY_TIMEOUT_MS_DEFAULT 60000u
 
 /* === Bind address + WebSocket Origin policy ===
  * http_listen binds 127.0.0.1 unless told otherwise: http_listen(port,
@@ -116,6 +118,7 @@ typedef struct {
      * been sent yet (bumped by the bridge, dropped by the responder), and a
      * flag saying the parser is holding a buffered request until it hits 0. */
     _Atomic int         pending;
+    _Atomic uint64_t    pending_since_ms; /* when the oldest owed reply began */
     _Atomic int         held;
 
     /* WebSocket state */

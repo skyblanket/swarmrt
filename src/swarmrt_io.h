@@ -57,6 +57,12 @@ typedef struct sw_port {
      * only between event batches and only once refs is 0. */
     _Atomic uint32_t refs;
     struct sw_port *retire_next;
+
+    /* CLOCK_MONOTONIC ms of the last successful read, stamped on the IO thread
+     * when the bytes arrive, not when the owner gets to them. The HTTP idle
+     * sweep reads it so a request still queued in the owner's mailbox does
+     * not look idle. */
+    _Atomic uint64_t last_rx_ms;
 } sw_port_t;
 
 /* Data message sent to owner */
