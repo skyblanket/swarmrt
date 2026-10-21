@@ -134,9 +134,14 @@ int sw_varena_ranges_below(sw_value_arena_t *a, sw_varena_mark_t mark,
  * it has handed out more than this many bytes since the last reset (total_bytes
  * only grows until a reset). This bounds a long-lived loop's memory to ~this
  * while avoiding a create+free per iteration for tight loops that allocate
- * little. Tunable; the gate just needs it well under the slope budget. */
+ * little. Tunable; the gate just needs it well under the slope budget. The
+ * default is 16 KB: a message-passing process holds up to this much turn garbage
+ * before its next checkpoint, so 256 KB put ~250 KB resident on every active
+ * process (10k busy processes ~2.5 GB) while 16 KB measures ~37 KB each. The
+ * adaptive trigger (turn_live * 2) still keeps large live state amortised.
+ * Compile-time only (-DSW_TURN_RESET_BYTES=...), not a runtime env var. */
 #ifndef SW_TURN_RESET_BYTES
-#define SW_TURN_RESET_BYTES (256 * 1024)
+#define SW_TURN_RESET_BYTES (16 * 1024)
 #endif
 
 #endif /* SWARMRT_VARENA_H */
