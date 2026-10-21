@@ -485,6 +485,13 @@ mailbox-flood: dirs
 	@SW_MAILBOX_MAX=1000 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood capped
 	@SW_MAILBOX_MAX=0 $(ASAN_FUZZ_ENV) $(BIN_DIR)/mailbox_flood uncapped
 
+# Mutual tail-call park is per process (two fibers on one scheduler thread must
+# not share it). Fails to build/run against a __thread park.
+.PHONY: tc-park
+tc-park: swc libswarmrt
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/stress/tc_park_per_process.c $(FUZZ_RT) -o $(BIN_DIR)/tc_park_per_process $(LDFLAGS)
+	@timeout 60 $(BIN_DIR)/tc_park_per_process
+
 # Per-process memory quota gate (SW_PROC_MEM_MAX) — bidirectional. Capped run:
 # a hog child accumulating ~6.5 MB of LIVE strings under a 2 MB quota is killed
 # by the arena grow/adopt quota check — the stderr panic names SW_PROC_MEM_MAX
