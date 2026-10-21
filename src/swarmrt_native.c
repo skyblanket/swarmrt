@@ -808,6 +808,8 @@ typedef struct sw_carrier {
     uint8_t *stack;            /* usable region, just above the guard page */
     size_t stack_size;
     sw_process_t *proc;        /* process this run is for */
+    void (*entry)(void *);     /* its entry and arg, snapshotted under */
+    void *arg;                 /* ctx_lock with the generation check */
     int *outcome;              /* set to 1 by carrier_main when the entry returned */
     struct sw_carrier *next;   /* free list / all-carriers list */
     struct sw_carrier *all_next;
@@ -954,7 +956,7 @@ static void carrier_main(void *arg) {
     sw_carrier_t *c = (sw_carrier_t *)arg;
     for (;;) {
         sw_process_t *p = c->proc;
-        p->entry(p->arg);
+        c->entry(c->arg);
         atomic_store_explicit(&p->state, SW_PROC_EXITING, memory_order_relaxed);
         if (c->outcome) *c->outcome = 1;
         /* p->scheduler is the scheduler running p now (set before every run),
@@ -1017,10 +1019,6 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->on_destroy = NULL;
     proc->on_destroy_arg = NULL;
 
-    /* Core fields */
-    proc->entry = entry;
-    proc->arg = arg;
-
     /* No per-process stack (PROCESS_WEIGHT.md §3.2): the process runs on a
      * scheduler's carrier, and holds one only while pinned. */
     proc->carrier = NULL;
@@ -1029,6 +1027,10 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
 
     sw_spin_lock(&proc->ctx_lock);
     atomic_fetch_add_explicit(&proc->generation, 1, memory_order_release);
+    /* Entry and arg change with the generation, under ctx_lock: a stale
+     * dispatch snapshots both under the same lock (see scheduler_loop). */
+    proc->entry = entry;
+    proc->arg = arg;
 
     /* proc->ctx is only meaningful while pinned: it is saved by the old-style
      * swap that pins the process, and read by sw_safe_swap_into to resume it. */
@@ -1828,7 +1830,15 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             } else {
                 c = sched->carrier ? sched->carrier : carrier_alloc();
                 sched->carrier = NULL;
-                if (atomic_load_explicit(&proc->generation, memory_order_acquire) != expected_gen) {
+                /* Same guard as sw_safe_swap_into: check the generation and
+                 * snapshot entry/arg under ctx_lock, so a slot being
+                 * reinitialized can't hand this run a half-written entry. */
+                int stale;
+                sw_spin_lock(&proc->ctx_lock);
+                stale = atomic_load_explicit(&proc->generation, memory_order_acquire) != expected_gen;
+                if (!stale && c) { c->entry = proc->entry; c->arg = proc->arg; }
+                sw_spin_unlock(&proc->ctx_lock);
+                if (stale) {
                     if (c) carrier_release(sched, c);
                     swapped = -1;
                 } else if (!c) {

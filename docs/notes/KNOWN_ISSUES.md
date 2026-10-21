@@ -17,8 +17,9 @@ process therefore still costs at least one page (4 KB on Linux x86-64, 16 KB on 
 Silicon) and two kernel mappings. Stock Linux (`vm.max_map_count` 65530) runs out near
 32,700 parked processes. Past that, a process that can't get a carrier fails with a
 `carrier stack` message on stderr and the node keeps running. Busy message-passing
-processes cost about 12.5 KB resident each with the default `SW_TURN_RESET_BYTES`
-(4 KB), and idle ones about 6.4 KB (measured with `bench/memory`, Linux x86-64).
+processes cost about 13.3 KB resident each with the default `SW_TURN_RESET_BYTES`
+(4 KB), and idle ones about 7.0 KB (measured with `bench/memory` at N=10K, Linux
+x86-64).
 **Workaround:** raise `vm.max_map_count` for more than ~30K parked processes. The fix
 (parked processes that hold no stack) is the rest of `docs/design/PROCESS_WEIGHT.md`
 Phase 2.

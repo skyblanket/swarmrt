@@ -26,7 +26,12 @@ fun main() { spawn_n(0, 200000)  print("spawned all") }
 SW
 "$SWC" build "$WORK/spawn_many.sw" -o "$WORK/spawn_many" >/dev/null 2>&1 || { echo "FAIL spawn_limit: build"; exit 1; }
 out=$( (ulimit -v 1500000; SW_SCHEDULERS=2 timeout 60 "$WORK/spawn_many") 2>&1); rc=$?
-if [ "$rc" -ne 139 ] && [ "$rc" -ne 124 ] && printf '%s' "$out" | grep -qE "spawn failed|carrier stack"; then
+# Carrier failure: only the starved processes fail, so main must still finish.
+# Spawn failure (pre-carrier runtimes): the spawner panics, non-zero exit.
+if { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "carrier stack" &&
+     printf '%s' "$out" | grep -q "spawned all"; } ||
+   { [ "$rc" -ne 0 ] && [ "$rc" -ne 139 ] && [ "$rc" -ne 124 ] &&
+     printf '%s' "$out" | grep -q "spawn failed"; }; then
     echo "PASS spawn_limit (rc=$rc, clean failure)"
     exit 0
 fi

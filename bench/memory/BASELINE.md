@@ -74,7 +74,7 @@ isn't set.
 ## After Phase 2a (carriers, every parked process pins)
 
 Same host and harness. Every process in the ring is parked in receive, so each
-one pins a carrier. Memory and mappings match Phase 1 by design; 2a only moves
+one pins a carrier. Memory stays comparable to Phase 1 (about 0.6 KB more) and mappings match it, by design; 2a only moves
 the stacks into a pool. The drop comes once parked processes stop pinning.
 
 | Mode | N | Per process | Phase 1 | Mappings (VMAs) |
