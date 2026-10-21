@@ -70,3 +70,25 @@ The turn-reset threshold trades memory for throughput (busy, N=10K):
 
 `MALLOC_ARENA_MAX=1` saves 5.8% more (11.8 KB), under the plan's 10% bar, so it
 isn't set.
+
+## After Phase 2a (carriers, every parked process pins)
+
+Same host and harness. Every process in the ring is parked in receive, so each
+one pins a carrier. Memory and mappings match Phase 1 by design; 2a only moves
+the stacks into a pool. The drop comes once parked processes stop pinning.
+
+| Mode | N | Per process | Phase 1 | Mappings (VMAs) |
+|---|---|---|---|---|
+| busy | 10,000 | 13.3 KB | 12.5 KB | 20,063 |
+| busy | 30,000 | 12.8 KB | 12.1 KB | 60,063 |
+| idle | 10,000 | 7.0 KB | 6.4 KB | 20,062 |
+| idle | 30,000 | 7.0 KB | — | 60,062 |
+
+`bench/actor`, main and 2a run back to back (seconds, best of 3):
+
+| Bench | main (Phase 1) | Phase 2a |
+|---|---|---|
+| spawn | 6.83 | 7.26 |
+| pingpong | 9.63 | 8.00 |
+| fanout | 5.46 | 5.01 |
+| parallel | 4.85 | 4.93 |
