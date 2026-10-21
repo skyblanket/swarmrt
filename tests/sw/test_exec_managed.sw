@@ -36,8 +36,6 @@ fun main() {
     # a live, non-zombie process counts as having survived. `kill -0` and `ps`
     # rather than /proc so this also checks on macOS. Only an explicit "dead"
     # passes: a missing ps or pid file must fail the test, not pass it.
-    # (No `exit` in the command: shell() wraps it in a group that writes its
-    # exit status afterwards, so an `exit` leaves shell() waiting forever.)
     alive = shell("case '" ++ gc ++ "' in ''|*[!0-9]*) echo bad-pid;; " ++
                   "*) if ! command -v ps >/dev/null 2>&1; then echo no-ps; " ++
                   "elif ! kill -0 '" ++ gc ++ "' 2>/dev/null; then echo dead; " ++
