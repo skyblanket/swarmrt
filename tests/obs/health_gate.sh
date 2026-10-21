@@ -53,6 +53,24 @@ for key in '"processes"' '"schedulers"' '"spawns"' '"crashes"' '"restarts"' '"sc
     grep -q "$key" bin/_hg.body || fail "/readyz JSON missing $key"
 done
 
+# 2b. resident memory + per-scheduler utilisation in /readyz
+grep -q '"resident_bytes"' bin/_hg.body || fail "/readyz JSON missing resident_bytes"
+grep -q '"utilization"' bin/_hg.body || fail "/readyz JSON missing scheduler utilization"
+
+# 2c. JSON introspection: /processes (+limit summary row), /tree, /top
+code=$(curl -s -o bin/_hg.body -w '%{http_code}' --max-time 5 "$BASE/processes") || fail "curl /processes"
+[ "$code" = "200" ] || fail "/processes status $code, want 200"
+for key in '"pid"' '"mailbox_len"' '"memory"' '"messages_sent"' '"messages_recv"'; do
+    grep -q "$key" bin/_hg.body || fail "/processes JSON missing $key"
+done
+curl -s --max-time 5 "$BASE/processes?limit=1" | grep -q '"summary":true' || fail "/processes?limit=1 has no summary row"
+code=$(curl -s -o bin/_hg.body -w '%{http_code}' --max-time 5 "$BASE/tree") || fail "curl /tree"
+[ "$code" = "200" ] && grep -q '"children"' bin/_hg.body || fail "/tree not a 200 forest with children"
+code=$(curl -s -o bin/_hg.body -w '%{http_code}' --max-time 5 "$BASE/top?by=mailbox&n=1") || fail "curl /top"
+[ "$code" = "200" ] && grep -q '"pid"' bin/_hg.body || fail "/top?by=mailbox&n=1 not a 200 ranked list"
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/top?by=bogus") || fail "curl /top bad"
+[ "$code" = "400" ] || fail "/top?by=bogus answered $code, want 400"
+
 # 3. unknown path: 404, not an accidental catch-all 200
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/definitely-not-a-route") || fail "curl 404 probe"
 [ "$code" = "404" ] || fail "unknown path answered $code, want 404"

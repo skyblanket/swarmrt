@@ -21,6 +21,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/resource.h>
+#endif
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -121,6 +125,32 @@ static _Atomic int g_sw_tearing_down = 0;
 
 int sw_is_draining(void) {
     return atomic_load_explicit(&g_sw_draining, memory_order_relaxed);
+}
+
+/* Process resident set size in bytes (swarm_stats().resident_bytes).
+ * Linux: /proc/self/statm field 2 x page size; elsewhere getrusage's
+ * ru_maxrss (peak RSS: bytes on macOS, KB elsewhere). 0 if unavailable. */
+int64_t sw_resident_bytes(void) {
+#ifdef _WIN32
+    return 0;
+#else
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f) {
+        long size = 0, rss = 0;
+        int n = fscanf(f, "%ld %ld", &size, &rss);
+        fclose(f);
+        if (n == 2 && rss >= 0) return (int64_t)rss * (int64_t)sysconf(_SC_PAGESIZE);
+    }
+#endif
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#ifdef __APPLE__
+    return (int64_t)ru.ru_maxrss;
+#else
+    return (int64_t)ru.ru_maxrss * 1024;
+#endif
+#endif
 }
 
 int sw_shutdown_requested(void) {

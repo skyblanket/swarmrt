@@ -608,6 +608,9 @@ int sw_shutdown_grace_ms(void);
  * (`draining`) so a readiness probe can fail during the drain window. */
 int sw_is_draining(void);
 
+/* Process resident set size in bytes (0 if unavailable). */
+int64_t sw_resident_bytes(void);
+
 /* Install async-signal-safe SIGTERM + SIGINT handlers that request graceful
  * shutdown. The handler ONLY sets an atomic flag (a second signal hard-exits
  * via _exit, an operator escape hatch); the actual drain runs from the
