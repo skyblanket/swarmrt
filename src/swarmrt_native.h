@@ -305,7 +305,7 @@ struct sw_process {
     void *arg;                /* Entry argument */
 
     /* === Process stack (for context switching) === */
-    void *stack_mem;          /* malloc'd stack for this process */
+    void *stack_mem;          /* the carrier stack it runs on, or NULL between runs */
     size_t stack_size;        /* Stack allocation size */
 
     /* === Arena allocation === */
@@ -429,6 +429,16 @@ struct sw_process {
      * Producer-side check is approximate by design (relaxed atomics).
      * At struct END so it shifts no asm-pinned offset. */
     _Atomic int64_t mb_len;
+
+    /* The carrier this process is pinned to, or NULL (docs/design/
+     * PROCESS_WEIGHT.md §3.2). A process no longer owns a stack: it runs on
+     * a scheduler's carrier, and keeps one only while it is parked inside
+     * code that blocked the old way (sw_context_swap from C). Set BEFORE a
+     * run starts, so a scheduler that picks the process up meanwhile always
+     * sees it; cleared when the run unwinds back to carrier_main. While set,
+     * stack_mem/stack_size above describe the carrier's stack. At struct END
+     * so it shifts no asm-pinned offset. */
+    struct sw_carrier *carrier;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -467,6 +477,9 @@ struct sw_scheduler {
 
     /* Run queue */
     sw_runq_t runq;
+
+    /* A spare carrier stack, so most runs skip the global pool. */
+    struct sw_carrier *carrier;
     
     /* Statistics */
     uint64_t context_switches;
