@@ -1326,9 +1326,25 @@ static void setup_preemption(void) {
 }
 
 /* Called by process to check if it should yield */
+/* SW_SUSPEND_TORTURE=n: report "yield" every nth check, so stackless code
+ * suspends and resumes at every reduction point (PROCESS_WEIGHT.md Phase 2c). */
+static int g_suspend_torture = -1;
+static _Atomic unsigned long g_torture_tick;
+
 int sw_check_reds(void) {
     sw_process_t *proc = tls_current;
     if (!proc) return 0;
+    if (SW_UNLIKELY(g_suspend_torture != 0)) {
+        if (g_suspend_torture < 0) {
+            const char *e = getenv("SW_SUSPEND_TORTURE");
+            g_suspend_torture = e ? atoi(e) : 0;
+            if (g_suspend_torture < 0) g_suspend_torture = 0;
+        }
+        if (g_suspend_torture > 0 &&
+                atomic_fetch_add_explicit(&g_torture_tick, 1, memory_order_relaxed) %
+                (unsigned long)g_suspend_torture == 0)
+            return 1;
+    }
 
     proc->fcalls--;
     proc->reductions_done++;

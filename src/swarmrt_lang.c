@@ -2630,7 +2630,18 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
 }
 
 #define SW_APPLY_INLINE_ARGS 16
+/* C callers (builtins, helpers, the runtime) apply closures through
+ * sw_val_apply: the callback can't suspend stacklessly, because its C caller
+ * can't be captured. Generated code calls sw_val_apply_s, which may return
+ * SW_SUSPEND (swarmrt_frames.h). */
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
+    sw_no_suspend_enter();
+    sw_val_t *r = sw_val_apply_s(fun, args, nargs);
+    sw_no_suspend_exit();
+    return r;
+}
+
+sw_val_t *sw_val_apply_s(sw_val_t *fun, sw_val_t **args, int nargs) {
     if (!fun || fun->type != SW_VAL_FUN || !fun->v.fun.cfunc)
         return sw_val_nil();
     typedef sw_val_t *(*sw_fn_t)(sw_val_t **, int);
@@ -3064,6 +3075,8 @@ sw_val_t *sw_resume_value(void) {
 
 void sw_no_suspend_enter(void) { sw_process_t *p = sw_self(); if (p) p->no_suspend++; }
 void sw_no_suspend_exit(void)  { sw_process_t *p = sw_self(); if (p && p->no_suspend) p->no_suspend--; }
+uint32_t sw_no_suspend_depth(void) { sw_process_t *p = sw_self(); return p ? p->no_suspend : 0; }
+void sw_no_suspend_set(uint32_t d) { sw_process_t *p = sw_self(); if (p) p->no_suspend = d; }
 
 /* The driver (§3.5). Runs one activation of a stackless process on its
  * carrier: the entry the first time, the innermost parked frame after that.
@@ -3104,7 +3117,7 @@ int sw_run_stackless(sw_process_t *p) {
             if (k) { waiting = k->parent; sw_frame_free(k); k = NULL; }
             sw_tc_park_t *pk = sw_tc_park();
             sw_varena_mark_t fl = pk->floor;
-            r = pk->fn(pk->args, pk->n, &fl);
+            r = pk->fn(pk->args, pk->n, &fl, NULL);
             continue;
         }
         sw_frame_t *next;

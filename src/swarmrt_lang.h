@@ -234,6 +234,7 @@ sw_val_t *sw_val_list_prepend(sw_val_t *x, sw_val_t *lst);
 sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
                              sw_val_t **captures, int ncaptures);
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs);
+sw_val_t *sw_val_apply_s(sw_val_t *fun, sw_val_t **args, int nargs);
 
 /* GC v1: deep-copy a value to the GLOBAL heap (copy-on-escape) so it
  * outlives the source process's arena. See [[swarmrt-gc-design]]. */
@@ -265,7 +266,8 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor);
  * the park is written only after the caller's last yield point, so no yield can
  * land between the park and that copy. */
 #define SW_TC_MAX 16
-typedef sw_val_t *(*sw_tc_body_t)(sw_val_t **args, int nargs, sw_varena_mark_t *floor);
+typedef sw_val_t *(*sw_tc_body_t)(sw_val_t **args, int nargs, sw_varena_mark_t *floor,
+                                  sw_frame_t *rs);
 extern sw_val_t sw_tc_hop_sentinel;
 #define SW_TC_HOP (&sw_tc_hop_sentinel)
 /* The park lives in the process (allocated on its first hop), not in
@@ -283,7 +285,7 @@ static inline sw_val_t *sw_tc_drive(sw_val_t *r) {
     while (r == SW_TC_HOP) {
         sw_tc_park_t *pk = sw_tc_park();
         sw_varena_mark_t fl = pk->floor;
-        r = pk->fn(pk->args, pk->n, &fl);
+        r = pk->fn(pk->args, pk->n, &fl, NULL);
     }
     return r;
 }
