@@ -11,6 +11,20 @@ module Test_http_pipeline
 # answers each request with its path as the body, so the output must hold
 # both bodies in order. Exits non-zero on any failure so the driver rolls it up.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -21,7 +35,7 @@ fun assert_eq(name, actual, expected) {
 }
 
 fun pipeline_server() {
-    http_listen(9471)
+    http_listen(test_port(471))
     pipeline_loop()
 }
 
@@ -56,7 +70,7 @@ fun pipelined_slow_close_bodies_slow() {
 }
 
 fun pipelined_out(reqs) {
-    cmd = "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9471; printf '%s' '" ++ reqs ++
+    cmd = "bash -c \"exec 3<>/dev/tcp/127.0.0.1/" ++ to_string(test_port(471)) ++ ";  printf '%s' '" ++ reqs ++
           "' >&3; perl -e 'alarm 3; exec @ARGV' cat <&3 | grep -o 'ok:/[a-z]*'\""
     elem(shell(cmd), 1)
 }
