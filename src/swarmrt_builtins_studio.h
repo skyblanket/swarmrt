@@ -7495,14 +7495,33 @@ static void _sw_llm_cond_wait(uint64_t ms) {
     pthread_cond_timedwait(&_sw_llm_cond, &_sw_llm_lock, &ts);
 }
 
+/* Sleeps ms in 100 ms ticks so a killed caller is noticed promptly. Returns 1
+ * when the caller is gone (the sleep is cut short), else 0. */
+static int _sw_llm_nap(double ms, sw_process_t *caller, uint64_t caller_id) {
+    double left = ms;
+    while (left > 0) {
+        if (_sw_caller_gone(caller, caller_id)) return 1;
+        double step = left > 100.0 ? 100.0 : left;
+        _sw_nap_us((unsigned)(step * 1000.0));
+        left -= step;
+    }
+    return _sw_caller_gone(caller, caller_id);
+}
+
 /* Blocks until `ep` may send one attempt that costs `tokens` (ep NULL: no
  * limits). Returns 0 with an in-flight slot taken, to be returned by
  * _sw_llm_release; or -1 when the wait would pass deadline_ms (0 = none), in
- * which case nothing is reserved. The pacing sleep happens outside the lock. */
-static int _sw_llm_acquire(_sw_llm_ep_t *ep, double tokens, uint64_t deadline_ms) {
-    if (!ep) return 0;
+ * which case nothing is reserved; or -2 when the caller was killed meanwhile
+ * (nothing stays reserved). The pacing sleep happens outside the lock. */
+static int _sw_llm_acquire(_sw_llm_ep_t *ep, double tokens, uint64_t deadline_ms,
+                           sw_process_t *caller, uint64_t caller_id) {
+    if (!ep) return _sw_caller_gone(caller, caller_id) ? -2 : 0;
     pthread_mutex_lock(&_sw_llm_lock);
     while (ep->in_flight >= ep->cap) {
+        if (_sw_caller_gone(caller, caller_id)) {
+            pthread_mutex_unlock(&_sw_llm_lock);
+            return -2;
+        }
         if (deadline_ms && _sw_now_ms() >= deadline_ms) {
             pthread_mutex_unlock(&_sw_llm_lock);
             return -1;
@@ -7535,7 +7554,14 @@ static int _sw_llm_acquire(_sw_llm_ep_t *ep, double tokens, uint64_t deadline_ms
     ep->in_flight++;
     ep->requests++;
     pthread_mutex_unlock(&_sw_llm_lock);
-    if (wait_ms >= 1.0) _sw_nap_us((unsigned)(wait_ms * 1000.0));
+    if (wait_ms >= 1.0 && _sw_llm_nap(wait_ms, caller, caller_id)) {
+        pthread_mutex_lock(&_sw_llm_lock);
+        ep->in_flight--;
+        ep->requests--;
+        pthread_cond_broadcast(&_sw_llm_cond);
+        pthread_mutex_unlock(&_sw_llm_lock);
+        return -2;
+    }
     return 0;
 }
 
@@ -7673,6 +7699,7 @@ static double _sw_llm_retry_after_ms(sw_val_t *headers) {
 typedef struct {
     int status;          /* HTTP status; 0 when no response came back */
     int curl_exit;       /* curl's exit code (28 = timed out); -1 if unknown */
+    int gone;            /* the caller was killed while the request ran */
     char *body;          /* malloc'd, never NULL */
     sw_val_t *headers;   /* response headers, lowercased keys */
 } _sw_llm_resp_t;
@@ -7681,7 +7708,8 @@ typedef struct {
  * http_request (no shell; the URL and values are literal argv elements).
  * max_time_s bounds the attempt, so it cannot outlive the caller's budget. */
 static void _sw_llm_send(const char *url, const char *api_key, const char *body,
-                         int max_time_s, _sw_llm_resp_t *out) {
+                         int max_time_s, sw_process_t *caller, uint64_t caller_id,
+                         _sw_llm_resp_t *out) {
     unsigned rnd = sw_random_u32();
     char body_file[256], out_file[256], hdr_file[256];
     snprintf(body_file, sizeof(body_file), "%s/sw_llm_b_%d_%u", sw_tmpdir(), sw_getpid_os(), rnd);
@@ -7710,16 +7738,31 @@ static void _sw_llm_send(const char *url, const char *api_key, const char *body,
     size_t code_len = 0;
     code_buf[0] = 0;
     _sw_popen_pid_t ch = _sw_popen_argv(argv, NULL);
-    int st = -1;
+    int st = -1, gone = 0;
     if (ch.fp) {
+        int fd = fileno(ch.fp);
         char rb[64];
-        size_t rd;
-        while ((rd = fread(rb, 1, sizeof(rb), ch.fp)) > 0)
-            for (size_t i = 0; i < rd && code_len + 1 < sizeof(code_buf); i++)
+        for (;;) {
+            /* A killed caller takes its curl with it, within one tick. */
+            if (_sw_caller_gone(caller, caller_id)) { gone = 1; break; }
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv = {0, 100000};
+            int sr = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (sr < 0) { if (errno == EINTR) continue; break; }
+            if (sr == 0) continue;
+            ssize_t rd = read(fd, rb, sizeof(rb));
+            if (rd < 0 && errno == EINTR) continue;
+            if (rd <= 0) break;
+            for (ssize_t i = 0; i < rd && code_len + 1 < sizeof(code_buf); i++)
                 code_buf[code_len++] = rb[i];
+        }
         code_buf[code_len] = 0;
-        st = _sw_popen_pid_close(ch);
+        if (gone) _sw_pkill_close(ch);
+        else st = _sw_popen_pid_close(ch);
     }
+    out->gone = gone;
     out->curl_exit = (st >= 0 && (st & 0x7f) == 0) ? ((st >> 8) & 0xff) : -1;
     out->status = (int)strtol(code_buf, NULL, 10);
     char *b = _sw_hr_slurp(out_file, NULL);
@@ -7846,10 +7889,18 @@ static sw_val_t *_builtin_llm_request(sw_val_t **a, int n) {
     pthread_mutex_unlock(&_sw_llm_lock);
 
     uint64_t deadline = timeout_ms > 0 ? t_start + (uint64_t)timeout_ms : 0;
+    sw_process_t *caller = _sw_offl_self();
+    uint64_t caller_id = caller ? caller->pid : 0;
     int64_t attempts = 0;
     sw_val_t *result = NULL;
     for (int64_t attempt = 0; !result; attempt++) {
-        if (_sw_llm_acquire(ep, est_tokens, deadline) != 0) {
+        int acq = _sw_llm_acquire(ep, est_tokens, deadline, caller, caller_id);
+        if (acq == -2) {
+            result = _sw_llm_error("cancelled", 0, -1,
+                "llm_request: the caller was killed", attempts);
+            break;
+        }
+        if (acq != 0) {
             result = _sw_llm_error("timeout", 0, -1,
                 "llm_request: the deadline passed before the request was sent", attempts);
             break;
@@ -7864,8 +7915,15 @@ static sw_val_t *_builtin_llm_request(sw_val_t **a, int n) {
             if (max_time_s > 300) max_time_s = 300;
         }
         _sw_llm_resp_t r;
-        _sw_llm_send(url, api_key, body, max_time_s, &r);
+        _sw_llm_send(url, api_key, body, max_time_s, caller, caller_id, &r);
         double latency_ms = (double)(_sw_now_ms() - t_try);
+        if (r.gone) {
+            _sw_llm_release(ep, _SW_LLM_OUT_OTHER, latency_ms, 0);
+            free(r.body);
+            result = _sw_llm_error("cancelled", 0, -1,
+                "llm_request: the caller was killed", attempts);
+            break;
+        }
 
         const char *kind = "bad_response";
         int outcome = _SW_LLM_OUT_OTHER, retryable = 0, is_ok = 0;
@@ -7879,8 +7937,10 @@ static sw_val_t *_builtin_llm_request(sw_val_t **a, int n) {
             retry_after = _sw_llm_retry_after_ms(r.headers);
         } else if (r.status == 408) {
             kind = "timeout"; outcome = _SW_LLM_OUT_TIMEOUT; retryable = 1;
+            retry_after = _sw_llm_retry_after_ms(r.headers);
         } else if (r.status >= 500 && r.status < 600) {
             kind = "server"; outcome = _SW_LLM_OUT_SERVER; retryable = 1;
+            retry_after = _sw_llm_retry_after_ms(r.headers);
         } else if (r.status == 401 || r.status == 403) {
             kind = "auth";
         } else if (r.status >= 400 && r.status < 500) {
@@ -7916,7 +7976,11 @@ static sw_val_t *_builtin_llm_request(sw_val_t **a, int n) {
         }
         _sw_llm_release(ep, outcome, latency_ms, 1);
         free(r.body);
-        _sw_nap_us((unsigned)(delay * 1000.0));
+        if (_sw_llm_nap(delay, caller, caller_id)) {
+            result = _sw_llm_error("cancelled", 0, -1,
+                "llm_request: the caller was killed", attempts);
+            break;
+        }
     }
     free(body);
     free(url);

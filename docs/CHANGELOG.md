@@ -48,8 +48,9 @@ timeouts, transport errors, average latency) appear in `swarm_stats()` under
 `http_post` backoff. It does not use the limiter. Moving it onto `llm_request` is a
 follow-up, once callers are ready for the structured result.
 
-**Not done:** the caller's death does not cancel retries. A call that is still retrying
-when its caller dies runs to its own `timeout_ms` (or to the end of its retries).
+**Caller death:** a killed caller stops its `llm_request` within ~100 ms: the limiter
+wait, the pacing sleep, the in-flight curl (killed) and the retry backoff all check it.
+`Retry-After` is honoured on 408, 429 and 5xx.
 
 **Gates:** `tests/sw/test_llm_request.sw` (a 429 with `Retry-After: 1` twice then 200 gives
 `ok` with 3 attempts in about 2 s; a 400 is `bad_request`, not retried; `timeout_ms` cuts

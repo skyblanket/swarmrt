@@ -38,6 +38,12 @@ fun reply(conn, path, seen) {
     if (path == "/rl" && seen < 2) {
         http_respond(conn, 429, "Retry-After: 1\r\nContent-Type: application/json\r\n",
                      "{\"error\":{\"type\":\"rate_limit_error\"}}")
+    } else if (path == "/s503" && seen < 1) {
+        http_respond(conn, 503, "Retry-After: 1\r\nContent-Type: application/json\r\n",
+                     "{\"error\":{\"type\":\"overloaded\"}}")
+    } else if (path == "/kill") {
+        http_respond(conn, 503, "Retry-After: 1\r\nContent-Type: application/json\r\n",
+                     "{\"error\":{\"type\":\"overloaded\"}}")
     } else if (path == "/always429") {
         http_respond(conn, 429, "Retry-After: 60\r\nContent-Type: application/json\r\n",
                      "{\"error\":{\"type\":\"rate_limit_error\"}}")
@@ -50,6 +56,10 @@ fun reply(conn, path, seen) {
         http_respond(conn, 200, "Content-Type: application/json\r\n",
                      "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hello there\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}")
     }
+}
+
+fun kill_caller(url) {
+    llm_request("x", %{url: url, api_key: "k", retries: 8, backoff_ms: 100})
 }
 
 fun delayed_reply(conn, ms) {
@@ -155,6 +165,27 @@ fun main() {
     failures = failures + assert_eq("stats_rl_retries", map_get(rl, 'retries'), 2)
     failures = failures + assert_eq("stats_rl_ok", map_get(rl, 'ok'), 1)
 
-    if (failures == 0) { print("OK test_llm_request 23/23") ; sys_exit(0) }
+    # --- 7. A 503 with Retry-After: 1 is waited out for exactly that long.
+    t7 = timestamp()
+    r7 = llm_request("x", %{url: base ++ "/s503", api_key: "k", retries: 3, backoff_ms: 5000})
+    el7 = timestamp() - t7
+    case r7 {
+        {'ok', m} -> failures = failures + assert_eq("s503_attempts", map_get(m, 'attempts'), 2)
+        _ ->
+            print("FAIL s503: got " ++ to_string(r7))
+            failures = failures + 1
+    }
+    failures = failures + assert_true("s503_retry_after_honoured", el7 >= 900 && el7 < 3000)
+
+    # --- 8. A killed caller stops retrying: the 503 + Retry-After: 1 loop would
+    # otherwise send ~5 more requests over the next seconds.
+    victim = spawn(kill_caller(base ++ "/kill"))
+    sleep(400)
+    exit_proc(victim, 'kill')
+    sleep(2500)
+    kst = endpoint_stat(map_get(swarm_stats(), 'llm_endpoints'), base ++ "/kill")
+    failures = failures + assert_eq("kill_stops_retrying", map_get(kst, 'requests'), 1)
+
+    if (failures == 0) { print("OK test_llm_request 26/26") ; sys_exit(0) }
     else { print(f"FAIL test_llm_request {failures} failed") ; sys_exit(1) }
 }
