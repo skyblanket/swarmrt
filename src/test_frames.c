@@ -120,6 +120,38 @@ static sw_val_t *parker_b(sw_frame_t *rs) {
 }
 static sw_val_t *parker_entry(void *arg) { (void)arg; return parker_b(NULL); }
 
+/* ---- crasher(): parks inside outer-style call, then panics on resume ---- */
+typedef struct { sw_frame_t h; } crash_F;
+static const sw_fn_meta_t crash_meta = { "T", "crasher", 4 };
+static sw_val_t *crash_leaf(sw_frame_t *rs);
+static sw_val_t *crash_leaf_rs(sw_frame_t *f) { return crash_leaf(f); }
+static sw_val_t *crash_leaf(sw_frame_t *rs) {
+    sw_msg_t *m = sw_mailbox_peek();
+    if (m) {
+        sw_mailbox_remove_msg(m); sw_msg_release(m);
+        sw_process_panic(sw_self(), -1, "crash after resume");
+        return sw_val_nil();
+    }
+    sw_suspend_recv(UINT64_MAX);
+    crash_F *f = rs ? (crash_F *)rs : (crash_F *)sw_frame_new(sizeof(crash_F), crash_leaf_rs, &crash_meta);
+    f->h.pt = 1;
+    sw_frame_link(&f->h, rs != NULL);
+    return SW_SUSPEND;
+}
+static sw_val_t *crash_mid(sw_frame_t *rs);
+static sw_val_t *crash_mid_rs(sw_frame_t *f) { return crash_mid(f); }
+static sw_val_t *crash_mid(sw_frame_t *rs) {
+    sw_val_t *r = rs ? sw_resume_value() : crash_leaf(NULL);
+    if (r == SW_SUSPEND) {
+        crash_F *f = rs ? (crash_F *)rs : (crash_F *)sw_frame_new(sizeof(crash_F), crash_mid_rs, &crash_meta);
+        f->h.pt = 1;
+        sw_frame_link(&f->h, rs != NULL);
+        return SW_SUSPEND;
+    }
+    return r;
+}
+static sw_val_t *crasher_entry(void *arg) { (void)arg; return crash_mid(NULL); }
+
 static int count_maps(void) {
     FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) return -1;
@@ -172,6 +204,15 @@ int main(void) {
         if (s == SW_PROC_WAITING || s == SW_PROC_RUNNABLE || s == SW_PROC_RUNNING) live++;
     }
     CHECK(live == 0, "woken and killed parkers all exited (%d still live)", live);
+
+    /* 5: a panic in a resumed activation frees its frame chain (checked
+     * by LeakSanitizer: run this binary under ASan with leaks on). */
+    static sw_process_t *crashers[100];
+    for (int i = 0; i < 100; i++) crashers[i] = sw_spawn_v(crasher_entry, NULL);
+    wait_ms(200);   /* all parked, two frames each */
+    for (int i = 0; i < 100; i++) sw_send_value(crashers[i], 0, sw_val_nil());
+    wait_ms(200);
+    CHECK(1, "100 processes panicked after a resume");
 
     sw_shutdown(0);
     printf("%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
