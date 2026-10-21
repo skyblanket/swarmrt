@@ -94,6 +94,9 @@ typedef struct sw_gen_exec {
     _sw_frame_t trace[64];       /* call-stack ring buffer (innermost last)     */
     int trace_top;               /* depth; >64 sets trace_overflowed            */
     int trace_overflowed;        /* 1 if the call chain exceeded 64 frames      */
+    /* Mutual tail-call hop park (sw_tc_park_t in swarmrt_lang.h): per process
+     * because a yield can resume the process on another scheduler thread. */
+    _Alignas(16) unsigned char tc_park[256];
 } sw_gen_exec_t;
 /* Points at the running process's gen_exec block (or a thread-local fallback for
  * non-process / OOM contexts). Swapped wherever tls_current is set. */

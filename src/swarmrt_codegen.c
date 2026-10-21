@@ -2571,12 +2571,14 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
             fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", nargs > 0 ? "_gc_v" : "NULL", nargs);
             fprintf(f, "      if (sw_check_reds()) sw_yield();\n");
+            /* After the yield: fetch the park of the process now running. */
+            fprintf(f, "      sw_tc_park_t *_tp = sw_tc_park();\n");
             for (int i = 0; i < nargs; i++)
-                fprintf(f, "      sw_tc_next_args[%d] = _gc_v[%d];\n", i, i);
+                fprintf(f, "      _tp->args[%d] = _gc_v[%d];\n", i, i);
+            fprintf(f, "      _tp->fn = %s_%s__b;\n", ctx->mod_name, fname);
+            fprintf(f, "      _tp->n = %d;\n", nargs);
+            fprintf(f, "      _tp->floor = _gc_floor;\n");
             fprintf(f, "    }\n");
-            fprintf(f, "    sw_tc_next_fn = %s_%s__b;\n", ctx->mod_name, fname);
-            fprintf(f, "    sw_tc_next_n = %d;\n", nargs);
-            fprintf(f, "    sw_tc_next_floor = _gc_floor;\n");
             fprintf(f, "    _sw_trace_pop();\n");
             fprintf(f, "    return SW_TC_HOP;\n");
             out[0] = '\0';

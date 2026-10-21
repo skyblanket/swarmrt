@@ -267,14 +267,22 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor);
 typedef sw_val_t *(*sw_tc_body_t)(sw_val_t **args, int nargs, sw_varena_mark_t *floor);
 extern sw_val_t sw_tc_hop_sentinel;
 #define SW_TC_HOP (&sw_tc_hop_sentinel)
-extern __thread sw_tc_body_t sw_tc_next_fn;
-extern __thread int sw_tc_next_n;
-extern __thread sw_varena_mark_t sw_tc_next_floor;
-extern __thread sw_val_t *sw_tc_next_args[SW_TC_MAX];
+/* The park lives in the running process's gen_exec block, never in TLS: a body
+ * can yield and resume on another scheduler thread. sw_tc_park() is an
+ * out-of-line call, so each use re-reads the CURRENT process (no TLS address
+ * cached across the body call). */
+typedef struct {
+    sw_tc_body_t fn;
+    int n;
+    sw_varena_mark_t floor;
+    sw_val_t *args[SW_TC_MAX];
+} sw_tc_park_t;
+sw_tc_park_t *sw_tc_park(void);
 static inline sw_val_t *sw_tc_drive(sw_val_t *r) {
     while (r == SW_TC_HOP) {
-        sw_varena_mark_t fl = sw_tc_next_floor;
-        r = sw_tc_next_fn(sw_tc_next_args, sw_tc_next_n, &fl);
+        sw_tc_park_t *pk = sw_tc_park();
+        sw_varena_mark_t fl = pk->floor;
+        r = pk->fn(pk->args, pk->n, &fl);
     }
     return r;
 }
