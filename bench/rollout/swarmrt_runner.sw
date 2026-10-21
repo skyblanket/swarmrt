@@ -70,18 +70,14 @@ fun done_ids(out) {
     else { collect_ids(string_split(file_read(out), "\n"), %{}) }
 }
 
-# task_stream results come back in input order; record the failures it caught
-# (grader crashes, deadline timeouts) that the episode itself could not write.
-fun record_failures(out, ids, results) {
-    if (length(ids) == 0) { 'ok' }
-    else {
-        id = hd(ids)
-        case hd(results) {
-            {'error', 'timeout'} -> record(out, id, "error", "timeout", 'false')
-            {'error', reason}    -> record(out, id, "error", "crash", 'false')
-            _                    -> 'ok'
-        }
-        record_failures(out, tl(ids), tl(results))
+# Called by task_stream the moment a cell is known. Records the failures it
+# caught (grader crashes, deadline timeouts) that the episode itself could not
+# write, so they are durable at once and a resume does not re-run them.
+fun record_cell(out, item, cell) {
+    case cell {
+        {'error', 'timeout'} -> record(out, item, "error", "timeout", 'false')
+        {'error', reason}    -> record(out, item, "error", "crash", 'false')
+        _                    -> 'ok'
     }
 }
 
@@ -97,8 +93,8 @@ fun main() {
     todo = filter(Std.range(0, n), fn(i) { map_get(seen, i) == nil })
     eprint(f"swarmrt: {length(todo)} of {n} episodes to run, concurrency {conc}")
     t0 = timestamp()
-    rs = Std.task_stream(todo, fn(id) { episode(id, llm, out, scenario) },
-                         %{max_concurrency: conc, timeout_ms: 15000})
-    record_failures(out, todo, rs)
+    Std.task_stream_each(todo, fn(id) { episode(id, llm, out, scenario) },
+                         %{max_concurrency: conc, timeout_ms: 15000,
+                           on_result: fn(idx, item, cell) { record_cell(out, item, cell) }})
     eprint(f"swarmrt: finished in {timestamp() - t0} ms")
 }
