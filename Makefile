@@ -73,7 +73,7 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
+.PHONY: all clean check-sources check-cmake v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
         test test-v2 test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
         test-sw benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
@@ -221,6 +221,8 @@ test-sw: swc libswarmrt
 	@./tests/sw/run_conform.sh
 	@./tests/sw/run_stub_warn.sh
 	@bash ./tests/sw/run_stdin.sh
+	@if [ -n "$$CI" ]; then $(MAKE) --no-print-directory check-cmake; \
+	else echo "note: check-cmake runs in CI only (set CI=1 or run 'make check-cmake')"; fi
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.
@@ -732,12 +734,23 @@ stress: swc libswarmrt
 benchmark-native: native
 	./$(BIN_DIR)/swarmrt-native
 
+# Makefile and CMakeLists.txt must list the same runtime sources (see the script).
+# Runs on every `make swc` / `make libswarmrt`, which CI already executes.
+check-sources:
+	bash scripts/check_source_lists.sh
+
+# Full CMake build (the Windows/MinGW path uses this). Not a prerequisite of
+# swc/libswarmrt, so local builds need no cmake. test-sw runs it under CI
+# (CI=1 is set by GitHub Actions), where a missing cmake fails the job.
+check-cmake:
+	bash scripts/check_cmake_build.sh
+
 # SwarmRT static library (for linking compiled .sw programs)
-libswarmrt: core-objs
+libswarmrt: check-sources core-objs
 	ar rcs $(BIN_DIR)/libswarmrt.a $(CORE_OBJS)
 
 # SwarmRT compiler
-swc: core-objs
+swc: check-sources core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/swc.c $(SRC_DIR)/swarmrt_codegen.c $(SRC_DIR)/swarmrt_obfusc.c \
 		$(SRC_DIR)/swarmrt_repl.c $(SRC_DIR)/swarmrt_test.c $(SRC_DIR)/swarmrt_lsp.c \
 		$(SRC_DIR)/swarmrt_battery_interp.c $(SRC_DIR)/swarmrt_new.c $(SRC_DIR)/swc_pkg.c $(SRC_DIR)/swc_imports.c \
