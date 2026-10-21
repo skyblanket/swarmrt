@@ -4,6 +4,24 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-21 — Compiled processes park without a stack
+
+**feat(codegen): every compiled function can suspend and resume (PROCESS_WEIGHT.md
+Phase 2c).** Generated functions and lambdas have suspend points at function entry and
+loop back-edges (reduction yields), at receive waits and after every module-function
+and closure call. A spawned process that reaches one with nothing to do saves each
+frame's locals to the heap and gives its carrier stack back; the scheduler commits the
+wait and resumes the innermost frame later, on any scheduler. Callbacks called from C
+(`sw_val_apply`), try bodies and processes with a C entry still block the old way and
+keep their stack. `SW_NO_STACKLESS=1` at build time turns it off;
+`SW_SUSPEND_TORTURE=n` forces a suspension every nth reduction check.
+
+`bench/memory`, ring of 99K processes, 4 schedulers: busy 13.3 KB → 8.4 KB per process,
+idle 7.0 KB → 2.5 KB, and 72–83 kernel mappings instead of 2 per process — the ring
+runs at the build's 100K process maximum on stock Linux. `bench/actor` within 7%. Gate:
+`tests/sw/test_stackless.sw`; `make test-sw` and swarm-code's 245 tests also pass under
+`SW_SUSPEND_TORTURE=3`.
+
 ## 2026-10-21 — Stackless processes: the runtime half
 
 **feat(runtime): a process can park without holding a stack (PROCESS_WEIGHT.md Phase

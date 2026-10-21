@@ -77,6 +77,14 @@ sw_val_t *sw_resume_value(void);
 /* While above zero, every suspend point takes its old-style path. */
 void sw_no_suspend_enter(void);
 void sw_no_suspend_exit(void);
+/* try/catch saves the depth and restores it on both arms: error() longjmps
+ * past the exits of any nested sw_val_apply. */
+uint32_t sw_no_suspend_depth(void);
+void sw_no_suspend_set(uint32_t depth);
+
+#ifndef SW_UNLIKELY
+#define SW_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
 
 /* Run a stackless process until it exits or suspends (called on a carrier). */
 int sw_run_stackless(struct sw_process *p);

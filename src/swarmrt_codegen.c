@@ -109,7 +109,23 @@ typedef struct {
      * spamming the generated file. Reset to 0 at the top of each
      * emit_function. */
     int last_line_emitted;
+
+    /* Stackless suspension (PROCESS_WEIGHT.md Phase 2c): set while emitting
+     * a function or lambda body that can capture itself; npt numbers its
+     * suspend points. try_depth > 0 inside a try body, which can't suspend
+     * (its jmp_buf can't survive capture) until Phase 2d. */
+    int stackless;
+    int npt;
+    int try_depth;
 } cg_ctx_t;
+
+/* SW_NO_STACKLESS=1 (or SW_NO_HOIST=1) at compile time emits no suspend
+ * points: every process blocks the old way and pins its carrier. */
+static int cg_stackless_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("SW_NO_STACKLESS") || getenv("SW_NO_HOIST"));
+    return on;
+}
 
 /* Forward decl: emit_expr's N_BLOCK case emits per-statement #line
  * directives, but guess_sw_path is defined further down with the rest
@@ -160,6 +176,34 @@ static const char *mangle_for_c(const char *name) {
 
 static void fresh_var(cg_ctx_t *ctx, char *buf, int sz) {
     snprintf(buf, sz, "_t%d", ctx->tmp_counter++);
+}
+
+/* Suspend points. Each is a statement-level label `_sw_rsN:;` that the
+ * resume dispatch (built by the hoisting pass, hz_emit_body) jumps to, plus
+ * an exit to the function's capture block. A label after a call carries a
+ * `/\*@sw_rv N var@*\/` marker: on resume, var receives the callee's value. */
+static int cg_can_suspend(cg_ctx_t *ctx) { return ctx->stackless && ctx->try_depth == 0; }
+
+/* A reduction check: yield stacklessly when possible, else the old way. */
+static void emit_reds_point(cg_ctx_t *ctx, const char *indent) {
+    FILE *f = ctx->out;
+    if (!cg_can_suspend(ctx)) {
+        fprintf(f, "%sif (sw_check_reds()) sw_yield();\n", indent);
+        return;
+    }
+    int k = ++ctx->npt;
+    fprintf(f, "%sif (sw_check_reds()) { if (sw_suspend_ok()) { sw_suspend_yield(); _pt = %d; goto _sw_capture; } sw_yield(); }\n",
+            indent, k);
+    fprintf(f, "_sw_rs%d:;\n", k);
+}
+
+/* After a call that may suspend: capture this frame too. */
+static void emit_call_check(cg_ctx_t *ctx, const char *res) {
+    if (!cg_can_suspend(ctx)) return;
+    FILE *f = ctx->out;
+    int k = ++ctx->npt;
+    fprintf(f, "_sw_rs%d:; /*@sw_rv %d %s@*/\n", k, k, res);
+    fprintf(f, "    if (SW_UNLIKELY(%s == SW_SUSPEND)) { _pt = %d; goto _sw_capture; }\n", res, k);
 }
 
 /* Escape a string for safe embedding in a C string literal.
@@ -1500,9 +1544,11 @@ static void emit_forward_decls(cg_ctx_t *ctx, node_t *mod) {
     FILE *f = ctx->out;
     fprintf(f, "/* === Forward declarations === */\n");
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
-        fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl);\n",
+        fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl, sw_frame_t *_rs);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
         fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs);\n",
+                ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
+        fprintf(f, "static sw_val_t *%s_%s__rs(sw_frame_t *_rs);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
     }
     /* Static storage for module-level globals */
@@ -1534,22 +1580,29 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
      * copied into a SPAWN region the child adopts on entry, then freed at child
      * exit — closing the leak in the `spawn(f)` / `spawn(fn(){...})` form. */
     fprintf(f, "typedef struct { sw_val_t *fn; } _sw_lam_sp_t;\n");
-    fprintf(f, "static void _sw_lambda_spawn_trampoline2(void *_raw) {\n");
+    /* Value-returning entries (sw_spawn_v): the process can suspend
+     * stacklessly. Each is transparent — it returns its callee's value and
+     * does nothing after the call. */
+    fprintf(f, "static sw_val_t *_sw_lambda_spawn_trampoline2(void *_raw) {\n");
     fprintf(f, "    _sw_lam_sp_t *_s = (_sw_lam_sp_t *)_raw;\n");
     fprintf(f, "    { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();\n");
     fprintf(f, "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n");
-    fprintf(f, "    if (_s->fn) sw_val_apply(_s->fn, NULL, 0);\n");
+    fprintf(f, "    sw_val_t *_fn = _s->fn;\n");
     fprintf(f, "    free(_s);\n");
+    fprintf(f, "    return _fn ? sw_val_apply_s(_fn, NULL, 0) : sw_val_nil();\n");
     fprintf(f, "}\n");
     /* spawn(f(a, b)) where `f` is a closure-valued variable: the closure and
      * its arguments travel in the spawn region; the child applies them. */
     fprintf(f, "typedef struct { sw_val_t *fn; int n; sw_val_t *args[16]; } _sw_lam_spa_t;\n");
-    fprintf(f, "static void _sw_lambda_spawn_trampoline3(void *_raw) {\n");
+    fprintf(f, "static sw_val_t *_sw_lambda_spawn_trampoline3(void *_raw) {\n");
     fprintf(f, "    _sw_lam_spa_t *_s = (_sw_lam_spa_t *)_raw;\n");
     fprintf(f, "    { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();\n");
     fprintf(f, "      if (_cv && _r) sw_varena_adopt(_cv, _r); }\n");
-    fprintf(f, "    if (_s->fn) sw_val_apply(_s->fn, _s->n > 0 ? _s->args : NULL, _s->n);\n");
+    fprintf(f, "    sw_val_t *_fn = _s->fn, *_a[16];\n");
+    fprintf(f, "    int _n = _s->n;\n");
+    fprintf(f, "    for (int _i = 0; _i < _n; _i++) _a[_i] = _s->args[_i];\n");
     fprintf(f, "    free(_s);\n");
+    fprintf(f, "    return _fn ? sw_val_apply_s(_fn, _n > 0 ? _a : NULL, _n) : sw_val_nil();\n");
     fprintf(f, "}\n");
     fprintf(f, "#endif\n\n");
 
@@ -1571,7 +1624,7 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
         fprintf(f, " } _%s_sp%d_t;\n", ctx->mod_name, sp->id);
 
         /* Entry function */
-        fprintf(f, "static void _%s_sp%d_entry(void *_raw) {\n", ctx->mod_name, sp->id);
+        fprintf(f, "static sw_val_t *_%s_sp%d_entry(void *_raw) {\n", ctx->mod_name, sp->id);
         fprintf(f, "    _%s_sp%d_t *_s = (_%s_sp%d_t *)_raw;\n",
                 ctx->mod_name, sp->id, ctx->mod_name, sp->id);
         /* Ownership v2: take + adopt the spawn region (which owns the copied args)
@@ -1587,11 +1640,12 @@ static void emit_spawn_trampolines(cg_ctx_t *ctx) {
                 fprintf(f, "_s->a%d", a);
             }
             fprintf(f, "};\n");
-            fprintf(f, "    %s_%s(_a, %d);\n", ctx->mod_name, sp->func_name, sp->nargs);
+            fprintf(f, "    free(_s);\n");
+            fprintf(f, "    return %s_%s(_a, %d);\n", ctx->mod_name, sp->func_name, sp->nargs);
         } else {
-            fprintf(f, "    %s_%s(NULL, 0);\n", ctx->mod_name, sp->func_name);
+            fprintf(f, "    free(_s);\n");
+            fprintf(f, "    return %s_%s(NULL, 0);\n", ctx->mod_name, sp->func_name);
         }
-        fprintf(f, "    free(_s);\n");
         fprintf(f, "}\n\n");
     }
 }
@@ -1983,8 +2037,40 @@ static int hz_scalar(const char *type) {
     return 0;
 }
 
-/* Rewrite one function body (the text between its braces) to `out`. */
-static void hz_emit_body(const char *body, size_t len, FILE *out) {
+/* What the hoisting pass needs to make a body resumable: its trace name,
+ * its resume entry and its frame metadata (emitted by the caller). */
+typedef struct { const char *mod, *fn, *rs, *meta; int line; } hz_fn_t;
+
+/* A local the frame must not save: try frames live and die inside a try,
+ * which never suspends. */
+static int hz_unsaved(const char *type) {
+    return strstr(type, "jmp_buf") || strstr(type, "_sw_try_frame_t");
+}
+
+/* Suspend points in the rewritten body: labels `_sw_rsN:;` at line start,
+ * and `@sw_rv N var@` markers naming the variable that receives the
+ * resumed callee's value. Returns the highest N (0 = none). */
+static int hz_points(const char *o, size_t n, char rv[][64], int cap) {
+    int maxk = 0;
+    for (int k = 0; k < cap; k++) rv[k][0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        if ((i == 0 || o[i - 1] == '\n') && strncmp(o + i, "_sw_rs", 6) == 0) {
+            int k = atoi(o + i + 6);
+            if (k > maxk) maxk = k;
+        }
+        if (strncmp(o + i, "@sw_rv ", 7) == 0) {
+            int k = 0; char var[64] = "";
+            if (sscanf(o + i + 7, "%d %63[A-Za-z0-9_]", &k, var) == 2 && k > 0 && k < cap)
+                snprintf(rv[k], 64, "%s", var);
+        }
+    }
+    return maxk;
+}
+
+/* Rewrite one function body (the text between its braces) to `out`. With
+ * `fi` and suspend points present, the body also gets its frame: the
+ * restore-and-dispatch block at the top and the capture block at the end. */
+static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t *fi) {
     static int off = -1;
     if (off < 0) off = getenv("SW_NO_HOIST") ? 1 : 0;
     hz_t z;
@@ -2000,6 +2086,13 @@ static void hz_emit_body(const char *body, size_t len, FILE *out) {
         }
     }
     if (off || z.failed) {
+        if (fi && strstr(body, "goto _sw_capture")) {
+            /* Suspend points need hoisted locals: fail loudly, not wrongly. */
+            fprintf(stderr, "swc: internal error: can't make %s.%s resumable "
+                            "(unrecognised C construct); rebuild with SW_NO_STACKLESS=1 "
+                            "and report this\n", fi->mod, fi->fn);
+            exit(1);
+        }
         if (!off && getenv("SW_HOIST_DEBUG"))
             fprintf(stderr, "swc: hoisting skipped for a function (unrecognised construct)\n");
         fwrite(body, 1, len, out);
@@ -2012,7 +2105,54 @@ static void hz_emit_body(const char *body, size_t len, FILE *out) {
                                z.h[i].had_init ? " = {0}" : "";
             fprintf(out, "    %s%s%s%s;\n", ty, ptr ? "" : " ", z.h[i].cname, init);
         }
+        enum { HZ_MAXPT = 4096 };
+        static char rv[HZ_MAXPT][64];
+        int npt = fi ? hz_points(z.o, z.olen, rv, HZ_MAXPT) : 0;
+        if (npt >= HZ_MAXPT) {
+            fprintf(stderr, "swc: %s.%s has too many suspend points\n", fi->mod, fi->fn);
+            exit(1);
+        }
+        if (npt > 0) {
+            /* The frame: every saved local, after the header. */
+            fprintf(out, "    struct _sw_F { sw_frame_t _sw_hdr;");
+            for (int i = 0; i < z.nh; i++) {
+                const char *ty = z.h[i].type;
+                if (hz_unsaved(ty)) continue;
+                size_t tl = strlen(ty);
+                int ptr = tl > 0 && ty[tl - 1] == '*';
+                fprintf(out, " %s%s%s;", ty, ptr ? "" : " ", z.h[i].cname);
+            }
+            fprintf(out, " } *_sw_f = (struct _sw_F *)_rs;\n");
+            fprintf(out, "    if (SW_UNLIKELY(_rs != NULL)) {\n");
+            for (int i = 0; i < z.nh; i++)
+                if (!hz_unsaved(z.h[i].type))
+                    fprintf(out, "        %s = _sw_f->%s;\n", z.h[i].cname, z.h[i].cname);
+            fprintf(out, "        _sw_trace_push(\"%s\", \"%s\", %d);\n", fi->mod, fi->fn, fi->line);
+            fprintf(out, "        switch (_rs->pt) {\n");
+            for (int k = 1; k <= npt; k++) {
+                if (rv[k][0])
+                    fprintf(out, "        case %d: %s = sw_resume_value(); goto _sw_rs%d;\n", k, rv[k], k);
+                else
+                    fprintf(out, "        case %d: goto _sw_rs%d;\n", k, k);
+            }
+            fprintf(out, "        default: abort();\n");
+            fprintf(out, "        }\n");
+            fprintf(out, "    }\n");
+        }
         fwrite(z.o, 1, z.olen, out);
+        if (npt > 0) {
+            fprintf(out, "_sw_capture: {\n");
+            fprintf(out, "    struct _sw_F *_f = _rs ? _sw_f : (struct _sw_F *)sw_frame_new(sizeof(struct _sw_F), %s, &%s);\n",
+                    fi->rs, fi->meta);
+            fprintf(out, "    _f->_sw_hdr.pt = (uint32_t)_pt;\n");
+            for (int i = 0; i < z.nh; i++)
+                if (!hz_unsaved(z.h[i].type))
+                    fprintf(out, "    _f->%s = %s;\n", z.h[i].cname, z.h[i].cname);
+            fprintf(out, "    sw_frame_link(&_f->_sw_hdr, _rs != NULL);\n");
+            fprintf(out, "    _sw_trace_pop();\n");
+            fprintf(out, "    return SW_SUSPEND;\n");
+            fprintf(out, "  }\n");
+        }
     }
     for (int i = 0; i < z.nh; i++) { free(z.h[i].cname); free(z.h[i].type); }
     for (int i = 0; i < z.nfree; i++) free(z.freen[i]);
@@ -2029,7 +2169,7 @@ static FILE *hz_begin(cg_ctx_t *ctx) {
     return real;
 }
 
-static void hz_end(cg_ctx_t *ctx, FILE *real) {
+static void hz_end(cg_ctx_t *ctx, FILE *real, const hz_fn_t *fi) {
     FILE *tmp = ctx->out;
     if (tmp == real) return;
     ctx->out = real;
@@ -2038,7 +2178,7 @@ static void hz_end(cg_ctx_t *ctx, FILE *real) {
     rewind(tmp);
     size_t got = len > 0 ? fread(buf, 1, (size_t)len, tmp) : 0;
     fclose(tmp);
-    hz_emit_body(buf, got, real);
+    hz_emit_body(buf, got, real, fi);
     free(buf);
 }
 
@@ -2046,17 +2186,33 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
     FILE *f = ctx->out;
     if (ctx->nlambdas == 0) return;
     fprintf(f, "/* === Lambda functions === */\n");
-    for (int i = 0; i < ctx->nlambdas; i++)
-        fprintf(f, "static sw_val_t *%s(sw_val_t **_args, int _nargs);\n", ctx->lambdas[i].gen_name);
+    for (int i = 0; i < ctx->nlambdas; i++) {
+        const char *g = ctx->lambdas[i].gen_name;
+        fprintf(f, "static sw_val_t *%s(sw_val_t **_args, int _nargs);\n", g);
+        fprintf(f, "static sw_val_t *%s__b(sw_val_t **_args, int _nargs, sw_frame_t *_rs);\n", g);
+        fprintf(f, "static sw_val_t *%s__rs(sw_frame_t *_rs);\n", g);
+    }
     fprintf(f, "\n");
     for (int i = 0; i < ctx->nlambdas; i++) {
         lambda_info_t *li = &ctx->lambdas[i];
         node_t *fn = li->node;
 
-        /* Lambda function signature: same as regular functions */
-        fprintf(f, "static sw_val_t *%s(sw_val_t **_args, int _nargs) {\n", li->gen_name);
+        /* Lambda: a body that can resume from a frame, the closure entry
+         * (same signature as before) and the resume entry. */
+        fprintf(f, "static const sw_fn_meta_t %s__meta = { \"%s\", \"%s\", %d };\n",
+                li->gen_name, ctx->mod_name, li->gen_name, fn->line);
+        fprintf(f, "static sw_val_t *%s(sw_val_t **_args, int _nargs) { return %s__b(_args, _nargs, NULL); }\n",
+                li->gen_name, li->gen_name);
+        fprintf(f, "static sw_val_t *%s__rs(sw_frame_t *_rs) { return %s__b(NULL, 0, _rs); }\n",
+                li->gen_name, li->gen_name);
+        fprintf(f, "static sw_val_t *%s__b(sw_val_t **_args, int _nargs, sw_frame_t *_rs) {\n", li->gen_name);
         FILE *real = hz_begin(ctx);
         f = ctx->out;
+        int save_stackless = ctx->stackless, save_npt = ctx->npt, save_try = ctx->try_depth;
+        ctx->stackless = cg_stackless_enabled();
+        ctx->npt = 0;
+        ctx->try_depth = 0;
+        fprintf(f, "    int _pt = 0; (void)_pt; (void)_rs;\n");
 
         /* Save/restore codegen context */
         char save_func[128];
@@ -2104,7 +2260,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s (lambda) — deep recursion? raise SW_PROC_STACK or restructure the loop\");\n",
                 ctx->mod_name, li->gen_name);
         /* Reduction check at every call, as for named functions. */
-        fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
+        emit_reds_point(ctx, "    ");
 
         /* Body */
         char result[32];
@@ -2114,9 +2270,18 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
             fprintf(f, "    return %s;\n", result);
         else
             fprintf(f, "    return sw_val_nil();\n");
-        hz_end(ctx, real);
+        {
+            char meta[160], rs[160];
+            snprintf(meta, sizeof(meta), "%s__meta", li->gen_name);
+            snprintf(rs, sizeof(rs), "%s__rs", li->gen_name);
+            hz_fn_t fi = { ctx->mod_name, li->gen_name, rs, meta, fn->line };
+            hz_end(ctx, real, &fi);
+        }
         f = ctx->out;
         fprintf(f, "}\n\n");
+        ctx->stackless = save_stackless;
+        ctx->npt = save_npt;
+        ctx->try_depth = save_try;
 
         /* Restore context */
         strncpy(ctx->cur_func, save_func, 127);
@@ -2732,7 +2897,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
          * of fairness). One TLS decrement per turn; yields every
          * SWARM_CONTEXT_REDS turns, same budget receive-blocking uses.
          * Both calls are no-ops outside a fiber (interpreter path). */
-        fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
+        emit_reds_point(ctx, "    ");
         fprintf(f, "    goto _tail;\n");
         out[0] = '\0';
         return;
@@ -2780,6 +2945,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, mod, func, arr, nargs);
         else
             fprintf(f, "    sw_val_t *%s = %s_%s(NULL, 0);\n", res, mod, func);
+        emit_call_check(ctx, res);
         strncpy(out, res, osz - 1);
         return;
     }
@@ -3001,7 +3167,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              * self-call, floor inherited: the target takes `_gc_floor` from the
              * park (emit_function), so a hop chain keeps the entry floor and
              * the arena stays bounded. The args are read in the callee's
-             * prologue before any yield or other call can reuse the park. */
+             * prologue before any yield or other call can reuse the park.
+             * The reduction check comes first: a suspension there must not
+             * fall between the turn checkpoint and the park. */
+            emit_reds_point(ctx, "    ");
             fprintf(f, "    {\n");
             if (nargs > 0) {
                 fprintf(f, "      sw_val_t *_gc_v[] = {");
@@ -3012,7 +3181,6 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "      sw_value_arena_t *_gc_a = sw_self_varena();\n");
             fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
             fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", nargs > 0 ? "_gc_v" : "NULL", nargs);
-            fprintf(f, "      if (sw_check_reds()) sw_yield();\n");
             fprintf(f, "      sw_tc_park_t *_pk = sw_tc_park();\n");
             for (int i = 0; i < nargs; i++)
                 fprintf(f, "      _pk->args[%d] = _gc_v[%d];\n", i, i);
@@ -3029,12 +3197,14 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
         else
             fprintf(f, "    sw_val_t *%s = %s_%s(NULL, 0);\n", res, ctx->mod_name, fname);
+        emit_call_check(ctx, res);
     } else if (is_declared(ctx, fname) && !is_builtin(fname)) {
         /* Dynamic dispatch: variable holds a closure value */
         if (nargs > 0)
-            fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, %s, %d);\n", res, fname, arr, nargs);
+            fprintf(f, "    sw_val_t *%s = sw_val_apply_s(%s, %s, %d);\n", res, fname, arr, nargs);
         else
-            fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, NULL, 0);\n", res, fname);
+            fprintf(f, "    sw_val_t *%s = sw_val_apply_s(%s, NULL, 0);\n", res, fname);
+        emit_call_check(ctx, res);
     } else {
         /* Unknown function — print did-you-mean to stderr. did_you_mean
          * also sets ctx->had_unknown_fn, so sw_codegen() returns -1 and
@@ -3121,7 +3291,7 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         fprintf(f, "    _sw_lam_sp_t *%s = malloc(sizeof(_sw_lam_sp_t));\n", ls);
         fprintf(f, "    %s->fn = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
                 ls, lr, fn_val, lr, fn_val);
-        fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline2, %s, %s);\n", pv, ls, lr);
+        fprintf(f, "    sw_process_t *%s = sw_spawn_v_owned(_sw_lambda_spawn_trampoline2, %s, %s);\n", pv, ls, lr);
         /* Spawn failure must be LOUD. Continuing with a pid wrapping NULL
          * made sends silently vanish at the SW_MAX_PROCS ceiling. */
         fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
@@ -3161,7 +3331,7 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
             for (int i = 0; i < na; i++)
                 fprintf(f, "    %s->args[%d] = %s ? deep_copy_into(%s, %s) : sw_val_deep_copy_global(%s);\n",
                         ls, i, lr, avs[i], lr, avs[i]);
-            fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline3, %s, %s);\n", pv, ls, lr);
+            fprintf(f, "    sw_process_t *%s = sw_spawn_v_owned(_sw_lambda_spawn_trampoline3, %s, %s);\n", pv, ls, lr);
             fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
             fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full (limit %%u, build maximum %%u)%%s\", (unsigned)sw_proc_limit(), (unsigned)SWARM_MAX_PROCESSES, sw_proc_limit() < (unsigned)SWARM_MAX_PROCESSES ? \" \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\" : \" \\xe2\\x80\\x94 reduce live processes (SW_MAX_PROCS cannot exceed the build maximum)\"); }\n");
             emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
@@ -3214,7 +3384,7 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
     fresh_var(ctx, pv, sizeof(pv));
     /* sw_spawn_owned records the region on the child so a pre-trampoline kill
      * reclaims it; the child adopts it on entry. */
-    fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_%s_sp%d_entry, %s, %s);\n",
+    fprintf(f, "    sw_process_t *%s = sw_spawn_v_owned(_%s_sp%d_entry, %s, %s);\n",
             pv, ctx->mod_name, sp_id, sa, rg);
     /* Spawn failure: child never started, region not recorded — reclaim,
      * then panic LOUDLY. Continuing with a pid wrapping NULL made every
@@ -3262,7 +3432,11 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
     if (has_timeout) {
         fprintf(f, "      uint64_t _recv_start_ms = _sw_now_ms();\n");
     }
+    /* A stackless receive suspends at its wait and resumes here, rescanning
+     * the mailbox; the deadline is recomputed from _recv_start_ms. */
+    int rk = cg_can_suspend(ctx) ? ++ctx->npt : 0;
     fprintf(f, "      while (!_matched) {\n");
+    if (rk) fprintf(f, "_sw_rs%d:;\n", rk);
     fprintf(f, "        sw_mailbox_drain_signals();\n");
     fprintf(f, "        sw_msg_t *%s = sw_mailbox_peek();\n", cur);
     fprintf(f, "        while (%s && !_matched) {\n", cur);
@@ -3379,18 +3553,22 @@ static void emit_receive(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz)
         if (budget_src) {
             fprintf(f, "          uint64_t _elapsed = _sw_now_ms() - _recv_start_ms;\n");
             fprintf(f, "          if (_elapsed >= %s) break;\n", budget_src);
+            if (rk) fprintf(f, "          if (sw_suspend_ok()) { sw_suspend_recv(%s - _elapsed); _pt = %d; goto _sw_capture; }\n", budget_src, rk);
             fprintf(f, "          sw_mailbox_wait_new(%s - _elapsed);\n", budget_src);
         } else {
             fprintf(f, "          uint64_t _elapsed = _sw_now_ms() - _recv_start_ms;\n");
             fprintf(f, "          if (_elapsed >= %lluULL) break;\n", (unsigned long long)timeout);
+            if (rk) fprintf(f, "          if (sw_suspend_ok()) { sw_suspend_recv(%lluULL - _elapsed); _pt = %d; goto _sw_capture; }\n", (unsigned long long)timeout, rk);
             fprintf(f, "          sw_mailbox_wait_new(%lluULL - _elapsed);\n", (unsigned long long)timeout);
         }
     } else {
         /* No after-clause — wait forever (or use the literal-int path
          * if some other code path set after_ms but no after_body). */
         if (to_ms[0]) {
+            if (rk) fprintf(f, "          if (sw_suspend_ok()) { sw_suspend_recv(%s); _pt = %d; goto _sw_capture; }\n", to_ms, rk);
             fprintf(f, "          if (!sw_mailbox_wait_new(%s)) break;\n", to_ms);
         } else {
+            if (rk) fprintf(f, "          if (sw_suspend_ok()) { sw_suspend_recv(%lluULL); _pt = %d; goto _sw_capture; }\n", (unsigned long long)timeout, rk);
             fprintf(f, "          if (!sw_mailbox_wait_new(%lluULL)) break;\n", (unsigned long long)timeout);
         }
     }
@@ -3599,10 +3777,12 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             strncpy(mod, fname, mlen); mod[mlen] = '\0';
             strncpy(fn, dot + 1, sizeof(fn) - 1); fn[sizeof(fn) - 1] = '\0';
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, mod, fn, arr, nargs);
+            emit_call_check(ctx, res);
         } else if (is_builtin(fname)) {
             fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, arr, nargs);
         } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
+            emit_call_check(ctx, res);
         }
 
         strncpy(out, res, osz - 1);
@@ -3625,7 +3805,8 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         if (!dot && !is_builtin(fname) && !is_module_func(ctx, fname) &&
             is_declared(ctx, fname)) {
             /* `x |> f` where f is a closure-valued variable. */
-            fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, %s, 1);\n", res, mangle_for_c(fname), arr);
+            fprintf(f, "    sw_val_t *%s = sw_val_apply_s(%s, %s, 1);\n", res, mangle_for_c(fname), arr);
+            emit_call_check(ctx, res);
         } else if (dot) {
             char mod[128], fn[128];
             int mlen = (int)(dot - fname);
@@ -3633,10 +3814,12 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             strncpy(mod, fname, mlen); mod[mlen] = '\0';
             strncpy(fn, dot + 1, sizeof(fn) - 1); fn[sizeof(fn) - 1] = '\0';
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, mod, fn, arr);
+            emit_call_check(ctx, res);
         } else if (is_builtin(fname)) {
             fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, 1);\n", res, fname, arr);
         } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, ctx->mod_name, fname, arr);
+            emit_call_check(ctx, res);
         }
 
         strncpy(out, res, osz - 1);
@@ -3648,7 +3831,8 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         fresh_var(ctx, arr, sizeof(arr));
         fprintf(f, "    sw_val_t *%s[] = {%s};\n", arr, val);
         fresh_var(ctx, res, sizeof(res));
-        fprintf(f, "    sw_val_t *%s = sw_val_apply(%s, %s, 1);\n", res, fv, arr);
+        fprintf(f, "    sw_val_t *%s = sw_val_apply_s(%s, %s, 1);\n", res, fv, arr);
+        emit_call_check(ctx, res);
         strncpy(out, res, osz - 1);
     }
     (void)tail;
@@ -4006,7 +4190,7 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         fprintf(f, "    if (%s < 0) %s = 0;\n", cnt, cnt);
         fprintf(f, "    sw_val_t **%s = malloc(sizeof(sw_val_t*) * (%s > 0 ? %s : 1));\n", arr, cnt, cnt);
         char ri[32]; fresh_var(ctx, ri, sizeof(ri));
-        fprintf(f, "    for (int %s = 0; %s < %s; %s++) %s[%s] = sw_val_int(%s->v.i + %s);\n",
+        fprintf(f, "    for (int %s = 0; %s < %s; %s++) { %s[%s] = sw_val_int(%s->v.i + %s); }\n",
                 ri, ri, cnt, ri, arr, ri, start_v, ri);
         fprintf(f, "    sw_val_t *%s = sw_val_list(%s, %s);\n", v, arr, cnt);
         fprintf(f, "    free(%s);\n", arr);
@@ -4040,6 +4224,14 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
          * same err_var re-declares rather than colliding. */
         char v[32]; fresh_var(ctx, v, sizeof(v));
         char fr[32]; fresh_var(ctx, fr, sizeof(fr));
+        /* A try body can't suspend stacklessly (its jmp_buf can't survive
+         * capture; Phase 2d): it runs under no_suspend, and the saved depth
+         * is restored on both arms because error() longjmps past the exits
+         * of nested sw_val_apply calls. */
+        char nsd[32]; fresh_var(ctx, nsd, sizeof(nsd));
+        fprintf(f, "    uint32_t %s = sw_no_suspend_depth();\n", nsd);
+        fprintf(f, "    sw_no_suspend_enter();\n");
+        ctx->try_depth++;
         fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", v);
         fprintf(f, "    _sw_try_frame_t _tf%s; _tf%s.prev = _sw_try_chain; _sw_try_chain = &_tf%s;\n",
                 fr, fr, fr);
@@ -4049,12 +4241,15 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         emit_expr(ctx, n->v.trycatch.body, 0, body_res, sizeof(body_res));
         fprintf(f, "        %s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
         fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
+        fprintf(f, "        sw_no_suspend_set(%s);\n", nsd);
         /* Belt-and-braces: a stale sentinel set by a chain-less error()
          * deeper in the call tree (no live frame at that moment) still
          * routes to catch here, preserving the old end-check behavior. */
         fprintf(f, "    }\n");
         fprintf(f, "    if (_sw_error) {\n");
         fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
+        fprintf(f, "        sw_no_suspend_set(%s);\n", nsd);
+        ctx->try_depth--;
         int saved_ndeclared = ctx->ndeclared;
         fprintf(f, "        sw_val_t *%s = _sw_error;\n", mangle_for_c(n->v.trycatch.err_var));
         declare_var(ctx, n->v.trycatch.err_var);
@@ -4176,11 +4371,18 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         ctx->last_line_emitted = 0;
     }
 
-    fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl) {\n",
+    fprintf(f, "static const sw_fn_meta_t %s_%s__meta = { \"%s\", \"%s\", %d };\n",
+            ctx->mod_name, fn->v.fun.name, ctx->mod_name, fn->v.fun.name, fn->line);
+    fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl, sw_frame_t *_rs) {\n",
             ctx->mod_name, fn->v.fun.name);
-    /* The body goes through the hoisting pass (hz_end). */
+    /* The body goes through the hoisting pass (hz_end), which also builds
+     * its frame, resume dispatch and capture block. */
     FILE *real = hz_begin(ctx);
     f = ctx->out;
+    ctx->stackless = cg_stackless_enabled();
+    ctx->npt = 0;
+    ctx->try_depth = 0;
+    fprintf(f, "    int _pt = 0; (void)_pt; (void)_rs;\n");
     fprintf(f, "    (void)_sw_tc_fl;\n");
 
     /* Parameter extraction */
@@ -4220,18 +4422,21 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * longer monopolises its scheduler thread — before, only self-tail-call
      * backedges yielded and such a process starved everything queued
      * behind it. One TLS decrement per call; a no-op outside a fiber. */
-    fprintf(f, "    if (sw_check_reds()) sw_yield();\n");
 
-    /* Tail call label. Ownership v2: record the arena "floor" at entry — the
-     * scoped turn-checkpoint (emit_call) reclaims only what THIS function
-     * allocates above it, never the caller's live values below it. A hop
-     * (emit_call) arrives with the floor of the chain's entry in `_sw_tc_fl`, so the
-     * whole mutual loop shares one floor, as a self-loop does. */
+    /* Ownership v2: record the arena "floor" at entry — the scoped
+     * turn-checkpoint (emit_call) reclaims only what THIS function allocates
+     * above it, never the caller's live values below it. A hop (emit_call)
+     * arrives with the floor of the chain's entry in `_sw_tc_fl`, so the whole
+     * mutual loop shares one floor, as a self-loop does. It is set BEFORE the
+     * entry suspend point: a resume gets no `_sw_tc_fl`, so the frame must
+     * carry the chain's floor, or each resume would raise it. */
     if (ctx->has_tail) {
         fprintf(f, "    sw_varena_mark_t _gc_floor = _sw_tc_fl ? *_sw_tc_fl : sw_varena_mark(sw_self_varena());\n");
         fprintf(f, "    (void)_gc_floor;\n");
-        fprintf(f, "_tail:;\n");
     }
+    emit_reds_point(ctx, "    ");
+    if (ctx->has_tail)
+        fprintf(f, "_tail:;\n");
 
     /* Body */
     char result[32];
@@ -4246,15 +4451,25 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     else
         fprintf(f, "    return sw_val_nil();\n");
 
-    hz_end(ctx, real);
+    {
+        char fname[300], meta[320], rs[320];
+        snprintf(fname, sizeof(fname), "%s", fn->v.fun.name);
+        snprintf(meta, sizeof(meta), "%s_%s__meta", ctx->mod_name, fn->v.fun.name);
+        snprintf(rs, sizeof(rs), "%s_%s__rs", ctx->mod_name, fn->v.fun.name);
+        hz_fn_t fi = { ctx->mod_name, fname, rs, meta, fn->line };
+        hz_end(ctx, real, &fi);
+    }
     f = ctx->out;
     fprintf(f, "}\n\n");
+    ctx->stackless = 0;
+    fprintf(f, "static sw_val_t *%s_%s__rs(sw_frame_t *_rs) { return %s_%s__b(NULL, 0, NULL, _rs); }\n",
+            ctx->mod_name, fn->v.fun.name, ctx->mod_name, fn->v.fun.name);
 
     /* The public entry: a normal call runs the body and then any hops it
      * parked, so callers see one ordinary function. */
     fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs) {\n",
             ctx->mod_name, fn->v.fun.name);
-    fprintf(f, "    return sw_tc_drive(%s_%s__b(_args, _nargs, NULL));\n",
+    fprintf(f, "    return sw_tc_drive(%s_%s__b(_args, _nargs, NULL, NULL));\n",
             ctx->mod_name, fn->v.fun.name);
     fprintf(f, "}\n\n");
 }

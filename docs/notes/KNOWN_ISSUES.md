@@ -8,21 +8,27 @@ a repro, impact, and current hypothesis.
 These are genuine limitations, not crashes. Each is reproducible with the
 shipped `bin/swc`.
 
-### Every parked process holds a stack mapping (memory floor and a Linux process ceiling)
+### Some processes still hold a stack while parked
 
-Processes run on pooled carrier stacks (128 KB plus a guard page). A process that is
-runnable or has finished holds none. One that is parked in receive, sleep or a
-blocking builtin keeps its carrier until it next runs to completion. Each parked
-process therefore still costs at least one page (4 KB on Linux x86-64, 16 KB on Apple
-Silicon) and two kernel mappings. Stock Linux (`vm.max_map_count` 65530) runs out near
-32,700 parked processes. Past that, a process that can't get a carrier fails with a
-`carrier stack` message on stderr and the node keeps running. Busy message-passing
-processes cost about 13.3 KB resident each with the default `SW_TURN_RESET_BYTES`
-(4 KB), and idle ones about 7.0 KB (measured with `bench/memory` at N=10K, Linux
-x86-64).
-**Workaround:** raise `vm.max_map_count` for more than ~30K parked processes. The fix
-(parked processes that hold no stack) is the rest of `docs/design/PROCESS_WEIGHT.md`
-Phase 2.
+A compiled process parks stacklessly: its frames go to the heap and its carrier stack
+goes back to the scheduler's pool, so it holds no stack mapping and costs about 2.5 KB
+idle, 8.4 KB busy (`bench/memory`, 99K processes, Linux x86-64). These still keep their
+carrier (128 KB virtual, a few pages resident, two mappings) for as long as they are
+blocked:
+- interpreted code (`swc run`, `swc test`, the REPL, agent tools run by `tool_call`);
+- runtime processes with a C entry (supervisors, internal servers);
+- a compiled process blocked inside a builtin (`sleep`, HTTP, shell) or inside a
+  callback called from C (`map`/`filter`/`reduce`, `ets_update`), or inside a `try`
+  body.
+
+On stock Linux (`vm.max_map_count` 65530) about 32,700 of those can be blocked at once.
+A process that can't get a carrier fails with a `carrier stack` message and the node
+keeps running. Busy processes also carry up to `SW_TURN_RESET_BYTES` (default 4 KB) of
+dead values between turn checkpoints; `SW_TURN_RESET_BYTES=1k` brings the busy figure
+to ~4.9 KB at some throughput cost.
+**Workaround:** raise `vm.max_map_count` if you block that many interpreted or
+builtin-waiting processes at once. Converting builtins and C callbacks, and compacting
+at park, are Phases 2e–2f of `docs/design/PROCESS_WEIGHT.md`.
 
 ### Interpreter non-tail recursion is bounded
 

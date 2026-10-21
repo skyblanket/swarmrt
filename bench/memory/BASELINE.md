@@ -92,3 +92,28 @@ the stacks into a pool. The drop comes once parked processes stop pinning.
 | pingpong | 9.63 | 8.00 |
 | fanout | 5.46 | 5.01 |
 | parallel | 4.85 | 4.93 |
+
+## After Phase 2c (compiled processes park stacklessly)
+
+Same host and harness. N=99,000 is the largest ring under the build's 100K process
+maximum (the ring plus its root).
+
+| Mode | N | Per process | After 2a | Mappings (VMAs) |
+|---|---|---|---|---|
+| busy | 10,000 | 8.9 KB | 13.3 KB | 72 |
+| busy | 99,000 | **8.4 KB** | — (needed 198K mappings) | 83 |
+| idle | 10,000 | 2.6 KB | 7.0 KB | 72 |
+| idle | 99,000 | **2.5 KB** | — | 74 |
+
+Busy processes still carry up to `SW_TURN_RESET_BYTES` of dead values between turn
+checkpoints: at N=99,000, `1k` gives 4.86 KB and `2k` 6.23 KB per process. Compaction
+at park (Phase 2f) removes that garbage at the default.
+
+`bench/actor` (seconds, best of 3), 2c runtime only vs this phase, back to back:
+
+| Bench | 2c runtime | 2c codegen |
+|---|---|---|
+| spawn | 7.58 | 7.31 |
+| pingpong | 8.17 | 8.72 |
+| fanout | 5.36 | 5.39 |
+| parallel | 4.64 | 4.82 |
