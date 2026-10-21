@@ -5626,6 +5626,19 @@ static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_le
     return buf;
 }
 
+/* The wrapper's `echo $? > exitf` creates exitf before it writes the status,
+ * so the file existing does not mean the status is there: reading it then
+ * gave atoi("") == 0, a failed command reported as success. echo writes
+ * "N\n" in one write; the status is complete once the trailing newline is. */
+static int _sw_shell_exit_ready(const char *exitf) {
+    FILE *ef = fopen(exitf, "r");
+    if (!ef) return 0;
+    char b[16];
+    size_t n = fread(b, 1, sizeof(b), ef);
+    fclose(ef);
+    return n > 0 && memchr(b, '\n', n) != NULL;
+}
+
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
@@ -5647,7 +5660,8 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (!wrapped) return sw_val_nil();
     /* The newline (not "; ") ends cmd: a trailing `# comment` or heredoc
      * terminator used to swallow the rest of the wrapper, and a trailing
-     * `&` made "& ;" a syntax error. */
+     * `&` made "& ;" a syntax error. Only shell builtins here: cmd may have
+     * changed PATH. */
     snprintf(wrapped, wrapcap,
         "{ %s\necho $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
     int launch = system(wrapped);
@@ -5700,8 +5714,7 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
 
         /* Check if command finished — BEFORE sleeping, so an already-done
          * command costs one fopen, not a poll interval. */
-        FILE *ef = fopen(exitf, "r");
-        if (ef) { fclose(ef); done = 1; break; }
+        if (_sw_shell_exit_ready(exitf)) { done = 1; break; }
 
         _sw_nap_us(delay_us);
         waited_us += delay_us;
