@@ -628,6 +628,10 @@ static inline void mailbox_wake(sw_process_t *to);
  * └────────────────────────────────────────────┘
  * ============================================================================ */
 
+uint32_t sw_proc_limit(void) {
+    return g_swarm ? g_swarm->arena.proc_capacity : SWARM_MAX_PROCESSES;
+}
+
 int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
     uint32_t num_parts = g_swarm->num_schedulers;
     if (num_parts == 0) num_parts = 1;
@@ -1943,6 +1947,12 @@ int sw_init(const char *name, uint32_t num_schedulers) {
     if (max_procs_env && *max_procs_env) {
         long n = strtol(max_procs_env, NULL, 10);
         if (n >= 16 && n <= (long)SWARM_MAX_PROCESSES) max_procs = (uint32_t)n;
+        else if (n > (long)SWARM_MAX_PROCESSES)
+            fprintf(stderr, "warning: SW_MAX_PROCS=%ld exceeds the build limit %d; using %d\n",
+                    n, SWARM_MAX_PROCESSES, SWARM_MAX_PROCESSES);
+        else
+            fprintf(stderr, "warning: SW_MAX_PROCS=%s is invalid (minimum 16); using %d\n",
+                    max_procs_env, SWARM_MAX_PROCESSES);
     }
 
     /* Mailbox depth cap — SW_MAILBOX_MAX overrides the 1M default, 0 disables.
