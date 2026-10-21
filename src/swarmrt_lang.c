@@ -4228,6 +4228,9 @@ static void interp_fiber_propagate_panic(sw_interp_t *interp) {
     const char *m = interp->error_msg;
     if (strncmp(m, "panic: ", 7) == 0) m += 7;
     snprintf(reason, sizeof(reason), "%s", m);
+    /* Same loud report the compiled _sw_runtime_panic prints. */
+    fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", reason);
+    fflush(stderr);
     interp->error = 0;
     interp->panicking = 0;
     interp->error_msg[0] = '\0';
