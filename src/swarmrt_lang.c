@@ -3075,8 +3075,11 @@ sw_val_t *sw_resume_value(void) {
 
 void sw_no_suspend_enter(void) { sw_process_t *p = sw_self(); if (p) p->no_suspend++; }
 void sw_no_suspend_exit(void)  { sw_process_t *p = sw_self(); if (p && p->no_suspend) p->no_suspend--; }
+<<<<<<< HEAD
 uint32_t sw_no_suspend_depth(void) { sw_process_t *p = sw_self(); return p ? p->no_suspend : 0; }
 void sw_no_suspend_set(uint32_t d) { sw_process_t *p = sw_self(); if (p) p->no_suspend = d; }
+=======
+>>>>>>> origin/main
 
 /* The driver (§3.5). Runs one activation of a stackless process on its
  * carrier: the entry the first time, the innermost parked frame after that.
@@ -3123,7 +3126,11 @@ int sw_run_stackless(sw_process_t *p) {
             p->run_waiting = waiting;
             sw_tc_park_t *pk = sw_tc_park();
             sw_varena_mark_t fl = pk->floor;
+<<<<<<< HEAD
             r = pk->fn(pk->args, pk->n, &fl, NULL);
+=======
+            r = pk->fn(pk->args, pk->n, &fl);
+>>>>>>> origin/main
             continue;
         }
         sw_frame_t *next;
