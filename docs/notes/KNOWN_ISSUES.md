@@ -86,8 +86,9 @@ replace/delete/drop. `tests/sw/run/test_spawn_value.sw` no longer re-spawns.
 thread, so a slow query (or a `busy_timeout` wait) froze every process on that
 scheduler. Two processes each holding a ~1s query on `SW_SCHEDULERS=2` delayed a 100ms
 timer to ~7s. They now run on the offload pool. The connection table and every use of
-a connection sit behind one process-wide lock (as `checkpoint` does), so db calls
-serialise across handles. Gate: `tests/sw/test_db_offload.sw`.
+a connection sit behind a per-handle lock, so calls on one handle serialise but
+different handles run in parallel (a `busy_timeout` wait on one never blocks another
+handle's COMMIT). Gate: `tests/sw/test_db_offload.sw`.
 
 ### Building a map one key at a time was quadratic (cleared 2026-09-27)
 

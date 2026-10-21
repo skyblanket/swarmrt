@@ -4870,25 +4870,36 @@ static sw_val_t *_builtin_trap_exit(sw_val_t **a, int n) {
 static sqlite3 *_sw_sqlite_db[_SW_SQLITE_MAX];
 
 /* These run on the offload pool, so two processes can be inside them at
- * once. The lock guards the slot table and every use of a connection: a
- * handle is one sqlite3 connection (one caller at a time), and db_close
- * must not free it under a running query. Same shape as g_durable_lock. */
-static pthread_mutex_t _sw_sqlite_lock = PTHREAD_MUTEX_INITIALIZER;
-static inline void _sw_sqlite_unlock_scope(int *unused) { (void)unused; pthread_mutex_unlock(&_sw_sqlite_lock); }
-#define SW_SQLITE_LOCK() \
-    int _sw_sqlite_lock_scope __attribute__((cleanup(_sw_sqlite_unlock_scope), unused)) = \
-        (pthread_mutex_lock(&_sw_sqlite_lock), 0)
+ * once. Each slot has its own mutex that covers every use of its connection
+ * (a sqlite3 handle takes one caller at a time, and db_close must not free
+ * it under a running query), so a slow query or busy_timeout wait on one
+ * handle never blocks another handle. _sw_sqlite_tab_lock only guards slot
+ * reservation, and is never held across a SQLite call. */
+static pthread_mutex_t _sw_sqlite_tab_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t _sw_sqlite_slot_lock[_SW_SQLITE_MAX] = {
+    [0 ... _SW_SQLITE_MAX - 1] = PTHREAD_MUTEX_INITIALIZER };
+static char _sw_sqlite_reserved[_SW_SQLITE_MAX];
+static inline void _sw_sqlite_unlock_scope(pthread_mutex_t **m) { if (*m) pthread_mutex_unlock(*m); }
+/* Lock slot `s` (already range-checked) until scope exit. */
+#define SW_SQLITE_LOCK_SLOT(s) \
+    pthread_mutex_t *_sw_sqlite_held __attribute__((cleanup(_sw_sqlite_unlock_scope), unused)) = \
+        (pthread_mutex_lock(&_sw_sqlite_slot_lock[(s)]), &_sw_sqlite_slot_lock[(s)])
 
 static sw_val_t *_builtin_db_open(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
     SW_OFFLOAD_BUILTIN(_builtin_db_open, a, n);
-    SW_SQLITE_LOCK();
     int slot = -1;
-    for (int i = 0; i < _SW_SQLITE_MAX; i++) if (!_sw_sqlite_db[i]) { slot = i; break; }
+    pthread_mutex_lock(&_sw_sqlite_tab_lock);
+    for (int i = 0; i < _SW_SQLITE_MAX; i++) if (!_sw_sqlite_reserved[i]) { slot = i; _sw_sqlite_reserved[i] = 1; break; }
+    pthread_mutex_unlock(&_sw_sqlite_tab_lock);
     if (slot < 0) return sw_val_int(-1);
+    SW_SQLITE_LOCK_SLOT(slot);
     sqlite3 *db = NULL;
     if (sqlite3_open(a[0]->v.str, &db) != SQLITE_OK) {
         if (db) sqlite3_close(db);
+        pthread_mutex_lock(&_sw_sqlite_tab_lock);
+        _sw_sqlite_reserved[slot] = 0;
+        pthread_mutex_unlock(&_sw_sqlite_tab_lock);
         return sw_val_int(-1);
     }
     _sw_sqlite_db[slot] = db;
@@ -4900,11 +4911,15 @@ static sw_val_t *_builtin_db_close(sw_val_t **a, int n) {
     /* Waits for any query in flight on this handle, so it must not pin a
      * scheduler thread: offload it like the others. */
     SW_OFFLOAD_BUILTIN(_builtin_db_close, a, n);
-    SW_SQLITE_LOCK();
     int slot = (int)a[0]->v.i;
-    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+    if (slot < 0 || slot >= _SW_SQLITE_MAX) return sw_val_atom("error");
+    SW_SQLITE_LOCK_SLOT(slot);
+    if (!_sw_sqlite_db[slot]) return sw_val_atom("error");
     sqlite3_close(_sw_sqlite_db[slot]);
     _sw_sqlite_db[slot] = NULL;
+    pthread_mutex_lock(&_sw_sqlite_tab_lock);
+    _sw_sqlite_reserved[slot] = 0;
+    pthread_mutex_unlock(&_sw_sqlite_tab_lock);
     return sw_val_atom("ok");
 }
 
@@ -4971,9 +4986,10 @@ static sw_val_t *_builtin_db_exec(sw_val_t **a, int n) {
         return sw_val_atom("error");
     SW_OFFLOAD_BUILTIN(_builtin_db_exec, a, n);
     SW_BLOCKING_SCOPE();
-    SW_SQLITE_LOCK();
     int slot = (int)a[0]->v.i;
-    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_atom("error");
+    if (slot < 0 || slot >= _SW_SQLITE_MAX) return sw_val_atom("error");
+    SW_SQLITE_LOCK_SLOT(slot);
+    if (!_sw_sqlite_db[slot]) return sw_val_atom("error");
 
     /* 3-arg overload: db_exec(h, sql, [args]) — prepare + bind + step, no
      * rows returned. Lets writes (INSERT/UPDATE/DELETE) use placeholders
@@ -5007,9 +5023,10 @@ static sw_val_t *_builtin_db_query(sw_val_t **a, int n) {
         return sw_val_list(NULL, 0);
     SW_OFFLOAD_BUILTIN(_builtin_db_query, a, n);
     SW_BLOCKING_SCOPE();
-    SW_SQLITE_LOCK();
     int slot = (int)a[0]->v.i;
-    if (slot < 0 || slot >= _SW_SQLITE_MAX || !_sw_sqlite_db[slot]) return sw_val_list(NULL, 0);
+    if (slot < 0 || slot >= _SW_SQLITE_MAX) return sw_val_list(NULL, 0);
+    SW_SQLITE_LOCK_SLOT(slot);
+    if (!_sw_sqlite_db[slot]) return sw_val_list(NULL, 0);
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(_sw_sqlite_db[slot], a[1]->v.str, -1, &stmt, NULL) != SQLITE_OK)
