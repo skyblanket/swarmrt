@@ -14,7 +14,7 @@
 | Message send (local) | ~10ns enqueue + payload deep-copy (O(message size); no shared heap) |
 | Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
 | Max concurrent processes | ~30K live idle on stock Linux (`vm.max_map_count=65530`, one stack mmap per live process); 100K idle after raising it |
-| Memory per *active* process | ~100–220 KB resident when actively passing messages, vs ~1 KB idle ([#161](https://github.com/skyblanket/swarmrt/issues/161)) |
+| Memory per *active* process | ~100–220 KB resident when actively passing messages, vs ~10 KB for an idle one (measured VmRSS) ([#161](https://github.com/skyblanket/swarmrt/issues/161)) |
 
 ---
 
