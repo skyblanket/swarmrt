@@ -51,8 +51,10 @@ fun main() {
     f = f + check("answers_directly", Agent.answer("ping", llm) == "pong", "")
     f = f + check("uses_the_tool", Agent.answer("count the words in: a b c d", llm) == "4 words", "")
     tasks = ["ping", "crash", "hang", "ping"]
+    print("note: the 'crash' task panics on purpose; the panic trace below is expected")
     rs = Std.task_stream(tasks, fn(t) { Agent.answer(t, llm) }, %{max_concurrency: 4, timeout_ms: 2000})
     oks = length(filter(rs, fn(r) { r == {'ok', "pong"} }))
-    f = f + check("bad_agents_cost_one_result_each", oks == 2 && length(rs) == 4, rs)
+    errs = length(filter(rs, fn(r) { elem(r, 0) == 'error' }))
+    f = f + check("bad_agents_cost_one_result_each", oks == 2 && length(rs) == 4 && errs == 2, rs)
     if (f == 0) { print("OK agent tests") ; sys_exit(0) } else { sys_exit(1) }
 }
