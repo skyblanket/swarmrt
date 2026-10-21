@@ -1892,6 +1892,16 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 sw_add_to_runq(&sched->runq, proc);
             }
             /* If WAITING: don't re-enqueue. sw_send will re-enqueue when message arrives. */
+            else if (proc->kill_flag &&
+                     atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_seq_cst)) {
+                /* A kill that raced the park: sw_process_kill stores kill_flag
+                 * (seq_cst) and then exchanges `waiting`; the receive stored
+                 * `waiting` (seq_cst) before swapping here. If the killer's
+                 * exchange saw 0, this load sees the flag (Dekker), and
+                 * winning the exchange makes us the one enqueuer. The kill
+                 * branch above then tears the process down. */
+                sw_add_to_runq(&sched->runq, proc);
+            }
 
         } else {
             sw_counter_bump(&sched->idle_waits);

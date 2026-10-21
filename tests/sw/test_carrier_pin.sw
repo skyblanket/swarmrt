@@ -71,7 +71,7 @@ fun sum_to(n) { n * (n - 1) / 2 }
 
 fun main() {
     me = self()
-    n = 5000
+    n = 10000
     f = 0
     spawn_quick(me, 0, n)
     f = f + assert_eq("returning runs free their carrier", collect(n, 0), sum_to(n))
