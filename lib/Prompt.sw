@@ -58,7 +58,13 @@ fun walk(t, vars, i, acc, strict) {
                 walk(t, vars, i + 2 + close_at + 2, acc ++ rendered, strict)
             }
         } else {
-            walk(t, vars, i + 1, acc ++ string_sub(t, i, 1), strict)
+            # Copy the literal run up to the next "{{" in one slice: string_sub
+            # never splits a UTF-8 character, so a byte-at-a-time walk would
+            # drop every non-ASCII byte.
+            lit = string_sub(t, i, string_length(t) - i)
+            nxt = string_index_of(lit, "{{")
+            if (nxt < 0) { acc ++ lit }
+            else { walk(t, vars, i + nxt, acc ++ string_sub(lit, 0, nxt), strict) }
         }
     }
 }

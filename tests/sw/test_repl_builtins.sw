@@ -31,8 +31,7 @@ fun test_string_sub() {
     fails = fails + assert_eq("sub_utf8_start", string_sub("ab—cd", 3, 4), "cd")
     fails = fails + assert_eq("sub_utf8_both", string_sub("—a—", 1, 3), "a")
     fails = fails + assert_eq("sub_utf8_inside", string_sub("—", 1, 1), "")
-    fails = fails + assert_eq("sub_utf8_walk_lead", string_sub("—", 0, 1), "—")
-    fails = fails + assert_eq("sub_utf8_walk_all", string_sub("é—", 0, 1) ++ string_sub("é—", 1, 1) ++ string_sub("é—", 2, 1) ++ string_sub("é—", 3, 1) ++ string_sub("é—", 4, 1), "é—")
+    fails = fails + assert_eq("sub_utf8_narrow", string_sub("ab—cd", 2, 2), "")
     fails
 }
 

@@ -4548,15 +4548,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (len <= 0) return sw_val_string("");
         /* Cuts stay on UTF-8 character boundaries (see studio.h). */
         int end = (len > slen - start) ? slen : start + len;
-        int cut = end;
-        while (cut > 0 && (((unsigned char)s[cut]) & 0xC0) == 0x80) cut--;
-        if (cut <= start && (((unsigned char)s[start]) & 0xC0) != 0x80) {
-            /* Window narrower than the char at a boundary start (byte-walk
-             * with len 1): return that whole char so walkers lose no text. */
-            cut = start + 1;
-            while (cut < slen && (((unsigned char)s[cut]) & 0xC0) == 0x80) cut++;
-        }
-        end = cut;
+        while (end > 0 && (((unsigned char)s[end]) & 0xC0) == 0x80) end--;
         while (start < slen && (((unsigned char)s[start]) & 0xC0) == 0x80) start++;
         if (end <= start) return sw_val_string("");
         len = end - start;
