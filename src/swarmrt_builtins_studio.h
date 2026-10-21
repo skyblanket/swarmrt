@@ -5661,9 +5661,12 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     /* The newline (not "; ") ends cmd: a trailing `# comment` or heredoc
      * terminator used to swallow the rest of the wrapper, and a trailing
      * `&` made "& ;" a syntax error. Only shell builtins here: cmd may have
-     * changed PATH. */
+     * changed PATH. cmd runs in a subshell so an `exit` in
+     * it ends only the subshell: in the group it ended the shell before the
+     * echo, so the exit file never appeared and shell() waited the full
+     * timeout (120s) and returned -1. */
     snprintf(wrapped, wrapcap,
-        "{ %s\necho $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
+        "{ ( %s\n) ; echo $? > %s ; } > %s 2>&1 &", cmd, exitf, outf);
     int launch = system(wrapped);
     free(wrapped);
     /* The launching sh backgrounds the group and exits 0. Anything else
