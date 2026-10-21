@@ -13,7 +13,8 @@
 | Context switch | ~100-200ns (assembly) |
 | Message send (local) | ~10ns enqueue + payload deep-copy (O(message size); no shared heap) |
 | Memory per process | ~2KB PCB + 128KB stack + value arena (8KB initial, grows; freed on exit) |
-| Max concurrent processes | ~30K live on stock Linux (`vm.max_map_count=65530`, one stack mmap per live process); 100K after raising it |
+| Max concurrent processes | ~30K live idle on stock Linux (`vm.max_map_count=65530`, one stack mmap per live process); 100K idle after raising it |
+| Memory per *active* process | ~100–220 KB resident when actively passing messages, vs ~10 KB for an idle one (measured VmRSS) ([#161](https://github.com/skyblanket/swarmrt/issues/161)) |
 
 ---
 
@@ -23,8 +24,10 @@
 100 processes:     < 1ms
 1,000 processes:   ~5ms
 10,000 processes:  ~50ms
-100,000 processes: ~500ms
+100,000 processes: ~500ms   (idle processes)
 ```
+
+These counts are for idle processes; an active message-passing process costs ~100–220 KB resident ([#161](https://github.com/skyblanket/swarmrt/issues/161)).
 
 Arena-allocated PCBs — no malloc on the hot path. Spawn cost is dominated by stack allocation (single mmap per scheduler partition).
 

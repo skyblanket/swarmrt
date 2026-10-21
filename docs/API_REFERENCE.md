@@ -1343,7 +1343,7 @@ Apply XOR string encryption and symbol mangling to generated C code.
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `SWARM_MAX_PROCESSES` | 100,000 | Max concurrent processes |
+| `SWARM_MAX_PROCESSES` | 100,000 | Max concurrent processes (idle; active message-passing processes cost ~100–220 KB resident each, see [#161](https://github.com/skyblanket/swarmrt/issues/161)) |
 | `SWARM_MAX_SCHEDULERS` | 64 | Max scheduler threads |
 | `SWARM_STACK_MIN_SIZE` | 2 KB | Minimum process stack |
 | `SWARM_STACK_MAX_SIZE` | 1 MB | Maximum process stack |
