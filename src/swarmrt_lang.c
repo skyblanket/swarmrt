@@ -277,6 +277,16 @@ static struct { const char *w; tok_type_t t; } kw_table[] = {
     {NULL, 0}
 };
 
+/* True for tokens lexed from a reserved word (`spawn`, `self`, ...). These
+ * are not TOK_IDENT, but they are still valid `name:` map keys. TOK_ATOM
+ * is excluded: quoted atoms and true/false/nil keep their own key branch. */
+static int tok_is_keyword(tok_type_t t) {
+    if (t == TOK_ATOM) return 0;
+    for (int k = 0; kw_table[k].w; k++)
+        if (kw_table[k].t == t) return 1;
+    return 0;
+}
+
 static void lex_init(lex_t *l, const char *src) {
     l->src = src; l->pos = 0; l->line = 1; l->col = 1;
 }
@@ -1677,8 +1687,10 @@ static node_t *par_primary_inner(par_t *p) {
         if (p->cur.type != TOK_RBRACE) {
             do {
                 node_t *key;
-                if (p->cur.type == TOK_IDENT) {
-                    /* Check for shorthand: name: val */
+                if (p->cur.type == TOK_IDENT || tok_is_keyword(p->cur.type)) {
+                    /* Check for shorthand: name: val. Keyword-named keys
+                     * (`spawn: 1`) take this path too; on a miss the lexer
+                     * is restored and they parse as ordinary expressions. */
                     lex_t sl = p->lex; tok_t sc = p->cur;
                     tok_t k = par_adv(p);
                     if (p->cur.type == TOK_COLON) {
