@@ -84,8 +84,10 @@ typedef enum {
 typedef struct {
     int                 id;         /* Connection handle (index in table) */
     sw_port_t          *port;       /* Underlying TCP port */
-    sw_http_mode_t      mode;
-    sw_process_t       *handler;    /* .sw process receiving messages */
+    /* mode and handler are read from other threads (sw_ws_send_*, sw_ws_close,
+     * sw_ws_set_handler) without g_http_lock, so both are atomic. */
+    _Atomic sw_http_mode_t mode;
+    _Atomic(sw_process_t *) handler; /* .sw process receiving messages */
 
     /* Receive buffer for partial data */
     uint8_t            *buf;
@@ -106,8 +108,15 @@ typedef struct {
     uint64_t            body_len;
     uint64_t            body_cap;
 
-    /* Connection persistence */
-    int                 keep_alive;     /* 1 = keep connection open after response */
+    /* Connection persistence. The parser sets it while the handler's
+     * sw_http_respond reads it on another thread, so it is atomic. */
+    _Atomic int         keep_alive;     /* 1 = keep connection open after response */
+
+    /* Pipelining: requests delivered to the handler whose response has not
+     * been sent yet (bumped by the bridge, dropped by the responder), and a
+     * flag saying the parser is holding a buffered request until it hits 0. */
+    _Atomic int         pending;
+    _Atomic int         held;
 
     /* WebSocket state */
     char                ws_key[128]; /* Sec-WebSocket-Key from upgrade */
