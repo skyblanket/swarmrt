@@ -35,6 +35,10 @@ fun test_process_info_counters() {
     p = spawn(echo())
     send(p, {'ping', self()})
     receive { 'pong' -> 'ok' }
+    # Second round: the worker's counter bump for its first send can land
+    # after the parent sees that pong; the second pong proves it has.
+    send(p, {'ping', self()})
+    receive { 'pong' -> 'ok' }
     me = process_info(self())
     fails = 0
     fails = fails + assert_eq("pi_memory_present", map_get(me, 'memory') == nil, false)
