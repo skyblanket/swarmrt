@@ -7,6 +7,11 @@
 #
 # Needs bin/swc (make swc). Exit non-zero if the check fails.
 set -u
+# macOS has no `ulimit -v` (and no `timeout`); the bug was Linux-only anyway.
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "SKIP spawn_limit (needs Linux ulimit -v)"
+    exit 0
+fi
 SWARMRT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SWC="$SWARMRT_ROOT/bin/swc"
 WORK="$(mktemp -d)"
