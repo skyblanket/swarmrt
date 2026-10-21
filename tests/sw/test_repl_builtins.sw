@@ -26,6 +26,11 @@ fun test_string_sub() {
     fails = fails + assert_eq("sub_mid", string_sub("hello", 1, 3), "ell")
     fails = fails + assert_eq("sub_clamp", string_sub("hi", 0, 10), "hi")
     fails = fails + assert_eq("sub_past_end", string_sub("hi", 5, 1), "")
+    fails = fails + assert_eq("sub_utf8_end", string_sub("ab—cd", 0, 3), "ab")
+    fails = fails + assert_eq("sub_utf8_end_whole", string_sub("ab—cd", 0, 5), "ab—")
+    fails = fails + assert_eq("sub_utf8_start", string_sub("ab—cd", 3, 4), "cd")
+    fails = fails + assert_eq("sub_utf8_both", string_sub("—a—", 1, 3), "a")
+    fails = fails + assert_eq("sub_utf8_inside", string_sub("—", 1, 1), "")
     fails
 }
 
@@ -42,6 +47,9 @@ fun test_string_truncate() {
     fails = fails + assert_eq("trunc_short", string_truncate("short", 100), "short")
     fails = fails + assert_eq("trunc_long", string_truncate("hello world", 8), "hello wo")
     fails = fails + assert_eq("trunc_exact", string_truncate("hi", 5), "hi")
+    fails = fails + assert_eq("trunc_utf8", string_truncate("ab—cd", 4), "ab")
+    fails = fails + assert_eq("trunc_utf8_whole", string_truncate("ab—cd", 5), "ab—")
+    fails = fails + assert_eq("trunc_utf8_first", string_truncate("—a", 2), "")
     fails
 }
 

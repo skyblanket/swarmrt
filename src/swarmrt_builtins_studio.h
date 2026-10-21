@@ -736,6 +736,18 @@ static sw_val_t *_builtin_string_replace(sw_val_t **a, int n) {
     return r;
 }
 
+/* Cut points stay byte offsets but never split a UTF-8 character: an end
+ * moves back to the start of the character it would split, a start moves
+ * forward past continuation bytes. Mirrored in swarmrt_lang.c. */
+static int _utf8_cut_end(const char *s, int end) {
+    while (end > 0 && (((unsigned char)s[end]) & 0xC0) == 0x80) end--;
+    return end;
+}
+static int _utf8_cut_start(const char *s, int start, int slen) {
+    while (start < slen && (((unsigned char)s[start]) & 0xC0) == 0x80) start++;
+    return start;
+}
+
 /* string_sub(str, start, len) — substring extraction */
 static sw_val_t *_builtin_string_sub(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING ||
@@ -747,8 +759,12 @@ static sw_val_t *_builtin_string_sub(sw_val_t **a, int n) {
     int len = (int)a[2]->v.i;
     if (start < 0) start = 0;
     if (start >= slen) return sw_val_string("");
-    if (start + len > slen) len = slen - start;
     if (len <= 0) return sw_val_string("");
+    int end = (len > slen - start) ? slen : start + len;
+    end = _utf8_cut_end(s, end);
+    start = _utf8_cut_start(s, start, slen);
+    if (end <= start) return sw_val_string("");
+    len = end - start;
     char *buf = (char *)malloc(len + 1);
     memcpy(buf, s + start, len);
     buf[len] = 0;
@@ -7609,6 +7625,7 @@ static sw_val_t *_builtin_string_truncate(sw_val_t **a, int n) {
     if (max_len <= 0) return sw_val_string("");
     size_t slen = strlen(s);
     if ((int64_t)slen <= max_len) return a[0];
+    max_len = _utf8_cut_end(s, (int)max_len);
     char *buf = (char *)malloc((size_t)max_len + 1);
     memcpy(buf, s, (size_t)max_len);
     buf[max_len] = 0;

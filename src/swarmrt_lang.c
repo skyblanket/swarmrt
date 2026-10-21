@@ -4545,8 +4545,13 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         int len = (int)args[2]->v.i;
         if (start < 0) start = 0;
         if (start >= slen) return sw_val_string("");
-        if (start + len > slen) len = slen - start;
         if (len <= 0) return sw_val_string("");
+        /* Cuts stay on UTF-8 character boundaries (see studio.h). */
+        int end = (len > slen - start) ? slen : start + len;
+        while (end > 0 && (((unsigned char)s[end]) & 0xC0) == 0x80) end--;
+        while (start < slen && (((unsigned char)s[start]) & 0xC0) == 0x80) start++;
+        if (end <= start) return sw_val_string("");
+        len = end - start;
         char *buf = (char *)malloc(len + 1);
         memcpy(buf, s + start, len); buf[len] = '\0';
         sw_val_t *r = sw_val_string(buf); free(buf); return r;
@@ -4584,6 +4589,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (max <= 0) return sw_val_string("");
         size_t slen = strlen(s);
         if ((int64_t)slen <= max) return args[0];
+        while (max > 0 && (((unsigned char)s[max]) & 0xC0) == 0x80) max--;
         char *r = (char *)malloc((size_t)max + 1);
         memcpy(r, s, (size_t)max); r[max] = '\0';
         sw_val_t *v = sw_val_string(r); free(r); return v;
