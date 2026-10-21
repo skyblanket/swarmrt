@@ -111,18 +111,24 @@ static void run_main_entry(void *arg) {
     ctx->rc = ctx->interp->error ? 1 : 0;
     if (ctx->interp->error) {
         sw_interp_t *ip = ctx->interp;
-        if (strncmp(ip->error_msg, "panic: ", 7) == 0 && ip->panic_nframes > 0) {
+        if (strncmp(ip->error_msg, "panic: ", 7) == 0 && ip->panic_valid) {
             /* Same report as the compiled binary's _sw_runtime_panic. */
-            const char *mod = ((node_t *)ip->module_ast)->v.mod.name;
             fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", ip->error_msg + 7);
-            if (ip->panic_line > 0)
-                fprintf(stderr, "  at %s:%d\n", ip->src_path ? ip->src_path : "?", ip->panic_line);
-            fprintf(stderr, "  call chain (innermost first):\n");
-            for (int i = ip->panic_nframes - 1; i >= 0; i--)
-                fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", ip->panic_nframes - 1 - i,
-                        mod, ip->panic_frames[i].fn, mod, ip->panic_frames[i].line);
-            if (ip->panic_overflow > 0)
-                fprintf(stderr, "    ... (truncated; %d frames omitted)\n", ip->panic_overflow);
+            if (ip->panic_file && ip->panic_line > 0)
+                fprintf(stderr, "  at %s:%d\n", ip->panic_file, ip->panic_line);
+            int top = ip->panic_top;
+            if (top > 0) {
+                fprintf(stderr, "  call chain (innermost first):\n");
+                for (int i = top - 1; i >= 0; i--) {
+                    const char *m = ip->panic_trace[i].mod ? ip->panic_trace[i].mod : "?";
+                    const char *f = ip->panic_trace[i].fn ? ip->panic_trace[i].fn : "?";
+                    int line = (i == top - 1 && ip->panic_line > 0)
+                                   ? ip->panic_line : ip->panic_trace[i].line;
+                    fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", top - 1 - i, m, f, m, line);
+                }
+                if (ip->panic_overflowed > 0)
+                    fprintf(stderr, "    ... (truncated; %d frames omitted)\n", ip->panic_overflowed);
+            }
         } else {
             fprintf(stderr, "swc: runtime error: %s\n", ip->error_msg);
         }
@@ -174,6 +180,16 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
         int unresolved = 0;
         for (int a = 0; a < nmods; a++)
             unresolved += sw_resolve_module(mods[a], mods, nmods, mod_paths[a]);
+        /* Tag each function with its module + file for panic reports (the
+         * file strings outlive the run; the AST does too). */
+        for (int a = 1; a < nmods; a++) {
+            node_t *m = (node_t *)mods[a];
+            const char *file = strdup(mod_paths[a]);
+            for (int i = 0; i < m->v.mod.nfuns; i++) {
+                m->v.mod.funs[i]->v.fun.src_mod = m->v.mod.name;
+                m->v.mod.funs[i]->v.fun.src_file = file;
+            }
+        }
         for (int a = 0; a < nmods; a++) free((char *)mod_paths[a]);
         if (unresolved) {
             fprintf(stderr, "swc: %d name error%s — not running\n",

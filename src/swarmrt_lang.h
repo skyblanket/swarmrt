@@ -152,19 +152,17 @@ typedef struct {
     sw_env_t *tail_env;
     int tail_nargs;
     sw_val_t *tail_args[16];
-    /* Panic location report (docs §11): cur_line tracks the line being
-     * evaluated, frames[] the active user-function chain (outermost first;
-     * a depth-restoring push/pop keeps it bounded across fibers). A panic
-     * snapshots both into panic_* so the top level can print `at FILE:LINE`
-     * and the call chain like the compiled binary. */
-    int cur_line;
-    int nframes;
-    struct { const char *fn; int line; } frames[64];
+    /* Panic location report (docs §11). The live line/file/call chain is the
+     * per-PROCESS `_sw_gen` block (same one the compiled backend uses), so
+     * fibers sharing this interp never see each other's frames. A panic
+     * snapshots it here for the top-level report in swc.c. */
+    int panic_valid;
     int panic_line;
-    int panic_nframes;
-    struct { const char *fn; int line; } panic_frames[64];
-    int panic_overflow;
-    const char *src_path;
+    const char *panic_file;
+    int panic_top;
+    int panic_overflowed;
+    struct { const char *mod; const char *fn; int line; } panic_trace[64];
+    const char *src_path;   /* root source file, as given to swc run */
 } sw_interp_t;
 
 /* === Public API === */
@@ -375,7 +373,10 @@ typedef struct node {
                  int nglobals; } mod;
         /* N_FUN */
         struct { char name[128]; char params[16][128]; int nparams;
-                 struct node *body; struct node *defaults[16]; } fun;
+                 struct node *body; struct node *defaults[16];
+                 /* Defining module + source file (set by swc for panic reports;
+                  * NULL → the root module / root file). */
+                 const char *src_mod; const char *src_file; } fun;
         /* N_BLOCK */
         struct { struct node **stmts; int nstmts; } block;
         /* N_ASSIGN */

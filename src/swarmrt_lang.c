@@ -3637,17 +3637,32 @@ static sw_val_t *builtin_print(sw_val_t **args, int nargs) {
  * (e.g. "division by zero", "hd: list is empty") so assert_raises() can
  * substring-match it exactly as it would the compiled panic text, and is
  * "panic:"-prefixed to match the panic() builtin's error surface. */
+/* Module / bare-name / file a frame reports for `fn`. Imported functions
+ * are merged under "Mod.fn" clones; the trace shows the bare name. */
+static const char *interp_fn_mod(sw_interp_t *interp, node_t *fn) {
+    return fn->v.fun.src_mod ? fn->v.fun.src_mod
+                             : ((node_t *)interp->module_ast)->v.mod.name;
+}
+static const char *interp_fn_bare(node_t *fn) {
+    const char *d = strrchr(fn->v.fun.name, '.');
+    return d ? d + 1 : fn->v.fun.name;
+}
+
 static void interp_note_panic(sw_interp_t *interp) {
-    int n = interp->nframes;
-    int keep = n > 64 ? 64 : n;
-    interp->panic_line = interp->cur_line;
-    interp->panic_nframes = keep;
-    interp->panic_overflow = n - keep;
+    if (interp->panic_valid) return;   /* keep the first (innermost) report */
+    int top = _sw_gen->trace_top;
+    int keep = top > 64 ? 64 : top;
+    if (keep < 0) keep = 0;
+    interp->panic_valid = 1;
+    interp->panic_line = _sw_gen->current_line;
+    interp->panic_file = _sw_gen->current_file;
+    interp->panic_top = keep;
+    interp->panic_overflowed = top > 64 ? top - 64 : 0;
     for (int i = 0; i < keep; i++) {
-        interp->panic_frames[i].fn   = interp->frames[(n - keep + i) % 64].fn;
-        interp->panic_frames[i].line = interp->frames[(n - keep + i) % 64].line;
+        interp->panic_trace[i].mod  = _sw_gen->trace[i].module_name;
+        interp->panic_trace[i].fn   = _sw_gen->trace[i].fn_name;
+        interp->panic_trace[i].line = _sw_gen->trace[i].line;
     }
-    if (keep > 0) interp->panic_frames[keep - 1].line = interp->cur_line;
 }
 
 static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, ...) {
@@ -6175,16 +6190,29 @@ static void bind_params(sw_interp_t *interp, node_t *fn, sw_env_t *fenv, sw_val_
  * run any tail calls it requests in this same C frame. */
 static sw_val_t *interp_eval_body_loop(sw_interp_t *interp, node_t *fn, sw_env_t *fenv);
 
+/* Record `fn` as the frame at `slot` of the process's call chain (the same
+ * ring the compiled _sw_trace_push fills). */
+static void interp_set_frame(sw_interp_t *interp, int slot, node_t *fn) {
+    if (slot >= 64) return;
+    _sw_gen->trace[slot].module_name = interp_fn_mod(interp, fn);
+    _sw_gen->trace[slot].fn_name = interp_fn_bare(fn);
+    _sw_gen->trace[slot].line = fn->line;
+}
+
 /* Push a call-chain frame around the body so a panic can report it. Outer
- * frames keep their entry line (as the compiled trace does); depth is restored (not just
- * decremented) so interleaved fibers can't drift it. */
+ * frames keep their entry line (as the compiled trace does). The state is
+ * per-process, so interleaved fibers never see each other's frames. */
 static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
-    int saved = interp->nframes;
-    interp->frames[saved % 64].fn = fn->v.fun.name;
-    interp->frames[saved % 64].line = fn->line;
-    interp->nframes = saved + 1;
+    sw_gen_exec_t *g = _sw_gen;
+    int saved = g->trace_top;
+    const char *saved_file = g->current_file;
+    interp_set_frame(interp, saved, fn);
+    g->trace_top = saved + 1;
+    g->current_file = fn->v.fun.src_file ? fn->v.fun.src_file : interp->src_path;
     sw_val_t *r = interp_eval_body_loop(interp, fn, fenv);
-    interp->nframes = saved;
+    g = _sw_gen;   /* a yield may have swapped blocks; same process on resume */
+    g->trace_top = saved;
+    g->current_file = saved_file;
     return r;
 }
 
@@ -6201,6 +6229,15 @@ static sw_val_t *interp_eval_body_loop(sw_interp_t *interp, node_t *fn, sw_env_t
         int nargs = interp->tail_nargs;
         memcpy(args, interp->tail_args, sizeof(sw_val_t *) * (size_t)nargs);
         fn = interp->tail_fn;
+        /* A same-module tail call replaces the frame (compiled does the same);
+         * a cross-module call is a plain call there, so it gets its own frame. */
+        {
+            int t = _sw_gen->trace_top;
+            if (t > 0 && t <= 64 && _sw_gen->trace[t - 1].module_name == interp_fn_mod(interp, fn))
+                interp_set_frame(interp, t - 1, fn);
+            else if (t > 0) { interp_set_frame(interp, t, fn); _sw_gen->trace_top = t + 1; }
+        }
+        _sw_gen->current_file = fn->v.fun.src_file ? fn->v.fun.src_file : interp->src_path;
         own = env_new(interp->tail_env ? interp->tail_env : interp->global_env);
         fenv = own;
         bind_params(interp, fn, fenv, args, nargs);
@@ -6475,7 +6512,7 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
 
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     if (!n || interp->error) return sw_val_nil();
-    if (n->line > 0) interp->cur_line = n->line;
+    if (n->line > 0) _sw_gen->current_line = n->line;
 
     switch (n->type) {
     case N_INT: return sw_val_int(n->v.ival);
@@ -6840,7 +6877,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                 return sw_val_nil();
             }
         }
-        if (n->line > 0) interp->cur_line = n->line;
+        if (n->line > 0) _sw_gen->current_line = n->line;
         return interp_call_named(interp, n, env, fname, args, nargs);
     }
 
