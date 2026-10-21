@@ -2633,6 +2633,71 @@ sw_val_t *sw_coerce_float(sw_val_t *v) {
     return sw_val_nil();
 }
 
+/* === random / random_seed / bit ops (shared by interp and compiled) =======
+ * xoshiro256** with a thread-local state: schedulers are threads, so draws
+ * take no lock. Lazily seeded from the CSPRNG; random_seed(n) makes the
+ * calling thread's stream reproducible. */
+static _Thread_local uint64_t g_prng[4];
+static _Thread_local int g_prng_ready;
+
+static uint64_t prng_splitmix(uint64_t *x) {
+    uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+static void prng_seed(uint64_t seed) {
+    for (int i = 0; i < 4; i++) g_prng[i] = prng_splitmix(&seed);
+    g_prng_ready = 1;
+}
+static uint64_t prng_next(void) {
+    if (!g_prng_ready) {
+        uint64_t seed;
+        arc4random_buf(&seed, sizeof(seed));
+        prng_seed(seed);
+    }
+    uint64_t *s = g_prng;
+    uint64_t r = s[1] * 5;
+    r = ((r << 7) | (r >> 57)) * 9;
+    uint64_t t = s[1] << 17;
+    s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = (s[3] << 45) | (s[3] >> 19);
+    return r;
+}
+
+/* random() -> float in [0,1); random(n) -> int in [0,n) (0 when n <= 0). */
+sw_val_t *sw_make_random(sw_val_t **args, int nargs) {
+    if (nargs < 1) return sw_val_float((double)(prng_next() >> 11) * (1.0 / 9007199254740992.0));
+    if (!args[0] || args[0]->type != SW_VAL_INT || args[0]->v.i <= 0) return sw_val_int(0);
+    uint64_t n = (uint64_t)args[0]->v.i;
+    /* rejection sampling to avoid modulo bias */
+    uint64_t limit = UINT64_MAX - (UINT64_MAX % n), r;
+    do { r = prng_next(); } while (r >= limit);
+    return sw_val_int((int64_t)(r % n));
+}
+
+sw_val_t *sw_make_random_seed(sw_val_t **args, int nargs) {
+    prng_seed(nargs >= 1 && args[0] && args[0]->type == SW_VAL_INT ? (uint64_t)args[0]->v.i : 0);
+    return sw_val_atom("ok");
+}
+
+/* band/bor/bxor/bsl/bsr on ints. Shifts outside 0..63 give 0 (bsr of a
+ * negative keeps the sign). Returns NULL if `fname` is not a bit op. */
+sw_val_t *sw_bitop(const char *fname, sw_val_t **args, int nargs) {
+    if (strcmp(fname, "band") && strcmp(fname, "bor") && strcmp(fname, "bxor") &&
+        strcmp(fname, "bsl") && strcmp(fname, "bsr")) return NULL;
+    if (nargs < 2 || args[0]->type != SW_VAL_INT || args[1]->type != SW_VAL_INT)
+        return sw_val_int(0);
+    int64_t a = args[0]->v.i, b = args[1]->v.i;
+    if (!strcmp(fname, "band")) return sw_val_int(a & b);
+    if (!strcmp(fname, "bor"))  return sw_val_int(a | b);
+    if (!strcmp(fname, "bxor")) return sw_val_int(a ^ b);
+    if (b < 0 || b > 63) return sw_val_int(!strcmp(fname, "bsr") && a < 0 ? -1 : 0);
+    if (!strcmp(fname, "bsl"))  return sw_val_int((int64_t)((uint64_t)a << b));
+    return sw_val_int(a >> b);
+}
+
 /* uuid(): a random RFC-4122 v4 UUID string. */
 sw_val_t *sw_make_uuid(void) {
     uint8_t b[16];
@@ -5727,6 +5792,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "to_int") == 0 && nargs >= 1)   return sw_coerce_int(args[0]);
     if (strcmp(fname, "to_float") == 0 && nargs >= 1) return sw_coerce_float(args[0]);
     if (strcmp(fname, "uuid") == 0)                   return sw_make_uuid();
+    if (strcmp(fname, "random") == 0)                 return sw_make_random(args, nargs);
+    if (strcmp(fname, "random_seed") == 0)            return sw_make_random_seed(args, nargs);
+    { sw_val_t *bv = sw_bitop(fname, args, nargs); if (bv) return bv; }
     if (strcmp(fname, "now_iso") == 0)                return sw_now_iso();
 
     /* === Math (libm-backed; parity with codegen) =============== */
@@ -7188,6 +7256,7 @@ static const char *k_interp_builtins[] = {
     "stdin_pending_push","stdin_take_pending","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
+    "random","random_seed","band","bor","bxor","bsl","bsr",
     NULL
 };
 int interp_is_known_builtin(const char *name) {

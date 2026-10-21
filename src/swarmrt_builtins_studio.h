@@ -654,6 +654,13 @@ static sw_val_t *_builtin_to_int(sw_val_t **a, int n) {
     return sw_coerce_int(a[0]);
 }
 /* uuid() → random RFC-4122 v4 string; now_iso() → current UTC ISO-8601. */
+static sw_val_t *_builtin_random(sw_val_t **a, int n) { return sw_make_random(a, n); }
+static sw_val_t *_builtin_random_seed(sw_val_t **a, int n) { return sw_make_random_seed(a, n); }
+static sw_val_t *_builtin_band(sw_val_t **a, int n) { return sw_bitop("band", a, n); }
+static sw_val_t *_builtin_bor(sw_val_t **a, int n) { return sw_bitop("bor", a, n); }
+static sw_val_t *_builtin_bxor(sw_val_t **a, int n) { return sw_bitop("bxor", a, n); }
+static sw_val_t *_builtin_bsl(sw_val_t **a, int n) { return sw_bitop("bsl", a, n); }
+static sw_val_t *_builtin_bsr(sw_val_t **a, int n) { return sw_bitop("bsr", a, n); }
 static sw_val_t *_builtin_uuid(sw_val_t **a, int n) { (void)a; (void)n; return sw_make_uuid(); }
 static sw_val_t *_builtin_now_iso(sw_val_t **a, int n) { (void)a; (void)n; return sw_now_iso(); }
 
