@@ -129,6 +129,9 @@ static const char *_c_reserved_words[] = {
     "inline", "int", "long", "register", "restrict", "return", "short",
     "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
     "unsigned", "void", "volatile", "while",
+    /* names the generated code itself declares in a function's scope: a sw
+     * local or parameter spelled the same must not shadow or redeclare them */
+    "_args", "_nargs", "_sw_tc_fl", "_gc_floor",
     NULL
 };
 

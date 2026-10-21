@@ -40,9 +40,10 @@ fun depth(n) { if (n == 0) { 0 } else { 1 + depth(n - 1) } }
 fun mixed(n) { if (n == 0) { depth(100) } else { mixed_b(n - 1) } }
 fun mixed_b(n) { mixed(n) }
 
-# A user local named like a codegen-internal parameter (`_fl`, the hop's
-# arena floor) must still compile: generated names can't collide with user ones.
-fun reserved_a(n) { _fl = n * 2 ; if (n == 0) { _fl } else { reserved_b(n - 1) } }
+# User locals named like codegen-internal names (`_fl` was the hop's arena
+# floor, `_sw_tc_fl` is now, `_args` holds the arguments) must still compile:
+# generated names can't collide with user ones.
+fun reserved_a(n) { _fl = n * 2 ; _sw_tc_fl = _fl ; _args = _sw_tc_fl ; if (n == 0) { _args } else { reserved_b(n - 1) } }
 fun reserved_b(n) { reserved_a(n) }
 
 fun main() {
