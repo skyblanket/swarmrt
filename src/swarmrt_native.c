@@ -801,6 +801,19 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
  *    run has overwritten the trampoline slot the initial ctx returns
  *    through, so the old ctx can't be trusted.
  * ============================================================================ */
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define SW_UNDER_ASAN 1
+#  endif
+#endif
+#if !defined(SW_UNDER_ASAN) && defined(__SANITIZE_ADDRESS__)
+#  define SW_UNDER_ASAN 1
+#endif
+#ifdef SW_UNDER_ASAN
+/* From <sanitizer/asan_interface.h>, which not every toolchain ships. */
+void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
+#endif
+
 typedef struct sw_carrier {
     sw_process_t cproc;        /* used only for its ctx/entry/arg (asm offsets) */
     void *map;                 /* mmap base (guard page first) */
@@ -917,6 +930,11 @@ static sw_carrier_t *carrier_alloc(void) {
 static void carrier_release(sw_scheduler_t *sched, sw_carrier_t *c) {
     c->proc = NULL;
     c->outcome = NULL;
+#ifdef SW_UNDER_ASAN
+    /* A run abandoned by a panic or kill leaves its frames' scope poison in
+     * the shadow; the next run on this stack would trip over it. */
+    __asan_unpoison_memory_region(c->stack, c->stack_size);
+#endif
     if (sched && !sched->carrier) {
         sw_ctx_init(&c->cproc, c->stack, c->stack_size);
         sched->carrier = c;
@@ -2006,14 +2024,6 @@ static void *scheduler_main(void *arg) {
  * + a per-thread sigaltstack lets the handler run on safe ground. Installed
  * by each scheduler thread and the thread that calls sw_init. 64KB static
  * per thread (SIGSTKSZ stopped being a compile-time constant in glibc 2.34). */
-#if defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-#    define SW_UNDER_ASAN 1
-#  endif
-#endif
-#if !defined(SW_UNDER_ASAN) && defined(__SANITIZE_ADDRESS__)
-#  define SW_UNDER_ASAN 1
-#endif
 
 static void _sw_install_altstack(void) {
 #ifdef SW_UNDER_ASAN
