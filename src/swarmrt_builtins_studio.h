@@ -5626,6 +5626,20 @@ static char *_sw_sanitize_output(const char *raw, size_t raw_len, size_t *out_le
     return buf;
 }
 
+/* True once the wrapper has written the command's exit status. The `>`
+ * redirect creates the exit file empty a moment before `echo $?` fills it,
+ * so the file existing does not mean the command is done: a poll that lands
+ * in that gap reads "" and reported exit 0 for a command that was killed.
+ * The status is written as one line, so wait for its newline. */
+static int _sw_shell_exit_ready(const char *exitf) {
+    FILE *ef = fopen(exitf, "r");
+    if (!ef) return 0;
+    char ebuf[16] = {0};
+    size_t er = fread(ebuf, 1, 15, ef);
+    fclose(ef);
+    return er > 0 && strchr(ebuf, '\n') != NULL;
+}
+
 static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING)
         return sw_val_nil();
@@ -5700,8 +5714,7 @@ static sw_val_t *_builtin_shell(sw_val_t **a, int n) {
 
         /* Check if command finished — BEFORE sleeping, so an already-done
          * command costs one fopen, not a poll interval. */
-        FILE *ef = fopen(exitf, "r");
-        if (ef) { fclose(ef); done = 1; break; }
+        if (_sw_shell_exit_ready(exitf)) { done = 1; break; }
 
         _sw_nap_us(delay_us);
         waited_us += delay_us;
