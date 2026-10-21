@@ -114,6 +114,10 @@ uint64_t sw_msgsize_dropped(void) {
  *                      teardown handshake is sw_shutdown's join. */
 static _Atomic int g_sw_draining = 0;
 static _Atomic int g_sw_shutdown_requested = 0;
+/* Set at the very start of sw_shutdown: sends become no-ops (payload region
+ * reclaimed by teardown) so a fiber finishing its slice on a scheduler thread
+ * that is being joined never touches tls_current / the mailboxes. */
+static _Atomic int g_sw_tearing_down = 0;
 
 int sw_is_draining(void) {
     return atomic_load_explicit(&g_sw_draining, memory_order_relaxed);
@@ -1988,6 +1992,7 @@ int sw_init(const char *name, uint32_t num_schedulers) {
      * prior sw_shutdown starts clean. No signal can have arrived yet — the
      * SIGTERM/SIGINT handler is installed only from the entry path AFTER
      * sw_init returns (sw_install_shutdown_signals). */
+    atomic_store_explicit(&g_sw_tearing_down, 0, memory_order_relaxed);
     atomic_store_explicit(&g_sw_draining, 0, memory_order_relaxed);
     atomic_store_explicit(&g_sw_shutdown_requested, 0, memory_order_relaxed);
 
@@ -2140,6 +2145,7 @@ void sw_shutdown(int swarm_id) {
 
     if (!g_swarm) return;
 
+    atomic_store_explicit(&g_sw_tearing_down, 1, memory_order_release);
     g_swarm->running = 0;
 
     /* Stop deadlock watchdog (if running) before tearing down the arena.
@@ -2154,7 +2160,11 @@ void sw_shutdown(int swarm_id) {
         g_watchdog_enabled = 0;
     }
 
-    /* Stop all schedulers */
+    /* Quiesce every scheduler before freeing any of them. A scheduler still
+     * running a fiber can wake a peer through wake_one_idle_scheduler, which
+     * scans the whole schedulers[] array, so no struct may be freed or have
+     * its mutex/cond destroyed while another scheduler thread is alive. Signal
+     * all, join all, then tear down. */
     for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
         sw_scheduler_t *sched = g_swarm->schedulers[i];
         sched->should_exit = 1;
@@ -2162,7 +2172,11 @@ void sw_shutdown(int swarm_id) {
         pthread_mutex_lock(&sched->runq.idle_lock);
         pthread_cond_signal(&sched->runq.idle_cond);
         pthread_mutex_unlock(&sched->runq.idle_lock);
-        pthread_join(sched->thread, NULL);
+    }
+    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++)
+        pthread_join(g_swarm->schedulers[i]->thread, NULL);
+    for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
+        sw_scheduler_t *sched = g_swarm->schedulers[i];
         pthread_mutex_destroy(&sched->runq.idle_lock);
         pthread_cond_destroy(&sched->runq.idle_cond);
         free(sched);
@@ -2774,6 +2788,7 @@ static void mailbox_overflow_drop(sw_process_t *to, uint64_t tag,
 
 void sw_send(sw_process_t *to, void *msg) {
     if (!to || !msg) return;
+    if (atomic_load_explicit(&g_sw_tearing_down, memory_order_acquire)) return;
 
     if (!mailbox_admit(to)) {
         mailbox_overflow_drop(to, SW_TAG_NONE, msg, NULL);
@@ -3813,6 +3828,7 @@ int sw_shutdown_graceful(int swarm_id, int deadline_ms) {
 static void send_tagged_internal(sw_process_t *to, uint64_t tag, void *msg,
                                  int capped) {
     if (!to) return;
+    if (atomic_load_explicit(&g_sw_tearing_down, memory_order_acquire)) return;
 
     if (capped) {
         if (!mailbox_admit(to)) {
@@ -3851,6 +3867,10 @@ void sw_send_tagged(sw_process_t *to, uint64_t tag, void *msg) {
 void sw_send_tagged_msg(sw_process_t *to, uint64_t tag, void *payload,
                         struct sw_value_arena *region) {
     if (!to) return;
+    if (atomic_load_explicit(&g_sw_tearing_down, memory_order_acquire)) {
+        if (region) sw_varena_free_all(region);
+        return;
+    }
 
     /* Message-size cap (SW_MSG_MAX_BYTES): the region's total_bytes IS the
      * deep-copied payload's size. Drop mirrors mailbox_overflow_drop: bulk-
