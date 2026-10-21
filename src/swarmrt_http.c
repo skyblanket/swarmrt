@@ -89,6 +89,16 @@ static uint64_t http_idle_timeout_ms(void) {
                           SW_HTTP_IDLE_TIMEOUT_MS_DEFAULT);
 }
 
+/* A request whose reply is still owed is exempt from the idle timeout: the
+ * server holds the next move. The exemption ends after this many ms
+ * (SW_HTTP_REPLY_TIMEOUT_MS, default 60000; 0 = no cap) so a handler that
+ * never answers cannot hold a slot forever. */
+static _Atomic uint64_t g_http_reply_conf;
+static uint64_t http_reply_timeout_ms(void) {
+    return http_idle_conf(&g_http_reply_conf, "SW_HTTP_REPLY_TIMEOUT_MS",
+                          SW_HTTP_REPLY_TIMEOUT_MS_DEFAULT);
+}
+
 /* Established WS default 0 = EXEMPT (see the header note: quiet LiveView/
  * agent sessions are legitimate; the server answers pings, never sends them). */
 static uint64_t http_ws_idle_timeout_ms(void) {
@@ -131,6 +141,7 @@ static int conn_alloc(sw_port_t *port, sw_http_bridge_t *bridge) {
             c->body_cap = 0;
             c->keep_alive = 1; /* HTTP/1.1 default */
             atomic_store(&c->pending, 0);
+            atomic_store(&c->pending_since_ms, 0);
             atomic_store(&c->held, 0);
             c->req_hdr = NULL;
             c->req_path = NULL;
@@ -632,12 +643,24 @@ static sw_val_t *http_hdr_map(const char *raw) {
     return http_parse_headers(raw, n >= 2 ? raw + n - 2 : raw);
 }
 
+/* The bridge is about to hand `c` a request: one more reply is owed. */
+static void http_owe_reply(sw_http_conn_t *c) {
+    if (atomic_fetch_add(&c->pending, 1) == 0)
+        atomic_store(&c->pending_since_ms, http_now_ms());
+}
+
 /* A response went out on `c`. Once none is outstanding, wake the bridge if
  * the parser is holding a buffered request, so it re-parses without waiting
  * for more bytes. Called with the port pinned. */
 static void http_response_done(sw_http_conn_t *c, sw_port_t *port) {
     int p = atomic_load(&c->pending);
     while (p > 0 && !atomic_compare_exchange_weak(&c->pending, &p, p - 1)) {}
+    if (p > 1) atomic_store(&c->pending_since_ms, http_now_ms());
+    /* The server just spoke: the client's idle clock restarts here, so the
+     * sweep cannot close the conn in the gap before its next request. */
+    pthread_mutex_lock(&g_http_lock);
+    if (c->port == port) c->last_activity_ms = http_now_ms();
+    pthread_mutex_unlock(&g_http_lock);
     if (p != 1 || !atomic_exchange(&c->held, 0)) return;
     pthread_mutex_lock(&g_http_lock);
     sw_process_t *owner = c->port == port ? c->owner : NULL;
@@ -1110,7 +1133,7 @@ static int http_try_parse(int cid, sw_port_t *port) {
          * block saved above. */
         items[4] = http_hdr_map(c->req_hdr);
         items[5] = sw_val_string(body_str);
-        atomic_fetch_add(&c->pending, 1);
+        http_owe_reply(c);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
         if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
@@ -1163,7 +1186,7 @@ deliver_body:
          * arrived (before the body was buffered). */
         items[4] = http_hdr_map(c->req_hdr);
         items[5] = sw_val_string(body_buf);
-        atomic_fetch_add(&c->pending, 1);
+        http_owe_reply(c);
         sw_send_value(c->handler, SW_TAG_NONE, sw_val_tuple(items, 6));
         if (c->req_hdr) { free(c->req_hdr); c->req_hdr = NULL; }
         if (c->req_path) { free(c->req_path); c->req_path = NULL; }
@@ -1285,6 +1308,7 @@ static void conn_on_close(int cid, sw_port_t *port) {
 static void http_sweep_idle(void) {
     uint64_t http_to = http_idle_timeout_ms();
     uint64_t ws_to   = http_ws_idle_timeout_ms();
+    uint64_t reply_to = http_reply_timeout_ms();
     if (!http_to && !ws_to) return;
 
     sw_process_t *self = sw_self();
@@ -1300,7 +1324,16 @@ static void http_sweep_idle(void) {
         if (!c->active || !c->port || c->owner != self) continue;
         uint64_t to = (c->mode == SW_HTTP_MODE_WS) ? ws_to : http_to;
         if (!to) continue;                       /* exempt (e.g. WS default) */
-        uint64_t idle = now - c->last_activity_ms;
+        uint64_t seen = c->last_activity_ms;
+        uint64_t rx = atomic_load_explicit(&c->port->last_rx_ms, memory_order_relaxed);
+        if (rx > seen) seen = rx;
+        uint64_t idle = seen < now ? now - seen : 0;
+        if (c->mode != SW_HTTP_MODE_WS && atomic_load(&c->pending) > 0) {
+            /* Reply owed: the client is waiting on us, not idle. */
+            uint64_t owed = now - atomic_load(&c->pending_since_ms);
+            if (!reply_to || owed < reply_to) continue;
+            idle = owed;
+        }
         if (idle >= to) {
             victim_cid[nv]  = i;
             victim_port[nv] = c->port;
