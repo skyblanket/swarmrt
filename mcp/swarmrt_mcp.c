@@ -3109,6 +3109,9 @@ static void tool_set_project(json_node_t *args, jbuf_t *out) {
  */
 static int shell_arg_safe(const char *s) {
     if (!s || !s[0]) return 0;
+    /* A leading '-' reaches git as an option, not a value: a `ref` of
+     * `--output=/path` made `git diff` write an arbitrary file (#109). */
+    if (s[0] == '-') return 0;
     for (const char *p = s; *p; p++) {
         unsigned char c = (unsigned char)*p;
         if (isalnum(c)) continue;
