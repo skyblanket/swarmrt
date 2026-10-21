@@ -4,6 +4,22 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-21 — Stackless processes: the runtime half
+
+**feat(runtime): a process can park without holding a stack (PROCESS_WEIGHT.md Phase
+2c, runtime).** A process spawned with `sw_spawn_v` (a value-returning entry) can
+suspend by returning `SW_SUSPEND`. Each generated frame on the way out saves its
+locals into a heap frame, and the driver (`sw_run_stackless`) ends the run. The
+scheduler then commits the wait: a yield re-enqueues the process, and a receive parks
+it with the Dekker protocol of `sw_mailbox_wait_new`, arming a timer for its deadline.
+Resuming re-enters the innermost frame, whose value goes to its caller's frame. The
+frame API is in `src/swarmrt_frames.h`. `make test-frames` drives it with hand-written
+frames: 10,000 parked processes add 6–12 mappings, where pinned stacks would add
+20,000. The codegen emits these frames from Phase 2c's next PR; until then every
+compiled process still blocks the old way.
+
+**fix(hops): mutual tail calls park in the process, not in thread-locals (#164).**
+
 ## 2026-10-21 — The codegen hoists every local to function scope
 
 **refactor(codegen): locals are declared once, at the top of each generated function

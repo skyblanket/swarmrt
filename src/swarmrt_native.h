@@ -439,6 +439,28 @@ struct sw_process {
      * stack_mem/stack_size above describe the carrier's stack. At struct END
      * so it shifts no asm-pinned offset. */
     struct sw_carrier *carrier;
+
+    /* Mutual-tail-call park (sw_tc_park in swarmrt_lang.c), allocated on the
+     * process's first hop and kept with the slab slot like gen_exec. */
+    struct sw_tc_park *tc_park;
+
+    /* Stackless execution (swarmrt_frames.h). entry_v is the value-returning
+     * entry of a process spawned with sw_spawn_v (NULL otherwise). While the
+     * process is parked, cont is its innermost heap frame; cap_inner and
+     * cap_outer hold the chain being captured during an unwind. wait_kind and
+     * wait_arg are the intent the scheduler commits after the run;
+     * wait_timer is a deadline timer to cancel on resume. */
+    struct sw_val *(*entry_v)(void *);
+    struct sw_frame *cont, *cap_inner, *cap_outer;
+    /* The chain of a run in progress (the driver's k and waiting), kept
+     * here so process_destroy can free it if the run panics. */
+    struct sw_frame *run_k, *run_waiting;
+    struct sw_val *resume_val;
+    uint64_t wait_arg;
+    uint64_t wait_timer;
+    uint32_t no_suspend;
+    uint8_t wait_kind;
+    uint8_t started;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
