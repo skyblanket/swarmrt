@@ -3643,8 +3643,9 @@ static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, .
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    (void)line;
     snprintf(interp->error_msg, sizeof(interp->error_msg), "panic: %s", msg);
+    interp->panic_line = interp->panic_pending_line = line;
+    interp->panic_nframes = 0;
     interp->error = 1;
     interp->panicking = 1;   /* uncatchable — N_TRY must not absorb a panic */
 }
@@ -4213,6 +4214,19 @@ typedef struct {
 
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env);
 
+/* Unwind hooks for the panic report. interp_eval_body records the frame that
+ * was running when the panic hit (at panic_pending_line); the call site then
+ * moves panic_pending_line to the line in the caller that made the call. */
+static void interp_panic_frame(sw_interp_t *interp, const char *name) {
+    if (!interp->panicking || interp->panic_nframes >= 64) return;
+    interp->panic_frames[interp->panic_nframes].name = name;
+    interp->panic_frames[interp->panic_nframes].line = interp->panic_pending_line;
+    interp->panic_nframes++;
+}
+static void interp_panic_caller_line(sw_interp_t *interp, int call_line) {
+    if (interp->panicking && call_line > 0) interp->panic_pending_line = call_line;
+}
+
 /* Child-fiber panic propagation, shared by every interpreter fiber that runs a
  * user fn as a process (plain spawn AND supervised children). If `interp` was
  * left in a crashed state by eval(), (1) clear the SHARED flags so the crash
@@ -4230,7 +4244,26 @@ static void interp_fiber_propagate_panic(sw_interp_t *interp) {
     snprintf(reason, sizeof(reason), "%s", m);
     /* Same loud report the compiled _sw_runtime_panic prints. */
     fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", reason);
+    if (interp->src_file && interp->panic_line > 0)
+        fprintf(stderr, "  at %s:%d\n", interp->src_file, interp->panic_line);
+    if (interp->panic_nframes > 0) {
+        const char *root_mod = interp->module_ast
+            ? ((node_t *)interp->module_ast)->v.mod.name : "?";
+        fprintf(stderr, "  call chain (innermost first):\n");
+        for (int i = 0; i < interp->panic_nframes; i++) {
+            const char *nm = interp->panic_frames[i].name;
+            char mod[128], fn[128];
+            snprintf(mod, sizeof(mod), "%s", root_mod);
+            snprintf(fn, sizeof(fn), "%s", (nm && *nm) ? nm : "<lambda>");
+            char *dot = strchr(fn, '.');
+            if (dot) { *dot = '\0'; snprintf(mod, sizeof(mod), "%s", fn);
+                       snprintf(fn, sizeof(fn), "%s", nm + (dot - fn) + 1); }
+            fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", i, mod, fn, mod,
+                    interp->panic_frames[i].line);
+        }
+    }
     fflush(stderr);
+    interp->panic_nframes = 0;
     interp->error = 0;
     interp->panicking = 0;
     interp->error_msg[0] = '\0';
@@ -4300,7 +4333,7 @@ static void _sup_interp_entry(void *raw) {
         interp->call_depth++;
         (void)interp_eval_body(interp, fn, fenv);
         interp->call_depth--;
-        env_free(fenv);
+            env_free(fenv);
     }
     /* `c` is THIS incarnation's private copy; freed in process_destroy via the
      * dtor sup_start_child armed (free_start_arg) before this fiber ran. */
@@ -4503,6 +4536,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         snprintf(interp->error_msg, sizeof(interp->error_msg),
                  "panic: %s", buf ? buf : "(no message)");
         free(buf);
+        interp->panic_line = interp->panic_pending_line = line;
+        interp->panic_nframes = 0;
         interp->error = 1;
         interp->panicking = 1;
         return sw_val_nil();
@@ -6163,12 +6198,24 @@ static void bind_params(sw_interp_t *interp, node_t *fn, sw_env_t *fenv, sw_val_
  * run any tail calls it requests in this same C frame. */
 static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
     sw_env_t *own = NULL;          /* env this loop created for a tail target */
+    node_t *first_fn = fn;         /* entry fn, replaced by tail calls */
+    int first_tail_line = 0;       /* its line at the first tail call */
     for (;;) {
         if (sw_check_reds()) sw_yield();   /* reduction-counted preemption */
         sw_val_t *r = eval(interp, fn->v.fun.body, fenv);
         if (own) { env_free(own); own = NULL; }
-        if (!interp->tail_pending) return r;
+        if (!interp->tail_pending) {
+            if (interp->panicking) {
+                interp_panic_frame(interp, fn->v.fun.name);
+                if (fn != first_fn && first_tail_line > 0) {
+                    interp->panic_pending_line = first_tail_line;
+                    interp_panic_frame(interp, first_fn->v.fun.name);
+                }
+            }
+            return r;
+        }
         interp->tail_pending = 0;
+        if (!first_tail_line) first_tail_line = interp->tail_line;
         if (interp->error) return sw_val_nil();
         sw_val_t *args[16];
         int nargs = interp->tail_nargs;
@@ -6421,6 +6468,7 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
         interp->call_depth++;
         sw_val_t *r = interp_eval_body(interp, fn, fenv);
         interp->call_depth--;
+        interp_panic_caller_line(interp, n->line);
         env_free(fenv);
         return r;
     }
@@ -6436,6 +6484,7 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
         interp->call_depth++;
         sw_val_t *r = interp_eval_body(interp, fn_node, fenv);
         interp->call_depth--;
+        interp_panic_caller_line(interp, n->line);
         env_free(fenv);
         return r;
     }
@@ -6806,6 +6855,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
             if (tf) {
                 interp->tail_pending = 1;
                 interp->tail_fn = tf;
+                interp->tail_line = n->line;
                 interp->tail_env = tenv;
                 interp->tail_nargs = nargs;
                 memcpy(interp->tail_args, args, sizeof(sw_val_t *) * (size_t)nargs);

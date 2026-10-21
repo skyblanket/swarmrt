@@ -172,6 +172,7 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
 
     /* Run main(). */
     sw_interp_t *interp = sw_lang_new(main_ast);
+    interp->src_file = path;
     int has_main = 0;
     for (int i = 0; i < root->v.mod.nfuns; i++)
         if (strcmp(root->v.mod.funs[i]->v.fun.name, "main") == 0) { has_main = 1; break; }

@@ -151,7 +151,17 @@ typedef struct {
     struct node *tail_fn;
     sw_env_t *tail_env;
     int tail_nargs;
+    int tail_line;                   /* source line of the pending tail call */
     sw_val_t *tail_args[16];
+    /* Panic report for `swc run` (compiled-path parity: "at FILE:LINE" + call
+     * chain). A panic unwinds synchronously on one fiber, so each user-fn
+     * return appends its frame while interp->panicking is set — no shared
+     * live call stack needed (fibers interleave at receive). */
+    const char *src_file;            /* path given to `swc run`, or NULL */
+    int panic_line;                  /* line where the panic was raised */
+    int panic_pending_line;          /* line the next-recorded frame was at */
+    int panic_nframes;
+    struct { const char *name; int line; } panic_frames[64];
 } sw_interp_t;
 
 /* === Public API === */
