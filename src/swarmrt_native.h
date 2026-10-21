@@ -452,6 +452,9 @@ struct sw_process {
      * wait_timer is a deadline timer to cancel on resume. */
     struct sw_val *(*entry_v)(void *);
     struct sw_frame *cont, *cap_inner, *cap_outer;
+    /* The chain of a run in progress (the driver's k and waiting), kept
+     * here so process_destroy can free it if the run panics. */
+    struct sw_frame *run_k, *run_waiting;
     struct sw_val *resume_val;
     uint64_t wait_arg;
     uint64_t wait_timer;

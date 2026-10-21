@@ -3090,11 +3090,14 @@ int sw_run_stackless(sw_process_t *p) {
     if (!p->started) {
         p->started = 1;
         k = NULL;
+        p->run_k = p->run_waiting = NULL;
         r = p->entry_v(p->arg);
     } else {
         k = p->cont;
         p->cont = NULL;
         if (!k) return SW_RUN_EXITED;
+        p->run_k = k;
+        p->run_waiting = NULL;
         r = k->resume(k);
     }
     for (;;) {
@@ -3109,12 +3112,15 @@ int sw_run_stackless(sw_process_t *p) {
                 abort();
             }
             p->cont = top;
+            p->run_k = p->run_waiting = NULL;
             return SW_RUN_SUSPENDED;
         }
         if (r == SW_TC_HOP) {
             /* The resumed body tail-called: its frame is done, and the
              * hop's value goes where the body's would have. */
             if (k) { waiting = k->parent; sw_frame_free(k); k = NULL; }
+            p->run_k = NULL;
+            p->run_waiting = waiting;
             sw_tc_park_t *pk = sw_tc_park();
             sw_varena_mark_t fl = pk->floor;
             r = pk->fn(pk->args, pk->n, &fl, NULL);
@@ -3122,10 +3128,12 @@ int sw_run_stackless(sw_process_t *p) {
         }
         sw_frame_t *next;
         if (k) { next = k->parent; sw_frame_free(k); } else next = waiting;
-        if (!next) return SW_RUN_EXITED;
+        if (!next) { p->run_k = p->run_waiting = NULL; return SW_RUN_EXITED; }
         p->resume_val = r;
         k = next;
         waiting = NULL;
+        p->run_k = k;
+        p->run_waiting = NULL;
         r = k->resume(k);
     }
 }
