@@ -129,6 +129,9 @@ static const char *_c_reserved_words[] = {
     "inline", "int", "long", "register", "restrict", "return", "short",
     "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
     "unsigned", "void", "volatile", "while",
+    /* names the generated code itself declares in a function's scope: a sw
+     * local or parameter spelled the same must not shadow or redeclare them */
+    "_args", "_nargs", "_sw_tc_fl", "_gc_floor",
     NULL
 };
 
@@ -1499,7 +1502,7 @@ static void emit_forward_decls(cg_ctx_t *ctx, node_t *mod) {
     FILE *f = ctx->out;
     fprintf(f, "/* === Forward declarations === */\n");
     for (int i = 0; i < mod->v.mod.nfuns; i++) {
-        fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_fl);\n",
+        fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
         fprintf(f, "static sw_val_t *%s_%s(sw_val_t **_args, int _nargs);\n",
                 ctx->mod_name, mod->v.mod.funs[i]->v.fun.name);
@@ -3733,9 +3736,9 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
         ctx->last_line_emitted = 0;
     }
 
-    fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_fl) {\n",
+    fprintf(f, "static sw_val_t *%s_%s__b(sw_val_t **_args, int _nargs, sw_varena_mark_t *_sw_tc_fl) {\n",
             ctx->mod_name, fn->v.fun.name);
-    fprintf(f, "    (void)_fl;\n");
+    fprintf(f, "    (void)_sw_tc_fl;\n");
 
     /* Parameter extraction */
     if (fn->v.fun.nparams > 0) {
@@ -3779,10 +3782,10 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     /* Tail call label. Ownership v2: record the arena "floor" at entry — the
      * scoped turn-checkpoint (emit_call) reclaims only what THIS function
      * allocates above it, never the caller's live values below it. A hop
-     * (emit_call) arrives with the floor of the chain's entry in `_fl`, so the
+     * (emit_call) arrives with the floor of the chain's entry in `_sw_tc_fl`, so the
      * whole mutual loop shares one floor, as a self-loop does. */
     if (ctx->has_tail) {
-        fprintf(f, "    sw_varena_mark_t _gc_floor = _fl ? *_fl : sw_varena_mark(sw_self_varena());\n");
+        fprintf(f, "    sw_varena_mark_t _gc_floor = _sw_tc_fl ? *_sw_tc_fl : sw_varena_mark(sw_self_varena());\n");
         fprintf(f, "    (void)_gc_floor;\n");
         fprintf(f, "_tail:;\n");
     }

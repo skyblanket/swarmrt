@@ -40,6 +40,12 @@ fun depth(n) { if (n == 0) { 0 } else { 1 + depth(n - 1) } }
 fun mixed(n) { if (n == 0) { depth(100) } else { mixed_b(n - 1) } }
 fun mixed_b(n) { mixed(n) }
 
+# User locals named like codegen-internal names (`_fl` was the hop's arena
+# floor, `_sw_tc_fl` is now, `_args` holds the arguments) must still compile:
+# generated names can't collide with user ones.
+fun reserved_a(n) { _fl = n * 2 ; _sw_tc_fl = _fl ; _args = _sw_tc_fl ; if (n == 0) { _args } else { reserved_b(n - 1) } }
+fun reserved_b(n) { reserved_a(n) }
+
 fun main() {
     failures = 0
 
@@ -73,6 +79,10 @@ fun main() {
     failures = failures + (if (mixed(100001) == 100) { print("PASS non_tail_mixed") ; 0 }
                            else { print("FAIL non_tail_mixed"); 1 })
 
-    if (failures == 0) { print("OK test_mutual_tail 5/5") ; sys_exit(0) }
+    # --- 6. a user local named like a generated parameter
+    failures = failures + (if (reserved_a(1000) == 0) { print("PASS reserved_local_name") ; 0 }
+                           else { print("FAIL reserved_local_name"); 1 })
+
+    if (failures == 0) { print("OK test_mutual_tail 6/6") ; sys_exit(0) }
     else { print(f"FAIL test_mutual_tail: {failures}") ; sys_exit(1) }
 }
