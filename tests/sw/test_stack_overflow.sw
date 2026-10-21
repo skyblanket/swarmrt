@@ -26,7 +26,13 @@ fun tick_loop(n) {
 
 fun ping(n) { pong(n + 1) }
 fun pong(n) { ping(n + 1) }
-fun runaway() { ping(0) }
+# Wait for 'go' so the parent's link() lands BEFORE the overflow; otherwise a
+# fast child can die first and link() then sees only the bare exit code.
+fun runaway() {
+    receive {
+        'go' -> ping(0)
+    }
+}
 
 fun main() {
     failures = 0
@@ -40,6 +46,7 @@ fun main() {
     trap_exit('true')
     w = spawn(runaway())
     link(w)
+    send(w, 'go')
     got = receive {
         {'EXIT', _, reason} -> reason
         after 30000 { 'no_exit' }
