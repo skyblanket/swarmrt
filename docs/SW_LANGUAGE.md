@@ -684,6 +684,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `format(template, args...)` | `format("hi {} ({} req)", name, n)` — positional `{}` placeholders, `{{` / `}}` escape to literal braces. (For inline-expression interpolation use an f-string: `f"hi {name} #{n}"`.) |
 | `strip_html(html)` | tags stripped, entities decoded |
 | `clean_json(s)` | strip code fences and trailing commas |
+| `Std.string_repeat(s, n)` | `s` repeated `n` times (`import Std`; `""` when `n <= 0`) |
 
 ### Base64
 | | |
@@ -760,6 +761,10 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `to_int(v)` | parse a string (`to_int("42")` → `42`), truncate a float, or pass an int; **`nil`** on a non-numeric string |
 | `to_float(v)` | parse a string (`to_float("3.14")` → `3.14`) or widen a number; **`nil`** on a non-numeric string |
 | `uuid()` | a random RFC-4122 v4 UUID string (e.g. `"f47ac10b-58cc-4372-a567-0e02b2c3d479"`) |
+| `random_int(lo, hi)` | uniform random int in `[lo, hi]`, both ends inclusive (`random_int(1, 6)` → a die roll); returns `lo` when `hi <= lo`. Backed by the OS CSPRNG, so it is not seedable. Ranges wider than 2³² are truncated |
+| `random()` / `random(n)` | seedable PRNG (xoshiro256**, per-thread state, no lock): `random()` → float in `[0, 1)`; `random(n)` → int in `[0, n)` (`0` when `n <= 0`) |
+| `random_seed(n)` | seed the calling scheduler's PRNG so `random` is reproducible; returns `:ok`. Unseeded, it starts from the OS CSPRNG |
+| `band(a,b)` `bor(a,b)` `bxor(a,b)` `bsl(a,n)` `bsr(a,n)` | 64-bit integer bitwise and / or / xor / shift-left / arithmetic shift-right. Shift counts outside `0..63` give `0` |
 | `now_iso()` | current UTC time as ISO-8601 (`"2026-06-06T13:08:05Z"`) |
 | `ord(s)` | first byte of a string as an int (`ord("A")` → `65`) |
 | `typeof(v)` | type as a string: `"int"`, `"float"`, `"string"`, `"atom"`, `"list"`, `"map"`, `"tuple"`, `"bytes"`, `"pid"`, … |
