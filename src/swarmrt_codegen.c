@@ -4422,18 +4422,21 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * longer monopolises its scheduler thread — before, only self-tail-call
      * backedges yielded and such a process starved everything queued
      * behind it. One TLS decrement per call; a no-op outside a fiber. */
-    emit_reds_point(ctx, "    ");
 
-    /* Tail call label. Ownership v2: record the arena "floor" at entry — the
-     * scoped turn-checkpoint (emit_call) reclaims only what THIS function
-     * allocates above it, never the caller's live values below it. A hop
-     * (emit_call) arrives with the floor of the chain's entry in `_sw_tc_fl`, so the
-     * whole mutual loop shares one floor, as a self-loop does. */
+    /* Ownership v2: record the arena "floor" at entry — the scoped
+     * turn-checkpoint (emit_call) reclaims only what THIS function allocates
+     * above it, never the caller's live values below it. A hop (emit_call)
+     * arrives with the floor of the chain's entry in `_sw_tc_fl`, so the whole
+     * mutual loop shares one floor, as a self-loop does. It is set BEFORE the
+     * entry suspend point: a resume gets no `_sw_tc_fl`, so the frame must
+     * carry the chain's floor, or each resume would raise it. */
     if (ctx->has_tail) {
         fprintf(f, "    sw_varena_mark_t _gc_floor = _sw_tc_fl ? *_sw_tc_fl : sw_varena_mark(sw_self_varena());\n");
         fprintf(f, "    (void)_gc_floor;\n");
-        fprintf(f, "_tail:;\n");
     }
+    emit_reds_point(ctx, "    ");
+    if (ctx->has_tail)
+        fprintf(f, "_tail:;\n");
 
     /* Body */
     char result[32];
