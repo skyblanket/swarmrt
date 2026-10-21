@@ -4441,6 +4441,7 @@ static sw_val_t *_builtin_registered(sw_val_t **a, int n) {
  *   msgsize_dropped  messages dropped by the SW_MSG_MAX_BYTES size cap
  *   overflow_queue   global overflow run-queue length (work no scheduler
  *                    has claimed; read under its own cold mutex)
+ *   resident_bytes   process RSS in bytes (/proc/self/statm; getrusage fallback)
  *   scheduler_stats  per-scheduler list of %{id, procs_run, loop_iters,
  *                    idle_waits, steals} — best-effort lock-free reads of the
  *                    scheduler debug counters (the watchdog contract; a stale
@@ -4484,7 +4485,7 @@ static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
     sw_val_t *sched_list = sw_val_list(scheds, (int)nsched);
     free(scheds);
 
-    sw_val_t *keys[11], *vals[11];
+    sw_val_t *keys[12], *vals[12];
     int c = 0;
     keys[c] = sw_val_atom("processes");       vals[c] = sw_val_int(live); c++;
     keys[c] = sw_val_atom("schedulers");      vals[c] = sw_val_int((int64_t)nsched); c++;
@@ -4500,6 +4501,7 @@ static sw_val_t *_builtin_swarm_stats(sw_val_t **a, int n) {
     /* draining: 1 once graceful shutdown has begun — a readiness probe
      * (/readyz) fails on this so a load balancer stops routing here. */
     keys[c] = sw_val_atom("draining");        vals[c] = sw_val_atom(sw_is_draining() ? "true" : "false"); c++;
+    keys[c] = sw_val_atom("resident_bytes");  vals[c] = sw_val_int(sw_resident_bytes()); c++;
     keys[c] = sw_val_atom("scheduler_stats"); vals[c] = sched_list; c++;
     return sw_val_map_new(keys, vals, c);
 }
