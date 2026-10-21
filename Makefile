@@ -113,6 +113,13 @@ otp-test: core-objs
 phase2: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/test_phase2.c -o $(BIN_DIR)/test-phase2 $(LDFLAGS)
 
+# Stackless processes: the suspend protocol with hand-written frames
+frames: core-objs
+	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/test_frames.c -o $(BIN_DIR)/test-frames $(LDFLAGS)
+
+test-frames: frames
+	./$(BIN_DIR)/test-frames
+
 # Phase 3 tests (Task + ETS)
 phase3: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/test_phase3.c -o $(BIN_DIR)/test-phase3 $(LDFLAGS)
@@ -201,7 +208,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
+test-full: test-core test-otp test-phase2 test-frames test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.

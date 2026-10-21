@@ -43,6 +43,7 @@
 #include "swarmrt_phase5.h"
 #include "swarmrt_hotload.h"
 #include "swarmrt_varena.h"   /* GC v1 per-process value arena */
+#include "swarmrt_frames.h"   /* stackless processes (PROCESS_WEIGHT.md Phase 2c) */
 #include <stddef.h>
 
 /* The context-switch asm (swarmrt_asm.S) reads sw_process fields by HARDCODED
@@ -307,6 +308,8 @@ static size_t g_env_proc_stack = 0;
 /* GC v2: region handed to the next sw_spawn_opts to record on the child's
  * proc->spawn_region (pre-runnable). Set by sw_spawn_owned, consumed once. */
 static __thread struct sw_value_arena *g_pending_spawn_region = NULL;
+/* sw_spawn_v: the value-returning entry, read by process_init_arena. */
+static __thread struct sw_val *(*g_pending_entry_v)(void *) = NULL;
 
 /* Per-process teardown hook handed to the next sw_spawn_opts to record on the
  * child's proc->on_destroy BEFORE it is runnable — so even a pre-trampoline kill
@@ -823,6 +826,7 @@ typedef struct sw_carrier {
     sw_process_t *proc;        /* process this run is for */
     void (*entry)(void *);     /* its entry and arg, snapshotted under */
     void *arg;                 /* ctx_lock with the generation check */
+    int stackless;             /* the process has an entry_v: run the driver */
     int *outcome;              /* set to 1 by carrier_main when the entry returned */
     struct sw_carrier *next;   /* free list / all-carriers list */
     struct sw_carrier *all_next;
@@ -974,9 +978,13 @@ static void carrier_main(void *arg) {
     sw_carrier_t *c = (sw_carrier_t *)arg;
     for (;;) {
         sw_process_t *p = c->proc;
-        c->entry(c->arg);
-        atomic_store_explicit(&p->state, SW_PROC_EXITING, memory_order_relaxed);
-        if (c->outcome) *c->outcome = 1;
+        int r = SW_RUN_EXITED;
+        if (c->stackless) r = sw_run_stackless(p);
+        else c->entry(c->arg);
+        /* p->scheduler may have changed if the run pinned and resumed elsewhere */
+        if (r == SW_RUN_EXITED)
+            atomic_store_explicit(&p->state, SW_PROC_EXITING, memory_order_relaxed);
+        if (c->outcome) *c->outcome = r;
         /* p->scheduler is the scheduler running p now (set before every run),
          * read through the process, not a thread-local: a pinned carrier can
          * finish on a different scheduler than it started on (#141). */
@@ -1018,6 +1026,13 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
         proc->varena = gc_off ? NULL : sw_varena_create(1024);
     }
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
+    proc->cont = proc->cap_inner = proc->cap_outer = NULL;
+    proc->resume_val = NULL;
+    proc->wait_kind = SW_WAIT_NONE;
+    proc->wait_arg = 0;
+    proc->wait_timer = 0;
+    proc->no_suspend = 0;
+    proc->started = 0;
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
     proc->try_chain = NULL;      /* per-process compiled try/catch chain (see sw_self_try_chain) */
 
@@ -1049,6 +1064,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
      * dispatch snapshots both under the same lock (see scheduler_loop). */
     proc->entry = entry;
     proc->arg = arg;
+    proc->entry_v = g_pending_entry_v;
 
     /* proc->ctx is only meaningful while pinned: it is saved by the old-style
      * swap that pins the process, and read by sw_safe_swap_into to resume it. */
@@ -1107,6 +1123,19 @@ static void process_destroy(sw_process_t *proc) {
      * can immediately reuse this slot and reinitialize it. */
     uint32_t block_idx = proc->heap_block_idx;
     uint32_t slot = proc->arena_slot;
+
+    /* Parked stacklessly: drop its frames and its deadline timer. */
+    if (proc->wait_timer) { sw_cancel_timer(proc->wait_timer); proc->wait_timer = 0; }
+    for (sw_frame_t *fr = proc->cont, *nx; fr; fr = nx) { nx = fr->parent; free(fr); }
+    proc->cont = NULL;
+    if (proc->cap_inner) {
+        /* Died mid-capture: free the frames captured so far. */
+        for (sw_frame_t *fr = proc->cap_inner, *nx; fr; fr = nx) {
+            nx = fr == proc->cap_outer ? NULL : fr->parent;
+            free(fr);
+        }
+        proc->cap_inner = proc->cap_outer = NULL;
+    }
 
     /* Killed while pinned: its carrier's frames are dead, the carrier is free. */
     if (proc->carrier) {
@@ -1739,6 +1768,36 @@ static void root_exit_check(sw_process_t *proc, int reason) {
     }
 }
 
+/* Commit the wait a stackless process recorded before it suspended
+ * (PROCESS_WEIGHT.md §3.3). Runs on the scheduler, after the run. */
+static void sw_commit_wait(sw_scheduler_t *sched, sw_process_t *proc) {
+    uint8_t kind = proc->wait_kind;
+    proc->wait_kind = SW_WAIT_NONE;
+    if (kind == SW_WAIT_RECV) {
+        /* The Dekker park of sw_mailbox_wait_new: publish `waiting`, then
+         * re-check for mail (and a kill) that arrived before it was set. */
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&proc->mailbox.sig_head, memory_order_seq_cst) ||
+                proc->kill_flag) {
+            if (atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_seq_cst)) {
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
+                sw_add_to_runq(&sched->runq, proc);
+            }
+            return;   /* else a waker already enqueued it */
+        }
+        /* A waker that enqueues it now enqueues onto this scheduler's run
+         * queue, which only this thread pops: the timer is armed before the
+         * process can run again. */
+        if (proc->wait_arg != UINT64_MAX)
+            proc->wait_timer = sw_send_after(proc->wait_arg, proc, SW_TAG_NONE, NULL);
+        return;
+    }
+    /* SW_WAIT_YIELD, or a suspension that recorded no intent */
+    atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
+    sw_add_to_runq(&sched->runq, proc);
+}
+
 static void scheduler_loop(sw_scheduler_t *sched) {
     tls_scheduler = sched;
     _sw_gen = &_sw_gen_fallback;  /* valid before the first switch-in sets it */
@@ -1854,7 +1913,10 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 int stale;
                 sw_spin_lock(&proc->ctx_lock);
                 stale = atomic_load_explicit(&proc->generation, memory_order_acquire) != expected_gen;
-                if (!stale && c) { c->entry = proc->entry; c->arg = proc->arg; }
+                if (!stale && c) {
+                    c->entry = proc->entry; c->arg = proc->arg;
+                    c->stackless = proc->entry_v != NULL;
+                }
                 sw_spin_unlock(&proc->ctx_lock);
                 if (stale) {
                     if (c) carrier_release(sched, c);
@@ -1885,10 +1947,11 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 sched->current = NULL;
                 continue;
             }
-            /* The run unwound to carrier_main (or the process died while on
-             * it): the carrier is free. Otherwise the process blocked inside
-             * a C primitive and stays pinned until a later run finishes. */
-            if (proc->carrier && (outcome == 1 ||
+            /* The run unwound to carrier_main (it exited or suspended
+             * stacklessly, or the process died while on it): the carrier is
+             * free. Otherwise the process blocked inside a C primitive and
+             * stays pinned until a later run finishes. */
+            if (proc->carrier && (outcome != 0 ||
                     atomic_load_explicit(&proc->state, memory_order_relaxed) == SW_PROC_EXITING)) {
                 sw_carrier_t *done = proc->carrier;
                 proc->carrier = NULL;
@@ -1904,6 +1967,14 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             /* A blocking section never outlives its process's time slice
              * (a builtin that parked or panicked inside one). */
             atomic_store_explicit(&sched->runq.blocking, 0, memory_order_relaxed);
+
+            /* Suspended stacklessly: nothing of it is on any stack now, so
+             * the wait it asked for can be committed race-free. */
+            if (outcome == SW_RUN_SUSPENDED &&
+                    atomic_load_explicit(&proc->state, memory_order_relaxed) != SW_PROC_EXITING) {
+                sw_commit_wait(sched, proc);
+                continue;
+            }
 
             if (proc->state == SW_PROC_EXITING) {
                 /* Process finished or killed — clean up */
@@ -2618,6 +2689,25 @@ sw_process_t *sw_spawn_owned(void (*entry)(void*), void *arg, struct sw_value_ar
     g_pending_spawn_region = region;
     sw_process_t *p = sw_spawn_opts(entry, arg, SW_PRIO_NORMAL);
     g_pending_spawn_region = NULL;   /* clear if spawn failed before consuming */
+    return p;
+}
+
+/* Stackless-capable spawn: the entry returns a value (swarmrt_frames.h). The
+ * void entry slot is never called for such a process. */
+static void sw_entry_v_unused(void *arg) { (void)arg; }
+
+sw_process_t *sw_spawn_v(sw_val_t *(*entry)(void *), void *arg) {
+    g_pending_entry_v = entry;
+    sw_process_t *p = sw_spawn_opts(sw_entry_v_unused, arg, SW_PRIO_NORMAL);
+    g_pending_entry_v = NULL;
+    return p;
+}
+
+sw_process_t *sw_spawn_v_owned(sw_val_t *(*entry)(void *), void *arg,
+                               struct sw_value_arena *region) {
+    g_pending_spawn_region = region;
+    sw_process_t *p = sw_spawn_v(entry, arg);
+    g_pending_spawn_region = NULL;
     return p;
 }
 

@@ -17,6 +17,7 @@
 
 #include "swarmrt_native.h"
 #include "swarmrt_varena.h"   /* sw_varena_mark_t for sw_turn_checkpoint */
+#include "swarmrt_frames.h"   /* stackless processes: SW_SUSPEND, frames */
 
 /* === Value Representation === */
 

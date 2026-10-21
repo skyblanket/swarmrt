@@ -3012,6 +3012,111 @@ sw_val_t *deep_copy_into(sw_val_t *v, sw_value_arena_t *region) {
 /* Mutual tail-call hop state (see swarmrt_lang.h). The sentinel only needs a
  * unique address; it is never read as a value. */
 sw_val_t sw_tc_hop_sentinel;
+/* ===== Stackless processes (swarmrt_frames.h, PROCESS_WEIGHT.md §3.3–3.5) ===== */
+
+struct sw_val sw_suspend_sentinel;
+
+int sw_suspend_ok(void) {
+    sw_process_t *p = sw_self();
+    return p && p->entry_v && p->no_suspend == 0;
+}
+
+void sw_suspend_yield(void) {
+    sw_process_t *p = sw_self();
+    if (p) p->wait_kind = SW_WAIT_YIELD;
+}
+
+void sw_suspend_recv(uint64_t timeout_ms) {
+    sw_process_t *p = sw_self();
+    if (!p) return;
+    p->wait_kind = SW_WAIT_RECV;
+    p->wait_arg = timeout_ms;
+}
+
+sw_frame_t *sw_frame_new(uint32_t size, sw_val_t *(*resume)(sw_frame_t *),
+                         const sw_fn_meta_t *meta) {
+    sw_frame_t *f = (sw_frame_t *)calloc(1, size);
+    if (!f) {
+        fprintf(stderr, "[SwarmRT] out of memory capturing a suspended frame\n");
+        abort();
+    }
+    f->resume = resume;
+    f->meta = meta;
+    f->size = size;
+    return f;
+}
+
+void sw_frame_link(sw_frame_t *f, int resumed) {
+    sw_process_t *p = sw_self();
+    if (!p) return;
+    if (!resumed) f->parent = NULL;      /* set by the next frame out, or the driver */
+    if (p->cap_outer) p->cap_outer->parent = f;
+    else p->cap_inner = f;
+    p->cap_outer = f;
+}
+
+void sw_frame_free(sw_frame_t *f) { free(f); }
+
+sw_val_t *sw_resume_value(void) {
+    sw_process_t *p = sw_self();
+    return p ? p->resume_val : NULL;
+}
+
+void sw_no_suspend_enter(void) { sw_process_t *p = sw_self(); if (p) p->no_suspend++; }
+void sw_no_suspend_exit(void)  { sw_process_t *p = sw_self(); if (p && p->no_suspend) p->no_suspend--; }
+
+/* The driver (§3.5). Runs one activation of a stackless process on its
+ * carrier: the entry the first time, the innermost parked frame after that.
+ * A finished activation's value goes to its parent frame, which resumes in
+ * turn; a resumed body that tail-calls hands over through the hop park. */
+int sw_run_stackless(sw_process_t *p) {
+    sw_frame_t *k, *waiting = NULL;
+    sw_val_t *r;
+    if (p->wait_timer) { sw_cancel_timer(p->wait_timer); p->wait_timer = 0; }
+    p->wait_kind = SW_WAIT_NONE;
+    if (!p->started) {
+        p->started = 1;
+        k = NULL;
+        r = p->entry_v(p->arg);
+    } else {
+        k = p->cont;
+        p->cont = NULL;
+        if (!k) return SW_RUN_EXITED;
+        r = k->resume(k);
+    }
+    for (;;) {
+        if (r == SW_SUSPEND) {
+            /* A fresh activation hangs under the frame waiting for it. */
+            if (!k && p->cap_outer) p->cap_outer->parent = waiting;
+            sw_frame_t *top = p->cap_inner ? p->cap_inner : waiting;
+            p->cap_inner = p->cap_outer = NULL;
+            if (!top) {
+                fprintf(stderr, "[SwarmRT] internal error: a process suspended "
+                                "without capturing a frame\n");
+                abort();
+            }
+            p->cont = top;
+            return SW_RUN_SUSPENDED;
+        }
+        if (r == SW_TC_HOP) {
+            /* The resumed body tail-called: its frame is done, and the
+             * hop's value goes where the body's would have. */
+            if (k) { waiting = k->parent; sw_frame_free(k); k = NULL; }
+            sw_tc_park_t *pk = sw_tc_park();
+            sw_varena_mark_t fl = pk->floor;
+            r = pk->fn(pk->args, pk->n, &fl);
+            continue;
+        }
+        sw_frame_t *next;
+        if (k) { next = k->parent; sw_frame_free(k); } else next = waiting;
+        if (!next) return SW_RUN_EXITED;
+        p->resume_val = r;
+        k = next;
+        waiting = NULL;
+        r = k->resume(k);
+    }
+}
+
 static __thread sw_tc_park_t sw_tc_park_tls;
 
 sw_tc_park_t *sw_tc_park(void) {
