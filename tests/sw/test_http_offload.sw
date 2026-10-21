@@ -12,12 +12,18 @@ module Test_http_offload
 # >= 2.4s; offloaded it is ~0.3s. We allow a generous 1.5s to stay robust
 # on a loaded CI host, and the test must pass even with SW_SCHEDULERS=1.
 
-# Listener port for this test. run_tests.sh gives each run its own
-# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
-# run by hand, the base falls back to 9000.
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
 fun test_port(offset) {
-    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
-    base + offset
+    test_base() + offset
 }
 
 fun slow_server() {

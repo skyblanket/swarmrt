@@ -21,12 +21,18 @@ module Test_wsc_invm_loopback
 #
 # Success = the bridge reaches O, exchanges a frame, prints DONE, exits 0.
 
-# Listener port for this test. run_tests.sh gives each run its own
-# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
-# run by hand, the base falls back to 9000.
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
 fun test_port(offset) {
-    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
-    base + offset
+    test_base() + offset
 }
 
 fun tx_server() {

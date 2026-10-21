@@ -14,12 +14,18 @@ module Test_http_hosts
 # open, so it runs under --max-time 1), and the body runs in a child with
 # SW_HTTP_HOSTS set before the runtime starts.
 
-# Listener port for this test. run_tests.sh gives each run its own
-# SW_TEST_PORT_BASE so two suite runs on one host can't bind the same port;
-# run by hand, the base falls back to 9000.
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
 fun test_port(offset) {
-    base = case getenv("SW_TEST_PORT_BASE") { 'nil' -> 9000 v -> to_int(v) }
-    base + offset
+    test_base() + offset
 }
 
 fun serve() {
@@ -77,7 +83,7 @@ fun child() {
 fun main() {
     if (getenv("SW_HTTP_HOSTS_CHILD") == "1") { child() }
     me = hd(os_args())
-    r = shell(f"SW_HTTP_HOSTS_CHILD=1 SW_SCHEDULERS=2 SW_HTTP_HOSTS='app.test:{test_port(172)}, localhost:{test_port(172)}' '" ++
+    r = shell(f"SW_TEST_PORT_BASE={test_base()} SW_HTTP_HOSTS_CHILD=1 SW_SCHEDULERS=2 SW_HTTP_HOSTS='app.test:{test_port(172)}, localhost:{test_port(172)}' '" ++
               me ++ "' 2>/dev/null")
     print(string_trim(elem(r, 1)))
     if (elem(r, 0) == 0) { print("OK http_hosts 8/8") ; sys_exit(0) }
