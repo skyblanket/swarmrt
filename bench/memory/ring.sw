@@ -29,5 +29,6 @@ fun main() {
         kick(base, 0, n)
         kick(base, 0, n)
     }
-    sleep(12000)
+    print("READY")   # measure.py starts its clock here
+    sleep(to_int(getenv_or("HOLD_MS", "12000")))
 }

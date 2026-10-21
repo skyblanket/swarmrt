@@ -132,6 +132,9 @@ jobs:
         run: make test-pkg
       - name: MCP server (root quoting, git option injection)
         run: make test-mcp
+      - name: Per-process memory (report-only, docs/design/PROCESS_WEIGHT.md)
+        continue-on-error: true
+        run: NS=10000 bash bench/memory/measure.sh
 
       - name: Phase test suite (C-side runtime tests)
         # Was not in CI before round 7 — codex review caught that
@@ -373,6 +376,9 @@ jobs:
         run: bash scripts/install_smoke.sh
       - name: Package manager (swc add / install, swarm.lock; offline git remotes)
         run: make test-pkg
+      - name: Per-process memory (report-only, docs/design/PROCESS_WEIGHT.md)
+        continue-on-error: true
+        run: NS=10000 bash bench/memory/measure.sh
 
       - name: Docs + examples still compile
         run: bash scripts/check_sw_docs.sh
