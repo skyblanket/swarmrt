@@ -54,6 +54,7 @@ set(CORE_SOURCES
     ${SRC_DIR}/swarmrt_lang.c
     ${SRC_DIR}/swarmrt_http.c
     ${SRC_DIR}/swarmrt_pdf.c
+    ${SRC_DIR}/swarmrt_varena.c
 )
 
 # swarmrt_native.c needs -fno-stack-protector (processes migrate between
@@ -104,25 +105,30 @@ endif()
 add_executable(swarmrt-native ${SRC_DIR}/benchmark_native.c)
 target_link_libraries(swarmrt-native swarmrt_lib)
 
-# Output to bin/
+# Output to bin/ by default. scripts/check_cmake_build.sh overrides it so a
+# CMake build never replaces the binaries the Makefile put there.
+if(NOT DEFINED SWARMRT_BIN_DIR)
+    set(SWARMRT_BIN_DIR ${CMAKE_SOURCE_DIR}/bin)
+endif()
+
 set_target_properties(swc sws swarmrt-native swarmrt_lib swarmrt_search
     PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin
-    ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin
+    RUNTIME_OUTPUT_DIRECTORY ${SWARMRT_BIN_DIR}
+    LIBRARY_OUTPUT_DIRECTORY ${SWARMRT_BIN_DIR}
+    ARCHIVE_OUTPUT_DIRECTORY ${SWARMRT_BIN_DIR}
 )
 
 # Test targets
 if(EXISTS ${SRC_DIR}/test_otp.c)
     add_executable(test-otp ${SRC_DIR}/test_otp.c)
     target_link_libraries(test-otp swarmrt_lib)
-    set_target_properties(test-otp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+    set_target_properties(test-otp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SWARMRT_BIN_DIR})
 endif()
 
 if(EXISTS ${SRC_DIR}/test_phase2.c)
     add_executable(test-phase2 ${SRC_DIR}/test_phase2.c)
     target_link_libraries(test-phase2 swarmrt_lib)
-    set_target_properties(test-phase2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+    set_target_properties(test-phase2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SWARMRT_BIN_DIR})
 endif()
 
 if(EXISTS ${SRC_DIR}/test_search.c)
@@ -131,7 +137,7 @@ if(EXISTS ${SRC_DIR}/test_search.c)
     if(NOT WIN32)
         target_compile_options(test-search PRIVATE -march=native)
     endif()
-    set_target_properties(test-search PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+    set_target_properties(test-search PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SWARMRT_BIN_DIR})
 endif()
 
 # MinGW-w64 cross-compilation toolchain
