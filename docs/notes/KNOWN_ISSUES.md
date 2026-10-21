@@ -8,19 +8,21 @@ a repro, impact, and current hypothesis.
 These are genuine limitations, not crashes. Each is reproducible with the
 shipped `bin/swc`.
 
-### Every live process owns a stack mapping (memory floor and a Linux process ceiling)
+### Every parked process holds a stack mapping (memory floor and a Linux process ceiling)
 
-Each process has its own mmap'd stack plus a guard page. A parked process costs at
-least one page for it (4 KB on Linux x86-64, 16 KB on Apple Silicon), and two kernel
-mappings, so stock Linux (`vm.max_map_count` 65530) runs out near 32,700 live
-processes. Past that, spawn now fails with a clear `spawn failed` panic and a stderr
-line naming the cause (it used to SIGSEGV the node). Busy message-passing processes
-cost about 12.5 KB resident each with the default `SW_TURN_RESET_BYTES` (4 KB; was
-about 250 KB at steady state with the old fixed 256 KB threshold), idle ones about
-6.4 KB (measured with `bench/memory`, Linux x86-64).
-**Workaround:** raise `vm.max_map_count` for more than ~30K live processes. The fix
-(processes that don't own a stack while parked) is designed in
-`docs/design/PROCESS_WEIGHT.md`, Phase 2.
+Processes run on pooled carrier stacks (128 KB plus a guard page). A process that is
+runnable or has finished holds none. One that is parked in receive, sleep or a
+blocking builtin keeps its carrier until it next runs to completion. Each parked
+process therefore still costs at least one page (4 KB on Linux x86-64, 16 KB on Apple
+Silicon) and two kernel mappings. Stock Linux (`vm.max_map_count` 65530) runs out near
+32,700 parked processes. Past that, a process that can't get a carrier fails with a
+`carrier stack` message on stderr and the node keeps running. Busy message-passing
+processes cost about 13.3 KB resident each with the default `SW_TURN_RESET_BYTES`
+(4 KB), and idle ones about 7.0 KB (measured with `bench/memory` at N=10K, Linux
+x86-64).
+**Workaround:** raise `vm.max_map_count` for more than ~30K parked processes. The fix
+(parked processes that hold no stack) is the rest of `docs/design/PROCESS_WEIGHT.md`
+Phase 2.
 
 ### Interpreter non-tail recursion is bounded
 

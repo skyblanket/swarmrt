@@ -297,7 +297,7 @@ static void emit_crash_json(sw_process_t *proc, int reason) {
 static __thread sw_gen_exec_t _sw_gen_fallback;
 __thread sw_gen_exec_t *_sw_gen;
 /* Per-process usable stack size in bytes. 0 = use the built-in
- * SW_PROC_STACK_SIZE default (128KB; compiled path). Set BEFORE sw_init by
+ * SW_CARRIER_STACK_DEFAULT (128KB; compiled path). Set BEFORE sw_init by
  * `swc run` so the interpreter's deep C-stack tree-walk runs on a large fiber
  * (it used to run on the 8MB OS main thread). Lazy mmap = no physical cost. */
 size_t sw_proc_stack_size = 0;
@@ -779,6 +779,193 @@ int sw_arena_init(sw_arena_t *arena, uint32_t max_procs) {
  * process_init_arena: Initialize a process using arena-allocated memory.
  * No mmap, no malloc, no calloc. Just pointer arithmetic + atomic ops.
  */
+/* ============================================================================
+ * CARRIERS — scheduler-owned stacks processes run on (PROCESS_WEIGHT.md §3.2)
+ *
+ * A process no longer owns a stack. The scheduler swaps onto a carrier, whose
+ * carrier_main calls the process's entry. If the process blocks the old way
+ * (a C primitive that sw_context_swap's to the scheduler), the carrier stays
+ * PINNED to it: proc->carrier = c, and the scheduler takes another carrier
+ * for its next run. When the process's code unwinds back to carrier_main
+ * (its entry returned), the episode is over and the carrier is free again.
+ *
+ * Invariants:
+ *  - proc->carrier is set BEFORE the run starts and cleared only after the
+ *    run reported its outcome, so any scheduler that picks the process up in
+ *    between sees it pinned and resumes it through proc->ctx (as before).
+ *  - A run's outcome is written through c->outcome, a pointer to a local of
+ *    the scheduler that started (or resumed) that run, so a later resume of
+ *    the same carrier on another scheduler can't be mistaken for this one.
+ *  - carrier_release restarts the carrier at its trampoline. A carrier whose
+ *    run was abandoned (panic, kill) never saved cproc.ctx, and its first
+ *    run has overwritten the trampoline slot the initial ctx returns
+ *    through, so the old ctx can't be trusted.
+ * ============================================================================ */
+typedef struct sw_carrier {
+    sw_process_t cproc;        /* used only for its ctx/entry/arg (asm offsets) */
+    void *map;                 /* mmap base (guard page first) */
+    size_t map_size;
+    uint8_t *stack;            /* usable region, just above the guard page */
+    size_t stack_size;
+    sw_process_t *proc;        /* process this run is for */
+    void (*entry)(void *);     /* its entry and arg, snapshotted under */
+    void *arg;                 /* ctx_lock with the generation check */
+    int *outcome;              /* set to 1 by carrier_main when the entry returned */
+    struct sw_carrier *next;   /* free list / all-carriers list */
+    struct sw_carrier *all_next;
+} sw_carrier_t;
+
+#define SW_CARRIER_POOL_MAX 64
+static sw_spinlock_t g_carrier_lock = SW_SPINLOCK_INIT;
+static sw_carrier_t *g_carrier_free;      /* idle carriers, under g_carrier_lock */
+static _Atomic int g_carrier_free_n;  /* written under g_carrier_lock */
+static sw_carrier_t *g_carrier_all;       /* every live carrier, for shutdown */
+
+static void carrier_main(void *arg);
+
+/* A stack mapping with a guard page below the usable region. */
+static int sw_stack_map(size_t usable, void **map, size_t *map_size,
+                        uint8_t **stack, size_t *stack_size) {
+#ifdef _WIN32
+    long page_size = 4096;
+    size_t total = ((size_t)page_size + usable + page_size - 1) & ~(size_t)(page_size - 1);
+    void *mem = VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem) return -1;
+    DWORD old_prot;
+    VirtualProtect(mem, page_size, PAGE_NOACCESS, &old_prot);
+#else
+    long page_size = sysconf(_SC_PAGESIZE);
+    size_t total = ((size_t)page_size + usable + page_size - 1) & ~(size_t)(page_size - 1);
+    void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return -1;
+    mprotect(mem, page_size, PROT_NONE);
+#endif
+    *map = mem;
+    *map_size = total;
+    *stack = (uint8_t *)mem + page_size;
+    *stack_size = total - page_size;
+    return 0;
+}
+
+static void sw_stack_unmap(void *map, size_t map_size) {
+#ifdef _WIN32
+    (void)map_size;
+    VirtualFree(map, 0, MEM_RELEASE);
+#else
+    munmap(map, map_size);
+#endif
+}
+
+/* Point a context at the asm trampoline, which calls owner->entry(owner->arg). */
+static void sw_ctx_init(sw_process_t *owner, uint8_t *stack, size_t stack_size) {
+    memset(&owner->ctx, 0, sizeof(sw_context_t));
+    uint8_t *stack_top = stack + stack_size;
+    stack_top = (uint8_t *)((uintptr_t)stack_top & ~0xFULL);  /* 16-byte align */
+#ifdef __aarch64__
+    owner->ctx.sp = (uint64_t)stack_top;
+    owner->ctx.pc = (uint64_t)sw_process_trampoline;
+    owner->ctx.x19 = (uint64_t)owner;  /* Trampoline reads the owner from x19 */
+#else
+    /* Pre-push the trampoline address so `ret` in context_swap jumps to it. */
+    stack_top -= 8;
+    *(uint64_t *)stack_top = (uint64_t)sw_process_trampoline;
+    owner->ctx.rsp = (uint64_t)stack_top;
+    owner->ctx.r12 = (uint64_t)owner;  /* Trampoline reads the owner from r12 */
+#endif
+    owner->ctx.stack_base = (uint64_t)stack_top;
+    owner->ctx.stack_limit = (uint64_t)stack;
+}
+
+/* Usable bytes per carrier stack: 128 KB, the old per-process stack size.
+ * The runtime embeds the tree-walking interpreter, and tools run it ON a
+ * process (tool_call -> sw_lang_call -> eval), which is recursive. Parsing is
+ * offloaded to an 8 MB helper thread in tool_define. Physical cost is touched
+ * pages only. */
+#define SW_CARRIER_STACK_DEFAULT (128 * 1024)
+static size_t sw_carrier_usable(void) {
+    extern size_t sw_proc_stack_size;
+    if (sw_proc_stack_size) return sw_proc_stack_size;
+    if (g_env_proc_stack) return g_env_proc_stack;
+    return SW_CARRIER_STACK_DEFAULT;
+}
+
+static sw_carrier_t *carrier_alloc(void) {
+    sw_spin_lock(&g_carrier_lock);
+    sw_carrier_t *c = g_carrier_free;
+    if (c) { g_carrier_free = c->next; g_carrier_free_n--; }
+    sw_spin_unlock(&g_carrier_lock);
+    if (c) return c;
+    c = (sw_carrier_t *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    if (sw_stack_map(sw_carrier_usable(), &c->map, &c->map_size, &c->stack, &c->stack_size) < 0) {
+        free(c);
+        return NULL;
+    }
+    c->cproc.entry = carrier_main;
+    c->cproc.arg = c;
+    sw_ctx_init(&c->cproc, c->stack, c->stack_size);
+    sw_spin_lock(&g_carrier_lock);
+    c->all_next = g_carrier_all;
+    g_carrier_all = c;
+    sw_spin_unlock(&g_carrier_lock);
+    return c;
+}
+
+/* Return a carrier: to the scheduler's slot if it is empty, else the pool. A
+ * full pool keeps the carrier mapped (it stays on g_carrier_all) but gives its
+ * touched pages back. */
+static void carrier_release(sw_scheduler_t *sched, sw_carrier_t *c) {
+    c->proc = NULL;
+    c->outcome = NULL;
+    if (sched && !sched->carrier) {
+        sw_ctx_init(&c->cproc, c->stack, c->stack_size);
+        sched->carrier = c;
+        return;
+    }
+#ifndef _WIN32
+    /* Over the pool's resident budget: give the touched pages back. */
+    if (atomic_load_explicit(&g_carrier_free_n, memory_order_relaxed)
+            >= SW_CARRIER_POOL_MAX)
+        madvise(c->stack, c->stack_size, MADV_DONTNEED);
+#endif
+    sw_ctx_init(&c->cproc, c->stack, c->stack_size);
+    sw_spin_lock(&g_carrier_lock);
+    c->next = g_carrier_free;
+    g_carrier_free = c;
+    g_carrier_free_n++;
+    sw_spin_unlock(&g_carrier_lock);
+}
+
+static void carriers_free_all(void) {
+    sw_carrier_t *c = g_carrier_all;
+    g_carrier_all = NULL;
+    g_carrier_free = NULL;
+    g_carrier_free_n = 0;
+    while (c) {
+        sw_carrier_t *n = c->all_next;
+        sw_stack_unmap(c->map, c->map_size);
+        free(c);
+        c = n;
+    }
+}
+
+/* The carrier's own loop. Each iteration runs one process to the end of its
+ * entry, marks it exiting (as sw_process_done did), reports the outcome to the
+ * scheduler that started or resumed this run, and swaps back. */
+static void carrier_main(void *arg) {
+    sw_carrier_t *c = (sw_carrier_t *)arg;
+    for (;;) {
+        sw_process_t *p = c->proc;
+        c->entry(c->arg);
+        atomic_store_explicit(&p->state, SW_PROC_EXITING, memory_order_relaxed);
+        if (c->outcome) *c->outcome = 1;
+        /* p->scheduler is the scheduler running p now (set before every run),
+         * read through the process, not a thread-local: a pinned carrier can
+         * finish on a different scheduler than it started on (#141). */
+        sw_context_swap(&c->cproc, &p->scheduler->sched_proc);
+    }
+}
+
 static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
                               void (*entry)(void*), void *arg) {
     sw_arena_t *arena = &g_swarm->arena;
@@ -817,7 +1004,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->try_chain = NULL;      /* per-process compiled try/catch chain (see sw_self_try_chain) */
 
     /* Per-process generated line/file/call-trace state. Lazily allocated and KEPT
-     * WITH THE SLAB SLOT across lifetimes (like stack_mem below): reset here, freed
+     * WITH THE SLAB SLOT across lifetimes: reset here, freed
      * only at slab teardown. On OOM it stays NULL and the context switch falls back
      * to a thread-local (diagnostic-only). _sw_gen is pointed here on switch-in. */
     if (!proc->gen_exec) proc->gen_exec = (sw_gen_exec_t *)calloc(1, sizeof(sw_gen_exec_t));
@@ -832,83 +1019,22 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->on_destroy = NULL;
     proc->on_destroy_arg = NULL;
 
-    /* Core fields */
+    /* No per-process stack (PROCESS_WEIGHT.md §3.2): the process runs on a
+     * scheduler's carrier, and holds one only while pinned. */
+    proc->carrier = NULL;
+    proc->stack_mem = NULL;
+    proc->stack_size = 0;
+
+    sw_spin_lock(&proc->ctx_lock);
+    atomic_fetch_add_explicit(&proc->generation, 1, memory_order_release);
+    /* Entry and arg change with the generation, under ctx_lock: a stale
+     * dispatch snapshots both under the same lock (see scheduler_loop). */
     proc->entry = entry;
     proc->arg = arg;
 
-    /* Allocate process stack with guard page (lazy — reuse across lifetimes).
-     * Layout: [GUARD PAGE | usable stack ... ]
-     * Stack grows downward; guard page at bottom catches overflow via SIGSEGV. */
-#define SW_PROC_STACK_SIZE  (128 * 1024) /* 128KB usable per process stack.
-     * The runtime embeds the tree-walking interpreter, and tools run it ON a
-     * process fiber (tool_call -> sw_lang_call -> eval). Parsing (the 8KB-token,
-     * ~14KB/frame hog) is offloaded to an 8MB helper thread in tool_define, so
-     * the fiber only carries eval — but eval is still recursive, so 64KB was
-     * tight. 128KB gives eval comfortable headroom while staying lightweight
-     * (stacks are lazily mmap'd; physical = touched pages only). */
-    if (!proc->stack_mem) {
-        /* Per-process usable stack. Defaults to SW_PROC_STACK_SIZE (128KB) so
-         * the compiled path is unchanged (millions of lightweight processes).
-         * `swc run` runs the WHOLE tree-walking interpreter on the root
-         * process fiber, which recurses deeply on the C stack (no TCO), so it
-         * sets sw_proc_stack_size large (like the 8MB OS main thread it used
-         * to run on) BEFORE sw_init. Lazy mmap means physical = touched pages,
-         * so a large reservation costs nothing for shallow programs. */
-        size_t usable = sw_proc_stack_size ? sw_proc_stack_size
-                      : g_env_proc_stack   ? g_env_proc_stack
-                      : (size_t)SW_PROC_STACK_SIZE;
-#ifdef _WIN32
-        long page_size = 4096;
-        size_t total = (size_t)page_size + usable;
-        total = (total + page_size - 1) & ~(page_size - 1);
-        void *mem = VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!mem) { return -1; }
-        /* Bottom page is guard — no access */
-        DWORD old_prot;
-        VirtualProtect(mem, page_size, PAGE_NOACCESS, &old_prot);
-#else
-        long page_size = sysconf(_SC_PAGESIZE);
-        size_t total = (size_t)page_size + usable;
-        /* Round up to page alignment */
-        total = (total + page_size - 1) & ~(page_size - 1);
-        void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (mem == MAP_FAILED) { return -1; }
-        /* Bottom page is guard — no access */
-        mprotect(mem, page_size, PROT_NONE);
-#endif
-        proc->stack_mem = (uint8_t *)mem + page_size;  /* usable region */
-        proc->stack_size = total - page_size;
-    }
-
-    /* Initialize context for first context switch → trampoline.
-     *
-     * ctx_lock + generation bump close the slot-reuse race (R2-#4):
-     * a scheduler that picked this slot before reuse is mid-
-     * sw_safe_swap_into, which holds the same lock to copy ctx to a
-     * stack-local before calling asm. If the scheduler's expected
-     * generation no longer matches what we set here, it skips the
-     * swap. See sw_safe_swap_into for the read side. */
-    sw_spin_lock(&proc->ctx_lock);
-    atomic_fetch_add_explicit(&proc->generation, 1, memory_order_release);
-
+    /* proc->ctx is only meaningful while pinned: it is saved by the old-style
+     * swap that pins the process, and read by sw_safe_swap_into to resume it. */
     memset(&proc->ctx, 0, sizeof(sw_context_t));
-    uint8_t *stack_top = (uint8_t *)proc->stack_mem + proc->stack_size;
-    stack_top = (uint8_t *)((uintptr_t)stack_top & ~0xFULL);  /* 16-byte align */
-#ifdef __aarch64__
-    proc->ctx.sp = (uint64_t)stack_top;
-    proc->ctx.pc = (uint64_t)sw_process_trampoline;
-    proc->ctx.x19 = (uint64_t)proc;  /* Trampoline reads proc from x19 */
-#else
-    /* Pre-push trampoline address onto the stack so `ret` in context_swap
-     * jumps to the trampoline on first switch (same mechanism as resuming). */
-    stack_top -= 8;
-    *(uint64_t *)stack_top = (uint64_t)sw_process_trampoline;
-    proc->ctx.rsp = (uint64_t)stack_top;
-    proc->ctx.r12 = (uint64_t)proc;  /* Trampoline reads proc from r12 */
-#endif
-    proc->ctx.stack_base = (uint64_t)stack_top;
-    proc->ctx.stack_limit = (uint64_t)proc->stack_mem;
     sw_spin_unlock(&proc->ctx_lock);
     atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
     proc->priority = SW_PRIO_NORMAL;
@@ -963,6 +1089,15 @@ static void process_destroy(sw_process_t *proc) {
      * can immediately reuse this slot and reinitialize it. */
     uint32_t block_idx = proc->heap_block_idx;
     uint32_t slot = proc->arena_slot;
+
+    /* Killed while pinned: its carrier's frames are dead, the carrier is free. */
+    if (proc->carrier) {
+        sw_carrier_t *c = proc->carrier;
+        proc->carrier = NULL;
+        proc->stack_mem = NULL;
+        proc->stack_size = 0;
+        carrier_release(tls_scheduler, c);
+    }
 
     /* Per-process teardown hook FIRST (snapshot-then-clear-then-call so a
      * re-entrant/double destroy can't fire it twice). Runs before the arena /
@@ -1685,12 +1820,63 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             /* Context switch to process (runs on process's own stack).
              * sw_safe_swap_into copies ctx under proc->ctx_lock so the
              * asm reads a stable snapshot. */
-            if (sw_safe_swap_into(&sched->sched_proc, proc, expected_gen) < 0) {
+            int outcome = 0;
+            sw_carrier_t *c = proc->carrier;
+            int swapped;
+            if (c) {
+                /* Pinned: resume it on its own carrier through proc->ctx. */
+                c->outcome = &outcome;
+                swapped = sw_safe_swap_into(&sched->sched_proc, proc, expected_gen);
+            } else {
+                c = sched->carrier ? sched->carrier : carrier_alloc();
+                sched->carrier = NULL;
+                /* Same guard as sw_safe_swap_into: check the generation and
+                 * snapshot entry/arg under ctx_lock, so a slot being
+                 * reinitialized can't hand this run a half-written entry. */
+                int stale;
+                sw_spin_lock(&proc->ctx_lock);
+                stale = atomic_load_explicit(&proc->generation, memory_order_acquire) != expected_gen;
+                if (!stale && c) { c->entry = proc->entry; c->arg = proc->arg; }
+                sw_spin_unlock(&proc->ctx_lock);
+                if (stale) {
+                    if (c) carrier_release(sched, c);
+                    swapped = -1;
+                } else if (!c) {
+                    /* No stack for it: fail this process, not the runtime. */
+                    static _Atomic int warned = 0;
+                    if (!atomic_exchange(&warned, 1))
+                        fprintf(stderr, "[SwarmRT] out of memory for a carrier stack; "
+                                        "failing the process\n");
+                    proc->exit_reason = -1;
+                    atomic_store_explicit(&proc->state, SW_PROC_EXITING, memory_order_relaxed);
+                    swapped = 0;
+                } else {
+                    c->proc = proc;
+                    c->outcome = &outcome;
+                    proc->stack_mem = c->stack;
+                    proc->stack_size = c->stack_size;
+                    proc->carrier = c;
+                    sw_context_swap(&sched->sched_proc, &c->cproc);
+                    swapped = 0;
+                }
+            }
+            if (swapped < 0) {
                 /* Slot was reused between pick and swap — just loop. */
                 tls_current = NULL;
                 _sw_gen = &_sw_gen_fallback;
                 sched->current = NULL;
                 continue;
+            }
+            /* The run unwound to carrier_main (or the process died while on
+             * it): the carrier is free. Otherwise the process blocked inside
+             * a C primitive and stays pinned until a later run finishes. */
+            if (proc->carrier && (outcome == 1 ||
+                    atomic_load_explicit(&proc->state, memory_order_relaxed) == SW_PROC_EXITING)) {
+                sw_carrier_t *done = proc->carrier;
+                proc->carrier = NULL;
+                proc->stack_mem = NULL;
+                proc->stack_size = 0;
+                carrier_release(sched, done);
             }
 
             /* Process yielded, blocked on receive, or finished */
@@ -1716,6 +1902,16 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 sw_add_to_runq(&sched->runq, proc);
             }
             /* If WAITING: don't re-enqueue. sw_send will re-enqueue when message arrives. */
+            else if (proc->kill_flag &&
+                     atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_seq_cst)) {
+                /* A kill that raced the park: sw_process_kill stores kill_flag
+                 * (seq_cst) and then exchanges `waiting`; the receive stored
+                 * `waiting` (seq_cst) before swapping here. If the killer's
+                 * exchange saw 0, this load sees the flag (Dekker), and
+                 * winning the exchange makes us the one enqueuer. The kill
+                 * branch above then tears the process down. */
+                sw_add_to_runq(&sched->runq, proc);
+            }
 
         } else {
             sw_counter_bump(&sched->idle_waits);
@@ -2234,29 +2430,12 @@ void sw_shutdown(int swarm_id) {
     pthread_mutex_destroy(&g_swarm->link_lock);
     pthread_mutex_destroy(&g_swarm->overflow_rq.lock);
 
-    /* Free process stacks (mmap'd with guard page) */
+    /* Free per-slot state kept across lifetimes */
     if (g_swarm->arena.proc_slab) {
-#ifdef _WIN32
-        long page_size = 4096;
-#else
-        long page_size = sysconf(_SC_PAGESIZE);
-#endif
         sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
         for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
-            if (slab[i].stack_mem) {
-                /* stack_mem points past the guard page — subtract to get mmap base */
-                void *base = (uint8_t *)slab[i].stack_mem - page_size;
-                size_t total = slab[i].stack_size + page_size;
-                total = (total + page_size - 1) & ~(page_size - 1);
-#ifdef _WIN32
-                VirtualFree(base, 0, MEM_RELEASE);
-#else
-                munmap(base, total);
-#endif
-                slab[i].stack_mem = NULL;
-            }
             /* Per-process generated exec state — kept with the slot across
-             * lifetimes (like stack_mem), so freed here at slab teardown. */
+             * lifetimes, so freed here at slab teardown. */
             if (slab[i].gen_exec) {
                 free(slab[i].gen_exec);
                 slab[i].gen_exec = NULL;
@@ -2267,6 +2446,9 @@ void sw_shutdown(int swarm_id) {
             slab[i].panic_msg = NULL;
         }
     }
+
+    /* Carriers own every process stack now (threads are joined). */
+    carriers_free_all();
 
     /* Clean up arena */
     if (g_swarm->arena.base) {
