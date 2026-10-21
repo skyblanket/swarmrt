@@ -4892,7 +4892,9 @@ static sw_val_t *_builtin_db_open(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_int(-1);
     pthread_once(&_sw_sqlite_conn_once, _sw_sqlite_conn_init);
     for (int slot = 0; slot < _SW_SQLITE_MAX; slot++) {
-        pthread_mutex_lock(&_sw_sqlite_conn[slot]);
+        /* db_open runs on the scheduler thread: never wait behind a slow
+         * query. A slot whose lock is held is in use, so skip it. */
+        if (pthread_mutex_trylock(&_sw_sqlite_conn[slot]) != 0) continue;
         if (!_sw_sqlite_db[slot]) {
             sqlite3 *db = NULL;
             if (sqlite3_open(a[0]->v.str, &db) == SQLITE_OK) {
