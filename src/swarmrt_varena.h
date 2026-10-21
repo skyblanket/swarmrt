@@ -52,8 +52,8 @@ typedef struct sw_value_arena {
 sw_value_arena_t *sw_varena_create(size_t first_chunk);
 
 /* Create a region of `kind` whose first chunk is right-sized: clamp(hint,
- * 256B, 64KB) with NO 8KB floor — so a tiny message (an int, a 3-tuple) costs
- * a 256B chunk, not 8KB. Used for message + spawn regions. */
+ * 64B, 64KB) with NO 8KB floor — so a tiny message (an int, a 3-tuple) costs
+ * a chunk its own size, not 8KB. Used for message + spawn regions. */
 sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind);
 
 /* O(1) ownership transfer: splice all of `src`'s chunks onto `dst` (via src's
@@ -135,8 +135,15 @@ int sw_varena_ranges_below(sw_value_arena_t *a, sw_varena_mark_t mark,
  * only grows until a reset). This bounds a long-lived loop's memory to ~this
  * while avoiding a create+free per iteration for tight loops that allocate
  * little. Tunable; the gate just needs it well under the slope budget. */
-#ifndef SW_TURN_RESET_BYTES
-#define SW_TURN_RESET_BYTES (256 * 1024)
+#ifndef SW_TURN_RESET_DEFAULT
+#define SW_TURN_RESET_DEFAULT (4 * 1024)
 #endif
+/* The live value: SW_TURN_RESET_BYTES (env, bytes or k/K/m/M) read once in
+ * sw_init, else SW_TURN_RESET_DEFAULT. Generated code reads it through the
+ * macro, so a binary can be tuned without recompiling. It used to be a fixed
+ * 256KB, which let every message-passing process carry up to 256KB of turn
+ * garbage (#161, docs/design/PROCESS_WEIGHT.md). */
+extern size_t sw_turn_reset_bytes;
+#define SW_TURN_RESET_BYTES (sw_turn_reset_bytes)
 
 #endif /* SWARMRT_VARENA_H */

@@ -1119,11 +1119,9 @@ static void emit_preamble(cg_ctx_t *ctx) {
      * per source line (cheap: now one pointer hop + two stores). Capacity 64
      * frames — deeper recursion sets the overflow flag rather than blowing up. */
     fprintf(f, "static inline void _sw_trace_push(const char *m, const char *fn, int line) {\n"
-               "    if (_sw_trace_top < 64) {\n"
-               "        _sw_trace[_sw_trace_top].module_name = m;\n"
-               "        _sw_trace[_sw_trace_top].fn_name = fn;\n"
-               "        _sw_trace[_sw_trace_top].line = line;\n"
-               "    } else { _sw_trace_overflowed = 1; }\n"
+               "    _sw_frame_t *_e = &_sw_trace[_sw_trace_top & (SW_TRACE_MAX - 1)];\n"
+               "    _e->module_name = m; _e->fn_name = fn; _e->line = line; _e->depth = _sw_trace_top;\n"
+               "    if (_sw_trace_top >= SW_TRACE_MAX) _sw_trace_overflowed = 1;\n"
                "    _sw_trace_top++;\n"
                "}\n");
     fprintf(f, "static inline void _sw_trace_pop(void) { if (_sw_trace_top > 0) _sw_trace_top--; }\n\n");

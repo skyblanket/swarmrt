@@ -806,7 +806,7 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     {
         static int gc_off = -1;
         if (gc_off < 0) gc_off = getenv("SW_GC_OFF") ? 1 : 0;
-        proc->varena = gc_off ? NULL : sw_varena_create(8192);
+        proc->varena = gc_off ? NULL : sw_varena_create(1024);
     }
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
@@ -1988,6 +1988,19 @@ int sw_init(const char *name, uint32_t num_schedulers) {
             g_env_proc_stack = (size_t)v;
     }
 
+    /* Turn-checkpoint threshold — SW_TURN_RESET_BYTES (bytes, or k/K/m/M).
+     * Clamped to [1KB, 64MB]; out of range keeps the default. Read before any
+     * process runs, like SW_PROC_STACK above. */
+    const char *reset_env = getenv("SW_TURN_RESET_BYTES");
+    if (reset_env && *reset_env) {
+        char *end = NULL;
+        unsigned long long v = strtoull(reset_env, &end, 10);
+        if (end && (*end == 'k' || *end == 'K')) v *= 1024ULL;
+        else if (end && (*end == 'm' || *end == 'M')) v *= 1024ULL * 1024ULL;
+        if (v >= 1024ULL && v <= 64ULL * 1024 * 1024)
+            sw_turn_reset_bytes = (size_t)v;
+    }
+
     /* Reset the graceful-shutdown flags so an embedder that re-inits after a
      * prior sw_shutdown starts clean. No signal can have arrived yet — the
      * SIGTERM/SIGINT handler is installed only from the entry path AFTER
@@ -2347,8 +2360,24 @@ sw_process_t *sw_spawn_opts(void (*entry)(void*), void *arg, sw_priority_t prio)
     sw_process_t *proc = &((sw_process_t *)arena->proc_slab)[slot];
     proc->arena_slot = (uint32_t)slot;
 
-    /* 4. Initialize process with arena block */
-    process_init_arena(proc, (uint32_t)block_idx, entry, arg);
+    /* 4. Initialize process with arena block. It fails when the OS refuses the
+     * process stack mapping — on Linux usually vm.max_map_count, since every
+     * process costs two mappings (stack + guard), so stock 65530 caps a node
+     * near 32,700 processes. Hand the slot back and report it instead of
+     * returning a half-built process (that used to SIGSEGV the node). */
+    if (process_init_arena(proc, (uint32_t)block_idx, entry, arg) < 0) {
+        if (proc->varena) { sw_varena_free_all(proc->varena); proc->varena = NULL; }
+        sw_spin_lock(&part->lock);
+        part_push_pid(part, (uint32_t)slot);
+        part_push_block(part, (uint32_t)block_idx);
+        sw_spin_unlock(&part->lock);
+        static _Atomic uint32_t g_stack_map_fails;
+        if ((atomic_fetch_add_explicit(&g_stack_map_fails, 1, memory_order_relaxed) & 0x3FF) == 0)
+            fprintf(stderr,
+                "[SwarmRT] spawn failed: the OS refused a process stack mapping "
+                "(each process needs 2; on Linux check vm.max_map_count)\n");
+        return NULL;
+    }
 
     /* GC v2: record the spawn region (if any) BEFORE the child is runnable, so a
      * pre-trampoline kill still reclaims it in process_destroy. Consumed once. */

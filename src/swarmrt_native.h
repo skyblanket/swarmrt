@@ -87,12 +87,16 @@ typedef struct sw_swarm sw_swarm_t;
  * block at every context switch, and the generated `_sw_current_line` /
  * `_sw_current_file` / `_sw_trace*` macros (swarmrt_builtins_studio.h) redirect
  * through it. `_sw_frame_t` is shared with the generated trace push/pop. */
-typedef struct { const char *module_name; const char *fn_name; int line; } _sw_frame_t;
+typedef struct { const char *module_name; const char *fn_name; int line; int depth; } _sw_frame_t;
+/* Innermost frames kept for panic traces, as a ring indexed by depth (a power
+ * of two). Was a 64-entry array (1.5KB per process) that kept the OUTERMOST
+ * frames once a chain got deeper than 64. */
+#define SW_TRACE_MAX 16
 typedef struct sw_gen_exec {
     int current_line;            /* source line of the statement now executing */
     const char *current_file;    /* source file (string literal, never freed)  */
-    _sw_frame_t trace[64];       /* call-stack ring buffer (innermost last)     */
-    int trace_top;               /* depth; >64 sets trace_overflowed            */
+    _sw_frame_t trace[SW_TRACE_MAX]; /* call-stack ring buffer (innermost last) */
+    int trace_top;               /* depth; >SW_TRACE_MAX sets trace_overflowed  */
     int trace_overflowed;        /* 1 if the call chain exceeded 64 frames      */
 } sw_gen_exec_t;
 /* Points at the running process's gen_exec block (or a thread-local fallback for
