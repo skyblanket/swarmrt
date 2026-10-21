@@ -18,6 +18,20 @@ module Test_http_headers
 #
 # Exits non-zero on any failure so the driver rolls it up.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -32,7 +46,7 @@ fun assert_eq(name, actual, expected) {
 # bytes survived. The server lowercases header NAMES, so we look them up
 # lowercased (the VALUE casing is preserved).
 fun header_server() {
-    http_listen(9131)
+    http_listen(test_port(131))
     header_loop()
 }
 
@@ -72,7 +86,7 @@ fun main() {
     custom = "telnyx-sig-abc123"
     hdrs = [{"Authorization", bearer}, {"X-Test-Header", custom}]
 
-    body = get_retry("http://127.0.0.1:9131/auth", hdrs, 100)
+    body = get_retry(f"http://127.0.0.1:{test_port(131)}/auth", hdrs, 100)
     fails = 0
     case body {
         'nil' ->

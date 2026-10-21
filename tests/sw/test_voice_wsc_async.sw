@@ -19,6 +19,20 @@ module Test_voice_wsc_async
 #
 # Exits non-zero on failure so the driver rolls it up.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -30,7 +44,7 @@ fun assert_eq(name, actual, expected) {
 
 # Echo server: becomes the WS handler for whatever connects, mirrors text.
 fun echo_server() {
-    http_listen(9097)
+    http_listen(test_port(97))
     echo_loop()
 }
 
@@ -96,7 +110,7 @@ fun main() {
     # Retry the dial until the spawned listener is bound and its bridge fiber
     # is scheduled to complete the handshake — deterministic under load,
     # unlike a fixed sleep (which raced and returned nil / hung in connect).
-    h = connect_retry("ws://127.0.0.1:9097/", 100)
+    h = connect_retry(f"ws://127.0.0.1:{test_port(97)}/", 100)
     fails = 0
     case h {
         'nil' ->

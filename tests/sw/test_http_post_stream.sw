@@ -15,6 +15,20 @@ module Test_http_post_stream
 #
 # Exits non-zero on any failure so run_tests.sh rolls it up.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -140,7 +154,7 @@ fun main() {
         print("OK test_http_post_stream 0/0 (SKIP: needs >=2 schedulers — blocking client + in-process server)")
         sys_exit(0)
     }
-    port = 9131
+    port = test_port(131)
     base = f"http://127.0.0.1:{port}"
     body = json_encode(%{model: "stub", stream: 'true', messages: []})
 
@@ -179,7 +193,7 @@ fun main() {
     }
 
     # 4. Connection refused on a dead port — tagged {'error, "curl exit ..."}.
-    r4 = http_post_stream(f"http://127.0.0.1:9132/dead",
+    r4 = http_post_stream(f"http://127.0.0.1:{test_port(132)}/dead",
                           [{"Content-Type", "application/json"}], body)
     case r4 {
         {'ok', _j4} ->
