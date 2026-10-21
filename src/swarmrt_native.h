@@ -846,6 +846,9 @@ void sw_reschedule(sw_process_t *proc);
 /* Arena management */
 int sw_arena_init(sw_arena_t *arena, uint32_t max_procs);
 
+/* Effective process-table ceiling (SW_MAX_PROCS, clamped to SWARM_MAX_PROCESSES). */
+uint32_t sw_proc_limit(void);
+
 /* Process trampoline (assembly entry point) */
 extern void sw_process_trampoline(void);
 

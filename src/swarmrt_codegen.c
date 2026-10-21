@@ -2683,7 +2683,7 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
         /* Spawn failure must be LOUD. Continuing with a pid wrapping NULL
          * made sends silently vanish at the SW_MAX_PROCS ceiling. */
         fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
-        fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
+        fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full (limit %%u, build maximum %%u)%%s\", (unsigned)sw_proc_limit(), (unsigned)SWARM_MAX_PROCESSES, sw_proc_limit() < (unsigned)SWARM_MAX_PROCESSES ? \" \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\" : \" \\xe2\\x80\\x94 reduce live processes (SW_MAX_PROCS cannot exceed the build maximum)\"); }\n");
         emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
         return;
     }
@@ -2721,7 +2721,7 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
                         ls, i, lr, avs[i], lr, avs[i]);
             fprintf(f, "    sw_process_t *%s = sw_spawn_owned(_sw_lambda_spawn_trampoline3, %s, %s);\n", pv, ls, lr);
             fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, lr, lr, ls);
-            fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
+            fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full (limit %%u, build maximum %%u)%%s\", (unsigned)sw_proc_limit(), (unsigned)SWARM_MAX_PROCESSES, sw_proc_limit() < (unsigned)SWARM_MAX_PROCESSES ? \" \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\" : \" \\xe2\\x80\\x94 reduce live processes (SW_MAX_PROCS cannot exceed the build maximum)\"); }\n");
             emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
             return;
         }
@@ -2778,7 +2778,7 @@ static void emit_spawn(cg_ctx_t *ctx, node_t *n, char *out, int osz) {
      * then panic LOUDLY. Continuing with a pid wrapping NULL made every
      * send to it silently vanish at the SW_MAX_PROCS ceiling. */
     fprintf(f, "    if (!%s) { if (%s) sw_varena_free_all(%s); free(%s);\n", pv, rg, rg, sa);
-    fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\"); }\n");
+    fprintf(f, "        _sw_runtime_panic(\"spawn failed: process table full (limit %%u, build maximum %%u)%%s\", (unsigned)sw_proc_limit(), (unsigned)SWARM_MAX_PROCESSES, sw_proc_limit() < (unsigned)SWARM_MAX_PROCESSES ? \" \\xe2\\x80\\x94 raise SW_MAX_PROCS or reduce live processes\" : \" \\xe2\\x80\\x94 reduce live processes (SW_MAX_PROCS cannot exceed the build maximum)\"); }\n");
     emit_spawn_wrap(ctx, is_monitor, pv, out, osz);
 }
 

@@ -117,6 +117,7 @@ static sw_val_t *_builtin_link(sw_val_t **a, int n) {
 
 #define _VETS_BUCKETS 256
 #define _VETS_MAX_TABLES 1024
+#define _VETS_STRIPES 16
 
 typedef struct _vets_entry {
     sw_val_t *key;
@@ -126,9 +127,17 @@ typedef struct _vets_entry {
 
 typedef struct {
     _vets_entry_t *buckets[_VETS_BUCKETS];
-    pthread_rwlock_t lock;
+    pthread_rwlock_t locks[_VETS_STRIPES];  /* bucket b is guarded by locks[b % _VETS_STRIPES] */
     int active;
 } _vets_table_t;
+
+static void _vets_lock_all(_vets_table_t *t, int write) {
+    for (int i = 0; i < _VETS_STRIPES; i++)
+        write ? pthread_rwlock_wrlock(&t->locks[i]) : pthread_rwlock_rdlock(&t->locks[i]);
+}
+static void _vets_unlock_all(_vets_table_t *t) {
+    for (int i = _VETS_STRIPES - 1; i >= 0; i--) pthread_rwlock_unlock(&t->locks[i]);
+}
 
 static _vets_table_t _vets_tables[_VETS_MAX_TABLES];
 static int _vets_next_id = 0;
@@ -264,10 +273,10 @@ static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
         /* Reused slot: its lock stays initialised (a straggler may still be
          * blocked on it); only the buckets are reset. */
         id = _vets_free_ids[--_vets_nfree];
-        pthread_rwlock_wrlock(&_vets_tables[id].lock);
+        _vets_lock_all(&_vets_tables[id], 1);
         memset(_vets_tables[id].buckets, 0, sizeof(_vets_tables[id].buckets));
         _vets_tables[id].active = 1;
-        pthread_rwlock_unlock(&_vets_tables[id].lock);
+        _vets_unlock_all(&_vets_tables[id]);
     } else {
         id = _vets_next_id;
         if (id >= _VETS_MAX_TABLES) {
@@ -278,7 +287,7 @@ static sw_val_t *_builtin_ets_new(sw_val_t **a, int n) {
         }
         _vets_next_id++;
         memset(&_vets_tables[id], 0, sizeof(_vets_table_t));
-        pthread_rwlock_init(&_vets_tables[id].lock, NULL);
+        for (int i = 0; i < _VETS_STRIPES; i++) pthread_rwlock_init(&_vets_tables[id].locks[i], NULL);
         _vets_tables[id].active = 1;
     }
     pthread_mutex_unlock(&_vets_meta);
@@ -298,7 +307,7 @@ static sw_val_t *_builtin_ets_drop(sw_val_t **a, int n) {
         return sw_val_atom("error");
     }
     _vets_table_t *t = &_vets_tables[id];
-    pthread_rwlock_wrlock(&t->lock);
+    _vets_lock_all(t, 1);
     t->active = 0;
     for (int b = 0; b < _VETS_BUCKETS; b++) {
         _vets_entry_t *e = t->buckets[b];
@@ -311,7 +320,7 @@ static sw_val_t *_builtin_ets_drop(sw_val_t **a, int n) {
         }
         t->buckets[b] = NULL;
     }
-    pthread_rwlock_unlock(&t->lock);
+    _vets_unlock_all(t);
     _vets_free_ids[_vets_nfree++] = id;
     pthread_mutex_unlock(&_vets_meta);
     return sw_val_atom("ok");
@@ -323,21 +332,30 @@ static sw_val_t *_builtin_ets_put(sw_val_t **a, int n) {
     if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_atom("error");
     _vets_table_t *t = &_vets_tables[id];
     uint32_t bucket = _vets_hash_val(a[1]);
-    /* ETS debug removed */
-    pthread_rwlock_wrlock(&t->lock);
-    _vets_entry_t *e = t->buckets[bucket];
-    while (e) {
-        /* GC v1: ETS is a cross-process store outliving the inserter, so its
-         * keys/values must live on the global heap (deep-copied), not in the
-         * inserting process's arena which is freed on its exit. */
-        if (_vets_key_eq(e->key, a[1])) { _sw_free_global_val(e->value); e->value = sw_val_deep_copy_global(a[2]); pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok"); }  /* free old to bound replace churn */
-        e = e->next;
-    }
+    pthread_rwlock_t *lk = &t->locks[bucket % _VETS_STRIPES];
+    /* GC v1: ETS is a cross-process store outliving the inserter, so its
+     * keys/values must live on the global heap (deep-copied), not in the
+     * inserting process's arena. The copies are made BEFORE taking the lock and
+     * the replaced value is freed AFTER releasing it, so the critical section
+     * is only pointer linking. */
+    sw_val_t *nk = sw_val_deep_copy_global(a[1]);
+    sw_val_t *nv = sw_val_deep_copy_global(a[2]);
     _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
-    ne->key = sw_val_deep_copy_global(a[1]); ne->value = sw_val_deep_copy_global(a[2]); ne->next = t->buckets[bucket];
+    pthread_rwlock_wrlock(lk);
+    for (_vets_entry_t *e = t->buckets[bucket]; e; e = e->next) {
+        if (_vets_key_eq(e->key, a[1])) {
+            sw_val_t *old = e->value;
+            e->value = nv;
+            pthread_rwlock_unlock(lk);
+            _sw_free_global_val(old);  /* free old to bound replace churn */
+            _sw_free_global_val(nk);
+            free(ne);
+            return sw_val_atom("ok");
+        }
+    }
+    ne->key = nk; ne->value = nv; ne->next = t->buckets[bucket];
     t->buckets[bucket] = ne;
-    pthread_rwlock_unlock(&t->lock);
-    /* ETS debug removed */
+    pthread_rwlock_unlock(lk);
     return sw_val_atom("ok");
 }
 
@@ -348,7 +366,7 @@ static sw_val_t *_builtin_ets_get(sw_val_t **a, int n) {
     _vets_table_t *t = &_vets_tables[id];
     uint32_t bucket = _vets_hash_val(a[1]);
     /* ETS debug removed */
-    pthread_rwlock_rdlock(&t->lock);
+    pthread_rwlock_rdlock(&t->locks[bucket % _VETS_STRIPES]);
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
@@ -357,13 +375,13 @@ static sw_val_t *_builtin_ets_get(sw_val_t **a, int n) {
              * under the read lock — a writer (replace/delete/take) needs the write
              * lock, so the stored value can't be freed mid-copy. */
             sw_val_t *v = sw_val_deep_copy_local(e->value);
-            pthread_rwlock_unlock(&t->lock);
+            pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
             return v;
         }
         e = e->next;
     }
     /* ETS debug removed */
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
     return sw_val_nil();
 }
 
@@ -373,17 +391,17 @@ static sw_val_t *_builtin_ets_delete(sw_val_t **a, int n) {
     if (id < 0 || id >= _VETS_MAX_TABLES || !_vets_tables[id].active) return sw_val_atom("error");
     _vets_table_t *t = &_vets_tables[id];
     uint32_t bucket = _vets_hash_val(a[1]);
-    pthread_rwlock_wrlock(&t->lock);
+    pthread_rwlock_wrlock(&t->locks[bucket % _VETS_STRIPES]);
     _vets_entry_t **pp = &t->buckets[bucket];
     while (*pp) {
         if (_vets_key_eq((*pp)->key, a[1])) {
             _vets_entry_t *dead = *pp; *pp = dead->next;
             _sw_free_global_val(dead->value); _sw_free_global_val(dead->key); free(dead);  /* free stored value+key, not just the entry */
-            pthread_rwlock_unlock(&t->lock); return sw_val_atom("ok");
+            pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]); return sw_val_atom("ok");
         }
         pp = &(*pp)->next;
     }
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
     return sw_val_atom("ok");
 }
 
@@ -397,7 +415,7 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
     int64_t delta = a[2]->v.i;
     int64_t initial = a[3]->v.i;
 
-    pthread_rwlock_wrlock(&t->lock);
+    pthread_rwlock_wrlock(&t->locks[bucket % _VETS_STRIPES]);
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
@@ -408,10 +426,10 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
                 int64_t result = e->value->v.i + delta;  /* read int BEFORE freeing */
                 _sw_free_global_val(e->value);
                 e->value = sw_val_deep_copy_global(sw_val_int(result));  /* GC v1: ETS store on global heap; free old to bound churn */
-                pthread_rwlock_unlock(&t->lock);
+                pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
                 return sw_val_int(result);
             }
-            pthread_rwlock_unlock(&t->lock);
+            pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
             return sw_val_atom("error");
         }
         e = e->next;
@@ -425,7 +443,7 @@ static sw_val_t *_builtin_ets_update_counter(sw_val_t **a, int n) {
     _vets_entry_t *ne = (_vets_entry_t *)malloc(sizeof(_vets_entry_t));
     ne->key = sw_val_deep_copy_global(a[1]); ne->value = stored; ne->next = t->buckets[bucket];
     t->buckets[bucket] = ne;
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
     return sw_val_int(seeded);
 }
 
@@ -436,22 +454,22 @@ static sw_val_t *_builtin_ets_cas(sw_val_t **a, int n) {
     _vets_table_t *t = &_vets_tables[id];
     uint32_t bucket = _vets_hash_val(a[1]);
 
-    pthread_rwlock_wrlock(&t->lock);
+    pthread_rwlock_wrlock(&t->locks[bucket % _VETS_STRIPES]);
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
             if (_vets_key_eq(e->value, a[2])) {  /* reads old value before freeing */
                 _sw_free_global_val(e->value);
                 e->value = sw_val_deep_copy_global(a[3]);  /* GC v1: ETS store on global heap; free old to bound churn */
-                pthread_rwlock_unlock(&t->lock);
+                pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
                 return sw_val_atom("true");
             }
-            pthread_rwlock_unlock(&t->lock);
+            pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
             return sw_val_atom("false");
         }
         e = e->next;
     }
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
     return sw_val_atom("false");
 }
 
@@ -462,7 +480,7 @@ static sw_val_t *_builtin_ets_take(sw_val_t **a, int n) {
     _vets_table_t *t = &_vets_tables[id];
     uint32_t bucket = _vets_hash_val(a[1]);
 
-    pthread_rwlock_wrlock(&t->lock);
+    pthread_rwlock_wrlock(&t->locks[bucket % _VETS_STRIPES]);
     _vets_entry_t **pp = &t->buckets[bucket];
     while (*pp) {
         if (_vets_key_eq((*pp)->key, a[1])) {
@@ -472,12 +490,12 @@ static sw_val_t *_builtin_ets_take(sw_val_t **a, int n) {
             sw_val_t *out = dead->value ? sw_val_deep_copy_local(dead->value) : sw_val_nil();
             *pp = dead->next;
             _sw_free_global_val(dead->value); _sw_free_global_val(dead->key); free(dead);
-            pthread_rwlock_unlock(&t->lock);
+            pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
             return out;
         }
         pp = &(*pp)->next;
     }
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
     return sw_val_nil();
 }
 
@@ -497,7 +515,7 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
     uint32_t bucket = _vets_hash_val(a[1]);
 
     /* Snapshot the current value under a read lock. */
-    pthread_rwlock_rdlock(&t->lock);
+    pthread_rwlock_rdlock(&t->locks[bucket % _VETS_STRIPES]);
     sw_val_t *old_val = NULL;
     _vets_entry_t *e = t->buckets[bucket];
     while (e) {
@@ -507,7 +525,7 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
         if (_vets_key_eq(e->key, a[1])) { old_val = sw_val_deep_copy_local(e->value); break; }
         e = e->next;
     }
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
 
     if (!old_val) return sw_val_atom("error");  /* key not found */
 
@@ -517,18 +535,18 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
 
     /* Write the result back under write lock; re-scan because lock was
      * dropped during the function call. */
-    pthread_rwlock_wrlock(&t->lock);
+    pthread_rwlock_wrlock(&t->locks[bucket % _VETS_STRIPES]);
     e = t->buckets[bucket];
     while (e) {
         if (_vets_key_eq(e->key, a[1])) {
             _sw_free_global_val(e->value);
             e->value = sw_val_deep_copy_global(new_val);  /* GC v1: ETS store on global heap; free old to bound churn */
-            pthread_rwlock_unlock(&t->lock);
+            pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
             return new_val;
         }
         e = e->next;
     }
-    pthread_rwlock_unlock(&t->lock);
+    pthread_rwlock_unlock(&t->locks[bucket % _VETS_STRIPES]);
     return sw_val_atom("error");  /* key disappeared between read and write */
 }
 
@@ -3895,7 +3913,8 @@ static sw_val_t *_builtin_sup_start_child(sw_val_t **a, int n) {
     sw_child_spec_t spec;
     memset(&spec, 0, sizeof(spec));
 
-    if (name_v && (name_v->type == SW_VAL_ATOM || name_v->type == SW_VAL_STRING) && name_v->v.str)
+    if (name_v && (name_v->type == SW_VAL_ATOM || name_v->type == SW_VAL_STRING) && name_v->v.str
+        && strcmp(name_v->v.str, "nil") != 0) /* nil == anonymous */
         strncpy(spec.name, name_v->v.str, sizeof(spec.name) - 1);
     else
         spec.name[0] = '\0'; /* anonymous */
@@ -8466,7 +8485,7 @@ static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
     int cap = 64, cnt = 0;
     sw_val_t **items = (sw_val_t **)malloc(sizeof(sw_val_t *) * cap);
 
-    pthread_rwlock_rdlock(&t->lock);
+    _vets_lock_all(t, 0);
     for (int b = 0; b < _VETS_BUCKETS; b++) {
         _vets_entry_t *e = t->buckets[b];
         while (e) {
@@ -8487,7 +8506,7 @@ static sw_val_t *_builtin_ets_list(sw_val_t **a, int n) {
             e = e->next;
         }
     }
-    pthread_rwlock_unlock(&t->lock);
+    _vets_unlock_all(t);
 
     sw_val_t *r = sw_val_list(items, cnt);
     free(items);
@@ -8502,11 +8521,11 @@ static sw_val_t *_builtin_ets_count(sw_val_t **a, int n) {
     _vets_table_t *t = &_vets_tables[id];
 
     int count = 0;
-    pthread_rwlock_rdlock(&t->lock);
+    _vets_lock_all(t, 0);
     for (int b = 0; b < _VETS_BUCKETS; b++) {
         for (_vets_entry_t *e = t->buckets[b]; e; e = e->next) count++;
     }
-    pthread_rwlock_unlock(&t->lock);
+    _vets_unlock_all(t);
 
     return sw_val_int((int64_t)count);
 }
