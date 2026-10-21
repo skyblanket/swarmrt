@@ -109,8 +109,24 @@ static void run_main_entry(void *arg) {
     run_boot_ctx_t *ctx = (run_boot_ctx_t *)arg;
     sw_lang_call(ctx->interp, "main", NULL, 0);
     ctx->rc = ctx->interp->error ? 1 : 0;
-    if (ctx->interp->error)
-        fprintf(stderr, "swc: runtime error: %s\n", ctx->interp->error_msg);
+    if (ctx->interp->error) {
+        sw_interp_t *ip = ctx->interp;
+        if (strncmp(ip->error_msg, "panic: ", 7) == 0 && ip->panic_nframes > 0) {
+            /* Same report as the compiled binary's _sw_runtime_panic. */
+            const char *mod = ((node_t *)ip->module_ast)->v.mod.name;
+            fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", ip->error_msg + 7);
+            if (ip->panic_line > 0)
+                fprintf(stderr, "  at %s:%d\n", ip->src_path ? ip->src_path : "?", ip->panic_line);
+            fprintf(stderr, "  call chain (innermost first):\n");
+            for (int i = ip->panic_nframes - 1; i >= 0; i--)
+                fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", ip->panic_nframes - 1 - i,
+                        mod, ip->panic_frames[i].fn, mod, ip->panic_frames[i].line);
+            if (ip->panic_overflow > 0)
+                fprintf(stderr, "    ... (truncated; %d frames omitted)\n", ip->panic_overflow);
+        } else {
+            fprintf(stderr, "swc: runtime error: %s\n", ip->error_msg);
+        }
+    }
     pthread_mutex_lock(&ctx->lock);
     ctx->done = 1;
     pthread_cond_signal(&ctx->cond);
@@ -172,6 +188,7 @@ static int run_file(const char *path, const char *argv0, int argc, char **argv) 
 
     /* Run main(). */
     sw_interp_t *interp = sw_lang_new(main_ast);
+    interp->src_path = path;
     int has_main = 0;
     for (int i = 0; i < root->v.mod.nfuns; i++)
         if (strcmp(root->v.mod.funs[i]->v.fun.name, "main") == 0) { has_main = 1; break; }

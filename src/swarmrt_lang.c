@@ -3637,6 +3637,19 @@ static sw_val_t *builtin_print(sw_val_t **args, int nargs) {
  * (e.g. "division by zero", "hd: list is empty") so assert_raises() can
  * substring-match it exactly as it would the compiled panic text, and is
  * "panic:"-prefixed to match the panic() builtin's error surface. */
+static void interp_note_panic(sw_interp_t *interp) {
+    int n = interp->nframes;
+    int keep = n > 64 ? 64 : n;
+    interp->panic_line = interp->cur_line;
+    interp->panic_nframes = keep;
+    interp->panic_overflow = n - keep;
+    for (int i = 0; i < keep; i++) {
+        interp->panic_frames[i].fn   = interp->frames[(n - keep + i) % 64].fn;
+        interp->panic_frames[i].line = interp->frames[(n - keep + i) % 64].line;
+    }
+    if (keep > 0) interp->panic_frames[keep - 1].line = interp->cur_line;
+}
+
 static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, ...) {
     char msg[200];
     va_list ap;
@@ -3644,6 +3657,7 @@ static void interp_raise_panic(sw_interp_t *interp, int line, const char *fmt, .
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     (void)line;
+    interp_note_panic(interp);
     snprintf(interp->error_msg, sizeof(interp->error_msg), "panic: %s", msg);
     interp->error = 1;
     interp->panicking = 1;   /* uncatchable — N_TRY must not absorb a panic */
@@ -4497,6 +4511,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         /* Panic: uncatchable (panicking flag bypasses N_TRY), aborts the run
          * with exit 1 at top level — same meaning as the compiled path. Only
          * assert_raises (the documented test seam) intercepts it. */
+        interp_note_panic(interp);
         snprintf(interp->error_msg, sizeof(interp->error_msg),
                  "panic: %s", buf ? buf : "(no message)");
         free(buf);
@@ -6158,7 +6173,22 @@ static void bind_params(sw_interp_t *interp, node_t *fn, sw_env_t *fenv, sw_val_
 
 /* Evaluate the body of `fn` (an N_FUN) in `fenv` (owned by the caller), then
  * run any tail calls it requests in this same C frame. */
+static sw_val_t *interp_eval_body_loop(sw_interp_t *interp, node_t *fn, sw_env_t *fenv);
+
+/* Push a call-chain frame around the body so a panic can report it. Outer
+ * frames keep their entry line (as the compiled trace does); depth is restored (not just
+ * decremented) so interleaved fibers can't drift it. */
 static sw_val_t *interp_eval_body(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
+    int saved = interp->nframes;
+    interp->frames[saved % 64].fn = fn->v.fun.name;
+    interp->frames[saved % 64].line = fn->line;
+    interp->nframes = saved + 1;
+    sw_val_t *r = interp_eval_body_loop(interp, fn, fenv);
+    interp->nframes = saved;
+    return r;
+}
+
+static sw_val_t *interp_eval_body_loop(sw_interp_t *interp, node_t *fn, sw_env_t *fenv) {
     sw_env_t *own = NULL;          /* env this loop created for a tail target */
     for (;;) {
         if (sw_check_reds()) sw_yield();   /* reduction-counted preemption */
@@ -6445,6 +6475,7 @@ static sw_val_t *interp_call_named(sw_interp_t *interp, node_t *n, sw_env_t *env
 
 static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
     if (!n || interp->error) return sw_val_nil();
+    if (n->line > 0) interp->cur_line = n->line;
 
     switch (n->type) {
     case N_INT: return sw_val_int(n->v.ival);
@@ -6809,6 +6840,7 @@ static sw_val_t *eval(sw_interp_t *interp, node_t *n, sw_env_t *env) {
                 return sw_val_nil();
             }
         }
+        if (n->line > 0) interp->cur_line = n->line;
         return interp_call_named(interp, n, env, fname, args, nargs);
     }
 
