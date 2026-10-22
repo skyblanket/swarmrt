@@ -1034,6 +1034,11 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->wait_kind = SW_WAIT_NONE;
     proc->wait_arg = 0;
     proc->wait_timer = 0;
+    proc->sleep_until_ns = 0;
+    proc->offl_job = NULL;
+    proc->offl_finish = NULL;
+    proc->offl_ctx = NULL;
+    proc->async_fn = NULL;
     proc->no_suspend = 0;
     proc->started = 0;
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
@@ -1149,6 +1154,10 @@ static void process_destroy(sw_process_t *proc) {
     proc->run_k = proc->run_waiting = NULL;
     free(proc->spill);
     proc->spill = NULL;
+    /* Died waiting for an offloaded builtin: the worker may still be
+     * running it; the last reference frees the job and its regions. */
+    if (proc->offl_job) { sw_offload_release(proc->offl_job); proc->offl_job = NULL; }
+    proc->sleep_until_ns = 0;
 
     /* Killed while pinned: its carrier's frames are dead, the carrier is free. */
     if (proc->carrier) {
@@ -1799,6 +1808,8 @@ static void root_exit_check(sw_process_t *proc, int reason) {
     }
 }
 
+static uint64_t now_ns(void);
+
 /* Commit the wait a stackless process recorded before it suspended
  * (PROCESS_WEIGHT.md §3.3). Runs on the scheduler, after the run. */
 static void sw_commit_wait(sw_scheduler_t *sched, sw_process_t *proc) {
@@ -1822,6 +1833,29 @@ static void sw_commit_wait(sw_scheduler_t *sched, sw_process_t *proc) {
          * process can run again. */
         if (proc->wait_arg != UINT64_MAX)
             proc->wait_timer = sw_send_after(proc->wait_arg, proc, SW_TAG_NONE, NULL);
+        return;
+    }
+    if (kind == SW_WAIT_SLEEP || kind == SW_WAIT_OFFLOAD) {
+        /* The same park, waiting on a deadline or a finished job instead
+         * of mail. Mail still wakes it (senders can't tell); the driver
+         * then sees the wait isn't over and parks it again. */
+        atomic_store_explicit(&proc->state, SW_PROC_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&proc->mailbox.waiting, 1, memory_order_seq_cst);
+        uint64_t now = now_ns();
+        int ready = proc->kill_flag ||
+            (kind == SW_WAIT_SLEEP ? now >= proc->sleep_until_ns
+                                   : sw_offload_done(proc->offl_job));
+        if (ready) {
+            if (atomic_exchange_explicit(&proc->mailbox.waiting, 0, memory_order_seq_cst)) {
+                atomic_store_explicit(&proc->state, SW_PROC_RUNNABLE, memory_order_relaxed);
+                sw_add_to_runq(&sched->runq, proc);
+            }
+            return;
+        }
+        if (kind == SW_WAIT_SLEEP) {
+            uint64_t ms = (proc->sleep_until_ns - now + 999999ULL) / 1000000ULL;
+            proc->wait_timer = sw_send_after(ms, proc, SW_TAG_NONE, NULL);
+        }
         return;
     }
     /* SW_WAIT_YIELD, or a suspension that recorded no intent */
@@ -4443,6 +4477,7 @@ void sw_park_until(_Atomic int *flag) {
 typedef struct sw_offload_job {
     void (*fn)(void *);
     void *arg;
+    void (*arg_free)(void *);
     sw_process_t *waiter;
     _Atomic int done;
     _Atomic int refs;
@@ -4455,7 +4490,10 @@ static sw_offload_job_t *g_off_head = NULL, *g_off_tail = NULL;
 static int g_off_threads = 0, g_off_idle = 0, g_off_queued = 0, g_off_max = -1;
 
 static void offload_job_release(sw_offload_job_t *j) {
-    if (atomic_fetch_sub_explicit(&j->refs, 1, memory_order_acq_rel) == 1) free(j);
+    if (atomic_fetch_sub_explicit(&j->refs, 1, memory_order_acq_rel) == 1) {
+        if (j->arg_free) j->arg_free(j->arg);
+        free(j);
+    }
 }
 
 static void *offload_worker(void *unused) {
@@ -4491,8 +4529,9 @@ static void *offload_worker(void *unused) {
     }
 }
 
-void sw_offload_run(void (*fn)(void *), void *arg) {
-    sw_process_t *proc = tls_current;
+/* Queue a job (refs = 2) and make sure a worker will take it. Returns 0 when
+ * there is no worker at all; the job is then not queued. */
+static int offload_enqueue(sw_offload_job_t *j) {
     if (g_off_max < 0) {
         const char *e = getenv("SW_OFFLOAD_THREADS");
         int m = e ? atoi(e) : 256;
@@ -4500,13 +4539,7 @@ void sw_offload_run(void (*fn)(void *), void *arg) {
         if (off && off[0] == '0') m = 0;
         g_off_max = m < 0 ? 0 : m;
     }
-    if (!proc || g_off_max == 0) { fn(arg); return; }
-
-    sw_offload_job_t *j = (sw_offload_job_t *)calloc(1, sizeof(*j));
-    if (!j) { fn(arg); return; }
-    j->fn = fn;
-    j->arg = arg;
-    j->waiter = proc;
+    if (g_off_max == 0) return 0;
     atomic_store_explicit(&j->refs, 2, memory_order_relaxed);
 
     pthread_mutex_lock(&g_off_lock);
@@ -4532,24 +4565,72 @@ void sw_offload_run(void (*fn)(void *), void *arg) {
             g_off_threads--;
             int none = (g_off_threads == 0);
             if (none) {
-                /* No worker at all — pull our job back and run it inline. */
+                /* No worker at all — pull our job back. */
                 sw_offload_job_t **pp = &g_off_head, *prev = NULL;
                 while (*pp && *pp != j) { prev = *pp; pp = &(*pp)->next; }
                 if (*pp) { *pp = j->next; if (g_off_tail == j) g_off_tail = prev; g_off_queued--; }
             }
             pthread_mutex_unlock(&g_off_lock);
             pthread_attr_destroy(&attr);
-            if (none) { free(j); fn(arg); return; }
+            if (none) return 0;
         } else {
             pthread_attr_destroy(&attr);
         }
     }
+    return 1;
+}
+
+void sw_offload_run(void (*fn)(void *), void *arg) {
+    sw_process_t *proc = tls_current;
+    if (!proc) { fn(arg); return; }
+    sw_offload_job_t *j = (sw_offload_job_t *)calloc(1, sizeof(*j));
+    if (!j) { fn(arg); return; }
+    j->fn = fn;
+    j->arg = arg;
+    j->waiter = proc;
+    if (!offload_enqueue(j)) { free(j); fn(arg); return; }
 
     atomic_fetch_add_explicit(&g_off_parked, 1, memory_order_acq_rel);
     sw_park_until(&j->done);
     atomic_fetch_sub_explicit(&g_off_parked, 1, memory_order_acq_rel);
     offload_job_release(j);
 }
+
+/* The stackless form: the caller parks through the scheduler (SW_WAIT_
+ * OFFLOAD, committed in sw_commit_wait) instead of in sw_park_until. The
+ * caller's reference is dropped by sw_offload_release, from the resumed
+ * process or from process_destroy if it dies first. */
+sw_offload_job_t *sw_offload_start(void (*fn)(void *), void *arg, void (*arg_free)(void *)) {
+    sw_process_t *proc = tls_current;
+    if (!proc) return NULL;
+    sw_offload_job_t *j = (sw_offload_job_t *)calloc(1, sizeof(*j));
+    if (!j) return NULL;
+    j->fn = fn;
+    j->arg = arg;
+    j->waiter = proc;
+    j->arg_free = arg_free;
+    if (!offload_enqueue(j)) { free(j); return NULL; }
+    atomic_fetch_add_explicit(&g_off_parked, 1, memory_order_acq_rel);
+    return j;
+}
+
+int sw_offload_done(sw_offload_job_t *j) {
+    return atomic_load_explicit(&j->done, memory_order_seq_cst);
+}
+
+void sw_offload_release(sw_offload_job_t *j) {
+    atomic_fetch_sub_explicit(&g_off_parked, 1, memory_order_acq_rel);
+    offload_job_release(j);
+}
+
+int sw_async_take(void *fn) {
+    sw_process_t *p = tls_current;
+    if (!p || p->async_fn != fn) return 0;
+    p->async_fn = NULL;
+    return sw_suspend_ok();
+}
+
+uint64_t sw_now_ns(void) { return now_ns(); }
 
 /*
  * sw_receive_any: Receive any message, returning the tag.

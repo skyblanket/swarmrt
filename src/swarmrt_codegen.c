@@ -200,6 +200,43 @@ static void emit_raise_exit(cg_ctx_t *ctx) {
         fprintf(f, "{ _sw_trace_pop(); return SW_RAISE; }");
 }
 
+/* Builtins that can park stacklessly when called from a resumable call site
+ * (Phase 2e): sleep, and the ones that hand their work to the offload pool
+ * (SW_OFFLOAD_BUILTIN in swarmrt_builtins_studio.h). */
+static int cg_async_builtin(const char *name) {
+    static const char *names[] = {
+        "sleep", "llm_complete", "http_post", "http_post_stream", "http_get", "http_request",
+        "shell", "shell_sandboxed", "shell_managed", "exec_argv", "exec_managed", NULL
+    };
+    for (int i = 0; names[i]; i++) if (strcmp(name, names[i]) == 0) return 1;
+    return 0;
+}
+
+static void emit_call_check(cg_ctx_t *ctx, const char *res);
+
+/* Call builtin `name` into a new variable `res`. An async builtin at a
+ * resumable call site may return SW_SUSPEND, so it gets a suspend point. */
+static void emit_builtin_invoke(cg_ctx_t *ctx, const char *res, const char *name,
+                                const char *arr, int nargs) {
+    FILE *f = ctx->out;
+    int hof = strcmp(name, "map") == 0 ? 0 : strcmp(name, "filter") == 0 ? 1 :
+              strcmp(name, "reduce") == 0 ? 2 : -1;
+    if (cg_can_suspend(ctx) && hof >= 0) {
+        /* Resumable map/filter/reduce: a callback that waits parks the
+         * process instead of pinning its stack (_sw_hof). */
+        fprintf(f, "    sw_val_t *%s = _sw_hof(%d, %s, %d, NULL);\n", res, hof, arr, nargs);
+        emit_call_check(ctx, res);
+    } else if (cg_can_suspend(ctx) && strcmp(name, "pmap") == 0) {
+        fprintf(f, "    sw_val_t *%s = _sw_pmap(%s, %d, NULL);\n", res, arr, nargs);
+        emit_call_check(ctx, res);
+    } else if (cg_can_suspend(ctx) && cg_async_builtin(name)) {
+        fprintf(f, "    sw_val_t *%s = _sw_async_call(_builtin_%s, %s, %d);\n", res, name, arr, nargs);
+        emit_call_check(ctx, res);
+    } else {
+        fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, name, arr, nargs);
+    }
+}
+
 /* After a builtin call: a callback it called through C may have raised. */
 static void emit_builtin_raise_check(cg_ctx_t *ctx) {
     if (!ctx->in_body) return;
@@ -2995,13 +3032,13 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     else if (strcmp(fname, "abs") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_abs(%s, %d);\n", res, arr, nargs);
     else if (strcmp(fname, "map") == 0)
-        fprintf(f, "    sw_val_t *%s = _builtin_map(%s, %d);\n", res, arr, nargs);
+        emit_builtin_invoke(ctx, res, "map", arr, nargs);
     else if (strcmp(fname, "pmap") == 0)
-        fprintf(f, "    sw_val_t *%s = _builtin_pmap(%s, %d);\n", res, arr, nargs);
+        emit_builtin_invoke(ctx, res, "pmap", arr, nargs);
     else if (strcmp(fname, "reduce") == 0)
-        fprintf(f, "    sw_val_t *%s = _builtin_reduce(%s, %d);\n", res, arr, nargs);
+        emit_builtin_invoke(ctx, res, "reduce", arr, nargs);
     else if (strcmp(fname, "filter") == 0)
-        fprintf(f, "    sw_val_t *%s = _builtin_filter(%s, %d);\n", res, arr, nargs);
+        emit_builtin_invoke(ctx, res, "filter", arr, nargs);
     else if (strcmp(fname, "supervise") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_supervise(%s, %d);\n", res, arr, nargs);
     /* Phase 11: Studio builtins (from swarmrt_builtins_studio.h) */
@@ -3189,7 +3226,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "tool_list") == 0 ||
              strcmp(fname, "tool_rollback") == 0 ||
              strcmp(fname, "tool_history") == 0)
-        fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
+        emit_builtin_invoke(ctx, res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
         user_call = 1;
         if (tail && ctx->tc_hop && ctx->has_tail && nargs <= SW_TC_MAX) {
@@ -3814,7 +3851,7 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, mod, fn, arr, nargs);
             emit_call_check(ctx, res);
         } else if (is_builtin(fname)) {
-            fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, arr, nargs);
+            emit_builtin_invoke(ctx, res, fname, arr, nargs);
             emit_builtin_raise_check(ctx);
         } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
@@ -3852,7 +3889,7 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, mod, fn, arr);
             emit_call_check(ctx, res);
         } else if (is_builtin(fname)) {
-            fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, 1);\n", res, fname, arr);
+            emit_builtin_invoke(ctx, res, fname, arr, 1);
             emit_builtin_raise_check(ctx);
         } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, ctx->mod_name, fname, arr);

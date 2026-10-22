@@ -117,3 +117,21 @@ at park (Phase 2f) removes that garbage at the default.
 | pingpong | 8.17 | 8.72 |
 | fanout | 5.36 | 5.39 |
 | parallel | 4.64 | 4.82 |
+
+## After Phase 2e (builtins that wait park stacklessly)
+
+`bench/memory/task_stream.sh`: N `Std.task_stream` workers that all wait, sampled 8 s
+in. The per-process cost is the slope between N=1,000 and N=10,000. Workers in `llm`
+mode wait on `llm_complete` against `bench/rollout`'s mock server, which never
+answers. Each run has 256 offload worker threads, a fixed cost.
+
+| Mode | Before (Phase 2d) | After 2e | Mappings at N=10,000 |
+|---|---|---|---|
+| idle (`receive`) | 5.5 KB | 5.6 KB | 76 → 75 |
+| llm (`llm_complete`) | **27.5 KB** | **6.6 KB** | 20,623 → 642 |
+
+An idle `task_stream` worker costs more than an idle ring process (2.5 KB). It also
+carries its closure and captures in a spawn region, the coordinator's bookkeeping for
+it, and the 1.5 KB per-process trace block. Phases 2f (compaction at park) and 2g
+(trace state per scheduler) target that, and with it the plan's under-5 KB goal for
+this run.

@@ -557,8 +557,15 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
 static sw_val_t *_builtin_sleep(sw_val_t **a, int n) {
     if (n < 1 || a[0]->type != SW_VAL_INT) return sw_val_atom("ok");
     /* Park this process (other processes keep running) without consuming
-     * any message that arrives during the sleep. */
-    if (a[0]->v.i > 0) sw_sleep_ms((uint64_t)a[0]->v.i);
+     * any message that arrives during the sleep. Called from a generated
+     * call site that can resume, it parks stacklessly (Phase 2e). */
+    if (a[0]->v.i > 0) {
+        if (sw_async_take((void *)_builtin_sleep)) {
+            sw_suspend_sleep((uint64_t)a[0]->v.i);
+            return SW_SUSPEND;
+        }
+        sw_sleep_ms((uint64_t)a[0]->v.i);
+    }
     return sw_val_atom("ok");
 }
 
@@ -1250,6 +1257,10 @@ typedef struct {
 
 static void _sw_offl_work(void *p) {
     _sw_offl_job_t *j = (_sw_offl_job_t *)p;
+    /* The stackless form creates the result region here, when the job
+     * runs, so queued jobs cost only their arguments. */
+    if (!j->out) j->out = sw_varena_create_kind(4096, SW_REGION_MESSAGE);
+    if (!j->out) { j->result = NULL; return; }
     sw_value_arena_t *prev = sw_swap_alloc_target(j->out);
     _sw_offl_depth++;
     _sw_offl_waiter = j->waiter;
@@ -1295,6 +1306,63 @@ static sw_val_t *_sw_offload_builtin(sw_val_t *(*fn)(sw_val_t **, int),
     return r;
 }
 
+/* The stackless form (Phase 2e): queue the job and park through the
+ * scheduler, so a process waiting on HTTP or a subprocess holds no stack.
+ * The job's regions belong to the offload job until the resumed process
+ * adopts them (_sw_offl_finish); if the process dies first, the job's last
+ * reference frees them (_sw_offl_free). Returns NULL to mean "run it the
+ * blocking way". */
+static void _sw_offl_free(void *p) {
+    _sw_offl_job_t *j = (_sw_offl_job_t *)p;
+    if (j->in) sw_varena_free_all(j->in);
+    if (j->out) sw_varena_free_all(j->out);
+    free(j->args);
+    free(j);
+}
+
+static sw_val_t *_sw_offl_finish(void *p) {
+    _sw_offl_job_t *j = (_sw_offl_job_t *)p;
+    sw_value_arena_t *mine = sw_self_varena();
+    sw_val_t *r = j->result ? j->result : sw_val_nil();
+    if (mine) {
+        sw_varena_adopt(mine, j->in);
+        if (j->out) sw_varena_adopt(mine, j->out);
+        j->in = j->out = NULL;
+    } else {
+        r = sw_val_nil();
+    }
+    return r;
+}
+
+static sw_val_t *_sw_offload_async(sw_val_t *(*fn)(sw_val_t **, int), sw_val_t **a, int n) {
+    if (!sw_self_varena()) return NULL;
+    _sw_offl_job_t *j = (_sw_offl_job_t *)calloc(1, sizeof(*j));
+    if (!j) return NULL;
+    j->in = sw_varena_create_kind(256, SW_REGION_MESSAGE);
+    j->args = (sw_val_t **)calloc(n > 0 ? (size_t)n : 1, sizeof(sw_val_t *));
+    if (!j->in || !j->args) { _sw_offl_free(j); return NULL; }
+    for (int i = 0; i < n; i++) j->args[i] = a[i] ? deep_copy_into(a[i], j->in) : NULL;
+    j->fn = fn;
+    j->n = n;
+    j->waiter = sw_self();
+    struct sw_offload_job *h = sw_offload_start(_sw_offl_work, j, _sw_offl_free);
+    if (!h) { _sw_offl_free(j); return NULL; }
+    sw_suspend_offload(h, _sw_offl_finish, j);
+    return SW_SUSPEND;
+}
+
+/* A generated call site that can resume calls a builtin through this: the
+ * builtin may then return SW_SUSPEND (sleep, SW_OFFLOAD_BUILTIN). The
+ * invitation names the builtin, so a builtin it calls in turn can't take
+ * it, and it lapses when the call returns. */
+static inline sw_val_t *_sw_async_call(sw_val_t *(*fn)(sw_val_t **, int), sw_val_t **a, int n) {
+    sw_process_t *p = sw_self();
+    if (p) p->async_fn = (void *)fn;
+    sw_val_t *r = fn(a, n);
+    if (p) p->async_fn = NULL;
+    return r;
+}
+
 /* First statement of a blocking builtin: re-dispatches the call through the
  * offload pool unless we are already running on the worker. */
 /* SW_BLOCKING_SCOPE(): the rest of this builtin blocks its OS thread
@@ -1307,7 +1375,12 @@ static inline void _sw_blocking_scope_end(int *unused) { (void)unused; sw_blocki
         (sw_blocking_enter(), 0)
 
 #define SW_OFFLOAD_BUILTIN(fn, a, n) \
-    do { if (_sw_offl_depth == 0) return _sw_offload_builtin((fn), (a), (n)); } while (0)
+    do { if (_sw_offl_depth == 0) { \
+        if (sw_async_take((void *)(fn))) { \
+            sw_val_t *_sw_ar = _sw_offload_async((fn), (a), (n)); \
+            if (_sw_ar) return _sw_ar; \
+        } \
+        return _sw_offload_builtin((fn), (a), (n)); } } while (0)
 
 /* ============================================================
  * Pending-input ring buffer — type-ahead captured mid-turn
@@ -7264,6 +7337,12 @@ static char *_sw_llm_model_field(const char *model) {
 
 static sw_val_t *_builtin_llm_complete(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    /* The whole call, retries and backoff included, runs on the offload
+     * pool (its http_post then runs inline there), so the caller parks once
+     * and, from a resumable call site, without a stack. Interactive
+     * sessions keep http_post's ESC-interrupt watcher on this thread. */
+    if (!(isatty(STDIN_FILENO) && _sw_rl.saved_ok))
+        SW_OFFLOAD_BUILTIN(_builtin_llm_complete, a, n);
     const char *prompt = a[0]->v.str;
 
     const char *opt_model = NULL, *opt_url = NULL, *opt_provider = NULL;
@@ -11037,6 +11116,196 @@ static sw_val_t *_builtin_base64_decode(sw_val_t **a, int n) {
     sw_val_t *r = sw_val_string(out);
     free(out);
     return r;
+}
+
+/* ============================================================
+ * Resumable map / filter / reduce (PROCESS_WEIGHT.md Phase 2e)
+ * ============================================================
+ *
+ * The generated _builtin_map/_filter/_reduce call their callback through
+ * sw_val_apply, which can't be captured, so a callback that waits (receive,
+ * sleep, an HTTP call) pins the process's stack. From a resumable call site
+ * the codegen calls _sw_hof instead: the callback runs through
+ * sw_val_apply_s, and when it suspends this loop saves its own state in a
+ * heap frame like any generated function (see src/test_frames.c for the
+ * shape) and resumes the loop where it was. kind: 0 map, 1 filter, 2 reduce.
+ * Argument order is as tolerant as the generated builtins': fn, list or
+ * list, fn. A raise in the callback returns SW_RAISE to the call site. */
+typedef struct { sw_frame_t h; sw_val_t *fn, *lst, *out; int32_t i, nr; } _sw_hof_F;
+static const sw_fn_meta_t _sw_hof_meta[3] = {
+    { "builtin", "map", 0 }, { "builtin", "filter", 0 }, { "builtin", "reduce", 0 } };
+static sw_val_t *_sw_hof(int kind, sw_val_t **a, int n, sw_frame_t *rs);
+static sw_val_t *_sw_map_rs(sw_frame_t *f) { return _sw_hof(0, NULL, 0, f); }
+static sw_val_t *_sw_filter_rs(sw_frame_t *f) { return _sw_hof(1, NULL, 0, f); }
+static sw_val_t *_sw_reduce_rs(sw_frame_t *f) { return _sw_hof(2, NULL, 0, f); }
+
+static sw_val_t *_sw_hof(int kind, sw_val_t **a, int n, sw_frame_t *rs) {
+    _sw_hof_F *F = (_sw_hof_F *)rs;
+    sw_val_t *fn, *lst, *out, *r;
+    int32_t i, nr = 0, cnt;
+    if (rs) {
+        fn = F->fn; lst = F->lst; out = F->out; i = F->i; nr = F->nr;
+        cnt = lst->v.tuple.count;
+        r = sw_resume_value();
+        goto resumed;
+    }
+    if (n < (kind == 2 ? 3 : 2)) return kind == 2 ? sw_val_nil() : sw_val_list(NULL, 0);
+    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }
+    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }
+    else { fn = a[0]; lst = a[1]; }
+    if (!lst || lst->type != SW_VAL_LIST) return kind == 2 ? a[2] : sw_val_list(NULL, 0);
+    cnt = lst->v.tuple.count;
+    if (kind == 2) out = a[2];
+    else {
+        if (cnt == 0) return sw_val_list(NULL, 0);
+        /* The result list, filled in place: nothing else can see it yet. */
+        sw_val_t **tmp = (sw_val_t **)calloc((size_t)cnt, sizeof(sw_val_t *));
+        if (!tmp) return sw_val_list(NULL, 0);
+        out = sw_val_list(tmp, cnt);
+        free(tmp);
+    }
+    for (i = 0; i < cnt; i++) {
+        if (kind == 2) {
+            sw_val_t *args[] = { out, lst->v.tuple.items[i] };
+            r = sw_val_apply_s(fn, args, 2);
+        } else {
+            sw_val_t *arg[] = { lst->v.tuple.items[i] };
+            r = sw_val_apply_s(fn, arg, 1);
+        }
+        if (SW_UNLIKELY(r == SW_SUSPEND)) goto capture;
+resumed:
+        if (SW_UNLIKELY(r == SW_RAISE)) return SW_RAISE;
+        if (kind == 0) out->v.tuple.items[i] = r;
+        else if (kind == 1) { if (sw_val_is_truthy(r)) out->v.tuple.items[nr++] = lst->v.tuple.items[i]; }
+        else out = r;
+    }
+    if (kind == 1) out->v.tuple.count = nr;
+    return out;
+capture: {
+    static sw_val_t *(*const resume[3])(sw_frame_t *) = { _sw_map_rs, _sw_filter_rs, _sw_reduce_rs };
+    if (!F) F = (_sw_hof_F *)sw_frame_new(sizeof(_sw_hof_F), resume[kind], &_sw_hof_meta[kind]);
+    F->h.pt = 1;
+    F->fn = fn; F->lst = lst; F->out = out; F->i = i; F->nr = nr;
+    sw_frame_link(&F->h, rs != NULL);
+    return SW_SUSPEND;
+  }
+}
+
+/* Resumable pmap. The workers are stackless value entries: one whose
+ * callback waits parks without a stack, keeping its state in a frame, and
+ * sends its result when it resumes. The collector parks on a receive the
+ * same way, with the same rules as the generated _builtin_pmap: one 5 s
+ * deadline for the call, results matched by this call's ref, a missing item
+ * becomes {'error', 'timeout'}. */
+typedef struct { sw_val_t *fn, *item; sw_process_t *caller; uint64_t ref; int idx; } _sw_pmw_t;
+typedef struct { sw_frame_t h; sw_process_t *caller; uint64_t ref; int32_t idx; } _sw_pmw_F;
+static const sw_fn_meta_t _sw_pmw_meta = { "builtin", "pmap worker", 0 };
+static uint64_t _sw_pmap_seq;
+static sw_val_t *_sw_pmw_body(_sw_pmw_t *w, sw_frame_t *rs);
+static sw_val_t *_sw_pmw_rs(sw_frame_t *f) { return _sw_pmw_body(NULL, f); }
+static sw_val_t *_sw_pmw_body(_sw_pmw_t *w, sw_frame_t *rs) {
+    _sw_pmw_F *F = (_sw_pmw_F *)rs;
+    sw_process_t *caller;
+    uint64_t ref;
+    int32_t idx;
+    sw_val_t *r;
+    if (rs) {
+        caller = F->caller; ref = F->ref; idx = F->idx;
+        r = sw_resume_value();
+    } else {
+        { sw_value_arena_t *_r = sw_self_take_spawn_region(), *_cv = sw_self_varena();
+          if (_cv && _r) sw_varena_adopt(_cv, _r); }
+        caller = w->caller; ref = w->ref; idx = w->idx;
+        sw_val_t *fn = w->fn, *arg[] = { w->item };
+        free(w);
+        r = sw_val_apply_s(fn, arg, 1);
+    }
+    if (SW_UNLIKELY(r == SW_SUSPEND)) {
+        if (!F) F = (_sw_pmw_F *)sw_frame_new(sizeof(_sw_pmw_F), _sw_pmw_rs, &_sw_pmw_meta);
+        F->h.pt = 1;
+        F->caller = caller; F->ref = ref; F->idx = idx;
+        sw_frame_link(&F->h, rs != NULL);
+        return SW_SUSPEND;
+    }
+    if (r == SW_RAISE) r = sw_val_nil();
+    sw_val_t *ti[] = { sw_val_int((int64_t)ref), sw_val_int(idx), r };
+    sw_send_value(caller, 11, sw_val_tuple(ti, 3));
+    return sw_val_nil();
+}
+static sw_val_t *_sw_pmw_entry(void *raw) { return _sw_pmw_body((_sw_pmw_t *)raw, NULL); }
+
+typedef struct { sw_frame_t h; sw_val_t *out; uint64_t ref, deadline; int32_t got; } _sw_pmap_F;
+static const sw_fn_meta_t _sw_pmap_meta = { "builtin", "pmap", 0 };
+static sw_val_t *_sw_pmap(sw_val_t **a, int n, sw_frame_t *rs);
+static sw_val_t *_sw_pmap_rs(sw_frame_t *f) { return _sw_pmap(NULL, 0, f); }
+static sw_val_t *_sw_pmap(sw_val_t **a, int n, sw_frame_t *rs) {
+    _sw_pmap_F *F = (_sw_pmap_F *)rs;
+    sw_val_t *out;
+    uint64_t ref, deadline;
+    int32_t got, cnt;
+    if (rs) {
+        out = F->out; ref = F->ref; deadline = F->deadline; got = F->got;
+        cnt = out->v.tuple.count;
+        goto collect;
+    }
+    if (n < 2) return sw_val_list(NULL, 0);
+    sw_val_t *fn, *lst;
+    if (a[0] && a[0]->type == SW_VAL_FUN) { fn = a[0]; lst = a[1]; }
+    else if (a[1] && a[1]->type == SW_VAL_FUN) { lst = a[0]; fn = a[1]; }
+    else { fn = a[0]; lst = a[1]; }
+    if (!lst || lst->type != SW_VAL_LIST) return sw_val_list(NULL, 0);
+    cnt = lst->v.tuple.count;
+    if (cnt == 0) return sw_val_list(NULL, 0);
+    ref = __atomic_add_fetch(&_sw_pmap_seq, 1, __ATOMIC_RELAXED);
+    {
+        sw_val_t **tmp = (sw_val_t **)calloc((size_t)cnt, sizeof(sw_val_t *));
+        if (!tmp) return sw_val_list(NULL, 0);
+        out = sw_val_list(tmp, cnt);
+        free(tmp);
+    }
+    for (int i = 0; i < cnt; i++) {
+        _sw_pmw_t *w = (_sw_pmw_t *)malloc(sizeof(_sw_pmw_t));
+        if (!w) continue;
+        /* fn + item travel in a SPAWN region the worker adopts. */
+        sw_value_arena_t *wr = sw_varena_create_kind(256, SW_REGION_SPAWN);
+        w->fn = wr ? deep_copy_into(fn, wr) : sw_val_deep_copy_global(fn);
+        w->item = wr ? deep_copy_into(lst->v.tuple.items[i], wr) : sw_val_deep_copy_global(lst->v.tuple.items[i]);
+        w->caller = sw_self(); w->idx = i; w->ref = ref;
+        if (!sw_spawn_v_owned(_sw_pmw_entry, w, wr)) { if (wr) sw_varena_free_all(wr); free(w); }
+    }
+    /* Monotonic, so a wall-clock step can't stretch or cut the deadline. */
+    deadline = sw_now_ns() / 1000000ULL + 5000;
+    got = 0;
+collect:
+    while (got < cnt) {
+        uint64_t now = sw_now_ns() / 1000000ULL;
+        if (now >= deadline) break;
+        sw_val_t *m = (sw_val_t *)sw_recv_tagged_adopt(11, 0);
+        if (!m) {
+            if (sw_suspend_ok()) {
+                sw_suspend_recv(deadline - now);
+                if (!F) F = (_sw_pmap_F *)sw_frame_new(sizeof(_sw_pmap_F), _sw_pmap_rs, &_sw_pmap_meta);
+                F->h.pt = 1;
+                F->out = out; F->ref = ref; F->deadline = deadline; F->got = got;
+                sw_frame_link(&F->h, rs != NULL);
+                return SW_SUSPEND;
+            }
+            m = (sw_val_t *)sw_recv_tagged_adopt(11, deadline - now);
+            if (!m) break;
+        }
+        if (m->type == SW_VAL_TUPLE && m->v.tuple.count == 3
+            && m->v.tuple.items[0]->type == SW_VAL_INT && m->v.tuple.items[0]->v.i == (int64_t)ref
+            && m->v.tuple.items[1]->type == SW_VAL_INT) {
+            int ix = (int)m->v.tuple.items[1]->v.i;
+            if (ix >= 0 && ix < cnt && !out->v.tuple.items[ix]) { out->v.tuple.items[ix] = m->v.tuple.items[2]; got++; }
+        }
+    }
+    for (int i = 0; i < cnt; i++)
+        if (!out->v.tuple.items[i]) {
+            sw_val_t *e[] = { sw_val_atom("error"), sw_val_atom("timeout") };
+            out->v.tuple.items[i] = sw_val_tuple(e, 2);
+        }
+    return out;
 }
 
 #endif /* SWARMRT_BUILTINS_STUDIO_H */

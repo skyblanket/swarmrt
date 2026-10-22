@@ -4,6 +4,43 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-22 — Builtins that wait park without a stack
+
+**feat(runtime): sleep, offloaded builtins and map/filter/reduce/pmap callbacks park
+stacklessly (PROCESS_WEIGHT.md Phase 2e).** A spawned compiled process that waits
+inside these builtins now gives its stack back, as a receive already did:
+- **`sleep`** parks until its deadline (`SW_WAIT_SLEEP`). Mail that arrives meanwhile
+  wakes it, stays queued, and the process parks again.
+- **Offloaded builtins** park until their job on the offload pool is done
+  (`SW_WAIT_OFFLOAD`): `shell`, `shell_sandboxed`, `shell_managed`, `exec_argv`,
+  `exec_managed`, `http_get`, `http_post`, `http_request`, `http_post_stream` when it
+  streams to a process, and
+  `llm_complete`. `llm_complete` now runs whole on the pool, retries and backoff
+  included. The job's argument region is created at submit, its result region when a
+  worker takes it, and the resumed process adopts both. A process killed while
+  waiting drops its reference, and the job's last reference frees the regions.
+- **`map`, `filter`, `reduce` and `pmap`**, called from a resumable site, run their
+  callback through `sw_val_apply_s` and keep their loop state in a heap frame
+  (`_sw_hof`, `_sw_pmap`). `pmap`'s workers are stackless value entries.
+
+A generated call site invites a builtin to suspend (`_sw_async_call`, `sw_async_take`).
+The invitation names that builtin, so a builtin it calls from C still blocks the old
+way.
+
+`bench/memory/task_stream.sh`, 10,000 `Std.task_stream` workers waiting on
+`llm_complete` against the rollout mock server: 27.5 KB → 6.6 KB per waiting
+process, and 20,623 → 642 mappings. Idle `task_stream` workers cost 5.5 KB. The plan's
+under-5 KB target for this run needs Phases 2f and 2g: compaction at park, and removing
+the 1.5 KB per-process trace block. Gate: `tests/sw/test_async_builtins.sw`. It covers:
+- sleep keeping mail and lasting its time;
+- `shell`/`exec_argv` through the pool;
+- `map`, `filter` and `reduce` callbacks that receive or sleep, nested maps, a piped
+  map, and an error in a map callback after it parked;
+- `pmap` from a spawned process and from `main`;
+- a process killed mid-offload;
+- 40,000 processes parked inside a map callback, which fails at 35,165 with
+  `SW_NO_STACKLESS=1`.
+
 ## 2026-10-22 — try/catch without setjmp
 
 **feat(codegen): a try body can park like any other code (PROCESS_WEIGHT.md Phase 2d,
