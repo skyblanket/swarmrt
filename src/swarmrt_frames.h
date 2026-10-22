@@ -26,6 +26,10 @@ struct sw_process;
 /* Sentinels: distinct objects, compared by address, never read as values. */
 extern struct sw_val sw_suspend_sentinel;
 #define SW_SUSPEND (&sw_suspend_sentinel)
+/* An error() raised inside a live try (PROCESS_WEIGHT.md §3.6): every
+ * generated call site passes it up to the innermost enclosing catch. */
+extern struct sw_val sw_raise_sentinel;
+#define SW_RAISE (&sw_raise_sentinel)
 
 typedef struct sw_fn_meta {
     const char *module, *fn;
@@ -87,10 +91,6 @@ sw_val_t *sw_resume_value(void);
 /* While above zero, every suspend point takes its old-style path. */
 void sw_no_suspend_enter(void);
 void sw_no_suspend_exit(void);
-/* try/catch saves the depth and restores it on both arms: error() longjmps
- * past the exits of any nested sw_val_apply. */
-uint32_t sw_no_suspend_depth(void);
-void sw_no_suspend_set(uint32_t depth);
 
 #ifndef SW_UNLIKELY
 #define SW_UNLIKELY(x) __builtin_expect(!!(x), 0)

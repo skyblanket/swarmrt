@@ -405,18 +405,17 @@ struct sw_process {
     void (*on_destroy)(void *);
     void *on_destroy_arg;
 
-    /* Innermost live try/catch frame for the COMPILED path, PER PROCESS for
-     * the same reason as gen_error: a fiber can yield (receive/sleep) inside a
-     * try and resume on another scheduler thread, so a thread-local would
-     * unwind the wrong process. The frame itself (jmp_buf + prev link) is a C
-     * local in the generated function, i.e. it lives on this process's fiber
-     * stack — setjmp/longjmp state is fiber-contained and survives scheduler
-     * migration. error() longjmps to this frame (full dynamic unwind, callee
-     * errors land in the nearest enclosing catch); with no frame it stays the
-     * documented "silent, continue with nil". Panics NEVER use this chain —
-     * they remain uncatchable and kill the process. NULL when no try is live.
-     * At struct END so it shifts no asm-pinned offset. */
-    void *try_chain;
+    /* Compiled try/catch state (PROCESS_WEIGHT.md §3.6), PER PROCESS for the
+     * same reason as gen_error: a try body can park and resume on another
+     * scheduler thread. try_live counts the live compiled try bodies in this
+     * process's dynamic extent; error() raises only while it is > 0 (with no
+     * live try it stays the documented "silent, continue with nil").
+     * raise_pending is set when a raise crosses C: a callback called through
+     * sw_val_apply raised, so its C caller sees nil and the generated code
+     * after that builtin re-raises. Panics never use this; they stay
+     * uncatchable. Same 8 bytes the old try_chain pointer took. */
+    int32_t try_live;
+    int32_t raise_pending;
 
     /* Pending-message count for the SW_MAILBOX_MAX depth cap: incremented by
      * every producer (sw_send / sw_send_tagged[_msg] / deliver_signal / timer
@@ -822,11 +821,17 @@ void *sw_recv_tagged_adopt(uint64_t tag, uint64_t timeout_ms);
  * fiber's error (whose value would be freed on that fiber's exit). */
 struct sw_val **sw_self_error_slot(void);
 
-/* Innermost live compiled try/catch frame for the current process
- * (thread-local fallback outside a process). Same per-process rationale as
- * sw_self_error_slot; see the try_chain field comment in struct sw_process.
- * Holds a _sw_try_frame_t* (defined in the studio builtins header). */
-void **sw_self_try_chain(void);
+/* Compiled try/catch state of the current process (thread-local fallback
+ * outside a process); see try_live in struct sw_process. sw_try_enter /
+ * sw_try_leave bracket a try body; sw_raise_begin is error()'s half: 1 if a
+ * try is live (the error raises), 0 if not. sw_raised() takes a pending
+ * raise left by a callback called through C (1 once, then 0). */
+void sw_try_enter(void);
+void sw_try_leave(void);
+int sw_raise_begin(void);
+void sw_raise_set_pending(void);
+int sw_raise_pending(void);
+int sw_raised(void);
 
 /* Ownership v2: spawn a process that OWNS `region` (its args/captures live in it)
  * until the child's trampoline adopts it. Reclaimed by process_destroy if the

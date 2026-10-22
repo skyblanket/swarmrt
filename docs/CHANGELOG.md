@@ -4,6 +4,31 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-22 — try/catch without setjmp
+
+**feat(codegen): a try body can park like any other code (PROCESS_WEIGHT.md Phase 2d,
+decision D2).** `error()` inside a live `try` now raises by returning the `SW_RAISE`
+sentinel instead of `longjmp`. Every generated call site checks for it and jumps to
+the innermost enclosing catch in that function, or returns it to the caller. A
+callback called from C (`map`, `filter`, `reduce`, `ets_update`) that raises makes
+`sw_val_apply` return nil and skip further callbacks; the generated code after the
+builtin re-raises. `ets_update` leaves the entry unchanged, and the circuit breaker
+counts nothing, as before. The semantics are unchanged:
+- the full dynamic extent unwinds and nothing after the error runs;
+- an error in a catch goes to the enclosing try;
+- with no live try, `error()` returns nil;
+- panics stay uncatchable.
+
+Try bodies no longer run under no-suspend, so a receive, sleep or reduction yield
+inside one parks stacklessly. 40,000 processes parked in a receive inside a try now
+all catch their error in 0.9 s. Before, they hit stock Linux's stack-mapping limit at
+32,733. Gate: `tests/sw/test_try_raise.sw`. It covers callees 50 deep, lambdas,
+pipes, comprehensions, `map`/`filter`/`ets_update` callbacks, nested tries, an error
+in a catch, error after a receive, a sleep and reduction yields, an error from a
+resumed heap frame, and the no-try case. The test also passes under
+`SW_SUSPEND_TORTURE`, `SW_SPILL_TORTURE` and `SW_NO_STACKLESS`, apart from the
+40,000-process check, which needs stackless parking.
+
 ## 2026-10-22 — Deep recursion moves to the heap
 
 **feat(runtime): deep non-tail recursion in a spawned process no longer overflows its
@@ -13,7 +38,7 @@ it go to the heap the same way a parked process's do, and the driver re-issues t
 on a fresh stack. A spawned process recurses until its saved frames reach
 `SW_FRAME_MAX` (default 256 MB, `k`/`m`/`g` suffixes), then panics with the usual
 recoverable `stack overflow` exit; that cap now also holds for a recursion that parks
-often enough never to fill a stack. `main`, C callbacks and `try` bodies keep the old
+often enough never to fill a stack. `main`, C callbacks and (until Phase 2d) `try` bodies keep the old
 `SW_PROC_STACK` limit. `SW_SPILL_TORTURE=n` forces a spill every nth call check.
 
 1,000,000-deep `1 + depth(n - 1)` in a spawned process: 0.5 s, ~300 MB. Gates:

@@ -412,7 +412,7 @@ void *sw_ets_update(sw_ets_tid_t tid, void *key, void *fun) {
 
     /* Call the compiled lambda outside the lock. */
     sw_val_t *new_val = sw_val_apply(fn, &old_val, 1);
-    if (!new_val) return NULL;
+    if (!new_val || sw_raise_pending()) return NULL;   /* raised: entry unchanged */
 
     /* Write the result back under the write lock; re-scan because the lock
      * was dropped during the function call. */

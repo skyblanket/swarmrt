@@ -2635,9 +2635,14 @@ sw_val_t *sw_val_fun_native(void *fn_ptr, int nparams,
  * can't be captured. Generated code calls sw_val_apply_s, which may return
  * SW_SUSPEND (swarmrt_frames.h). */
 sw_val_t *sw_val_apply(sw_val_t *fun, sw_val_t **args, int nargs) {
+    /* A raise can't pass through the C caller: it sees nil, and further
+     * callbacks are skipped until the generated code after the builtin
+     * takes the pending raise (sw_raised) and re-raises it. */
+    if (SW_UNLIKELY(sw_raise_pending())) return sw_val_nil();
     sw_no_suspend_enter();
     sw_val_t *r = sw_val_apply_s(fun, args, nargs);
     sw_no_suspend_exit();
+    if (SW_UNLIKELY(r == SW_RAISE)) { sw_raise_set_pending(); return sw_val_nil(); }
     return r;
 }
 
@@ -3026,6 +3031,7 @@ sw_val_t sw_tc_hop_sentinel;
 /* ===== Stackless processes (swarmrt_frames.h, PROCESS_WEIGHT.md §3.3–3.5) ===== */
 
 struct sw_val sw_suspend_sentinel;
+struct sw_val sw_raise_sentinel;
 
 int sw_suspend_ok(void) {
     sw_process_t *p = sw_self();
@@ -3197,8 +3203,6 @@ sw_val_t *sw_resume_value(void) {
 
 void sw_no_suspend_enter(void) { sw_process_t *p = sw_self(); if (p) p->no_suspend++; }
 void sw_no_suspend_exit(void)  { sw_process_t *p = sw_self(); if (p && p->no_suspend) p->no_suspend--; }
-uint32_t sw_no_suspend_depth(void) { sw_process_t *p = sw_self(); return p ? p->no_suspend : 0; }
-void sw_no_suspend_set(uint32_t d) { sw_process_t *p = sw_self(); if (p) p->no_suspend = d; }
 
 /* The driver (§3.5). Runs one activation of a stackless process on its
  * carrier: the entry the first time, the innermost parked frame after that.

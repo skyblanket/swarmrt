@@ -18,8 +18,7 @@ blocked:
 - interpreted code (`swc run`, `swc test`, the REPL, agent tools run by `tool_call`);
 - runtime processes with a C entry (supervisors, internal servers);
 - a compiled process blocked inside a builtin (`sleep`, HTTP, shell) or inside a
-  callback called from C (`map`/`filter`/`reduce`, `ets_update`), or inside a `try`
-  body.
+  callback called from C (`map`/`filter`/`reduce`, `ets_update`).
 
 On stock Linux (`vm.max_map_count` 65530) about 32,700 of those can be blocked at once.
 A process that can't get a carrier fails with a `carrier stack` message and the node
@@ -33,8 +32,8 @@ at park, are Phases 2e–2f of `docs/design/PROCESS_WEIGHT.md`.
 ### Compiled non-tail recursion outside a spawned process is bounded by the stack
 
 A spawned compiled process moves deep recursion to the heap (up to `SW_FRAME_MAX`,
-default 256 MB of saved frames). `main`, a callback called from C (`map`/`filter`/
-`reduce`) and a `try` body can't park, so there a deep enough recursion still raises
+default 256 MB of saved frames). `main` and a callback called from C (`map`/`filter`/
+`reduce`) can't park, so there a deep enough recursion still raises
 `stack overflow` at the `SW_PROC_STACK` limit (default 128 KB).
 **Workaround:** run the deep work in a spawned process, raise `SW_PROC_STACK`, or write
 it tail-recursively.
@@ -247,8 +246,10 @@ on both paths and gated by the dual-path conformance runner
 
 - `error()` unwinds the full dynamic extent to the nearest `try` — an
   `error()` raised inside a callee lands in the caller's `catch`, and the
-  statements after the raise do NOT run. (Compiled: per-process
-  setjmp/longjmp chain, `sw_self_try_chain`; the old codegen ran the whole
+  statements after the raise do NOT run. (Compiled: since Phase 2d of
+  `docs/design/PROCESS_WEIGHT.md`, error() inside a live try returns the
+  `SW_RAISE` sentinel up the call chain to the catch, with no setjmp; before
+  that a per-process setjmp/longjmp chain; and before that the codegen ran the whole
   try body and tested the sentinel once at the end, so the statement after
   an `error()` still executed — and could panic the process before the
   catch was consulted.)
