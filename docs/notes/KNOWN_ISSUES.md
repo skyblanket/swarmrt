@@ -30,6 +30,15 @@ to ~4.9 KB at some throughput cost.
 builtin-waiting processes at once. Converting builtins and C callbacks, and compacting
 at park, are Phases 2e–2f of `docs/design/PROCESS_WEIGHT.md`.
 
+### Compiled non-tail recursion outside a spawned process is bounded by the stack
+
+A spawned compiled process moves deep recursion to the heap (up to `SW_FRAME_MAX`,
+default 256 MB of saved frames). `main`, a callback called from C (`map`/`filter`/
+`reduce`) and a `try` body can't park, so there a deep enough recursion still raises
+`stack overflow` at the `SW_PROC_STACK` limit (default 128 KB).
+**Workaround:** run the deep work in a spawned process, raise `SW_PROC_STACK`, or write
+it tail-recursively.
+
 ### Interpreter non-tail recursion is bounded
 
 The interpreter (`swc run` / REPL / `swc test`) runs tail calls in place (see

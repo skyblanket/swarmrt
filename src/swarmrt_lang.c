@@ -3044,6 +3044,11 @@ void sw_suspend_recv(uint64_t timeout_ms) {
     p->wait_arg = timeout_ms;
 }
 
+/* Frames alive in the whole runtime, for tests that check teardown. */
+static _Atomic long g_frames_live;
+
+long sw_frames_live(void) { return atomic_load_explicit(&g_frames_live, memory_order_relaxed); }
+
 sw_frame_t *sw_frame_new(uint32_t size, sw_val_t *(*resume)(sw_frame_t *),
                          const sw_fn_meta_t *meta) {
     sw_frame_t *f = (sw_frame_t *)calloc(1, size);
@@ -3054,6 +3059,9 @@ sw_frame_t *sw_frame_new(uint32_t size, sw_val_t *(*resume)(sw_frame_t *),
     f->resume = resume;
     f->meta = meta;
     f->size = size;
+    atomic_fetch_add_explicit(&g_frames_live, 1, memory_order_relaxed);
+    sw_process_t *p = sw_self();
+    if (p) p->frame_bytes += size;
     return f;
 }
 
@@ -3066,7 +3074,121 @@ void sw_frame_link(sw_frame_t *f, int resumed) {
     p->cap_outer = f;
 }
 
-void sw_frame_free(sw_frame_t *f) { free(f); }
+void sw_frame_free(sw_frame_t *f) {
+    sw_process_t *p = sw_self();
+    if (p && f && p->frame_bytes >= f->size) p->frame_bytes -= f->size;
+    sw_frame_drop(f);
+}
+
+void sw_frame_drop(sw_frame_t *f) {
+    if (f) atomic_fetch_sub_explicit(&g_frames_live, 1, memory_order_relaxed);
+    free(f);
+}
+
+/* ---- Spill (deep recursion) ---- */
+
+typedef struct sw_spill {
+    sw_tc_body_t fn;            /* a module function body, or */
+    sw_lambda_body_t lfn;       /* a lambda body */
+    int n;
+    int has_floor;
+    sw_varena_mark_t floor;
+    sw_val_t *args[];
+} sw_spill_t;
+
+static uint64_t sw_frame_max(void) {
+    static uint64_t cap = 0;
+    if (!cap) {
+        uint64_t v = 256ULL << 20;
+        const char *e = getenv("SW_FRAME_MAX");
+        if (e && *e) {
+            char *end = NULL;
+            unsigned long long x = strtoull(e, &end, 10);
+            if (end && (*end == 'k' || *end == 'K')) x <<= 10;
+            else if (end && (*end == 'm' || *end == 'M')) x <<= 20;
+            else if (end && (*end == 'g' || *end == 'G')) x <<= 30;
+            if (x >= 4096) v = x;
+        }
+        cap = v;
+    }
+    return cap;
+}
+
+static _Atomic int g_spill_torture = -1;
+static _Atomic unsigned long g_spill_tick;
+
+/* Spill starts 16 KB before the red zone: the generated panic check and this
+ * one probe the stack from different frames, so they must not race for the
+ * same boundary. */
+#define SW_STACK_SPILL_ZONE (SW_STACK_RED_ZONE + 16 * 1024)
+
+int sw_spill_now(void) {
+    sw_process_t *p = sw_self();
+    if (p && p->stack_mem) {
+        char probe;
+        uintptr_t delta = (uintptr_t)&probe - (uintptr_t)p->stack_mem;
+        if (delta <= p->stack_size && delta < SW_STACK_SPILL_ZONE) return 1;
+    }
+    int t = atomic_load_explicit(&g_spill_torture, memory_order_relaxed);
+    if (SW_UNLIKELY(t != 0)) {
+        if (t < 0) {
+            const char *e = getenv("SW_SPILL_TORTURE");
+            t = e ? atoi(e) : 0;
+            if (t < 0) t = 0;
+            atomic_store_explicit(&g_spill_torture, t, memory_order_relaxed);
+        }
+        if (t > 0 && atomic_fetch_add_explicit(&g_spill_tick, 1, memory_order_relaxed) %
+                         (unsigned long)t == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static sw_val_t *sw_spill_park(sw_tc_body_t fn, sw_lambda_body_t lfn, sw_val_t **args,
+                               int nargs, sw_varena_mark_t *floor) {
+    sw_process_t *p = sw_self();
+    if (!p || p->frame_bytes > sw_frame_max()) return NULL;
+    if (nargs < 0) nargs = 0;
+    /* The caller's argument array is about to unwind: copy it. */
+    sw_spill_t *sp = (sw_spill_t *)malloc(sizeof(sw_spill_t) + sizeof(sw_val_t *) * (size_t)nargs);
+    if (!sp) return NULL;
+    sp->fn = fn;
+    sp->lfn = lfn;
+    sp->n = nargs;
+    sp->has_floor = floor != NULL;
+    if (floor) sp->floor = *floor;
+    for (int i = 0; i < nargs; i++) sp->args[i] = args ? args[i] : NULL;
+    free(p->spill);
+    p->spill = sp;
+    p->wait_kind = SW_WAIT_CALL;
+    return SW_SUSPEND;
+}
+
+sw_val_t *sw_spill_call(sw_tc_body_t body, sw_val_t **args, int nargs, sw_varena_mark_t *floor) {
+    return sw_spill_park(body, NULL, args, nargs, floor);
+}
+
+sw_val_t *sw_spill_lambda(sw_lambda_body_t body, sw_val_t **args, int nargs) {
+    return sw_spill_park(NULL, body, args, nargs, NULL);
+}
+
+/* Re-issue a spilled call. The driver runs this on the carrier the unwind
+ * just emptied; the callee copies its arguments in its prologue, so the
+ * spill record can go as soon as the call returns. */
+static sw_val_t *sw_spill_reissue(sw_process_t *p) {
+    sw_spill_t *sp = p->spill;
+    p->spill = NULL;
+    if (!sp) return sw_val_nil();
+    sw_val_t *r;
+    if (sp->lfn) {
+        r = sp->lfn(sp->n > 0 ? sp->args : NULL, sp->n, NULL);
+    } else {
+        sw_varena_mark_t fl = sp->floor;
+        r = sp->fn(sp->n > 0 ? sp->args : NULL, sp->n, sp->has_floor ? &fl : NULL, NULL);
+    }
+    free(sp);
+    return r;
+}
 
 sw_val_t *sw_resume_value(void) {
     sw_process_t *p = sw_self();
@@ -3106,6 +3228,17 @@ int sw_run_stackless(sw_process_t *p) {
             if (!k && p->cap_outer) p->cap_outer->parent = waiting;
             sw_frame_t *top = p->cap_inner ? p->cap_inner : waiting;
             p->cap_inner = p->cap_outer = NULL;
+            if (p->wait_kind == SW_WAIT_CALL) {
+                /* Spill: the frames above the parked call are captured;
+                 * re-issue it here, its value going to `top`. */
+                p->wait_kind = SW_WAIT_NONE;
+                waiting = top;
+                k = NULL;
+                p->run_k = NULL;
+                p->run_waiting = waiting;
+                r = sw_spill_reissue(p);
+                continue;
+            }
             if (!top) {
                 fprintf(stderr, "[SwarmRT] internal error: a process suspended "
                                 "without capturing a frame\n");
@@ -3113,6 +3246,17 @@ int sw_run_stackless(sw_process_t *p) {
             }
             p->cont = top;
             p->run_k = p->run_waiting = NULL;
+            /* A runaway recursion that parks often never fills a stack,
+             * so the spill check never sees it: hold its saved frames to
+             * the same budget here. Teardown frees the chain in cont. */
+            if (SW_UNLIKELY(p->frame_bytes > sw_frame_max())) {
+                char msg[160];
+                snprintf(msg, sizeof msg, "stack overflow: %llu MB of saved frames "
+                         "(deep recursion? raise SW_FRAME_MAX)",
+                         (unsigned long long)(p->frame_bytes >> 20));
+                fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg);
+                sw_process_panic(p, -1, msg);
+            }
             return SW_RUN_SUSPENDED;
         }
         if (r == SW_TC_HOP) {

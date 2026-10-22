@@ -204,15 +204,24 @@ int main(void) {
         if (s == SW_PROC_WAITING || s == SW_PROC_RUNNABLE || s == SW_PROC_RUNNING) live++;
     }
     CHECK(live == 0, "woken and killed parkers all exited (%d still live)", live);
+    CHECK(sw_frames_live() == 0, "their frames were freed (%ld still live)", sw_frames_live());
 
     /* 5: a panic in a resumed activation frees its frame chain (checked
-     * by LeakSanitizer: run this binary under ASan with leaks on). */
+     * here by count, and by LeakSanitizer under ASan with leaks on). */
     static sw_process_t *crashers[100];
     for (int i = 0; i < 100; i++) crashers[i] = sw_spawn_v(crasher_entry, NULL);
     wait_ms(200);   /* all parked, two frames each */
+    int parked_frames = (int)sw_frames_live();
     for (int i = 0; i < 100; i++) sw_send_value(crashers[i], 0, sw_val_nil());
     wait_ms(200);
-    CHECK(1, "100 processes panicked after a resume");
+    int up = 0;
+    for (int i = 0; i < 100; i++) {
+        int s = atomic_load(&crashers[i]->state);
+        if (s == SW_PROC_WAITING || s == SW_PROC_RUNNABLE || s == SW_PROC_RUNNING) up++;
+    }
+    CHECK(up == 0, "100 processes panicked after a resume (%d still live)", up);
+    CHECK(parked_frames == 200 && sw_frames_live() == 0,
+          "their frame chains were freed (%d parked, %ld left)", parked_frames, sw_frames_live());
 
     sw_shutdown(0);
     printf("%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);

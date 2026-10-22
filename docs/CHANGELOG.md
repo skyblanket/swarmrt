@@ -4,6 +4,25 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-22 — Deep recursion moves to the heap
+
+**feat(runtime): deep non-tail recursion in a spawned process no longer overflows its
+stack (PROCESS_WEIGHT.md Phase 2c).** When a compiled call finds the carrier stack
+nearly full, it parks the call (`sw_spill_call` / `sw_spill_lambda`), the frames above
+it go to the heap the same way a parked process's do, and the driver re-issues the call
+on a fresh stack. A spawned process recurses until its saved frames reach
+`SW_FRAME_MAX` (default 256 MB, `k`/`m`/`g` suffixes), then panics with the usual
+recoverable `stack overflow` exit; that cap now also holds for a recursion that parks
+often enough never to fill a stack. `main`, C callbacks and `try` bodies keep the old
+`SW_PROC_STACK` limit. `SW_SPILL_TORTURE=n` forces a spill every nth call check.
+
+1,000,000-deep `1 + depth(n - 1)` in a spawned process: 0.5 s, ~300 MB. Gates:
+`tests/sw/test_deep_recursion.sw` (non-tail, mutual, list-building and lambda
+recursion, 100K–1M deep); `make gc-slope` now runs `tests/gc/slope_mutual_park.sw`
+under `SW_SUSPEND_TORTURE=50` (the arena-floor regression from #192); `test-frames`
+counts frames to check a panic after a resume frees the whole chain. `make test-sw`
+passes under `SW_SUSPEND_TORTURE=3` and with `SW_SPILL_TORTURE=11` added.
+
 ## 2026-10-21 — Compiled processes park without a stack
 
 **feat(codegen): every compiled function can suspend and resume (PROCESS_WEIGHT.md

@@ -281,6 +281,16 @@ typedef struct sw_tc_park {
     sw_val_t *args[SW_TC_MAX];
 } sw_tc_park_t;
 sw_tc_park_t *sw_tc_park(void);
+
+/* Spill (PROCESS_WEIGHT.md §3.4 rule 5): a function that finds its carrier
+ * nearly full at entry parks its own call (args copied) and returns
+ * SW_SUSPEND; its callers capture themselves and the driver re-issues the
+ * call on the now-empty carrier. Returns NULL when the process's heap frames
+ * already exceed SW_FRAME_MAX (default 256 MB): recursion is bounded by
+ * memory, and past that the caller panics as a stack overflow. */
+typedef sw_val_t *(*sw_lambda_body_t)(sw_val_t **args, int nargs, sw_frame_t *rs);
+sw_val_t *sw_spill_call(sw_tc_body_t body, sw_val_t **args, int nargs, sw_varena_mark_t *floor);
+sw_val_t *sw_spill_lambda(sw_lambda_body_t body, sw_val_t **args, int nargs);
 static inline sw_val_t *sw_tc_drive(sw_val_t *r) {
     while (r == SW_TC_HOP) {
         sw_tc_park_t *pk = sw_tc_park();
