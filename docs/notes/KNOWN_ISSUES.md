@@ -28,8 +28,9 @@ blocked:
 On stock Linux (`vm.max_map_count` 65530) about 32,700 of those can be blocked at once.
 A process that can't get a carrier fails with a `carrier stack` message and the node
 keeps running. A process that parks stacklessly is compacted when its arena has grown
-past `SW_PARK_COMPACT_MIN` (default 2 KB) or twice what the last compaction kept; a
-pinned one isn't.
+past both `SW_PARK_COMPACT_MIN` (default 2 KB) and twice what the last compaction kept.
+A pinned process isn't compacted, and neither is one with a frame whose slot layout is
+unknown.
 **Workaround:** raise `vm.max_map_count` if you block that many interpreted or
 builtin-waiting processes at once.
 

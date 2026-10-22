@@ -146,15 +146,22 @@ this run.
 | idle | 2.6 KB | 2.6 KB |
 
 The default trigger (`SW_PARK_COMPACT_MIN` 2 KB) is what gets busy processes under 5 KB:
-at 4 KB they cost 7.8 KB, at 8 KB 8.1 KB. Busy ring setup (`ready_ms`) takes 29 s instead
-of 13 s. That isn't a slowdown: during setup `main` competes with a ring that now runs.
-Steady-state throughput of a token ring (every process passing a token, 5 s, `-O`):
+at 4 KB they cost 7.8 KB, at 8 KB 8.1 KB.
 
-| Ring | 2e hops | 2f hops |
+`bench/memory/ring_throughput.sw` (`-O`, every process passes a token, two runs each).
+Each worker counts its own hops; the count is taken once the tokens are out and again
+5 s later.
+
+| Ring | 2e hops in 5 s | 2f hops in 5 s |
 |---|---|---|
-| 1,000 | 5.5–5.8M | 5.7–6.0M |
-| 20,000 | 0.7–1.9M | 1.5–2.0M |
-| 99,000 | 35–131K | **2.7–3.1M** |
+| 1,000 | 6.5–7.1M | 7.1–8.1M |
+| 20,000 | 13.3–15.3M | 13.0–14.9M |
+| 99,000 | 37–45M | **52.6–53.5M** |
+
+One cost stays open. At 99,000, `main` takes 12.7–15.2 s instead of 8.3–8.5 s to send
+the tokens into the already-running ring, and the busy `measure.sh` ring takes 29 s
+instead of 13 s to reach READY. Spawning (0.9 s against 1.0 s) and the `go` broadcast
+(3.3 s both) are unchanged. The cause isn't pinned down.
 
 `task_stream.sh`: idle 5.9 KB, `llm_complete` 7.1 KB per waiting worker, within noise of
 2e. Those workers' arenas stay under the trigger, so compaction doesn't apply to them.

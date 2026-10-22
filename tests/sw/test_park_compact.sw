@@ -17,6 +17,19 @@ fun assert_eq(name, actual, expected) {
     }
 }
 
+# A module global (initialised in main's arena) read by a spawned process
+# across parks: the reference is outside the parked process's arena.
+let TABLE = [{"one", 1}, {"two", 2}, %{k: "v"}]
+
+fun global_reader(parent) {
+    a = elem(hd(TABLE), 0)
+    garbage(200, [])
+    tick()
+    garbage(200, [])
+    tick()
+    send(parent, {'global', {a, length(TABLE), map_get(hd(tl(tl(TABLE))), 'k')}})
+}
+
 fun garbage(n, acc) { if (n == 0) { length(acc) } else { garbage(n - 1, [to_string(n) ++ "-junk" | acc]) } }
 
 fun tick() { receive { 'tick' -> 'ok' } }
@@ -77,6 +90,9 @@ fun main() {
     pump(h, 20)
     f = f + assert_eq("live map, list and closure survive parks",
                       await('held'), {'done', "alice", ["s", 1], 16, [1, 2, 3, "four", {5, 6}]})
+    g = spawn(global_reader(me))
+    pump(g, 2)
+    f = f + assert_eq("module global read across parks", await('global'), {"one", 3, "v"})
     c = spawn(counter(me, 30, []))
     feed(c, 1, 30)
     f = f + assert_eq("loop state through a parking self-tail call",
