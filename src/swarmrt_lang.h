@@ -224,6 +224,7 @@ static inline sw_process_t *sw_pid_of(sw_val_t *v) {
 sw_val_t *sw_val_remote_pid(const char *node, uint64_t id);
 sw_val_t *sw_val_tuple(sw_val_t **items, int count);
 sw_val_t *sw_val_list(sw_val_t **items, int count);
+sw_val_t *sw_val_list_slots(int count);
 /* O(1) sub-list sharing src's storage when arena-backed (see swarmrt_lang.c). */
 sw_val_t *sw_val_list_view(sw_val_t *src, int off, int count);
 /* New list = lst ++ [x] / [x | lst]. O(1) amortized when `lst` ends / starts

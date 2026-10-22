@@ -45,6 +45,8 @@ typedef struct sw_value_arena {
     struct sw_value_arena *list_next; /* per-process region chain (accounting/teardown) */
     size_t turn_live;              /* bytes carried by the last turn checkpoint
                                       (adaptive trigger: see sw_turn_checkpoint) */
+    size_t park_live;              /* bytes kept by the last compaction at park
+                                      (adaptive trigger: see sw_park_compact) */
 } sw_value_arena_t;
 
 /* Create a SW_REGION_PROCESS arena with an initial chunk of at least
@@ -62,6 +64,7 @@ sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind);
  * a message region into the receiver's arena on match, and a spawn region into
  * the child's arena on entry. */
 void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src);
+void sw_varena_replace(sw_value_arena_t *dst, sw_value_arena_t *src);
 
 /* Bump-allocate `n` bytes, 16-byte aligned. NOT zeroed (callers that need
  * zeroing — e.g. value nodes — memset themselves). Returns NULL on OOM. */

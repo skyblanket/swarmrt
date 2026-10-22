@@ -11,8 +11,8 @@ shipped `bin/swc`.
 ### Some processes still hold a stack while parked
 
 A compiled process parks stacklessly: its frames go to the heap and its carrier stack
-goes back to the scheduler's pool, so it holds no stack mapping and costs about 2.5 KB
-idle, 8.4 KB busy (`bench/memory`, 99K processes, Linux x86-64). These still keep their
+goes back to the scheduler's pool, so it holds no stack mapping and costs about 2.6 KB
+idle, 4.9 KB busy (`bench/memory`, 99K processes, Linux x86-64). These still keep their
 carrier (128 KB virtual, a few pages resident, two mappings) for as long as they are
 blocked:
 - interpreted code (`swc run`, `swc test`, the REPL, agent tools run by `tool_call`);
@@ -27,12 +27,12 @@ blocked:
 
 On stock Linux (`vm.max_map_count` 65530) about 32,700 of those can be blocked at once.
 A process that can't get a carrier fails with a `carrier stack` message and the node
-keeps running. Busy processes also carry up to `SW_TURN_RESET_BYTES` (default 4 KB) of
-dead values between turn checkpoints; `SW_TURN_RESET_BYTES=1k` brings the busy figure
-to ~4.9 KB at some throughput cost.
+keeps running. A process that parks stacklessly is compacted when its arena has grown
+past both `SW_PARK_COMPACT_MIN` (default 2 KB) and twice what the last compaction kept.
+A pinned process isn't compacted, and neither is one with a frame whose slot layout is
+unknown.
 **Workaround:** raise `vm.max_map_count` if you block that many interpreted or
-builtin-waiting processes at once. Compacting at park is Phase 2f of
-`docs/design/PROCESS_WEIGHT.md`.
+builtin-waiting processes at once.
 
 ### Compiled non-tail recursion outside a spawned process is bounded by the stack
 

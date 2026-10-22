@@ -4,6 +4,47 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-22 — A parked process keeps only what it can reach
+
+**feat(runtime): compaction at park (PROCESS_WEIGHT.md Phase 2f).** When a stackless
+process parks on a receive, a sleep or an offloaded builtin, nothing of it is on any
+stack. Its roots are then exactly its saved frames' value slots plus `gen_error` and
+`resume_val`.
+- **Trigger:** compaction runs when the arena has grown past both `SW_PARK_COMPACT_MIN`
+  (default 2 KB) and twice what the last compaction kept.
+- **What it does:** it copies those roots into a fresh region (sharing preserved, NULL
+  slots of a list being built kept), frees the old chunks, and moves every frame's
+  floor to the new top.
+- **Frame layout:** frames now put their value slots first, then the arena floor. The
+  header's `roots` field gives the count. A frame with an unknown layout
+  (`sw_frame_new`'s default) keeps its process from compacting.
+- **Comprehensions:** they fill an arena list in place instead of a malloc'd scratch
+  array, which was a hidden root and leaked when the process died mid-comprehension.
+
+Fixes found on the way. At a self-tail call, the turn checkpoint frees the turn's
+values, and the reduction point that follows can save the frame before `_tail:`
+reassigns its temporaries. The hoisting pass now clears every value local the loop
+doesn't carry right after the checkpoint (`/*@sw_tail_reset@*/`), so no saved slot
+dangles. Before the fix, `gc-stress` under `SW_COMPACT_TORTURE=1` reported it as a
+use-after-free in `process_info_uaf_repro`.
+
+`bench/memory` at 99K processes: busy 8.3 KB → **4.9 KB** per process, idle unchanged
+at 2.6 KB. Steady-state token-ring throughput (`bench/memory/ring_throughput.sw`) is
+~25% higher at 99K processes (52.6–53.5M hops in 5 s, against 37–45M) and level at 1K
+and 20K. `bench/actor` is within noise. One cost stays open: `main` sending 99K tokens
+into the already-running ring takes 12.7–15.2 s instead of 8.3–8.5 s, and the cause
+isn't pinned down. `task_stream` workers
+waiting on `llm_complete` don't improve (7.1 KB, against 6.6 KB within noise), because
+their arenas stay under the trigger; the rest is Phase 2g's trace state.
+
+Gates:
+- `tests/sw/test_park_compact.sw` covers live maps, lists and closures with shared
+  substructure across 20 parks, loop state through a parking self-tail call, a
+  half-built comprehension and map, and `pmap`'s collector. It passes with
+  `SW_COMPACT_TORTURE=1` and `SW_SUSPEND_TORTURE=3`.
+- CI's hardening gates run `gc-stress` (ASan and arena poison) with
+  `SW_SUSPEND_TORTURE=3 SW_COMPACT_TORTURE=1`.
+
 ## 2026-10-22 — Builtins that wait park without a stack
 
 **feat(runtime): sleep, offloaded builtins and map/filter/reduce/pmap callbacks park

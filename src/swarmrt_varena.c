@@ -51,6 +51,7 @@ static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
     a->kind = kind;
     a->list_next = NULL;
     a->turn_live = 0;
+    a->park_live = 0;
     return a;
 }
 
@@ -119,6 +120,28 @@ void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src) {
      * belong to dst = the process arena, bulk-freed in process_destroy;
      * nothing is half-owned, no leak, no double-free). May not return. */
     sw_varena_quota_check(dst, 0);
+}
+
+/* dst takes src's chunks in place of its own, which are freed; src's header
+ * goes. dst keeps its identity (the process's arena pointer, its region
+ * chain). Used by compaction at park, after the live values were copied
+ * into src. */
+void sw_varena_replace(sw_value_arena_t *dst, sw_value_arena_t *src) {
+    if (!dst || !src) return;
+    sw_varena_chunk_t *c = dst->head;
+    while (c) {
+        sw_varena_chunk_t *next = c->next;
+#ifdef SW_ARENA_POISON
+        memset(chunk_data(c), 0xDE, c->cap);
+#endif
+        free(c);
+        c = next;
+    }
+    dst->head = src->head;
+    dst->tail = src->tail;
+    dst->total_bytes = src->total_bytes;
+    dst->chunk_count = src->chunk_count;
+    free(src);
 }
 
 void *sw_varena_alloc(sw_value_arena_t *a, size_t n) {

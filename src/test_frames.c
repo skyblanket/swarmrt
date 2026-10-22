@@ -62,6 +62,7 @@ rs2:;
 capture: {
     sum_F *f = rs ? (sum_F *)rs : (sum_F *)sw_frame_new(sizeof(sum_F), sumloop_rs, &sum_meta);
     f->h.pt = pt; f->n = n; f->acc = acc; f->seen = seen;
+    f->h.roots = 0;   /* int slots only */
     sw_frame_link(&f->h, rs != NULL);
     return SW_SUSPEND;
   }
@@ -88,7 +89,8 @@ rs1:
     if (r == SW_SUSPEND) {
         out_F *f = rs ? (out_F *)rs : (out_F *)sw_frame_new(sizeof(out_F), outer_rs, &out_meta);
         f->h.pt = 1; f->base = base;
-        sw_frame_link(&f->h, rs != NULL);
+        f->h.roots = 0;   /* int slots only */
+    sw_frame_link(&f->h, rs != NULL);
         return SW_SUSPEND;
     }
     atomic_store(&g_result, (long)(r->v.i + base));
@@ -114,7 +116,8 @@ static sw_val_t *parker_b(sw_frame_t *rs) {
         sw_suspend_recv(UINT64_MAX);
         park_F *f = rs ? (park_F *)rs : (park_F *)sw_frame_new(sizeof(park_F), parker_rs, &park_meta);
         f->h.pt = 1;
-        sw_frame_link(&f->h, rs != NULL);
+        f->h.roots = 0;   /* int slots only */
+    sw_frame_link(&f->h, rs != NULL);
         return SW_SUSPEND;
     }
 }
@@ -135,6 +138,7 @@ static sw_val_t *crash_leaf(sw_frame_t *rs) {
     sw_suspend_recv(UINT64_MAX);
     crash_F *f = rs ? (crash_F *)rs : (crash_F *)sw_frame_new(sizeof(crash_F), crash_leaf_rs, &crash_meta);
     f->h.pt = 1;
+    f->h.roots = 0;   /* int slots only */
     sw_frame_link(&f->h, rs != NULL);
     return SW_SUSPEND;
 }
@@ -145,7 +149,8 @@ static sw_val_t *crash_mid(sw_frame_t *rs) {
     if (r == SW_SUSPEND) {
         crash_F *f = rs ? (crash_F *)rs : (crash_F *)sw_frame_new(sizeof(crash_F), crash_mid_rs, &crash_meta);
         f->h.pt = 1;
-        sw_frame_link(&f->h, rs != NULL);
+        f->h.roots = 0;   /* int slots only */
+    sw_frame_link(&f->h, rs != NULL);
         return SW_SUSPEND;
     }
     return r;
