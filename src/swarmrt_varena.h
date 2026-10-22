@@ -47,6 +47,9 @@ typedef struct sw_value_arena {
                                       (adaptive trigger: see sw_turn_checkpoint) */
     size_t park_live;              /* bytes kept by the last compaction at park
                                       (adaptive trigger: see sw_park_compact) */
+    sw_varena_chunk_t *marked;     /* head when the last mark was taken (or
+                                      reset to): a chunk a live mark may name,
+                                      so sw_varena_adopt keeps it in place */
 } sw_value_arena_t;
 
 /* Create a SW_REGION_PROCESS arena with an initial chunk of at least

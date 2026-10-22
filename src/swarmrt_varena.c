@@ -45,13 +45,14 @@ static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
     if (!a) return NULL;
     a->head = chunk_new(first_chunk);
     if (!a->head) { free(a); return NULL; }
-    a->tail = a->head;   /* oldest chunk; never changes (new chunks prepend at head) */
+    a->tail = a->head;   /* oldest chunk (new chunks go in front of it) */
     a->total_bytes = 0;
     a->chunk_count = 1;
     a->kind = kind;
     a->list_next = NULL;
     a->turn_live = 0;
     a->park_live = 0;
+    a->marked = NULL;
     return a;
 }
 
@@ -68,13 +69,12 @@ sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind) {
     return varena_new(hint, kind);
 }
 
-/* O(1) splice: move src's chunk list onto dst, then free src's header. dst->head
- * becomes src's (full) head, so the next dst alloc trips used+n>cap and grows a
- * fresh chunk — correct, one partially-used chunk's tail goes unused. src is dead
- * after this (header freed; chunks now owned by dst, reclaimed on dst free). */
 sw_varena_mark_t sw_varena_mark(sw_value_arena_t *a) {
     sw_varena_mark_t m = { NULL, 0, 0 };
-    if (a) { m.chunk = a->head; m.used = a->head ? a->head->used : 0; m.total_bytes = a->total_bytes; }
+    if (a) {
+        m.chunk = a->head; m.used = a->head ? a->head->used : 0; m.total_bytes = a->total_bytes;
+        a->marked = a->head;
+    }
     return m;
 }
 
@@ -94,6 +94,7 @@ void sw_varena_reset_to(sw_value_arena_t *a, sw_varena_mark_t mark) {
     }
     /* c == mark.chunk (still in the list, below the freed ones). */
     a->head = mark.chunk;
+    a->marked = mark.chunk;
 #ifdef SW_ARENA_POISON
     if (mark.chunk->used > mark.used)
         memset((char *)(mark.chunk + 1) + mark.used, 0xDE, mark.chunk->used - mark.used);
@@ -102,14 +103,31 @@ void sw_varena_reset_to(sw_value_arena_t *a, sw_varena_mark_t mark) {
     a->total_bytes = mark.total_bytes;
 }
 
+/* O(1) splice: move src's chunk list into dst, then free src's header. src is
+ * dead after this (header freed; chunks now owned by dst, reclaimed on dst free).
+ *
+ * Where the chunks go. Every mark names the head it was taken on, and a reset
+ * frees the chunks in front of it, so whatever is adopted must land in front
+ * of every live mark's chunk.
+ *  - dst's head carries no mark (it grew since the last one): src's chunks go
+ *    right behind it, still in front of every marked chunk, and dst keeps
+ *    allocating in its own head. A process receiving a stream of small
+ *    messages then holds about one chunk per message instead of three or
+ *    four, which compaction at park and every reset walk and free.
+ *  - Otherwise (the head may be a live mark's chunk): src's newest chunk
+ *    becomes dst's head, so the next dst alloc grows a fresh chunk.
+ * dst's own tail (oldest) changes only when dst's head was also its tail. */
 void sw_varena_adopt(sw_value_arena_t *dst, sw_value_arena_t *src) {
     if (!dst || !src) return;
     if (src->head && src->tail) {
-        /* O(1): src->tail is src's oldest chunk (tracked, not walked). Link it
-         * onto dst's stack and make src's newest chunk dst's alloc point. dst's
-         * own tail (oldest) is unchanged. */
-        src->tail->next = dst->head;
-        dst->head = src->head;
+        if (dst->head && dst->head != dst->marked) {
+            src->tail->next = dst->head->next;
+            dst->head->next = src->head;
+            if (dst->tail == dst->head) dst->tail = src->tail;
+        } else {
+            src->tail->next = dst->head;
+            dst->head = src->head;
+        }
         dst->total_bytes += src->total_bytes;
         dst->chunk_count += src->chunk_count;
     }
@@ -141,6 +159,7 @@ void sw_varena_replace(sw_value_arena_t *dst, sw_value_arena_t *src) {
     dst->tail = src->tail;
     dst->total_bytes = src->total_bytes;
     dst->chunk_count = src->chunk_count;
+    dst->marked = NULL;
     free(src);
 }
 

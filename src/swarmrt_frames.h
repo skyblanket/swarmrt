@@ -116,6 +116,10 @@ void sw_no_suspend_exit(void);
 #define SW_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
+/* A panic's call chain: print the running process's heap frames (those not
+ * on the carrier), numbered from idx; 1 if it has any. */
+void sw_print_heap_chain(int idx);
+int  sw_heap_chain_live(void);
 /* Run a stackless process until it exits or suspends (called on a carrier). */
 int sw_run_stackless(struct sw_process *p);
 

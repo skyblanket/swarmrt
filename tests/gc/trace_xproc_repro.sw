@@ -13,10 +13,13 @@
 # .rodata function-name literals + ints), but the diagnostic is WRONG: a panic in
 # process A blames process B's call stack.
 #
-# THE FIX: line/file/trace live in a PER-PROCESS `sw_gen_exec_t` (swarmrt_native.h)
-# reached through `_sw_gen`, which the scheduler points at the running process on
-# every context switch. Each process's `_sw_trace_top` starts at 0 and only ever
-# holds its own frames, so a panic prints exactly the panicking process's chain.
+# THE FIX: line/file/trace live on the CARRIER a process runs on (`sw_gen_exec_t`
+# in swarmrt_native.h, reached through `_sw_gen`, pointed at the carrier on every
+# context switch; Phase 2g). Every unpinned run starts with an empty ring, a
+# process that blocks the old way keeps its carrier and so its ring, and a
+# stackless process keeps its line in sw_process_t while parked. A panic prints
+# the ring plus the process's heap frames, so the chain is the panicking
+# process's own and complete even after it parked and resumed.
 #
 # DETERMINISTIC INTERLEAVE (run under SW_SCHEDULERS=1 — one OS thread, one runq):
 #   * A `contaminant` builds a DEEP, distinctively-named chain (xcontam_a..e) and
@@ -44,17 +47,27 @@ fun xcontam_b() { xcontam_c() }
 fun xcontam_a() { xcontam_b() }
 fun contaminant() { xcontam_a() }
 
-# Short, distinctively-named victim chain. Parks briefly, then panics.
-fun xvictim_b() { sleep(40); panic("XVICTIM_PANIC") }
-fun xvictim_a() { xvictim_b() }
-fun victim() { xvictim_a() }
+# Short, distinctively-named victim chain. Parks briefly, then panics. The
+# calls aren't tail calls, so its callers stay in the chain: a stackless
+# victim resumes from the heap with only xvictim_b on the carrier, and the
+# panic must still print xvictim_a and victim (Phase 2g walks its frames).
+# It panics in the statement it parked in, so the banner's line is the one
+# it saved when it parked, not whatever its new carrier held.
+fun xvictim_b() {
+    t = "XVICTIM_"
+    panic(receive { 'go' -> t ++ "PANIC" })
+}
+fun xvictim_a() { r = xvictim_b() ; r }
+fun victim() { r = xvictim_a() ; r }
 
 fun main() {
     print("trace_xproc_repro start (run with SW_SCHEDULERS=1)")
     spawn(contaminant())   # runs while main sleeps below; parks deep (top high pre-fix)
     sleep(20)              # let the contaminant reach its deep sleep() and park
-    spawn(victim())        # builds its short chain, then panics
-    sleep(300)             # outlive the victim's 40ms park + panic + stderr flush
+    v = spawn(victim())    # builds its short chain and parks in a receive
+    sleep(20)
+    send(v, 'go')          # resumes it; it panics
+    sleep(300)             # outlive the panic + stderr flush
     print("trace_xproc_repro done")
     sys_exit(0)
 }

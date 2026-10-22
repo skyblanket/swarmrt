@@ -6,7 +6,9 @@
 # the bug is diagnostic, not a memory fault — ASAN just confirms the trace path is
 # clean), runs it under SW_SCHEDULERS=1, and inspects the panic banner:
 #
-#   PASS   the victim's panic chain contains "xvictim" and NOT "xcontam"
+#   PASS   the victim's panic chain contains "xvictim" and NOT "xcontam", and
+#          still lists its callers (xvictim_a, victim) after it parked
+#          and resumed, and the banner's line is the one it parked at
 #   FAIL   stderr contains "xcontam" — a foreign process's frames leaked into the
 #          victim's panic call chain (the cross-fiber trace-TLS bug), OR the
 #          expected "xvictim" panic banner never appeared (test didn't run right)
@@ -49,7 +51,15 @@ if echo "$OUT" | grep -q "xcontam"; then
   echo "$OUT" | grep -A20 "XVICTIM_PANIC" | grep -E "xcontam|xvictim|call chain" | head -20
   exit 1
 fi
-echo "VERDICT: PASS (victim panic chain is xvictim-only; no foreign frames)"
+CHAIN=$(echo "$OUT" | grep -A12 "XVICTIM_PANIC")
+if ! echo "$CHAIN" | grep -q "Main.xvictim_a" || ! echo "$CHAIN" | grep -q "Main.victim "; then
+  echo "VERDICT: FAIL (victim panic chain lost its callers after resuming)"; echo "$CHAIN"; exit 1
+fi
+VLINE=$(grep -n "panic(receive" "$SW" | head -1 | cut -d: -f1)
+if [ -n "$VLINE" ] && ! echo "$CHAIN" | grep -qE "^  at .*:${VLINE}\$"; then
+  echo "VERDICT: FAIL (victim panic banner lost the line it parked at, expected :$VLINE)"; echo "$CHAIN"; exit 1
+fi
+echo "VERDICT: PASS (victim panic chain is xvictim-only and complete; no foreign frames)"
 echo "$OUT" | grep -E "xvictim|call chain" | head -6
 rm -f "${b}_asan" "${b}.cc.err"
 exit 0
