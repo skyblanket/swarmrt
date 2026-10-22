@@ -278,23 +278,18 @@ static void emit_crash_json(sw_process_t *proc, int reason) {
             (unsigned long long)ms);
 }
 
-/* Generated-code execution state (line/file/call-trace), PER PROCESS. `_sw_gen`
- * is pointed at the running process's gen_exec block on every context switch in
- * (below), so the generated _sw_current_line/_sw_current_file/_sw_trace* macros
- * (swarmrt_builtins_studio.h) reach the right process — a panic after a blocking
- * op then reports THIS process's location, not a fiber that shared the thread.
- * The fallback covers OOM (gen_exec calloc failed) and any code not running on a
- * fiber; it's a single thread-local, so its only failure mode is a wrong line in
- * a diagnostic banner from non-fiber code — never a memory-safety issue.
+/* Generated-code execution state (line/file/call-trace) lives on the carrier
+ * (swarmrt_native.h): `_sw_gen` is pointed at the running carrier's block on
+ * every context switch in (below), so the generated _sw_current_line /
+ * _sw_current_file / _sw_trace* macros (swarmrt_builtins_studio.h) reach the
+ * run in progress. The fallback covers code not running on a carrier; it's a
+ * single thread-local, so its only failure mode is a wrong line in a
+ * diagnostic banner from non-fiber code — never a memory-safety issue.
  *
  * Both are zero-initialized (a __thread initializer must be a compile-time
- * constant; a string-literal designated init / a TLS address is not). The
- * fallback's NULL current_file is fine — the panic readers guard on it — and
- * `_sw_gen` is assigned (to a process block or &_sw_gen_fallback) at every
- * context switch before any generated code runs, so it's never read while NULL:
- * generated line/file/trace writes and the studio.h panic readers both execute
- * only on a fiber, after switch-in. Belt-and-braces, it's set at scheduler-loop
- * entry too. */
+ * constant). The fallback's NULL current_file is fine — the panic readers
+ * guard on it — and `_sw_gen` is set at scheduler-loop entry and at every
+ * context switch before any generated code runs. */
 static __thread sw_gen_exec_t _sw_gen_fallback;
 __thread sw_gen_exec_t *_sw_gen;
 /* Per-process usable stack size in bytes. 0 = use the built-in
@@ -830,6 +825,7 @@ typedef struct sw_carrier {
     int *outcome;              /* set to 1 by carrier_main when the entry returned */
     struct sw_carrier *next;   /* free list / all-carriers list */
     struct sw_carrier *all_next;
+    sw_gen_exec_t gen;         /* line/file/call trace of the run on it (Phase 2g) */
 } sw_carrier_t;
 
 #define SW_CARRIER_POOL_MAX 64
@@ -1045,15 +1041,10 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->try_live = 0;          /* compiled try/catch state (see sw_try_enter) */
     proc->raise_pending = 0;
 
-    /* Per-process generated line/file/call-trace state. Lazily allocated and KEPT
-     * WITH THE SLAB SLOT across lifetimes: reset here, freed
-     * only at slab teardown. On OOM it stays NULL and the context switch falls back
-     * to a thread-local (diagnostic-only). _sw_gen is pointed here on switch-in. */
-    if (!proc->gen_exec) proc->gen_exec = (sw_gen_exec_t *)calloc(1, sizeof(sw_gen_exec_t));
-    if (proc->gen_exec) {
-        memset(proc->gen_exec, 0, sizeof(sw_gen_exec_t));
-        proc->gen_exec->current_file = "<unknown>";
-    }
+    /* Line and file while parked stacklessly (the carrier holds them while
+     * the process runs; see sw_gen_exec_t). */
+    proc->park_line = 0;
+    proc->park_file = NULL;
 
     /* Optional per-process teardown hook — cleared on every (re)use of the slot
      * so a reused slot never inherits a stale destructor (set later by e.g. a
@@ -1955,9 +1946,9 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             proc->fcalls = SWARM_CONTEXT_REDS;
             sched->current = proc;
             tls_current = proc;
-            /* Point generated line/file/trace state at THIS process (fallback if
-             * gen_exec wasn't allocated, e.g. OOM — diagnostic-only degradation). */
-            _sw_gen = proc->gen_exec ? proc->gen_exec : &_sw_gen_fallback;
+            /* Generated line/file/trace state is the carrier's, set below
+             * once the carrier is known. */
+            _sw_gen = &_sw_gen_fallback;
 
             /* Context switch to process (runs on process's own stack).
              * sw_safe_swap_into copies ctx under proc->ctx_lock so the
@@ -1966,8 +1957,10 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             sw_carrier_t *c = proc->carrier;
             int swapped;
             if (c) {
-                /* Pinned: resume it on its own carrier through proc->ctx. */
+                /* Pinned: resume it on its own carrier through proc->ctx,
+                 * with the trace it had when it blocked. */
                 c->outcome = &outcome;
+                _sw_gen = &c->gen;
                 swapped = sw_safe_swap_into(&sched->sched_proc, proc, expected_gen);
             } else {
                 c = sched->carrier ? sched->carrier : carrier_alloc();
@@ -1998,6 +1991,14 @@ static void scheduler_loop(sw_scheduler_t *sched) {
                 } else {
                     c->proc = proc;
                     c->outcome = &outcome;
+                    /* A fresh run: an empty trace (an abandoned run, a panic
+                     * or kill, may have left entries), and the line a parked
+                     * stackless process is restored by its driver. */
+                    c->gen.trace_top = 0;
+                    c->gen.trace_overflowed = 0;
+                    c->gen.current_line = 0;
+                    c->gen.current_file = "<unknown>";
+                    _sw_gen = &c->gen;
                     proc->stack_mem = c->stack;
                     proc->stack_size = c->stack_size;
                     proc->carrier = c;
@@ -2580,12 +2581,6 @@ void sw_shutdown(int swarm_id) {
     if (g_swarm->arena.proc_slab) {
         sw_process_t *slab = (sw_process_t *)g_swarm->arena.proc_slab;
         for (uint32_t i = 0; i < g_swarm->arena.proc_capacity; i++) {
-            /* Per-process generated exec state — kept with the slot across
-             * lifetimes, so freed here at slab teardown. */
-            if (slab[i].gen_exec) {
-                free(slab[i].gen_exec);
-                slab[i].gen_exec = NULL;
-            }
             free(slab[i].tc_park);
             slab[i].tc_park = NULL;
             /* Last panic message of the slot's final occupant (see

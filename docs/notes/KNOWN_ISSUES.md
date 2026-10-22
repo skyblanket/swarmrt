@@ -11,8 +11,8 @@ shipped `bin/swc`.
 ### Some processes still hold a stack while parked
 
 A compiled process parks stacklessly: its frames go to the heap and its carrier stack
-goes back to the scheduler's pool, so it holds no stack mapping and costs about 2.6 KB
-idle, 4.9 KB busy (`bench/memory`, 99K processes, Linux x86-64). These still keep their
+goes back to the scheduler's pool, so it holds no stack mapping and costs about 2.2 KB
+idle, 4.3 KB busy (`bench/memory`, 99K processes, Linux x86-64). These still keep their
 carrier (128 KB virtual, a few pages resident, two mappings) for as long as they are
 blocked:
 - interpreted code (`swc run`, `swc test`, the REPL, agent tools run by `tool_call`);

@@ -406,7 +406,7 @@ paid off — it found a **reproduced P0 use-after-free** the shipping suite miss
 
 - **`struct sw_process` asm offsets are pinned**: `ctx`=0x70, `entry`/`arg` (arm64 0xF0/0xF8,
   x86_64 0xC0/0xC8), enforced by `_Static_assert(offsetof(...))` in `swarmrt_native.c`. **New
-  fields go at the END of the struct** (after `gen_exec`/`on_destroy`) or you shift the offsets and
+  fields go at the END of the struct** (after `park_file`/`on_destroy`) or you shift the offsets and
   the asm context switch corrupts. `swarmrt_asm.S` hardcodes these.
 - **`on_destroy` hook**: per-process teardown callback fired in `process_destroy` on every exit
   (normal/kill/panic), snapshot-then-cleared so it can't double-fire; reset to NULL in

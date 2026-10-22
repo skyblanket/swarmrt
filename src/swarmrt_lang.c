@@ -3272,6 +3272,11 @@ int sw_run_stackless(sw_process_t *p) {
         k = p->cont;
         p->cont = NULL;
         if (!k) return SW_RUN_EXITED;
+        /* The line it parked at, for a panic before its next statement. */
+        if (p->park_file) {
+            _sw_gen->current_line = p->park_line;
+            _sw_gen->current_file = p->park_file;
+        }
         p->run_k = k;
         p->run_waiting = NULL;
         r = k->resume(k);
@@ -3300,6 +3305,8 @@ int sw_run_stackless(sw_process_t *p) {
             }
             p->cont = top;
             p->run_k = p->run_waiting = NULL;
+            p->park_line = _sw_gen->current_line;
+            p->park_file = _sw_gen->current_file;
             /* A runaway recursion that parks often never fills a stack,
              * so the spill check never sees it: hold its saved frames to
              * the same budget here. Teardown frees the chain in cont. */
@@ -3335,6 +3342,34 @@ int sw_run_stackless(sw_process_t *p) {
         p->run_waiting = NULL;
         r = k->resume(k);
     }
+}
+
+/* The heap part of a panic's call chain (PROCESS_WEIGHT.md §3.7): the
+ * frames of the running stackless process that aren't on the carrier — the
+ * callers of the frame being resumed, or the frames waiting on a fresh call.
+ * The carrier's ring (printed first by _sw_print_trace) holds the rest.
+ * Numbering continues from `idx`. A frame's line is its function's entry
+ * line, as for the ring's outer entries. */
+#define SW_HEAP_CHAIN_SHOW 32
+void sw_print_heap_chain(int idx) {
+    sw_process_t *p = sw_self();
+    if (!p) return;
+    sw_frame_t *f = p->run_k ? p->run_k->parent : p->run_waiting;
+    long more = 0;
+    for (int shown = 0; f; f = f->parent) {
+        if (shown >= SW_HEAP_CHAIN_SHOW) { more++; continue; }
+        const char *m = f->meta && f->meta->module ? f->meta->module : "?";
+        const char *fn = f->meta && f->meta->fn ? f->meta->fn : "?";
+        int line = f->meta ? f->meta->line : 0;
+        fprintf(stderr, "    [%d] %s.%s at src/%s.sw:%d\n", idx++, m, fn, m, line);
+        shown++;
+    }
+    if (more) fprintf(stderr, "    ... (%ld outer frames)\n", more);
+}
+
+int sw_heap_chain_live(void) {
+    sw_process_t *p = sw_self();
+    return p && (p->run_k ? p->run_k->parent != NULL : p->run_waiting != NULL);
 }
 
 static __thread sw_tc_park_t sw_tc_park_tls;

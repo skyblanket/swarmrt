@@ -4,6 +4,41 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-22 — Panic traces live on the carrier; the 2f distribution cost found
+
+**feat(runtime): trace and line state on the carrier (PROCESS_WEIGHT.md Phase 2g).** The
+panic trace ring and the current line/file moved out of every process (`sw_gen_exec_t`,
+about 410 B plus its malloc header) into the carrier a process runs on.
+- **Pinned processes:** a process that blocks the old way pins its carrier, so its trace
+  stays with it.
+- **Stackless processes:** a parked stackless process keeps its line and file in
+  `sw_process_t`, and the driver puts them back on resume. Every unpinned run starts
+  with an empty ring.
+- **Panics after a resume:** a panic prints the ring, then the process's heap frames.
+  Since Phase 2c, a process that parked and resumed printed only its innermost frame.
+  `trace_xproc_repro` now checks that the callers and the parked line survive.
+
+**fix(runtime): adopted message chunks no longer reset the arena's chunk growth.**
+`sw_varena_adopt` put each received message's chunk at the arena's head, so the
+process's next allocation started yet another small chunk, and compaction at park
+walked and freed about 27 cold chunks each time. A head that carries no mark now
+keeps its place, and the message's chunks go behind it. This is the cause of 2f's
+slower token distribution into a running 99K ring:
+- `main` sending tokens: 14.9 s → 10.6 s (2e: 9.4 s);
+- busy `measure.sh` ring to READY: 28.4 s → 15–18.7 s (2e: 13.7 s).
+What's left is about one cold chunk per received message (bench/memory/BASELINE.md).
+
+`bench/memory` at 99K processes: busy 4.9 → **4.3 KB**, idle 2.6 → **2.2 KB** per
+process. `ring_throughput` is up at every size (99K: 49.5–50.0M → 52.7–55.4M hops in
+5 s). `task_stream` workers waiting on `llm_complete`: 7.1 → 6.6 KB.
+
+Gates: `test-sw`, `test-full`, `gc-stress` (also with `SW_SUSPEND_TORTURE=3
+SW_COMPACT_TORTURE=1`), `gc-slope`, `lsan-gate`, `tsan-gate`, `alloc-fault`, `stress`,
+`fuzz`, and `test-sw` under `SW_SUSPEND_TORTURE=1`. Under `SW_COMPACT_TORTURE=1`, the
+three deep-recursion tests time out, as on 2f.
+
+---
+
 ## 2026-10-22 — A parked process keeps only what it can reach
 
 **feat(runtime): compaction at park (PROCESS_WEIGHT.md Phase 2f).** When a stackless

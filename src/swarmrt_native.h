@@ -78,15 +78,22 @@ typedef struct sw_swarm sw_swarm_t;
 
 /* === Generated-code execution state (PER PROCESS, not thread-local) ===
  * The compiled backend keeps a current source line/file (for panic banners)
- * and a call-stack ring buffer (for stack traces). These were scheduler-thread
- * locals, but a blocking op (sleep/receive) yields the fiber, so a process
- * resuming on the same scheduler thread would inherit an UNRELATED process's
- * line/file/trace — a panic would then print the wrong location/call chain.
- * (Memory-safe — they hold only .rodata string literals + ints — but wrong.)
- * So this state lives per-process: `_sw_gen` is swapped to the running process's
- * block at every context switch, and the generated `_sw_current_line` /
- * `_sw_current_file` / `_sw_trace*` macros (swarmrt_builtins_studio.h) redirect
- * through it. `_sw_frame_t` is shared with the generated trace push/pop. */
+ * and a call-stack ring buffer (for stack traces). They live on the CARRIER
+ * a process runs on (PROCESS_WEIGHT.md §3.7, Phase 2g), not in the process:
+ * `_sw_gen` is pointed at the carrier's block at every context switch, and
+ * the generated `_sw_current_line` / `_sw_current_file` / `_sw_trace*`
+ * macros (swarmrt_builtins_studio.h) redirect through it.
+ *  - A process that blocks the old way pins its carrier, so its block
+ *    (frames, line) stays with it while another process uses a fresh
+ *    carrier.
+ *  - A stackless process has nothing on the carrier while parked: its frames
+ *    popped their ring entries as they returned SW_SUSPEND. It keeps its line
+ *    and file in sw_process_t (park_line/park_file) and the driver puts them
+ *    back on resume. A panic's call chain is the ring plus the process's
+ *    heap frames (sw_print_heap_chain).
+ * Every unpinned run starts with an empty ring, so no process ever sees
+ * another's frames. `_sw_frame_t` is shared with the generated trace
+ * push/pop. */
 typedef struct { const char *module_name; const char *fn_name; int line; int depth; } _sw_frame_t;
 /* Innermost frames kept for panic traces, as a ring indexed by depth (a power
  * of two). Was a 64-entry array (1.5KB per process) that kept the OUTERMOST
@@ -99,8 +106,8 @@ typedef struct sw_gen_exec {
     int trace_top;               /* depth; >SW_TRACE_MAX sets trace_overflowed  */
     int trace_overflowed;        /* 1 if the call chain exceeded 64 frames      */
 } sw_gen_exec_t;
-/* Points at the running process's gen_exec block (or a thread-local fallback for
- * non-process / OOM contexts). Swapped wherever tls_current is set. */
+/* Points at the running carrier's block (or a thread-local fallback for
+ * non-process contexts). Swapped wherever tls_current is set. */
 extern __thread sw_gen_exec_t *_sw_gen;
 
 /* === Context (for assembly switching) === */
@@ -387,13 +394,11 @@ struct sw_process {
      * at the END so it shifts no asm-pinned offset.) */
     struct sw_val *gen_error;
 
-    /* Per-process generated execution state (line/file/call-trace). Lazily
-     * allocated on first run and KEPT WITH THE SLAB SLOT across lifetimes (like
-     * stack_mem) — reset, not freed, in process_init_arena; freed only at slab
-     * teardown. `_sw_gen` is pointed here on context-switch in. NULL until first
-     * use / on OOM (then `_sw_gen` falls back to a thread-local). At struct END
-     * so it shifts no asm-pinned offset. */
-    sw_gen_exec_t *gen_exec;
+    /* Source line and file of a stackless process while it is parked (the
+     * carrier's sw_gen_exec_t holds them while it runs). At struct END so
+     * they shift no asm-pinned offset. */
+    int park_line;
+    const char *park_file;
 
     /* Optional per-process teardown hook, invoked in process_destroy on EVERY
      * exit path — normal return, kill, AND panic (a panic sw_context_swaps to
@@ -440,7 +445,7 @@ struct sw_process {
     struct sw_carrier *carrier;
 
     /* Mutual-tail-call park (sw_tc_park in swarmrt_lang.c), allocated on the
-     * process's first hop and kept with the slab slot like gen_exec. */
+     * process's first hop and kept with the slab slot. */
     struct sw_tc_park *tc_park;
 
     /* Stackless execution (swarmrt_frames.h). entry_v is the value-returning

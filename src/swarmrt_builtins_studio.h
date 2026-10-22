@@ -17,6 +17,7 @@
 #include "swarmrt_phase4.h"   /* sw_dynsup_* — DynamicSupervisor (runtime start_child) */
 #include "swarmrt_http.h"
 #include "swarmrt_varena.h"   /* varena->total_bytes — process_info 'memory' stat */
+#include "swarmrt_frames.h"   /* sw_print_heap_chain — panic call chains */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -4757,25 +4758,28 @@ static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     return sw_val_nil();
 }
 
-/* Generated execution state (line/file/call-trace) is PER PROCESS, reached via
- * `_sw_gen` (swarmrt_native.h) — swapped on every context switch. These macros
- * redirect the generated `_sw_current_line = N; _sw_current_file = "..."` writes
- * and the trace push/pop + panic readers below to the running process's block,
- * so a panic after a blocking op reports THIS process's location/call chain, not
- * a fiber that happened to share the scheduler thread. (`_sw_frame_t` and the
- * sw_gen_exec_t fields are declared in swarmrt_native.h, included above.) */
+/* Generated execution state (line/file/call-trace) lives on the carrier the
+ * process runs on, reached via `_sw_gen` (swarmrt_native.h) — swapped on
+ * every context switch. These macros redirect the generated
+ * `_sw_current_line = N; _sw_current_file = "..."` writes and the trace
+ * push/pop + panic readers below to it, so a panic reports THIS process's
+ * location/call chain, not a fiber that happened to share the scheduler
+ * thread. (`_sw_frame_t` and the sw_gen_exec_t fields are declared in
+ * swarmrt_native.h, included above.) */
 #define _sw_current_line     (_sw_gen->current_line)
 #define _sw_current_file     (_sw_gen->current_file)
 #define _sw_trace            (_sw_gen->trace)
 #define _sw_trace_top        (_sw_gen->trace_top)
 #define _sw_trace_overflowed (_sw_gen->trace_overflowed)
 
-/* Print the current call stack to stderr, top of stack first. Reads the
- * running process's call-stack ring buffer (via the _sw_trace* macros above),
- * which the codegen maintains through _sw_trace_push / _sw_trace_pop. */
+/* Print the current call stack to stderr, top of stack first: the carrier's
+ * ring buffer (via the _sw_trace* macros above, maintained by _sw_trace_push /
+ * _sw_trace_pop), then the frames a stackless process holds on the heap,
+ * which are its outer callers after it parked and resumed. */
 static void _sw_print_trace(void) {
     int top = _sw_trace_top;
-    if (top <= 0) return;
+    int heap = sw_heap_chain_live();
+    if (top <= 0 && !heap) return;
     int lo = top > SW_TRACE_MAX ? top - SW_TRACE_MAX : 0;
     fprintf(stderr, "  call chain (innermost first):\n");
     /* The innermost frame's "current line" lives in _sw_current_line —
@@ -4794,6 +4798,7 @@ static void _sw_print_trace(void) {
     }
     if (shown < top)
         fprintf(stderr, "    ... (%d outer frames not kept)\n", top - shown);
+    if (heap) sw_print_heap_chain(top > 0 ? top : 0);
 }
 
 /* C-level panic helper for builtins. Takes a printf-style format so

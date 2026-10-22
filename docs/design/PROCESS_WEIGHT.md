@@ -783,6 +783,12 @@ Each sub-step leaves `main` green and is independently revertable.
 - **2g. Trace and line state per scheduler**, with traces taken from frames.
   Remove the per-process `sw_gen_exec_t`. A panic after resume must still
   print the full chain (existing panic-trace tests).
+  - As built: the state lives on the carrier, not the scheduler, so a process
+    that blocks the old way keeps its trace with its carrier. A parked stackless
+    process keeps its line in `sw_process_t` (`park_line`/`park_file`).
+    `trace_xproc_repro` now also checks that the chain keeps its callers after a
+    resume and that the banner keeps the parked line; on the code before 2g it
+    printed only the innermost frame.
 - **2h. Liveness for frame slots.** Save only the locals live at each `pt`.
   - A simple def/last-use interval per local over the emitted body is
     enough. Treat sw variables and anything live into a loop header as live

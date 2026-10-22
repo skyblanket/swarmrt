@@ -132,9 +132,9 @@ answers. Each run has 256 offload worker threads, a fixed cost.
 
 An idle `task_stream` worker costs more than an idle ring process (2.5 KB). It also
 carries its closure and captures in a spawn region, the coordinator's bookkeeping for
-it, and the 1.5 KB per-process trace block. Phases 2f (compaction at park) and 2g
-(trace state per scheduler) target that, and with it the plan's under-5 KB goal for
-this run.
+it, and the per-process trace block (about 410 B since Phase 1 cut it to 16 entries).
+Phases 2f (compaction at park) and 2g (trace state on the carrier) target that, and
+with it the plan's under-5 KB goal for this run.
 
 ## After Phase 2f (compaction at park)
 
@@ -161,7 +161,52 @@ Each worker counts its own hops; the count is taken once the tokens are out and 
 One cost stays open. At 99,000, `main` takes 12.7–15.2 s instead of 8.3–8.5 s to send
 the tokens into the already-running ring, and the busy `measure.sh` ring takes 29 s
 instead of 13 s to reach READY. Spawning (0.9 s against 1.0 s) and the `go` broadcast
-(3.3 s both) are unchanged. The cause isn't pinned down.
+(3.3 s both) are unchanged. Phase 2g found the cause and recovers most of it (below).
 
 `task_stream.sh`: idle 5.9 KB, `llm_complete` 7.1 KB per waiting worker, within noise of
 2e. Those workers' arenas stay under the trigger, so compaction doesn't apply to them.
+
+## After Phase 2g (trace state on the carrier)
+
+`bench/memory` ring at N=99,000, back to back with Phase 2f (two runs each):
+
+| Mode | After 2f | After 2g |
+|---|---|---|
+| busy | 4.9 KB | **4.3 KB** |
+| idle | 2.6 KB | **2.2 KB** |
+| busy ring, time to READY | 28.2–28.6 s | 15.0–18.7 s (2e: 13.7 s) |
+
+Idle drops by the per-process trace block (`sw_gen_exec_t`, about 410 B plus its malloc
+header), which now lives on the carrier. Busy drops by that and by the arena change
+below.
+
+`bench/memory/ring_throughput.sw` (`-O`, two runs each):
+
+| Ring | 2f hops in 5 s | 2g hops in 5 s |
+|---|---|---|
+| 1,000 | 7.4M | 7.7–8.0M |
+| 20,000 | 12.4–12.6M | 13.7–14.3M |
+| 99,000 | 49.5–50.0M | 52.7–55.4M |
+
+`task_stream.sh`, per waiting worker from the 1,000 → 10,000 slope: `llm_complete` 7.1 →
+6.6 KB, idle about 450 B lower at N=10,000.
+
+**The 2f distribution cost.** While `main` sends tokens into a running 99K ring, three of
+the four schedulers sit idle and the ring runs on `main`'s thread, so whatever a hop
+costs comes out of `main`'s sends. Instrumented, a ring worker compacted on every third
+park (1.9M compactions, 13.8 s of CPU, about 7 µs each), copying about 80 B and freeing
+about 2.6 KB spread over 27 chunks. The cost was walking and freeing those cold chunks.
+Each received message is its own small chunk, and adopting one into the arena made it
+the head, so the process's next allocation started yet another small chunk.
+
+`sw_varena_adopt` now puts a message's chunks behind the head whenever the head
+carries no mark (it grew since the last `sw_varena_mark`), so the process keeps filling
+its own chunk; a head that may be a live mark's chunk keeps the old order. That cut
+the chunks per compaction from 27 to about 17. Time for `main` to send the tokens
+(medians of four runs, `ring_dist`-style timing, not `-O`): 2e 9.4 s, 2f 14.9 s, 2g
+10.6 s; 2g with compaction off 9.1 s. Raising `SW_PARK_COMPACT_MIN` to 4 KB removes the
+rest but puts busy processes at 7.4 KB, so the default stays at 2 KB.
+
+What's left is about one cold chunk walked per message received. Copying small messages
+into the receiver's arena on receive would remove it. So would Phase 4's allocator.
+

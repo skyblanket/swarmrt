@@ -1216,20 +1216,16 @@ static void emit_preamble(cg_ctx_t *ctx) {
     fprintf(f, "#include <time.h>\n");
     fprintf(f, "#include <errno.h>\n\n");
 
-    /* Generated execution state — _sw_error, _sw_current_line/_sw_current_file,
-     * and the _sw_trace call-stack ring buffer — is PER PROCESS, not a
-     * scheduler-thread-local. A blocking op (sleep/receive) yields the fiber,
-     * so a thread-local would leak across the context switch: a try/catch could
-     * catch an unrelated fiber's error (UAF on its freed value), and a panic
-     * could print another fiber's line/file/call-chain. swarmrt_native.h holds
-     * the per-process `sw_gen_exec_t` + the `_sw_gen` pointer (swapped on every
-     * context switch); swarmrt_builtins_studio.h #defines _sw_error and the
-     * _sw_current_line/_sw_current_file/_sw_trace* macros to reach through it.
-     * So codegen emits NO storage for these here — just the push/pop helpers,
-     * which operate on the running process's block via those macros. Codegen
-     * still emits `_sw_current_line = N; _sw_current_file = "src/Mod.sw";` once
-     * per source line (cheap: now one pointer hop + two stores). Capacity 64
-     * frames — deeper recursion sets the overflow flag rather than blowing up. */
+    /* Generated execution state — _sw_current_line/_sw_current_file and the
+     * _sw_trace call-stack ring buffer — lives on the carrier the process runs
+     * on (sw_gen_exec_t in swarmrt_native.h, reached through `_sw_gen`, swapped
+     * on every context switch); a stackless process keeps its line across a
+     * park in sw_process_t, and a panic adds its heap frames to the chain.
+     * swarmrt_builtins_studio.h #defines the macros that reach through `_sw_gen`.
+     * So codegen emits NO storage for these here — just the push/pop helpers.
+     * Codegen still emits `_sw_current_line = N; _sw_current_file = "src/Mod.sw";`
+     * once per source line (one pointer hop + two stores). The ring keeps the
+     * innermost SW_TRACE_MAX frames. */
     fprintf(f, "static inline void _sw_trace_push(const char *m, const char *fn, int line) {\n"
                "    _sw_frame_t *_e = &_sw_trace[_sw_trace_top & (SW_TRACE_MAX - 1)];\n"
                "    _e->module_name = m; _e->fn_name = fn; _e->line = line; _e->depth = _sw_trace_top;\n"
