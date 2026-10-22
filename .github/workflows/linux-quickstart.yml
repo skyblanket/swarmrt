@@ -187,6 +187,13 @@ jobs:
         # surfaces as a use-after-free or a 0xDE-garbage content assert.
         run: make gc-stress
 
+      - name: Compaction-at-park gate (ASAN + arena poison, compact at every park)
+        # PROCESS_WEIGHT.md Phase 2f: a parked process's live values are copied
+        # into a fresh arena and the rest freed. A frame slot the compaction
+        # misses, or one left pointing at memory a turn checkpoint freed, is a
+        # use-after-free here: every reduction suspends and every park compacts.
+        run: SW_SUSPEND_TORTURE=3 SW_COMPACT_TORTURE=1 make gc-stress
+
       - name: GC memory-slope gate (Ownership v2 — bounded escaped memory)
         # Proves RECLAMATION, not just safety: peak-RSS growth must stay under
         # budget across a 10x scale-up of fixed-concurrency spawns, fixed-depth

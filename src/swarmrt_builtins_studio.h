@@ -11158,11 +11158,7 @@ static sw_val_t *_sw_hof(int kind, sw_val_t **a, int n, sw_frame_t *rs) {
     if (kind == 2) out = a[2];
     else {
         if (cnt == 0) return sw_val_list(NULL, 0);
-        /* The result list, filled in place: nothing else can see it yet. */
-        sw_val_t **tmp = (sw_val_t **)calloc((size_t)cnt, sizeof(sw_val_t *));
-        if (!tmp) return sw_val_list(NULL, 0);
-        out = sw_val_list(tmp, cnt);
-        free(tmp);
+        out = sw_val_list_slots(cnt);   /* filled in place: nothing else sees it yet */
     }
     for (i = 0; i < cnt; i++) {
         if (kind == 2) {
@@ -11185,6 +11181,7 @@ capture: {
     static sw_val_t *(*const resume[3])(sw_frame_t *) = { _sw_map_rs, _sw_filter_rs, _sw_reduce_rs };
     if (!F) F = (_sw_hof_F *)sw_frame_new(sizeof(_sw_hof_F), resume[kind], &_sw_hof_meta[kind]);
     F->h.pt = 1;
+    F->h.roots = 3;   /* fn, lst, out */
     F->fn = fn; F->lst = lst; F->out = out; F->i = i; F->nr = nr;
     sw_frame_link(&F->h, rs != NULL);
     return SW_SUSPEND;
@@ -11223,6 +11220,7 @@ static sw_val_t *_sw_pmw_body(_sw_pmw_t *w, sw_frame_t *rs) {
     if (SW_UNLIKELY(r == SW_SUSPEND)) {
         if (!F) F = (_sw_pmw_F *)sw_frame_new(sizeof(_sw_pmw_F), _sw_pmw_rs, &_sw_pmw_meta);
         F->h.pt = 1;
+        F->h.roots = 0;   /* no values */
         F->caller = caller; F->ref = ref; F->idx = idx;
         sw_frame_link(&F->h, rs != NULL);
         return SW_SUSPEND;
@@ -11257,12 +11255,7 @@ static sw_val_t *_sw_pmap(sw_val_t **a, int n, sw_frame_t *rs) {
     cnt = lst->v.tuple.count;
     if (cnt == 0) return sw_val_list(NULL, 0);
     ref = __atomic_add_fetch(&_sw_pmap_seq, 1, __ATOMIC_RELAXED);
-    {
-        sw_val_t **tmp = (sw_val_t **)calloc((size_t)cnt, sizeof(sw_val_t *));
-        if (!tmp) return sw_val_list(NULL, 0);
-        out = sw_val_list(tmp, cnt);
-        free(tmp);
-    }
+    out = sw_val_list_slots(cnt);
     for (int i = 0; i < cnt; i++) {
         _sw_pmw_t *w = (_sw_pmw_t *)malloc(sizeof(_sw_pmw_t));
         if (!w) continue;
@@ -11286,6 +11279,7 @@ collect:
                 sw_suspend_recv(deadline - now);
                 if (!F) F = (_sw_pmap_F *)sw_frame_new(sizeof(_sw_pmap_F), _sw_pmap_rs, &_sw_pmap_meta);
                 F->h.pt = 1;
+                F->h.roots = 1;   /* out */
                 F->out = out; F->ref = ref; F->deadline = deadline; F->got = got;
                 sw_frame_link(&F->h, rs != NULL);
                 return SW_SUSPEND;

@@ -2132,6 +2132,39 @@ static int hz_points(const char *o, size_t n, char rv[][64], int cap) {
 /* Rewrite one function body (the text between its braces) to `out`. With
  * `fi` and suspend points present, the body also gets its frame: the
  * restore-and-dispatch block at the top and the capture block at the end. */
+/* Write the rewritten body. At each self-tail call (the codegen's
+ * sw_tail_reset marker, right after the turn checkpoint) reset every value
+ * local the loop doesn't carry: the checkpoint has just freed what they
+ * pointed at, and a frame saved by the reduction point that follows must
+ * not hold a dangling root (§3.7). A local assigned before the `_tail:`
+ * label (a parameter) carries the loop's state and keeps its value. */
+static char *hz_find(const char *h, size_t hn, const char *nd) {
+    size_t nn = strlen(nd);
+    for (size_t i = 0; nn <= hn && i <= hn - nn; i++)
+        if (h[i] == nd[0] && memcmp(h + i, nd, nn) == 0) return (char *)h + i;
+    return NULL;
+}
+
+static void hz_write_body(hz_t *z, FILE *out) {
+    const char *lab = "\n_tail:;\n", *mark = "    /*@sw_tail_reset@*/\n";
+    char *at = hz_find(z->o, z->olen, lab);
+    size_t pre = at ? (size_t)(at - z->o) : 0;
+    const char *p = z->o, *end = z->o + z->olen;
+    for (;;) {
+        char *m = hz_find(p, (size_t)(end - p), mark);
+        if (!m) { fwrite(p, 1, (size_t)(end - p), out); break; }
+        fwrite(p, 1, (size_t)(m - p), out);
+        for (int i = 0; i < z->nh && at; i++) {
+            if (strcmp(z->h[i].type, "sw_val_t *") != 0) continue;
+            char pat[160];
+            snprintf(pat, sizeof pat, "\n    %s = ", z->h[i].cname);
+            if (hz_find(z->o, pre, pat)) continue;
+            fprintf(out, "    %s = NULL;\n", z->h[i].cname);
+        }
+        p = m + strlen(mark);
+    }
+}
+
 static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t *fi) {
     static int off = -1;
     if (off < 0) off = getenv("SW_NO_HOIST") ? 1 : 0;
@@ -2174,10 +2207,27 @@ static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t 
             fprintf(stderr, "swc: %s.%s has too many suspend points\n", fi->mod, fi->fn);
             exit(1);
         }
+        /* Frame slot order (§3.7): the sw_val_t pointers first, then the
+         * arena floor, then everything else, so the header's `roots` can
+         * describe the precise roots with a count. */
+        int *ord = (int *)malloc(sizeof(int) * (size_t)(z.nh > 0 ? z.nh : 1));
+        int nord = 0, nvals = 0, hasfloor = 0;
+        for (int i = 0; i < z.nh; i++)
+            if (strcmp(z.h[i].type, "sw_val_t *") == 0) { ord[nord++] = i; nvals++; }
+        for (int i = 0; i < z.nh; i++)
+            if (strcmp(z.h[i].type, "sw_varena_mark_t") == 0 && strcmp(z.h[i].cname, "_gc_floor") == 0) {
+                ord[nord++] = i; hasfloor = 1;
+            }
+        for (int i = 0; i < z.nh; i++)
+            if (strcmp(z.h[i].type, "sw_val_t *") != 0 &&
+                !(strcmp(z.h[i].type, "sw_varena_mark_t") == 0 && strcmp(z.h[i].cname, "_gc_floor") == 0))
+                ord[nord++] = i;
+        unsigned roots = nvals > 0x7fff ? 0xffffu : (unsigned)nvals | (hasfloor ? 0x8000u : 0);
         if (npt > 0) {
             /* The frame: every saved local, after the header. */
             fprintf(out, "    struct _sw_F { sw_frame_t _sw_hdr;");
-            for (int i = 0; i < z.nh; i++) {
+            for (int oi = 0; oi < nord; oi++) {
+                int i = ord[oi];
                 const char *ty = z.h[i].type;
                 size_t tl = strlen(ty);
                 int ptr = tl > 0 && ty[tl - 1] == '*';
@@ -2199,12 +2249,13 @@ static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t 
             fprintf(out, "        }\n");
             fprintf(out, "    }\n");
         }
-        fwrite(z.o, 1, z.olen, out);
+        hz_write_body(&z, out);
         if (npt > 0) {
             fprintf(out, "_sw_capture: {\n");
             fprintf(out, "    struct _sw_F *_f = _rs ? _sw_f : (struct _sw_F *)sw_frame_new(sizeof(struct _sw_F), %s, &%s);\n",
                     fi->rs, fi->meta);
-            fprintf(out, "    _f->_sw_hdr.pt = (uint32_t)_pt;\n");
+            fprintf(out, "    _f->_sw_hdr.pt = (uint16_t)_pt;\n");
+            fprintf(out, "    _f->_sw_hdr.roots = 0x%xu;\n", roots);
             for (int i = 0; i < z.nh; i++)
                 fprintf(out, "    _f->%s = %s;\n", z.h[i].cname, z.h[i].cname);
             fprintf(out, "    sw_frame_link(&_f->_sw_hdr, _rs != NULL);\n");
@@ -2212,6 +2263,7 @@ static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t 
             fprintf(out, "    return SW_SUSPEND;\n");
             fprintf(out, "  }\n");
         }
+        free(ord);
     }
     for (int i = 0; i < z.nh; i++) { free(z.h[i].cname); free(z.h[i].type); }
     for (int i = 0; i < z.nfree; i++) free(z.freen[i]);
@@ -2955,6 +3007,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         for (int i = 0; i < np; i++)
             fprintf(f, "      %s = _gc_v[%d];\n", ctx->cur_params[i], i);
         fprintf(f, "    }\n");
+        /* The checkpoint may have freed this turn's values: the hoisting
+         * pass clears the locals that held them here, before the reduction
+         * point below can save the frame (§3.7). */
+        fprintf(f, "    /*@sw_tail_reset@*/\n");
         /* Reduction check at the loop backedge. A self-tail-call is the
          * language's only unbounded loop, and without this the compiled
          * loop never yields: a spawn storm on one scheduler kept every
@@ -4215,11 +4271,11 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         char src_cnt[32]; fresh_var(ctx, src_cnt, sizeof(src_cnt));
         fprintf(f, "    int %s = (%s->type == SW_VAL_LIST) ? %s->v.tuple.count : 0;\n",
                 src_cnt, iter_var, iter_var);
-        /* scratch array and output counter */
+        /* The result list, filled in place (a root if the body parks) and
+         * its output counter. */
         char arr[32]; fresh_var(ctx, arr, sizeof(arr));
         char out_cnt[32]; fresh_var(ctx, out_cnt, sizeof(out_cnt));
-        fprintf(f, "    sw_val_t **%s = malloc(sizeof(sw_val_t*) * (%s > 0 ? %s : 1));\n",
-                arr, src_cnt, src_cnt);
+        fprintf(f, "    sw_val_t *%s = sw_val_list_slots(%s);\n", arr, src_cnt);
         fprintf(f, "    int %s = 0;\n", out_cnt);
         /* loop variable */
         char idx[32]; fresh_var(ctx, idx, sizeof(idx));
@@ -4243,13 +4299,11 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         /* evaluate body and store */
         char bv[32];
         emit_expr(ctx, n->v.lcomp.body, 0, bv, sizeof(bv));
-        fprintf(f, "    %s[%s++] = %s;\n", arr, out_cnt, bv);
+        fprintf(f, "    %s->v.tuple.items[%s++] = %s;\n", arr, out_cnt, bv);
         fprintf(f, "    }\n");
         ctx->ndeclared = saved_ndecl; /* restore: loop var is block-scoped */
-        char v[32]; fresh_var(ctx, v, sizeof(v));
-        fprintf(f, "    sw_val_t *%s = sw_val_list(%s, %s);\n", v, arr, out_cnt);
-        fprintf(f, "    free(%s);\n", arr);
-        strncpy(out, v, osz - 1);
+        fprintf(f, "    %s->v.tuple.count = %s;\n", arr, out_cnt);
+        strncpy(out, arr, osz - 1);
         break;
     }
     case N_RANGE: {

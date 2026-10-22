@@ -2499,6 +2499,20 @@ sw_val_t *sw_val_tuple(sw_val_t **items, int count) {
     return v;
 }
 
+/* A list of `count` empty (NULL) slots to fill in place before anyone else
+ * sees it; a builder that stops early lowers v.tuple.count. Unlike a malloc'd
+ * scratch array it lives in the arena, so it is freed with the process and
+ * is a root like any value (PROCESS_WEIGHT.md §3.7). */
+sw_val_t *sw_val_list_slots(int count) {
+    if (count < 0) count = 0;
+    sw_val_t *v = val_alloc(sizeof(sw_val_t));
+    v->type = SW_VAL_LIST;
+    v->v.tuple.items = val_alloc(sizeof(sw_val_t*) * (size_t)(count > 0 ? count : 1));
+    memset(v->v.tuple.items, 0, sizeof(sw_val_t*) * (size_t)(count > 0 ? count : 1));
+    v->v.tuple.count = count;
+    return v;
+}
+
 sw_val_t *sw_val_list(sw_val_t **items, int count) {
     sw_val_t *v = val_alloc(sizeof(sw_val_t));
     v->type = SW_VAL_LIST;
@@ -2755,6 +2769,7 @@ typedef struct {
     size_t cap, n;
     const sw_varena_range_t *keep;
     int nkeep;
+    int keep_null;   /* NULL stays NULL (a list being filled in place) */
 } dc_ctx_t;
 static __thread dc_ctx_t *g_dc = NULL;
 
@@ -2938,6 +2953,7 @@ static void dc_push(dc_frame_t **st, size_t *n, size_t *cap, sw_val_t *src) {
  * Children are copied before their parent (post-order); every container is
  * memoised, so DAG-shared subvalues copy once. */
 static sw_val_t *deep_copy_rec(sw_val_t *v) {
+    if (!v && g_dc && g_dc->keep_null) return NULL;
     sw_val_t *r = dc_try(v);
     if (r) return r;
     dc_frame_t *st = NULL;
@@ -2948,6 +2964,7 @@ static sw_val_t *deep_copy_rec(sw_val_t *v) {
         dc_frame_t *f = &st[n - 1];
         if (f->idx < f->total) {
             sw_val_t *child = dc_child(f->src, f->idx);
+            if (!child && g_dc && g_dc->keep_null) { f->out[f->idx++] = NULL; continue; }
             sw_val_t *c = dc_try(child);
             f->idx++;
             if (c) f->out[f->idx - 1] = c;
@@ -3082,6 +3099,7 @@ sw_frame_t *sw_frame_new(uint32_t size, sw_val_t *(*resume)(sw_frame_t *),
     f->resume = resume;
     f->meta = meta;
     f->size = size;
+    f->roots = SW_FRAME_ROOTS_UNKNOWN;
     atomic_fetch_add_explicit(&g_frames_live, 1, memory_order_relaxed);
     sw_process_t *p = sw_self();
     if (p) p->frame_bytes += size;
@@ -3293,6 +3311,7 @@ int sw_run_stackless(sw_process_t *p) {
                 fprintf(stderr, "\n\x1b[1;31mpanic\x1b[0m: %s\n", msg);
                 sw_process_panic(p, -1, msg);
             }
+            sw_park_compact(p, p->wait_kind == SW_WAIT_YIELD);
             return SW_RUN_SUSPENDED;
         }
         if (r == SW_TC_HOP) {
@@ -3370,6 +3389,70 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
     sw_varena_reset_to(a, floor);
     sw_varena_adopt(a, r);
     a->turn_live = live;
+    return 1;
+}
+
+/* Compaction at park (PROCESS_WEIGHT.md §3.7). When a stackless process parks
+ * to wait, nothing of it is on any stack, so its roots are exactly its saved
+ * frames' value slots plus gen_error and resume_val. If its arena has grown
+ * past max(SW_PARK_COMPACT_MIN, 2 x what the last compaction kept), copy
+ * those roots (sharing preserved) into a fresh region, free everything else,
+ * and move every frame's floor to the new top: a parked process holds only
+ * what it can still reach. A frame whose layout is unknown skips it.
+ * SW_COMPACT_TORTURE=1 compacts at every park, yields included. */
+static size_t g_park_min = (size_t)-1;
+static int g_compact_torture = -1;
+
+static void park_compact_cfg(void) {
+    if (g_park_min != (size_t)-1) return;
+    size_t v = 2048;
+    const char *e = getenv("SW_PARK_COMPACT_MIN");
+    if (e && *e) {
+        char *end = NULL;
+        unsigned long long x = strtoull(e, &end, 10);
+        if (end && (*end == 'k' || *end == 'K')) x <<= 10;
+        v = (size_t)x;
+    }
+    const char *t = getenv("SW_COMPACT_TORTURE");
+    g_compact_torture = t && t[0] == '1';
+    g_park_min = v;
+}
+
+int sw_park_compact(sw_process_t *p, int yield) {
+    sw_value_arena_t *a = sw_self_varena();
+    if (!a || !p) return 0;
+    park_compact_cfg();
+    if (yield && !g_compact_torture) return 0;
+    size_t need = g_park_min > 2 * a->park_live ? g_park_min : 2 * a->park_live;
+    if (!g_compact_torture && a->total_bytes <= need) return 0;
+    for (sw_frame_t *f = p->cont; f; f = f->parent)
+        if (f->roots == SW_FRAME_ROOTS_UNKNOWN) return 0;
+    sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_PROCESS);
+    if (!r) return 0;
+    sw_value_arena_t *save_t = g_alloc_target;
+    int save_g = g_alloc_force_global;
+    g_alloc_target = r;
+    g_alloc_force_global = 0;
+    dc_ctx_t dc, *saved;
+    dc_begin(&dc, &saved);
+    dc.keep_null = 1;
+    for (sw_frame_t *f = p->cont; f; f = f->parent) {
+        sw_val_t **slot = (sw_val_t **)(f + 1);
+        int nv = f->roots & 0x7fff;
+        for (int i = 0; i < nv; i++) slot[i] = deep_copy_rec(slot[i]);
+    }
+    p->gen_error = deep_copy_rec(p->gen_error);
+    p->resume_val = deep_copy_rec(p->resume_val);
+    dc_end(&dc, saved);
+    g_alloc_target = save_t;
+    g_alloc_force_global = save_g;
+    sw_varena_replace(a, r);
+    sw_varena_mark_t top = sw_varena_mark(a);
+    for (sw_frame_t *f = p->cont; f; f = f->parent)
+        if (f->roots & SW_FRAME_FLOOR)
+            *(sw_varena_mark_t *)((sw_val_t **)(f + 1) + (f->roots & 0x7fff)) = top;
+    a->park_live = a->total_bytes;
+    a->turn_live = 0;
     return 1;
 }
 

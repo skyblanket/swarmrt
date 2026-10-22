@@ -40,9 +40,18 @@ typedef struct sw_frame {
     struct sw_frame *parent;                 /* caller's frame; NULL = the process root */
     sw_val_t *(*resume)(struct sw_frame *);  /* re-enters the function at pt */
     const sw_fn_meta_t *meta;
-    uint32_t pt;                             /* suspend point to resume at */
+    uint16_t pt;                             /* suspend point to resume at */
+    uint16_t roots;                          /* slot layout, for compaction at park */
     uint32_t size;
 } sw_frame_t;                                /* generated slots follow */
+
+/* Frame slot layout (PROCESS_WEIGHT.md §3.7): the first (roots & 0x7fff)
+ * slots after the header are sw_val_t pointers, the precise roots; with
+ * SW_FRAME_FLOOR set, an sw_varena_mark_t (the function's arena floor)
+ * follows them. A frame whose roots is SW_FRAME_ROOTS_UNKNOWN (the default
+ * from sw_frame_new) keeps its process from being compacted. */
+#define SW_FRAME_ROOTS_UNKNOWN 0xffffu
+#define SW_FRAME_FLOOR         0x8000u
 
 enum {
     SW_WAIT_NONE = 0,
@@ -95,6 +104,9 @@ long sw_frames_live(void);
 
 /* The value delivered to the frame being resumed (its callee's result). */
 sw_val_t *sw_resume_value(void);
+
+/* Compaction at park (§3.7); called by the driver as a process parks. */
+int sw_park_compact(struct sw_process *p, int yield);
 
 /* While above zero, every suspend point takes its old-style path. */
 void sw_no_suspend_enter(void);

@@ -135,3 +135,26 @@ carries its closure and captures in a spawn region, the coordinator's bookkeepin
 it, and the 1.5 KB per-process trace block. Phases 2f (compaction at park) and 2g
 (trace state per scheduler) target that, and with it the plan's under-5 KB goal for
 this run.
+
+## After Phase 2f (compaction at park)
+
+`bench/memory` ring at N=99,000, back to back with Phase 2e (two runs each):
+
+| Mode | After 2e | After 2f |
+|---|---|---|
+| busy | 8.3–8.6 KB | **4.8–4.9 KB** |
+| idle | 2.6 KB | 2.6 KB |
+
+The default trigger (`SW_PARK_COMPACT_MIN` 2 KB) is what gets busy processes under 5 KB:
+at 4 KB they cost 7.8 KB, at 8 KB 8.1 KB. Busy ring setup (`ready_ms`) takes 29 s instead
+of 13 s. That isn't a slowdown: during setup `main` competes with a ring that now runs.
+Steady-state throughput of a token ring (every process passing a token, 5 s, `-O`):
+
+| Ring | 2e hops | 2f hops |
+|---|---|---|
+| 1,000 | 5.5–5.8M | 5.7–6.0M |
+| 20,000 | 0.7–1.9M | 1.5–2.0M |
+| 99,000 | 35–131K | **2.7–3.1M** |
+
+`task_stream.sh`: idle 5.9 KB, `llm_complete` 7.1 KB per waiting worker, within noise of
+2e. Those workers' arenas stay under the trigger, so compaction doesn't apply to them.
