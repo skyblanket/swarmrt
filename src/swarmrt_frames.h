@@ -44,7 +44,13 @@ enum {
     SW_WAIT_NONE = 0,
     SW_WAIT_YIELD,                           /* re-enqueue at the back of the run queue */
     SW_WAIT_RECV,                            /* park until mail arrives or wait_arg (ms) passes */
+    SW_WAIT_CALL,                            /* spill: re-issue the parked call on an empty carrier */
 };
+
+/* Spill (deep recursion): 1 when a function entry should park its own call
+ * and let the driver re-issue it on an empty carrier — the carrier is near
+ * its red zone, or SW_SPILL_TORTURE=n says so every nth entry. */
+int sw_spill_now(void);
 
 /* Run results reported by sw_run_stackless. */
 #define SW_RUN_EXITED    1
@@ -70,6 +76,10 @@ sw_frame_t *sw_frame_new(uint32_t size, sw_val_t *(*resume)(sw_frame_t *),
                          const sw_fn_meta_t *meta);
 void sw_frame_link(sw_frame_t *f, int resumed);
 void sw_frame_free(sw_frame_t *f);
+/* Free a frame of a process being torn down (no frame_bytes update). */
+void sw_frame_drop(sw_frame_t *f);
+/* Frames alive in the runtime: tests check that teardown frees them all. */
+long sw_frames_live(void);
 
 /* The value delivered to the frame being resumed (its callee's result). */
 sw_val_t *sw_resume_value(void);

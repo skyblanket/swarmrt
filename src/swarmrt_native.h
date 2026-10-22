@@ -455,6 +455,8 @@ struct sw_process {
     /* The chain of a run in progress (the driver's k and waiting), kept
      * here so process_destroy can free it if the run panics. */
     struct sw_frame *run_k, *run_waiting;
+    struct sw_spill *spill;           /* the parked call of a spill (sw_spill_call) */
+    uint64_t frame_bytes;             /* heap frames held, against SW_FRAME_MAX */
     struct sw_val *resume_val;
     uint64_t wait_arg;
     uint64_t wait_timer;

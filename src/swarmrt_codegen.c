@@ -2257,7 +2257,12 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         /* Red-zone stack guard — same as emit_function: recursion through
          * lambdas (apply chains, Y-combinator shapes) must die as a process
          * panic, not a native guard-page fault. */
-        fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s (lambda) — deep recursion? raise SW_PROC_STACK or restructure the loop\");\n",
+        /* Spill (Phase 2c): a stackless process parks this call and
+         * re-issues it on an empty carrier instead of overflowing. */
+        if (cg_can_suspend(ctx))
+            fprintf(f, "    if (SW_UNLIKELY(sw_spill_now()) && sw_suspend_ok()) { sw_val_t *_sp = sw_spill_lambda(%s__b, _args, _nargs); if (_sp) { _sw_trace_pop(); return _sp; } }\n",
+                    li->gen_name);
+        fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s (lambda) — deep recursion? raise SW_PROC_STACK or SW_FRAME_MAX, or restructure the loop\");\n",
                 ctx->mod_name, li->gen_name);
         /* Reduction check at every call, as for named functions. */
         emit_reds_point(ctx, "    ");
@@ -4414,7 +4419,14 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
      * headroom for the panic path. Fires on deep NON-tail recursion —
      * self-tail-calls take the goto below and module-function tail calls
      * return to the driver (sw_tc_drive), so neither re-enters here deeper. */
-    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep non-tail recursion? tail calls do not grow the stack; make the recursive call the last thing the function does, or raise SW_PROC_STACK\");\n",
+    /* Spill (Phase 2c): near the red zone, a stackless process parks this
+     * call (its args copied) and the driver re-issues it on an empty
+     * carrier, so non-tail recursion is bounded by SW_FRAME_MAX, not by the
+     * stack. Elsewhere (and past SW_FRAME_MAX) it still panics. */
+    if (cg_can_suspend(ctx))
+        fprintf(f, "    if (SW_UNLIKELY(sw_spill_now()) && sw_suspend_ok()) { sw_val_t *_sp = sw_spill_call(%s_%s__b, _args, _nargs, _sw_tc_fl); if (_sp) { _sw_trace_pop(); return _sp; } }\n",
+                ctx->mod_name, fn->v.fun.name);
+    fprintf(f, "    if (sw_stack_low()) _sw_runtime_panic(\"stack overflow in %s.%s — deep non-tail recursion? tail calls do not grow the stack; make the recursive call the last thing the function does, or raise SW_PROC_STACK or SW_FRAME_MAX\");\n",
             ctx->mod_name, fn->v.fun.name);
     /* Reduction-counted preemption at every call (BEAM-style): a process
      * yields once it has made SWARM_CONTEXT_REDS calls or loop turns, so a

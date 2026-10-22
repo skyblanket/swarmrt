@@ -1028,6 +1028,8 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->spawn_region = NULL;   /* set by sw_spawn_owned before the child runs */
     proc->cont = proc->cap_inner = proc->cap_outer = NULL;
     proc->run_k = proc->run_waiting = NULL;
+    proc->frame_bytes = 0;
+    proc->spill = NULL;
     proc->resume_val = NULL;
     proc->wait_kind = SW_WAIT_NONE;
     proc->wait_arg = 0;
@@ -1127,7 +1129,7 @@ static void process_destroy(sw_process_t *proc) {
 
     /* Parked stacklessly: drop its frames and its deadline timer. */
     if (proc->wait_timer) { sw_cancel_timer(proc->wait_timer); proc->wait_timer = 0; }
-    for (sw_frame_t *fr = proc->cont, *nx; fr; fr = nx) { nx = fr->parent; free(fr); }
+    for (sw_frame_t *fr = proc->cont, *nx; fr; fr = nx) { nx = fr->parent; sw_frame_drop(fr); }
     proc->cont = NULL;
     /* Died during a run (a panic): free the run's chain — the frame being
      * resumed and its ancestors, or the frames waiting on a fresh call — and
@@ -1138,12 +1140,14 @@ static void process_destroy(sw_process_t *proc) {
         for (sw_frame_t *fr = proc->cap_inner, *nx; fr; fr = nx) {
             nx = fr == proc->cap_outer ? NULL : fr->parent;
             if (fr == run) run = fr->parent;
-            free(fr);
+            sw_frame_drop(fr);
         }
         proc->cap_inner = proc->cap_outer = NULL;
     }
-    for (sw_frame_t *fr = run, *nx; fr; fr = nx) { nx = fr->parent; free(fr); }
+    for (sw_frame_t *fr = run, *nx; fr; fr = nx) { nx = fr->parent; sw_frame_drop(fr); }
     proc->run_k = proc->run_waiting = NULL;
+    free(proc->spill);
+    proc->spill = NULL;
 
     /* Killed while pinned: its carrier's frames are dead, the carrier is free. */
     if (proc->carrier) {
