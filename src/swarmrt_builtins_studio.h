@@ -531,6 +531,8 @@ static sw_val_t *_builtin_ets_update(sw_val_t **a, int n) {
 
     /* Call the compiled lambda outside any lock. */
     sw_val_t *new_val = sw_val_apply(fn, &old_val, 1);
+    /* The callback raised (§3.6): leave the entry as it was. */
+    if (sw_raise_pending()) return sw_val_nil();
     if (!new_val) return sw_val_atom("error");
 
     /* Write the result back under write lock; re-scan because lock was
@@ -4667,25 +4669,18 @@ static sw_val_t *_builtin_format(sw_val_t **a, int n) {
  * `_sw_error` (here + the codegen try/catch) to the current process's slot. */
 #define _sw_error (*sw_self_error_slot())
 
-/* Compiled try/catch frame. The generated N_TRY allocates one as a C local —
- * it lives on the process's FIBER stack, so the setjmp state survives a
- * mid-try yield + resume on another scheduler thread — links it through the
- * per-process chain head (sw_self_try_chain), and setjmps. error() unwinds by
- * longjmp to the innermost frame: full dynamic extent, so an error() raised
- * in a CALLEE lands in the caller's catch, matching the interpreter and every
- * exception system users come from. With no live frame, error() keeps the
- * documented no-try behavior: silent, execution continues with nil. Panics
- * never use this chain — they stay uncatchable (process death). */
-#include <setjmp.h>
-typedef struct _sw_try_frame {
-    jmp_buf jb;
-    struct _sw_try_frame *prev;
-} _sw_try_frame_t;
-#define _sw_try_chain (*(_sw_try_frame_t **)sw_self_try_chain())
-
+/* Compiled try/catch (PROCESS_WEIGHT.md §3.6). With a try live in this
+ * process, error() raises: it marks the raise pending and the generated code
+ * after this builtin call returns SW_RAISE up the call chain to the nearest
+ * enclosing catch, through any callee depth (and through callbacks called
+ * from C, which see nil and skip further callbacks). The full dynamic extent
+ * unwinds, matching the interpreter. No setjmp, so a try body can park
+ * stacklessly like any other code. With no live try, error() keeps the
+ * documented behavior: silent, execution continues with nil. Panics never
+ * raise; they stay uncatchable (process death). */
 static sw_val_t *_builtin_error(sw_val_t **a, int n) {
     _sw_error = (n >= 1) ? a[0] : sw_val_string("error");
-    if (_sw_try_chain) longjmp(_sw_try_chain->jb, 1);
+    if (sw_raise_begin()) sw_raise_set_pending();
     return sw_val_nil();
 }
 
@@ -8193,6 +8188,9 @@ static sw_val_t *_builtin_breaker_call(sw_val_t **a, int n) {
 
     /* Execute the function */
     sw_val_t *result = sw_val_apply(a[1], NULL, 0);
+    /* The call raised (§3.6): it goes on to the caller's catch, and the
+     * breaker counts nothing, as when error() unwound past it. */
+    if (sw_raise_pending()) return sw_val_nil();
 
     pthread_mutex_lock(&_breaker_lock);
     /* Re-find breaker (safe) */

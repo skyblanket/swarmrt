@@ -1037,7 +1037,8 @@ static int process_init_arena(sw_process_t *proc, uint32_t block_idx,
     proc->no_suspend = 0;
     proc->started = 0;
     proc->gen_error = NULL;      /* per-process generated-error slot (see sw_self_error_slot) */
-    proc->try_chain = NULL;      /* per-process compiled try/catch chain (see sw_self_try_chain) */
+    proc->try_live = 0;          /* compiled try/catch state (see sw_try_enter) */
+    proc->raise_pending = 0;
 
     /* Per-process generated line/file/call-trace state. Lazily allocated and KEPT
      * WITH THE SLAB SLOT across lifetimes: reset here, freed
@@ -2932,12 +2933,26 @@ struct sw_val **sw_self_error_slot(void) {
     return tls_current ? &tls_current->gen_error : &fallback;
 }
 
-/* Innermost live compiled try frame (see try_chain in struct sw_process).
- * Thread-local fallback covers the pre-fiber/main-thread path the same way
+/* Compiled try/catch state (see try_live in struct sw_process). The
+ * thread-local fallback covers the pre-fiber/main-thread path the same way
  * sw_self_error_slot's does. */
-void **sw_self_try_chain(void) {
-    static __thread void *fallback = NULL;
-    return tls_current ? &tls_current->try_chain : &fallback;
+static __thread int32_t tls_try_live, tls_raise_pending;
+static inline int32_t *try_live_slot(void) {
+    return tls_current ? &tls_current->try_live : &tls_try_live;
+}
+static inline int32_t *raise_pending_slot(void) {
+    return tls_current ? &tls_current->raise_pending : &tls_raise_pending;
+}
+void sw_try_enter(void) { (*try_live_slot())++; }
+void sw_try_leave(void) { int32_t *t = try_live_slot(); if (*t > 0) (*t)--; }
+int sw_raise_begin(void) { return *try_live_slot() > 0; }
+void sw_raise_set_pending(void) { *raise_pending_slot() = 1; }
+int sw_raise_pending(void) { return *raise_pending_slot(); }
+int sw_raised(void) {
+    int32_t *r = raise_pending_slot();
+    if (__builtin_expect(!*r, 1)) return 0;
+    *r = 0;
+    return 1;
 }
 
 /* Ownership v2 turn-checkpoint: install a fresh value arena for the current

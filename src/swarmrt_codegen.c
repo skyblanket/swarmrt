@@ -112,11 +112,17 @@ typedef struct {
 
     /* Stackless suspension (PROCESS_WEIGHT.md Phase 2c): set while emitting
      * a function or lambda body that can capture itself; npt numbers its
-     * suspend points. try_depth > 0 inside a try body, which can't suspend
-     * (its jmp_buf can't survive capture) until Phase 2d. */
+     * suspend points. */
     int stackless;
     int npt;
+    /* try/catch (§3.6): try_ids[try_depth-1] is the innermost try around the
+     * code being emitted in this function, whose catch label a raise jumps
+     * to; outside any try a raise returns SW_RAISE. in_body is set inside a
+     * function or lambda body, the only places a call can raise. */
     int try_depth;
+    int try_ids[64];
+    int ntry;
+    int in_body;
 } cg_ctx_t;
 
 /* SW_NO_STACKLESS=1 (or SW_NO_HOIST=1) at compile time emits no suspend
@@ -182,7 +188,25 @@ static void fresh_var(cg_ctx_t *ctx, char *buf, int sz) {
  * resume dispatch (built by the hoisting pass, hz_emit_body) jumps to, plus
  * an exit to the function's capture block. A label after a call carries a
  * `/\*@sw_rv N var@*\/` marker: on resume, var receives the callee's value. */
-static int cg_can_suspend(cg_ctx_t *ctx) { return ctx->stackless && ctx->try_depth == 0; }
+static int cg_can_suspend(cg_ctx_t *ctx) { return ctx->stackless; }
+
+/* Where a raise goes from here: the innermost enclosing try's catch in this
+ * function, or up to the caller. */
+static void emit_raise_exit(cg_ctx_t *ctx) {
+    FILE *f = ctx->out;
+    if (ctx->try_depth > 0)
+        fprintf(f, "goto _sw_catch%d;", ctx->try_ids[ctx->try_depth - 1]);
+    else
+        fprintf(f, "{ _sw_trace_pop(); return SW_RAISE; }");
+}
+
+/* After a builtin call: a callback it called through C may have raised. */
+static void emit_builtin_raise_check(cg_ctx_t *ctx) {
+    if (!ctx->in_body) return;
+    fprintf(ctx->out, "    if (SW_UNLIKELY(sw_raised())) ");
+    emit_raise_exit(ctx);
+    fprintf(ctx->out, "\n");
+}
 
 /* A reduction check: yield stacklessly when possible, else the old way. */
 static void emit_reds_point(cg_ctx_t *ctx, const char *indent) {
@@ -199,11 +223,18 @@ static void emit_reds_point(cg_ctx_t *ctx, const char *indent) {
 
 /* After a call that may suspend: capture this frame too. */
 static void emit_call_check(cg_ctx_t *ctx, const char *res) {
-    if (!cg_can_suspend(ctx)) return;
     FILE *f = ctx->out;
-    int k = ++ctx->npt;
-    fprintf(f, "_sw_rs%d:; /*@sw_rv %d %s@*/\n", k, k, res);
-    fprintf(f, "    if (SW_UNLIKELY(%s == SW_SUSPEND)) { _pt = %d; goto _sw_capture; }\n", res, k);
+    if (cg_can_suspend(ctx)) {
+        int k = ++ctx->npt;
+        fprintf(f, "_sw_rs%d:; /*@sw_rv %d %s@*/\n", k, k, res);
+        fprintf(f, "    if (SW_UNLIKELY(%s == SW_SUSPEND)) { _pt = %d; goto _sw_capture; }\n", res, k);
+    }
+    /* A raise in the callee (§3.6) unwinds to our catch or our caller. */
+    if (ctx->in_body) {
+        fprintf(f, "    if (SW_UNLIKELY(%s == SW_RAISE)) ", res);
+        emit_raise_exit(ctx);
+        fprintf(f, "\n");
+    }
 }
 
 /* Escape a string for safe embedding in a C string literal.
@@ -2041,12 +2072,6 @@ static int hz_scalar(const char *type) {
  * its resume entry and its frame metadata (emitted by the caller). */
 typedef struct { const char *mod, *fn, *rs, *meta; int line; } hz_fn_t;
 
-/* A local the frame must not save: try frames live and die inside a try,
- * which never suspends. */
-static int hz_unsaved(const char *type) {
-    return strstr(type, "jmp_buf") || strstr(type, "_sw_try_frame_t");
-}
-
 /* Suspend points in the rewritten body: labels `_sw_rsN:;` at line start,
  * and `@sw_rv N var@` markers naming the variable that receives the
  * resumed callee's value. Returns the highest N (0 = none). */
@@ -2117,7 +2142,6 @@ static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t 
             fprintf(out, "    struct _sw_F { sw_frame_t _sw_hdr;");
             for (int i = 0; i < z.nh; i++) {
                 const char *ty = z.h[i].type;
-                if (hz_unsaved(ty)) continue;
                 size_t tl = strlen(ty);
                 int ptr = tl > 0 && ty[tl - 1] == '*';
                 fprintf(out, " %s%s%s;", ty, ptr ? "" : " ", z.h[i].cname);
@@ -2125,8 +2149,7 @@ static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t 
             fprintf(out, " } *_sw_f = (struct _sw_F *)_rs;\n");
             fprintf(out, "    if (SW_UNLIKELY(_rs != NULL)) {\n");
             for (int i = 0; i < z.nh; i++)
-                if (!hz_unsaved(z.h[i].type))
-                    fprintf(out, "        %s = _sw_f->%s;\n", z.h[i].cname, z.h[i].cname);
+                fprintf(out, "        %s = _sw_f->%s;\n", z.h[i].cname, z.h[i].cname);
             fprintf(out, "        _sw_trace_push(\"%s\", \"%s\", %d);\n", fi->mod, fi->fn, fi->line);
             fprintf(out, "        switch (_rs->pt) {\n");
             for (int k = 1; k <= npt; k++) {
@@ -2146,8 +2169,7 @@ static void hz_emit_body(const char *body, size_t len, FILE *out, const hz_fn_t 
                     fi->rs, fi->meta);
             fprintf(out, "    _f->_sw_hdr.pt = (uint32_t)_pt;\n");
             for (int i = 0; i < z.nh; i++)
-                if (!hz_unsaved(z.h[i].type))
-                    fprintf(out, "    _f->%s = %s;\n", z.h[i].cname, z.h[i].cname);
+                fprintf(out, "    _f->%s = %s;\n", z.h[i].cname, z.h[i].cname);
             fprintf(out, "    sw_frame_link(&_f->_sw_hdr, _rs != NULL);\n");
             fprintf(out, "    _sw_trace_pop();\n");
             fprintf(out, "    return SW_SUSPEND;\n");
@@ -2209,9 +2231,11 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         FILE *real = hz_begin(ctx);
         f = ctx->out;
         int save_stackless = ctx->stackless, save_npt = ctx->npt, save_try = ctx->try_depth;
+        int save_in_body = ctx->in_body;
         ctx->stackless = cg_stackless_enabled();
         ctx->npt = 0;
         ctx->try_depth = 0;
+        ctx->in_body = 1;
         fprintf(f, "    int _pt = 0; (void)_pt; (void)_rs;\n");
 
         /* Save/restore codegen context */
@@ -2287,6 +2311,7 @@ static void emit_lambda_functions(cg_ctx_t *ctx) {
         ctx->stackless = save_stackless;
         ctx->npt = save_npt;
         ctx->try_depth = save_try;
+        ctx->in_body = save_in_body;
 
         /* Restore context */
         strncpy(ctx->cur_func, save_func, 127);
@@ -2956,6 +2981,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
     }
 
     /* Dispatch to builtin or user function */
+    int user_call = 0;
     if (strcmp(fname, "print") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_print(%s, %d);\n", res, arr, nargs);
     else if (strcmp(fname, "length") == 0)
@@ -3165,6 +3191,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "tool_history") == 0)
         fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, nargs > 0 ? arr : "NULL", nargs);
     else if (is_module_func(ctx, fname)) {
+        user_call = 1;
         if (tail && ctx->tc_hop && ctx->has_tail && nargs <= SW_TC_MAX) {
             /* Mutual tail call: park the args and return SW_TC_HOP, so the
              * driver (sw_tc_drive) calls the target body after this frame is
@@ -3204,6 +3231,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             fprintf(f, "    sw_val_t *%s = %s_%s(NULL, 0);\n", res, ctx->mod_name, fname);
         emit_call_check(ctx, res);
     } else if (is_declared(ctx, fname) && !is_builtin(fname)) {
+        user_call = 1;
         /* Dynamic dispatch: variable holds a closure value */
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = sw_val_apply_s(%s, %s, %d);\n", res, fname, arr, nargs);
@@ -3221,12 +3249,14 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
          * the surrounding statement walker expects emit_call to produce
          * a valid C variable name. The emitted C is unreachable: swc
          * never invokes cc once had_unknown_fn is set. */
+        user_call = 1;
         did_you_mean(ctx, fname, n->line);
         if (nargs > 0)
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
         else
             fprintf(f, "    sw_val_t *%s = %s_%s(NULL, 0);\n", res, ctx->mod_name, fname);
     }
+    if (!user_call) emit_builtin_raise_check(ctx);
 
     strncpy(out, res, osz - 1);
 }
@@ -3785,6 +3815,7 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             emit_call_check(ctx, res);
         } else if (is_builtin(fname)) {
             fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, %d);\n", res, fname, arr, nargs);
+            emit_builtin_raise_check(ctx);
         } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, %d);\n", res, ctx->mod_name, fname, arr, nargs);
             emit_call_check(ctx, res);
@@ -3822,6 +3853,7 @@ static void emit_pipe(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             emit_call_check(ctx, res);
         } else if (is_builtin(fname)) {
             fprintf(f, "    sw_val_t *%s = _builtin_%s(%s, 1);\n", res, fname, arr);
+            emit_builtin_raise_check(ctx);
         } else {
             fprintf(f, "    sw_val_t *%s = %s_%s(%s, 1);\n", res, ctx->mod_name, fname, arr);
             emit_call_check(ctx, res);
@@ -4203,58 +4235,50 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         break;
     }
     case N_TRY: {
-        /* try { body } catch e { handler }
+        /* try { body } catch e { handler }  (PROCESS_WEIGHT.md §3.6)
          *
          * error() must abort the REST of the try body and the dynamic
          * extent below it (an error() inside a callee lands here too),
-         * exactly like the interpreter. The old shape ran the whole
-         * body and tested _sw_error once at the end — so the statement
-         * AFTER an error() still executed (and could panic, killing
-         * the process before the catch was ever consulted).
+         * exactly like the interpreter. With a try live in the process,
+         * error() raises: every call site in the body checks for SW_RAISE
+         * (or, after a builtin, a raise pending from a callback called
+         * through C) and jumps to this try's catch label; a callee
+         * without a try of its own returns SW_RAISE to us. No setjmp, so
+         * the body can park and resume stacklessly like any other code.
          *
-         * Now: push a _sw_try_frame_t (a C local — fiber-stack-
-         * resident, so a mid-try yield + resume on another scheduler
-         * is safe) onto the per-process chain and setjmp. error()
-         * longjmps to the innermost frame. The frame is popped on BOTH
-         * arms — at the top of the catch arm so an error() raised
-         * INSIDE the catch body propagates to the enclosing try, not
-         * back into this one (infinite loop otherwise).
-         *
-         * The result var is written after setjmp returns (either
-         * entry), never read across the longjmp, so the setjmp
-         * indeterminate-locals rule doesn't bite it.
+         * sw_try_enter/leave count live tries per process, which is what
+         * makes error() raise instead of returning nil. The count drops
+         * on both arms — at the top of the catch, so an error() raised
+         * INSIDE the catch body goes to the enclosing try, as does a
+         * call site in the catch (try_depth is popped first).
          *
          * The catch block is its own lexical scope; snapshot ndeclared
          * around it (same pattern as emit_if) so a second try with the
          * same err_var re-declares rather than colliding. */
         char v[32]; fresh_var(ctx, v, sizeof(v));
-        char fr[32]; fresh_var(ctx, fr, sizeof(fr));
-        /* A try body can't suspend stacklessly (its jmp_buf can't survive
-         * capture; Phase 2d): it runs under no_suspend, and the saved depth
-         * is restored on both arms because error() longjmps past the exits
-         * of nested sw_val_apply calls. */
-        char nsd[32]; fresh_var(ctx, nsd, sizeof(nsd));
-        fprintf(f, "    uint32_t %s = sw_no_suspend_depth();\n", nsd);
-        fprintf(f, "    sw_no_suspend_enter();\n");
-        ctx->try_depth++;
+        int id = ++ctx->ntry;
+        if (ctx->try_depth >= (int)(sizeof(ctx->try_ids) / sizeof(ctx->try_ids[0]))) {
+            fprintf(stderr, "swc: src/%s.sw:%d: try blocks nested more than %d deep in one function\n",
+                    ctx->mod_name, n->line, (int)(sizeof(ctx->try_ids) / sizeof(ctx->try_ids[0])));
+            ctx->had_unknown_fn = 1;
+            strncpy(out, "sw_val_nil()", osz - 1);
+            break;
+        }
         fprintf(f, "    sw_val_t *%s = sw_val_nil();\n", v);
-        fprintf(f, "    _sw_try_frame_t _tf%s; _tf%s.prev = _sw_try_chain; _sw_try_chain = &_tf%s;\n",
-                fr, fr, fr);
         fprintf(f, "    _sw_error = NULL;\n");
-        fprintf(f, "    if (setjmp(_tf%s.jb) == 0) {\n", fr);
+        fprintf(f, "    sw_try_enter();\n");
+        fprintf(f, "    {\n");
+        ctx->try_ids[ctx->try_depth++] = id;
         char body_res[32];
         emit_expr(ctx, n->v.trycatch.body, 0, body_res, sizeof(body_res));
         fprintf(f, "        %s = %s;\n", v, body_res[0] ? body_res : "sw_val_nil()");
-        fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
-        fprintf(f, "        sw_no_suspend_set(%s);\n", nsd);
-        /* Belt-and-braces: a stale sentinel set by a chain-less error()
-         * deeper in the call tree (no live frame at that moment) still
-         * routes to catch here, preserving the old end-check behavior. */
-        fprintf(f, "    }\n");
-        fprintf(f, "    if (_sw_error) {\n");
-        fprintf(f, "        _sw_try_chain = _tf%s.prev;\n", fr);
-        fprintf(f, "        sw_no_suspend_set(%s);\n", nsd);
         ctx->try_depth--;
+        fprintf(f, "    }\n");
+        fprintf(f, "    sw_try_leave();\n");
+        fprintf(f, "    goto _sw_tryend%d;\n", id);
+        fprintf(f, "_sw_catch%d:;\n", id);
+        fprintf(f, "    sw_try_leave();\n");
+        fprintf(f, "    {\n");
         int saved_ndeclared = ctx->ndeclared;
         fprintf(f, "        sw_val_t *%s = _sw_error;\n", mangle_for_c(n->v.trycatch.err_var));
         declare_var(ctx, n->v.trycatch.err_var);
@@ -4263,6 +4287,7 @@ static void emit_expr(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         emit_expr(ctx, n->v.trycatch.catch_body, 0, catch_res, sizeof(catch_res));
         fprintf(f, "        %s = %s;\n", v, catch_res[0] ? catch_res : "sw_val_nil()");
         fprintf(f, "    }\n");
+        fprintf(f, "_sw_tryend%d:;\n", id);
         ctx->ndeclared = saved_ndeclared;
         strncpy(out, v, osz - 1);
         break;
@@ -4387,6 +4412,7 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     ctx->stackless = cg_stackless_enabled();
     ctx->npt = 0;
     ctx->try_depth = 0;
+    ctx->in_body = 1;
     fprintf(f, "    int _pt = 0; (void)_pt; (void)_rs;\n");
     fprintf(f, "    (void)_sw_tc_fl;\n");
 
@@ -4474,6 +4500,7 @@ static void emit_function(cg_ctx_t *ctx, node_t *fn) {
     f = ctx->out;
     fprintf(f, "}\n\n");
     ctx->stackless = 0;
+    ctx->in_body = 0;
     fprintf(f, "static sw_val_t *%s_%s__rs(sw_frame_t *_rs) { return %s_%s__b(NULL, 0, NULL, _rs); }\n",
             ctx->mod_name, fn->v.fun.name, ctx->mod_name, fn->v.fun.name);
 
