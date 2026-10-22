@@ -462,6 +462,16 @@ struct sw_process {
     uint32_t no_suspend;
     uint8_t wait_kind;
     uint8_t started;
+    /* Async builtins (Phase 2e). A sleep parks until sleep_until_ns (a
+     * message wakes it early and it parks again); an offloaded builtin parks
+     * until its job on the offload pool is done, then offl_finish(offl_ctx)
+     * hands back the value. async_fn: the builtin a generated call site
+     * invited to suspend (sw_async_take). */
+    uint64_t sleep_until_ns;
+    struct sw_offload_job *offl_job;
+    struct sw_val *(*offl_finish)(void *ctx);
+    void *offl_ctx;
+    void *async_fn;
 };
 
 /* === Run Queue (Vyukov MPSC — lock-free enqueue) === */
@@ -790,6 +800,18 @@ void *sw_receive_any(uint64_t timeout_ms, uint64_t *out_tag);
  * its `arg` is leaked rather than freed under the worker. Pool size grows on
  * demand up to SW_OFFLOAD_THREADS (default 256); idle workers exit after 30s. */
 void sw_offload_run(void (*fn)(void *), void *arg);
+/* Non-blocking form for a process that parks stacklessly: queue fn(arg) on
+ * the pool and return its job, or NULL when there is no worker (run it
+ * inline then). The job holds two references, the worker's and the
+ * caller's; arg_free(arg) runs when the last one goes. */
+struct sw_offload_job;
+struct sw_offload_job *sw_offload_start(void (*fn)(void *), void *arg, void (*arg_free)(void *));
+int sw_offload_done(struct sw_offload_job *j);
+void sw_offload_release(struct sw_offload_job *j);
+/* 1 once if the calling generated site invited `fn` to suspend (and the
+ * process can), clearing the invitation; see async_fn. */
+int sw_async_take(void *fn);
+uint64_t sw_now_ns(void);
 /* Park the calling process until *flag becomes non-zero. The waker stores the
  * flag (seq_cst) and then calls sw_wake(proc). The mailbox is untouched:
  * messages arriving meanwhile wake us, we re-check, and they stay queued. */

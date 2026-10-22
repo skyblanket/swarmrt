@@ -49,6 +49,8 @@ enum {
     SW_WAIT_YIELD,                           /* re-enqueue at the back of the run queue */
     SW_WAIT_RECV,                            /* park until mail arrives or wait_arg (ms) passes */
     SW_WAIT_CALL,                            /* spill: re-issue the parked call on an empty carrier */
+    SW_WAIT_SLEEP,                           /* park until sleep_until_ns (sw_suspend_sleep) */
+    SW_WAIT_OFFLOAD,                         /* park until an offloaded builtin's job is done */
 };
 
 /* Spill (deep recursion): 1 when a function entry should park its own call
@@ -71,6 +73,12 @@ int  sw_suspend_ok(void);
 /* Record an intent; the caller then returns SW_SUSPEND. */
 void sw_suspend_yield(void);
 void sw_suspend_recv(uint64_t timeout_ms);   /* UINT64_MAX = no deadline */
+/* Park for ms without touching the mailbox; the call's value is 'ok. */
+void sw_suspend_sleep(uint64_t ms);
+/* Park until an offload job (sw_offload_start) is done; then the call's
+ * value is finish(ctx), run on the resumed process. */
+struct sw_offload_job;
+void sw_suspend_offload(struct sw_offload_job *j, sw_val_t *(*finish)(void *), void *ctx);
 
 /* Frames. sw_frame_new returns a zeroed frame of `size` bytes (header
  * included); sw_frame_link records a capturing frame in the chain being

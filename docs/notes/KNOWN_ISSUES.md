@@ -17,8 +17,13 @@ carrier (128 KB virtual, a few pages resident, two mappings) for as long as they
 blocked:
 - interpreted code (`swc run`, `swc test`, the REPL, agent tools run by `tool_call`);
 - runtime processes with a C entry (supervisors, internal servers);
-- a compiled process blocked inside a builtin (`sleep`, HTTP, shell) or inside a
-  callback called from C (`map`/`filter`/`reduce`, `ets_update`).
+- a compiled process blocked inside a builtin that hasn't been converted (terminal
+  input, `llm_stream`, `http_post`/`llm_complete` in an interactive TTY session), or
+  inside a callback called from C (`ets_update`, or `map`/`filter`/`reduce` called from
+  `main`), or in `http_post_stream` when it doesn't stream to a process. `sleep`,
+  `shell`, `exec_*`, `http_get`/`http_post`/`http_request`, `llm_complete` (outside an
+  interactive TTY session), and `map`/`filter`/`reduce`/`pmap` callbacks in a spawned
+  process park without a stack.
 
 On stock Linux (`vm.max_map_count` 65530) about 32,700 of those can be blocked at once.
 A process that can't get a carrier fails with a `carrier stack` message and the node
@@ -26,14 +31,14 @@ keeps running. Busy processes also carry up to `SW_TURN_RESET_BYTES` (default 4 
 dead values between turn checkpoints; `SW_TURN_RESET_BYTES=1k` brings the busy figure
 to ~4.9 KB at some throughput cost.
 **Workaround:** raise `vm.max_map_count` if you block that many interpreted or
-builtin-waiting processes at once. Converting builtins and C callbacks, and compacting
-at park, are Phases 2e–2f of `docs/design/PROCESS_WEIGHT.md`.
+builtin-waiting processes at once. Compacting at park is Phase 2f of
+`docs/design/PROCESS_WEIGHT.md`.
 
 ### Compiled non-tail recursion outside a spawned process is bounded by the stack
 
 A spawned compiled process moves deep recursion to the heap (up to `SW_FRAME_MAX`,
-default 256 MB of saved frames). `main` and a callback called from C (`map`/`filter`/
-`reduce`) can't park, so there a deep enough recursion still raises
+default 256 MB of saved frames). `main` and a callback called from C (`ets_update`)
+can't park, so there a deep enough recursion still raises
 `stack overflow` at the `SW_PROC_STACK` limit (default 128 KB).
 **Workaround:** run the deep work in a spawned process, raise `SW_PROC_STACK`, or write
 it tail-recursively.

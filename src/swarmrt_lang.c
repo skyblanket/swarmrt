@@ -3050,6 +3050,23 @@ void sw_suspend_recv(uint64_t timeout_ms) {
     p->wait_arg = timeout_ms;
 }
 
+void sw_suspend_sleep(uint64_t ms) {
+    sw_process_t *p = sw_self();
+    if (!p) return;
+    p->wait_kind = SW_WAIT_SLEEP;
+    p->sleep_until_ns = sw_now_ns() + ms * 1000000ULL;
+    p->resume_val = sw_val_atom("ok");
+}
+
+void sw_suspend_offload(struct sw_offload_job *j, sw_val_t *(*finish)(void *), void *ctx) {
+    sw_process_t *p = sw_self();
+    if (!p) return;
+    p->wait_kind = SW_WAIT_OFFLOAD;
+    p->offl_job = j;
+    p->offl_finish = finish;
+    p->offl_ctx = ctx;
+}
+
 /* Frames alive in the whole runtime, for tests that check teardown. */
 static _Atomic long g_frames_live;
 
@@ -3219,6 +3236,21 @@ int sw_run_stackless(sw_process_t *p) {
         p->run_k = p->run_waiting = NULL;
         r = p->entry_v(p->arg);
     } else {
+        /* A sleep or an offloaded builtin that mail woke early parks again;
+         * one that is over delivers its value to the waiting frame. */
+        if (p->sleep_until_ns) {
+            if (sw_now_ns() < p->sleep_until_ns) { p->wait_kind = SW_WAIT_SLEEP; return SW_RUN_SUSPENDED; }
+            p->sleep_until_ns = 0;
+        }
+        if (p->offl_job) {
+            if (!sw_offload_done(p->offl_job)) { p->wait_kind = SW_WAIT_OFFLOAD; return SW_RUN_SUSPENDED; }
+            struct sw_offload_job *j = p->offl_job;
+            p->resume_val = p->offl_finish ? p->offl_finish(p->offl_ctx) : sw_val_nil();
+            p->offl_job = NULL;
+            p->offl_finish = NULL;
+            p->offl_ctx = NULL;
+            sw_offload_release(j);
+        }
         k = p->cont;
         p->cont = NULL;
         if (!k) return SW_RUN_EXITED;
