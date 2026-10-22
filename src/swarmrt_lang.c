@@ -3418,6 +3418,26 @@ static void park_compact_cfg(void) {
     g_park_min = v;
 }
 
+/* A root is copied only if it points into the arena being compacted. A slot
+ * can also hold a stale pointer (a temporary that last held a message
+ * payload, since freed with its region): nothing reads it again, so it is
+ * left alone, as it was before compaction existed. */
+static int pc_in_arena(const sw_varena_range_t *r, int n, const void *v) {
+    const char *x = (const char *)v;
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (x < r[mid].lo) hi = mid - 1;
+        else if (x >= r[mid].hi) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+
+static sw_val_t *pc_copy(const sw_varena_range_t *r, int n, sw_val_t *v) {
+    return v && pc_in_arena(r, n, v) ? deep_copy_rec(v) : v;
+}
+
 int sw_park_compact(sw_process_t *p, int yield) {
     sw_value_arena_t *a = sw_self_varena();
     if (!a || !p) return 0;
@@ -3427,8 +3447,11 @@ int sw_park_compact(sw_process_t *p, int yield) {
     if (!g_compact_torture && a->total_bytes <= need) return 0;
     for (sw_frame_t *f = p->cont; f; f = f->parent)
         if (f->roots == SW_FRAME_ROOTS_UNKNOWN) return 0;
+    sw_varena_range_t *rg = NULL;
+    int nrg = sw_varena_ranges_below(a, sw_varena_mark(a), &rg);
+    if (!rg) return 0;
     sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_PROCESS);
-    if (!r) return 0;
+    if (!r) { free(rg); return 0; }
     sw_value_arena_t *save_t = g_alloc_target;
     int save_g = g_alloc_force_global;
     g_alloc_target = r;
@@ -3439,11 +3462,12 @@ int sw_park_compact(sw_process_t *p, int yield) {
     for (sw_frame_t *f = p->cont; f; f = f->parent) {
         sw_val_t **slot = (sw_val_t **)(f + 1);
         int nv = f->roots & 0x7fff;
-        for (int i = 0; i < nv; i++) slot[i] = deep_copy_rec(slot[i]);
+        for (int i = 0; i < nv; i++) slot[i] = pc_copy(rg, nrg, slot[i]);
     }
-    p->gen_error = deep_copy_rec(p->gen_error);
-    p->resume_val = deep_copy_rec(p->resume_val);
+    p->gen_error = pc_copy(rg, nrg, p->gen_error);
+    p->resume_val = pc_copy(rg, nrg, p->resume_val);
     dc_end(&dc, saved);
+    free(rg);
     g_alloc_target = save_t;
     g_alloc_force_global = save_g;
     sw_varena_replace(a, r);
