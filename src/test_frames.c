@@ -204,6 +204,8 @@ int main(void) {
         if (s == SW_PROC_WAITING || s == SW_PROC_RUNNABLE || s == SW_PROC_RUNNING) live++;
     }
     CHECK(live == 0, "woken and killed parkers all exited (%d still live)", live);
+    /* EXITING is published before the scheduler frees the frames. */
+    for (int i = 0; i < 2000 && sw_frames_live() != 0; i++) wait_ms(1);
     CHECK(sw_frames_live() == 0, "their frames were freed (%ld still live)", sw_frames_live());
 
     /* 5: a panic in a resumed activation frees its frame chain (checked
@@ -220,6 +222,7 @@ int main(void) {
         if (s == SW_PROC_WAITING || s == SW_PROC_RUNNABLE || s == SW_PROC_RUNNING) up++;
     }
     CHECK(up == 0, "100 processes panicked after a resume (%d still live)", up);
+    for (int i = 0; i < 2000 && sw_frames_live() != 0; i++) wait_ms(1);
     CHECK(parked_frames == 200 && sw_frames_live() == 0,
           "their frame chains were freed (%d parked, %ld left)", parked_frames, sw_frames_live());
 
