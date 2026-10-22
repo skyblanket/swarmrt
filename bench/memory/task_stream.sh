@@ -15,7 +15,9 @@ python3 "$ROOT/bench/rollout/mock_server.py" "$PORT" >"$WORK/mock.log" 2>&1 &
 MOCK=$!
 trap 'kill $MOCK 2>/dev/null || true; wait $MOCK 2>/dev/null || true; rm -rf "$WORK"' EXIT
 "$ROOT/bin/swc" build "$HERE/task_stream.sw" -o "$WORK/ts" >"$WORK/build.log" 2>&1 || { cat "$WORK/build.log" >&2; exit 1; }
-for _ in $(seq 50); do curl -sf "127.0.0.1:$PORT/stats" >/dev/null && break; sleep 0.1; done
+ready=0
+for _ in $(seq 50); do curl -sf "127.0.0.1:$PORT/stats" >/dev/null && { ready=1; break; }; sleep 0.1; done
+if [ "$ready" != 1 ]; then echo "error: mock server did not start" >&2; cat "$WORK/mock.log" >&2; exit 1; fi
 for mode in idle llm; do
     for n in ${NS:-1000 10000}; do
         MODE=$mode N=$n URL="http://127.0.0.1:$PORT/v1/chat/completions" SW_DEADLOCK_DETECT=0 \

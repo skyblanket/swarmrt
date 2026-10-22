@@ -29,7 +29,7 @@ way.
 
 `bench/memory/task_stream.sh`, 10,000 `Std.task_stream` workers waiting on
 `llm_complete` against the rollout mock server: 27.5 KB → 6.6 KB per waiting
-process, and 20,623 → 642 mappings. Idle `task_stream` workers cost 5.5 KB. The plan's
+process, and 20,623 → 642 mappings. Idle `task_stream` workers cost 5.6 KB. The plan's
 under-5 KB target for this run needs Phases 2f and 2g: compaction at park, and removing
 the 1.5 KB per-process trace block. Gate: `tests/sw/test_async_builtins.sw`. It covers:
 - sleep keeping mail and lasting its time;

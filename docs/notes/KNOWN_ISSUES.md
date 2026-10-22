@@ -20,8 +20,10 @@ blocked:
 - a compiled process blocked inside a builtin that hasn't been converted (terminal
   input, `llm_stream`, `http_post`/`llm_complete` in an interactive TTY session), or
   inside a callback called from C (`ets_update`, or `map`/`filter`/`reduce` called from
-  `main`). `sleep`, `shell`, `exec_*`, `http_*`, `llm_complete`, and `map`/`filter`/
-  `reduce`/`pmap` callbacks in a spawned process park without a stack.
+  `main`), or in `http_post_stream` when it doesn't stream to a process. `sleep`,
+  `shell`, `exec_*`, `http_get`/`http_post`/`http_request`, `llm_complete` (outside an
+  interactive TTY session), and `map`/`filter`/`reduce`/`pmap` callbacks in a spawned
+  process park without a stack.
 
 On stock Linux (`vm.max_map_count` 65530) about 32,700 of those can be blocked at once.
 A process that can't get a carrier fails with a `carrier stack` message and the node
