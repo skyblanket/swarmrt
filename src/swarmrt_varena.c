@@ -50,7 +50,6 @@ static sw_value_arena_t *varena_new(size_t first_chunk, sw_region_kind_t kind) {
     a->chunk_count = 1;
     a->kind = kind;
     a->list_next = NULL;
-    a->turn_live = 0;
     a->park_live = 0;
     a->marked = NULL;
     return a;
@@ -70,7 +69,7 @@ sw_value_arena_t *sw_varena_create_kind(size_t hint, sw_region_kind_t kind) {
 }
 
 sw_varena_mark_t sw_varena_mark(sw_value_arena_t *a) {
-    sw_varena_mark_t m = { NULL, 0, 0 };
+    sw_varena_mark_t m = { NULL, 0, 0, 0 };
     if (a) {
         m.chunk = a->head; m.used = a->head ? a->head->used : 0; m.total_bytes = a->total_bytes;
         a->marked = a->head;

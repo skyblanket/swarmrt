@@ -2999,7 +2999,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
         }
         fprintf(f, "      sw_value_arena_t *_gc_a = sw_self_varena();\n");
         fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
-        fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", np > 0 ? "_gc_v" : "NULL", np);
+        fprintf(f, "        sw_turn_checkpoint(%s, %d, &_gc_floor);\n", np > 0 ? "_gc_v" : "NULL", np);
         for (int i = 0; i < np; i++)
             fprintf(f, "      %s = _gc_v[%d];\n", ctx->cur_params[i], i);
         fprintf(f, "    }\n");
@@ -3301,7 +3301,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
             }
             fprintf(f, "      sw_value_arena_t *_gc_a = sw_self_varena();\n");
             fprintf(f, "      if (_gc_a && (_gc_a->total_bytes - _gc_floor.total_bytes) > SW_TURN_RESET_BYTES)\n");
-            fprintf(f, "        sw_turn_checkpoint(%s, %d, _gc_floor);\n", nargs > 0 ? "_gc_v" : "NULL", nargs);
+            fprintf(f, "        sw_turn_checkpoint(%s, %d, &_gc_floor);\n", nargs > 0 ? "_gc_v" : "NULL", nargs);
             fprintf(f, "      sw_tc_park_t *_pk = sw_tc_park();\n");
             for (int i = 0; i < nargs; i++)
                 fprintf(f, "      _pk->args[%d] = _gc_v[%d];\n", i, i);

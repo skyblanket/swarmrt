@@ -9,6 +9,8 @@
  *   2. A yield every few messages (SW_WAIT_YIELD).
  *   3. 10,000 parked stackless processes hold no stack mappings.
  *   4. A process killed while parked is torn down, frames included.
+ *   5. A panic in a resumed activation frees its frame chain.
+ *   6. The turn-checkpoint trigger is per loop and counts its walk (#205).
  */
 #include "swarmrt_native.h"
 #include "swarmrt_lang.h"
@@ -157,6 +159,50 @@ static sw_val_t *crash_mid(sw_frame_t *rs) {
 }
 static sw_val_t *crasher_entry(void *arg) { (void)arg; return crash_mid(NULL); }
 
+/* ---- 6: turn-checkpoint triggers (#205) ----
+ * A loop's trigger is twice what a checkpoint would cost it: the bytes it
+ * last carried (kept in its own floor) plus a walk of the arena's chunks. */
+static _Atomic int g_tc_done;
+static int g_tc[5];
+static void tc_garbage(int n) { for (int i = 0; i < n; i++) (void)sw_val_string("garbage-garbage-garbage-garbage"); }
+static sw_val_t *tc_entry(void *arg) {
+    (void)arg;
+    sw_value_arena_t *a = sw_self_varena();
+    /* An outer loop with a ~200 KB accumulator above its floor. */
+    sw_varena_mark_t outer = sw_varena_mark(a);
+    enum { NACC = 2000 };
+    sw_val_t **items = malloc(sizeof(*items) * NACC);
+    for (int i = 0; i < NACC; i++) items[i] = sw_val_string("an item of the accumulator");
+    sw_val_t *args[1] = { sw_val_list(items, NACC) };
+    free(items);
+    g_tc[0] = sw_turn_checkpoint(args, 1, &outer);
+    /* Its body calls a helper whose loop makes lots of garbage and carries
+     * almost nothing, and checkpoints. */
+    sw_varena_mark_t inner = sw_varena_mark(a);
+    tc_garbage(8000);
+    sw_val_t *iargs[1] = { sw_val_int(1) };
+    g_tc[1] = sw_turn_checkpoint(iargs, 1, &inner);
+    /* A little more garbage in the outer loop, far less than it carries:
+     * re-copying the accumulator now is what made such loops quadratic. */
+    tc_garbage(100);
+    g_tc[2] = sw_turn_checkpoint(args, 1, &outer);
+    g_tc[3] = args[0] && args[0]->type == SW_VAL_LIST && args[0]->v.tuple.count == NACC;
+    /* A short helper loop over an arena of thousands of chunks: 5 KB of
+     * garbage doesn't pay for walking them. */
+    for (int i = 0; i < 3000; i++) {
+        sw_value_arena_t *r = sw_varena_create_kind(64, SW_REGION_PROCESS);
+        if (!r) break;
+        (void)sw_varena_alloc(r, 48);
+        sw_varena_adopt(a, r);
+    }
+    sw_varena_mark_t shortl = sw_varena_mark(a);
+    tc_garbage(60);
+    sw_val_t *sargs[1] = { sw_val_int(2) };
+    g_tc[4] = sw_turn_checkpoint(sargs, 1, &shortl);
+    atomic_store(&g_tc_done, 1);
+    return sw_val_nil();
+}
+
 static int count_maps(void) {
     FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) return -1;
@@ -230,6 +276,15 @@ int main(void) {
     for (int i = 0; i < 2000 && sw_frames_live() != 0; i++) wait_ms(1);
     CHECK(parked_frames == 200 && sw_frames_live() == 0,
           "their frame chains were freed (%d parked, %ld left)", parked_frames, sw_frames_live());
+
+    /* 6: turn-checkpoint triggers */
+    sw_spawn_v(tc_entry, NULL);
+    for (int i = 0; i < 5000 && !atomic_load(&g_tc_done); i++) wait_ms(1);
+    CHECK(atomic_load(&g_tc_done) && g_tc[0] == 1 && g_tc[1] == 1,
+          "an accumulator loop and a garbage-heavy helper loop checkpoint (%d, %d)", g_tc[0], g_tc[1]);
+    CHECK(g_tc[2] == 0 && g_tc[3],
+          "the helper's small carry doesn't set the outer loop's trigger (checkpointed: %d)", g_tc[2]);
+    CHECK(g_tc[4] == 0, "a short loop doesn't walk an arena of thousands of chunks (checkpointed: %d)", g_tc[4]);
 
     sw_shutdown(0);
     printf("%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
