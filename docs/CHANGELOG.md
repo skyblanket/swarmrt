@@ -4,6 +4,41 @@ Recent commits, newest first. Strict format: date, headline, what changed, what 
 
 ---
 
+## 2026-10-23 — Turn checkpoints scale with their own cost (#205)
+
+**fix(runtime): a loop's turn-checkpoint trigger is its own, and counts its walk.** A
+message-heavy workload (swarm-live's evolve4 forge, 8 islands) ran 2.4× slower on
+main than on ae943e8. The reporter's A/B on a 128-core EPYC pinned the cause on Phase
+1's 4 KB `SW_TURN_RESET_BYTES`: setting it to 256k gave 2.14 ticks/s, against 0.93 on
+main and 1.94 on the old build.
+
+Instrumenting the forge showed checkpoints copying 114 MB per tick. The trigger waits
+for twice what the last checkpoint carried, but that figure was kept per arena, and
+there were two problems:
+- **Overwritten trigger:** an accumulator loop (`act_all(tab, tl(crs), [act_one(...) |
+  acc])`) calls a helper whose own loop checkpoints the same arena with a small carry.
+  That reset the outer loop's trigger, so it re-copied its whole accumulator every
+  4 KB, which is quadratic.
+- **Walk cost:** each checkpoint walks and sorts every chunk below its floor. With the
+  carry kept per loop, a short helper loop called once per item checkpointed on every
+  call and walked its caller's whole arena each time, also quadratic.
+
+The carry now lives in the loop's floor (`sw_varena_mark_t.live`; `sw_turn_checkpoint`
+takes the floor by pointer). The trigger is twice the checkpoint's cost: the carry plus
+128 B per arena chunk.
+
+Measured on the forge from fresh founders, 4 schedulers, 90 s runs:
+- checkpoint copying per tick: 114 MB → 11–16 MB;
+- checkpoint CPU per tick: 385 ms → 30–44 ms;
+- ticks in 90 s: 600 → 3,000–4,200.
+That's at or better than main with `SW_TURN_RESET_BYTES=256k` (40–91 ms per tick).
+`bench/memory` at 99K: busy 4.1 KB, idle 2.2 KB (unchanged); `task_stream` unchanged.
+
+Gate: `test-frames` case 6 checks both triggers directly. The outer-loop case fails
+with the per-arena carry.
+
+---
+
 ## 2026-10-22 — Panic traces live on the carrier; the 2f distribution cost found
 
 **feat(runtime): trace and line state on the carrier (PROCESS_WEIGHT.md Phase 2g).** The

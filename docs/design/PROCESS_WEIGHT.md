@@ -678,6 +678,9 @@ are Linux x86-64; macOS numbers are recorded from Phase 0 on.
    from the environment, read once in `sw_init`, into a global that the
    generated code reads. Change the default from 256 KB to 4 KB, keeping the
    `2 × turn_live` adaptive rule.
+   - (#205: the carry later moved into each loop's floor, and the trigger
+     counts the chunk walk too; a per-arena carry made nested loops
+     quadratic at the 4 KB default.)
    - Measure 2, 4, 8 and 16 KB against `bench/actor` and `gc-slope`, and pick
      the smallest default that costs ≤ 3% throughput.
 2. Change the process arena's first chunk from 8 KB to 1 KB: `sw_varena_create`

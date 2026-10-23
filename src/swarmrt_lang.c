@@ -3393,15 +3393,27 @@ sw_tc_park_t *sw_tc_park(void) {
  * proportional to what the loop keeps ABOVE its floor, not to everything it
  * can reach. Returns 1 if the arena was rewound, 0 if skipped (no process
  * arena, below the adaptive threshold, or OOM: args untouched). */
-int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
+/* What walking one chunk costs a checkpoint, in bytes copied (a cold cache
+ * line plus its share of the sort). */
+#define SW_TC_CHUNK_COST 128
+int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t *fl) {
     sw_value_arena_t *a = sw_self_varena();
-    if (!a) return 0;
+    if (!a || !fl) return 0;
+    sw_varena_mark_t floor = *fl;
     size_t used = a->total_bytes - floor.total_bytes;
-    /* Adaptive trigger: wait until the turn garbage is at least twice what
-     * the last checkpoint carried forward, so copying stays amortised O(1)
-     * per allocated byte even when the loop keeps a large live state. */
+    /* Adaptive trigger: a checkpoint costs the bytes it copies (this loop's
+     * last carry, kept in its own floor) plus a walk of the arena's chunks
+     * (the ranges below the floor), so wait for twice that in turn garbage:
+     * amortised O(1) per allocated byte, whatever the loop keeps or its
+     * caller holds. Both terms matter (#205). With the carry kept per arena,
+     * a helper loop called from this loop's body set this loop's trigger to
+     * its own small carry, so a loop growing an accumulator re-copied all of
+     * it every few KB. Without the walk term, a short helper loop called per
+     * item checkpointed every call and walked its caller's whole arena each
+     * time. Both are quadratic. */
+    size_t cost = floor.live + a->chunk_count * SW_TC_CHUNK_COST;
     size_t need = SW_TURN_RESET_BYTES;
-    if (a->turn_live * 2 > need) need = a->turn_live * 2;
+    if (cost * 2 > need) need = cost * 2;
     if (used <= need) return 0;
     sw_value_arena_t *r = sw_varena_create_kind(256, SW_REGION_PROCESS);
     if (!r) return 0;
@@ -3423,7 +3435,7 @@ int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor) {
     size_t live = r->total_bytes;
     sw_varena_reset_to(a, floor);
     sw_varena_adopt(a, r);
-    a->turn_live = live;
+    fl->live = live;
     return 1;
 }
 
@@ -3511,7 +3523,6 @@ int sw_park_compact(sw_process_t *p, int yield) {
         if (f->roots & SW_FRAME_FLOOR)
             *(sw_varena_mark_t *)((sw_val_t **)(f + 1) + (f->roots & 0x7fff)) = top;
     a->park_live = a->total_bytes;
-    a->turn_live = 0;
     return 1;
 }
 

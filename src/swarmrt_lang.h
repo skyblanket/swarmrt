@@ -257,7 +257,7 @@ struct sw_value_arena *sw_swap_alloc_target(struct sw_value_arena *region);
 /* Ownership v2 turn checkpoint for compiled self-tail-calls: copy the live
  * args above `floor`, rewind the process arena to it, rewrite args[] in place.
  * Returns 1 if rewound (see swarmrt_lang.c). */
-int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t floor);
+int sw_turn_checkpoint(sw_val_t **args, int n, sw_varena_mark_t *floor);
 
 /* Mutual tail calls (codegen emit_call). Every module function `M_f` is a
  * driver over its body `M_f__b`. A body that tail-calls another module

@@ -43,8 +43,6 @@ typedef struct sw_value_arena {
     size_t chunk_count;            /* stat: number of chunks */
     sw_region_kind_t kind;         /* lifecycle owner class (v2) */
     struct sw_value_arena *list_next; /* per-process region chain (accounting/teardown) */
-    size_t turn_live;              /* bytes carried by the last turn checkpoint
-                                      (adaptive trigger: see sw_turn_checkpoint) */
     size_t park_live;              /* bytes kept by the last compaction at park
                                       (adaptive trigger: see sw_park_compact) */
     sw_varena_chunk_t *marked;     /* head when the last mark was taken (or
@@ -119,6 +117,8 @@ typedef struct {
     sw_varena_chunk_t *chunk;
     size_t used;
     size_t total_bytes;
+    size_t live;      /* bytes the loop's last turn checkpoint carried forward
+                         (its adaptive trigger: see sw_turn_checkpoint) */
 } sw_varena_mark_t;
 
 sw_varena_mark_t sw_varena_mark(sw_value_arena_t *a);
