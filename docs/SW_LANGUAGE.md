@@ -841,7 +841,7 @@ Needs `import Chrome` (a battery; see §2).
 | `process_info(pid)` | inspection map: `pid, status, reductions, messages` (drained mailbox), `mailbox_len` (pending depth — what `SW_MAILBOX_MAX` meters), `memory` (value-arena bytes — what `SW_PROC_MEM_MAX` meters), `messages_sent`, `messages_recv`, `heap_used`, `heap_size`, plus `name` / `parent` (parent's pid) when set |
 | `process_list()` | all live pids |
 | `registered()` | all registered `{name, pid}` pairs |
-| `swarm_stats()` | node-level metrics map: `processes` (live), `schedulers`, `spawns` / `crashes` / `restarts` (monotonic since boot), `mailbox_dropped` / `msgsize_dropped` (cap-drop counters), `overflow_queue`, and `scheduler_stats` — a per-scheduler list of `%{id, procs_run, loop_iters, idle_waits, steals}` |
+| `swarm_stats()` | node-level metrics map: `processes` (live), `schedulers`, `spawns` / `crashes` / `restarts` (monotonic since boot), `mailbox_dropped` / `msgsize_dropped` (cap-drop counters), `overflow_queue`, and `scheduler_stats` — a per-scheduler list of `%{id, procs_run, loop_iters, idle_waits, steals}` — and `llm_endpoints`, one map per endpoint `llm_request` / `llm_limit` has seen (see the LLM section) |
 | `import Swarm` → `Swarm.top()` / `Swarm.tree()` | live snapshot (list of process maps) / supervision forest, grouped by `parent`; `print_top()` / `print_tree()` format them. Works under `swc run` once imported (see note below). |
 | `import Sandbox` → `Sandbox.start(image, opts)` / `Sandbox.exec(sb, cmd, args, opts)` / `Sandbox.stop(sb)` / `Sandbox.sweep()` | a Docker container as the sandbox for one episode. The container carries `swarmrt.sandbox=1` and `swarmrt.owner=<runtime pid>` labels and a cidfile; a detached watcher removes it within about a second of the owner's death, even on SIGKILL. `start` first sweeps containers whose owner is dead, never a live owner's or an unlabelled one. `exec` runs the command as its own process group inside the container, and on `timeout_ms` (exit 124) kills that group there, so nothing it started survives. Needs `docker` and `util-linux` `setsid` in the image. See `lib/Sandbox.sw`. |
 | `import Health` → `Health.start(port)` / `Health.serve(port)` | operator liveness/readiness HTTP endpoint: `/healthz` → 200 `"ok"`, `/readyz` → 200 `swarm_stats()` as JSON, 404 elsewhere. `start` spawns the server (returns its pid); `serve` runs it in the calling process (blocks). See `examples/health_endpoint.sw`. Compiled-only. |
@@ -994,6 +994,41 @@ fun worker_loop(n) {
 |---|---|
 | `llm_complete(prompt, opts)` → string | one-shot chat completion against an OpenAI-compatible endpoint; `"error: ..."` on failure |
 | `llm_stream(prompt, opts)` → pid | streaming variant: sends `{'llm_token', text}` then `{'llm_done', full_text}` to the caller |
+| `llm_request(prompt, opts)` → `{'ok', map}` \| `{'error', map}` | structured completion (below): the failure says what went wrong, and transient failures are retried by the server's own `Retry-After` |
+| `llm_limit(url_or_provider, opts)` → `'ok'` \| `'error'` | per-endpoint limiter shared by every process on the node: `rpm`, `tpm`, `max_concurrency` (adaptive) |
+
+`llm_request` takes a prompt string or a list of `%{role:, content:}` messages.
+Its success map is `%{content, finish_reason, usage: %{prompt_tokens, completion_tokens}, latency_ms, attempts}`.
+Its error map is `%{kind, status, retry_after_ms, body, attempts}`, where `kind` is
+`'rate_limited'` (429), `'server'` (5xx), `'timeout'` (408 or a curl timeout),
+`'transport'` (no response), `'bad_request'` (other 4xx), `'auth'` (401, 403),
+`'bad_response'` (a 2xx with no completion) or `'config'` (no endpoint). Opts:
+`retries` (3, at most 10), `backoff_ms` (1000), `max_backoff_ms` (30000) and
+`timeout_ms` (0 = none; the budget for the whole call, retries and waits
+included). A 429 or 5xx with `Retry-After` waits exactly that many seconds; other
+retries back off exponentially with jitter. Only 408, 429, 5xx and transport
+failures are retried.
+
+`llm_limit("https://…/chat/completions", %{rpm: 60, tpm: 90000, max_concurrency: 8})`
+(or a provider name, which stands for its URL) sets the limits. `rpm` paces request starts
+60000/rpm ms apart, with no burst. `tpm` is a token bucket, charged before each attempt
+with the estimate (request bytes / 4 + `max_tokens`). `max_concurrency` is adaptive,
+as in Inspect: a 429 cuts the in-flight cap to 0.8× (at most once per 15 s), and each
+success adds one back up to the limit. Each endpoint's counts show in `swarm_stats()`
+under `llm_endpoints`. `llm_complete` is unchanged and does not use the limiter.
+
+```sw
+module LLMRequest
+export [main]
+
+fun main() {
+    llm_limit("openai", %{rpm: 60, max_concurrency: 4})
+    case llm_request("Summarise SwarmRT in one line.", %{provider: "openai", timeout_ms: 30000}) {
+        {'ok', r} -> print(map_get(r, 'content'))
+        {'error', e} -> print(f"{map_get(e, 'kind')} after {map_get(e, 'attempts')} attempt(s)")
+    }
+}
+```
 
 There is no default endpoint. The URL is `opts.url`, else `LLM_URL`, else the
 provider's (`opts.provider`, else `LLM_PROVIDER`): `openai`, `ollama`
