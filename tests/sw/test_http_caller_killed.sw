@@ -12,8 +12,22 @@ module Test_http_caller_killed
 
 import Std
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun hung_server() {
-    http_listen(9181)
+    http_listen(test_port(181))
     hung_loop()
 }
 
@@ -25,7 +39,7 @@ fun hung_loop() {
 }
 
 fun curl_left() {
-    r = shell("pgrep -f '[c]url .*127[.]0[.]0[.]1:9181' | wc -l")
+    r = shell("pgrep -f '[c]url .*127[.]0[.]0[.]1:" ++ to_string(test_port(181)) ++ "' | wc -l")
     string_trim(elem(r, 1))
 }
 
@@ -52,7 +66,7 @@ fun assert_eq(name, actual, expected) {
 fun main() {
     spawn(hung_server())
     sleep(300)
-    url = "http://127.0.0.1:9181/v1/chat/completions"
+    url = "http://127.0.0.1:" ++ to_string(test_port(181)) ++ "/v1/chat/completions"
     opts = %{url: url, api_key: "k", model: "m"}
     fails = 0
 

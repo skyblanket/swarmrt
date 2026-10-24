@@ -11,6 +11,20 @@ module Test_voice_bridge_async
 # No live credentials; plaintext ws:// against a local echo server.
 # Exits non-zero on failure.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -68,12 +82,12 @@ fun connect_retry(url, attempts) {
 }
 
 fun main() {
-    spawn(fun() { echo_server(9095) })
+    spawn(fun() { echo_server(test_port(95)) })
     sleep(200)
 
     fails = 0
-    ha = connect_retry("ws://127.0.0.1:9095/", 100)
-    hb = connect_retry("ws://127.0.0.1:9095/", 100)
+    ha = connect_retry(f"ws://127.0.0.1:{test_port(95)}/", 100)
+    hb = connect_retry(f"ws://127.0.0.1:{test_port(95)}/", 100)
     case ha {
         'nil' -> print("FAIL bridge_async_connect_a") ; fails = 1
         _ ->

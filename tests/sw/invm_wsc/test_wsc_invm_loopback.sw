@@ -8,8 +8,8 @@ module Test_wsc_invm_loopback
 # alarm fires, and the file FAILs.
 #
 # Topology (exactly the bridge shape that deadlocked), all in ONE VM:
-#   server T (Telnyx stand-in)  on :9311 — one handler process.
-#   server O (OpenAI stand-in)  on :9312 — echoes WS frames.
+#   server T (Telnyx stand-in)  on test_port(311) — one handler process.
+#   server O (OpenAI stand-in)  on test_port(312) — echoes WS frames.
 #   driver = Telnyx: connects to T and sends a "start" frame, then stays alive
 #            so T's incoming WS connection is LIVE.
 #   T's handler, on the FIRST ws_message, BLOCKS in wsc_connect -> O while T's
@@ -21,8 +21,22 @@ module Test_wsc_invm_loopback
 #
 # Success = the bridge reaches O, exchanges a frame, prints DONE, exits 0.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun tx_server() {
-    http_listen(9311)
+    http_listen(test_port(311))
     tx_handler('false')
 }
 
@@ -32,7 +46,7 @@ fun tx_handler(done) {
             case done {
                 'false' -> {
                     # The blocking dial-while-conn-is-live that used to deadlock.
-                    oa = connect_retry("ws://127.0.0.1:9312/", 200)
+                    oa = connect_retry(f"ws://127.0.0.1:{test_port(312)}/", 200)
                     case oa {
                         'nil' -> { print("FAIL: bridge could not reach O") sys_exit(1) }
                         _     -> {
@@ -61,7 +75,7 @@ fun tx_handler(done) {
 }
 
 fun oa_server() {
-    http_listen(9312)
+    http_listen(test_port(312))
     oa_loop()
 }
 fun oa_loop() {
@@ -84,7 +98,7 @@ fun main() {
     spawn(fun() { tx_server() })
     spawn(fun() { oa_server() })
 
-    h = connect_retry("ws://127.0.0.1:9311/", 200)
+    h = connect_retry(f"ws://127.0.0.1:{test_port(311)}/", 200)
     case h {
         'nil' -> { print("FAIL: driver could not connect to T") sys_exit(1) }
         _     -> { wsc_send(h, "start") }

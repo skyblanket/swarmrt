@@ -14,6 +14,20 @@ module Test_voice_ws_loopback
 #
 # Exits non-zero on failure so the driver rolls it up.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun assert_eq(name, actual, expected) {
     if (actual == expected) { print("PASS " ++ name) ; 0 }
     else {
@@ -25,7 +39,7 @@ fun assert_eq(name, actual, expected) {
 
 # Echo server: becomes the WS handler for whatever connects, mirrors text.
 fun echo_server() {
-    http_listen(9099)
+    http_listen(test_port(99))
     echo_loop()
 }
 
@@ -71,7 +85,7 @@ fun connect_retry(url, attempts) {
 fun main() {
     spawn(fun() { echo_server() })
 
-    h = connect_retry("ws://127.0.0.1:9099/", 100)
+    h = connect_retry(f"ws://127.0.0.1:{test_port(99)}/", 100)
     fails = 0
     case h {
         'nil' ->

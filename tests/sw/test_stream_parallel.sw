@@ -6,12 +6,26 @@ module Test_stream_parallel
 # 6 streams against an in-VM server that answers after 300ms finish together
 # instead of one scheduler-at-a-time.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun sse() {
     "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" ++
     "data: [DONE]\n\n"
 }
 
-fun server() { http_listen(9155) ; serve() }
+fun server() { http_listen(test_port(155)) ; serve() }
 fun serve() {
     receive {
         {'http_request', conn, _m, _p, _h, _b} ->
@@ -22,12 +36,12 @@ fun serve() {
 }
 
 fun wait_up(attempts) {
-    r = http_request("http://127.0.0.1:9155/ping", %{})
+    r = http_request(f"http://127.0.0.1:{test_port(155)}/ping", %{})
     case r { {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) } ; _ -> 'up' }
 }
 
 fun agent(parent, i) {
-    r = http_post_stream("http://127.0.0.1:9155/v1/chat/completions", [], "{}", parent, f"a{i}")
+    r = http_post_stream(f"http://127.0.0.1:{test_port(155)}/v1/chat/completions", [], "{}", parent, f"a{i}")
     send(parent, {'agent_done', i, elem(r, 0)})
 }
 

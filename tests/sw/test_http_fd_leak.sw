@@ -8,8 +8,22 @@ module Test_http_fd_leak
 
 import Std
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun server() {
-    http_listen(9153)
+    http_listen(test_port(153))
     serve()
 }
 
@@ -21,7 +35,7 @@ fun serve() {
 }
 
 fun wait_up(attempts) {
-    r = http_request("http://127.0.0.1:9153/ping", %{})
+    r = http_request(f"http://127.0.0.1:{test_port(153)}/ping", %{})
     case r {
         {'error', _} -> if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) }
         _ -> 'up'
@@ -31,7 +45,7 @@ fun wait_up(attempts) {
 fun hammer(i, n, ok) {
     if (i == n) { ok }
     else {
-        body = http_get("http://127.0.0.1:9153/x")
+        body = http_get(f"http://127.0.0.1:{test_port(153)}/x")
         hammer(i + 1, n, if (body == "ok") { ok + 1 } else { ok })
     }
 }

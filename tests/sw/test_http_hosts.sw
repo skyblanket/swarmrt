@@ -14,6 +14,20 @@ module Test_http_hosts
 # open, so it runs under --max-time 1), and the body runs in a child with
 # SW_HTTP_HOSTS set before the runtime starts.
 
+# Listener ports for this test: a per-process base (derived from our pid, or
+# SW_TEST_PORT_BASE when set) plus a fixed offset, so two suite runs on one
+# host don't bind the same port.
+fun test_base() {
+    case getenv("SW_TEST_PORT_BASE") {
+        'nil' -> case shell("printf %s $PPID") { {_c, out} -> 20000 + (to_int(out) * 97) % 40000 }
+        v -> to_int(v)
+    }
+}
+
+fun test_port(offset) {
+    test_base() + offset
+}
+
 fun serve() {
     receive {
         {'ws_connect', _conn, _path} -> serve()
@@ -27,14 +41,14 @@ fun curl_code(extra) {
 }
 
 fun plain(host) {
-    curl_code(" -H 'Host: " ++ host ++ "' http://127.0.0.1:9172/ping")
+    curl_code(" -H 'Host: " ++ host ++ f"' http://127.0.0.1:{test_port(172)}/ping")
 }
 
 fun upgrade(host, origin) {
     base = " -H 'Connection: Upgrade' -H 'Upgrade: websocket'" ++
            " -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='"
     o = if (origin == "") { "" } else { " -H 'Origin: " ++ origin ++ "'" }
-    curl_code(base ++ " -H 'Host: " ++ host ++ "'" ++ o ++ " http://127.0.0.1:9172/ws")
+    curl_code(base ++ " -H 'Host: " ++ host ++ "'" ++ o ++ f" http://127.0.0.1:{test_port(172)}/ws")
 }
 
 fun check(name, got, want) {
@@ -43,24 +57,24 @@ fun check(name, got, want) {
 }
 
 fun wait_up(attempts) {
-    r = plain("app.test:9172")
+    r = plain(f"app.test:{test_port(172)}")
     if (r == "200") { 'up' }
     else { if (attempts <= 1) { 'down' } else { sleep(50) ; wait_up(attempts - 1) } }
 }
 
 fun child() {
     spawn(fun() {
-        http_listen(9172, %{})
+        http_listen(test_port(172), %{})
         serve()
     })
     if (wait_up(100) != 'up') { print("FAIL server_up") ; sys_exit(1) }
     fails = 0
-    fails = fails + check("listed_http_ok", plain("app.test:9172"), "200")
-    fails = fails + check("listed_second_entry_ok", plain("localhost:9172"), "200")
-    fails = fails + check("listed_case_insensitive_ok", plain("APP.test:9172"), "200")
+    fails = fails + check("listed_http_ok", plain(f"app.test:{test_port(172)}"), "200")
+    fails = fails + check("listed_second_entry_ok", plain(f"localhost:{test_port(172)}"), "200")
+    fails = fails + check("listed_case_insensitive_ok", plain(f"APP.test:{test_port(172)}"), "200")
     fails = fails + check("rebind_http_refused", plain("evil.test"), "403")
     fails = fails + check("port_mismatch_refused", plain("app.test:9999"), "403")
-    fails = fails + check("listed_upgrade_ok", upgrade("app.test:9172", "http://app.test:9172"), "101")
+    fails = fails + check("listed_upgrade_ok", upgrade(f"app.test:{test_port(172)}", f"http://app.test:{test_port(172)}"), "101")
     fails = fails + check("rebind_upgrade_refused", upgrade("evil.test", "http://evil.test"), "403")
     fails = fails + check("rebind_no_origin_refused", upgrade("evil.test", ""), "403")
     sys_exit(fails)
@@ -69,7 +83,7 @@ fun child() {
 fun main() {
     if (getenv("SW_HTTP_HOSTS_CHILD") == "1") { child() }
     me = hd(os_args())
-    r = shell("SW_HTTP_HOSTS_CHILD=1 SW_SCHEDULERS=2 SW_HTTP_HOSTS='app.test:9172, localhost:9172' '" ++
+    r = shell(f"SW_TEST_PORT_BASE={test_base()} SW_HTTP_HOSTS_CHILD=1 SW_SCHEDULERS=2 SW_HTTP_HOSTS='app.test:{test_port(172)}, localhost:{test_port(172)}' '" ++
               me ++ "' 2>/dev/null")
     print(string_trim(elem(r, 1)))
     if (elem(r, 0) == 0) { print("OK http_hosts 8/8") ; sys_exit(0) }
