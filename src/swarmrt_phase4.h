@@ -91,7 +91,8 @@ sw_process_t *sw_app_get_supervisor(const char *name);
  *   sw_dynsup_terminate_child("sessions", child);
  * ========================================================================= */
 
-#define SW_DYNSUP_MAX_CHILDREN 4096
+/* Default per-supervisor child cap; override with env SW_DYNSUP_MAX_CHILDREN. */
+#define SW_DYNSUP_MAX_CHILDREN 100000
 
 typedef struct {
     uint32_t max_restarts;

@@ -852,7 +852,7 @@ Needs `import Chrome` (a battery; see §2).
 | `trap_exit('true' \| 'false')` | toggle exit-signal trapping; on, exit signals arrive as `{'EXIT', from, reason}` messages |
 | `supervise(strategy, [{name, fn, restart}, …])` | restart-tree supervisor (`'one_for_one'` / `'one_for_all'` / `'rest_for_one'`) — children fixed at start |
 | `dyn_supervisor()` / `dyn_supervisor(max_restarts, max_seconds)` → pid | dynamic supervisor — starts empty, always `one_for_one`, add children at runtime |
-| `sup_start_child(sup, {name, fn, restart})` → pid | add+start one supervised child at runtime (`name` may be `nil` for anonymous); `nil` on failure |
+| `sup_start_child(sup, {name, fn, restart})` → pid | add+start one supervised child at runtime (`name` may be `nil` for anonymous); `nil` on failure. A supervisor holds at most 100000 children (override with env `SW_DYNSUP_MAX_CHILDREN`); past that it prints `dyn_supervisor: child limit (N) reached` to stderr once and returns `nil`. To go beyond, shard across several `dyn_supervisor`s |
 | `sup_terminate_child(sup, child)` → `'ok'` \| `'error'` | kill and forget one dynamic child |
 | `sup_count_children(sup)` → int | number of live supervised children |
 
