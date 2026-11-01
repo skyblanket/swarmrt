@@ -73,7 +73,7 @@ CORE_SRCS = swarmrt_native swarmrt_asm swarmrt_otp swarmrt_task swarmrt_ets \
 CORE_OBJS = $(patsubst %,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 # Main targets
-.PHONY: all clean v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
+.PHONY: all clean check-sources check-cmake v2 native otp-test phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase9 phase10 \
         test test-v2 test-native test-otp test-phase2 test-phase3 test-phase4 \
         test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-all test-core test-full \
         test-sw benchmark-native stats h2h swc libswarmrt example-counter search test-search bench-search \
@@ -740,6 +740,15 @@ stress: swc libswarmrt
 # Benchmarks
 benchmark-native: native
 	./$(BIN_DIR)/swarmrt-native
+
+# Makefile CORE_SRCS / swc sources and CMakeLists.txt must name the same
+# files (CMake is the Windows/MinGW path); see scripts/check_source_lists.sh.
+check-sources:
+	@bash scripts/check_source_lists.sh
+
+# Full CMake build into build/cmake (never bin/) plus a smoke run. Needs cmake.
+check-cmake:
+	@bash scripts/check_cmake_build.sh
 
 # SwarmRT static library (for linking compiled .sw programs)
 libswarmrt: core-objs

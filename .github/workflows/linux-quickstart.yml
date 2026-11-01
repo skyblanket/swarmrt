@@ -19,6 +19,8 @@ name: Linux quickstart
 #   quickstart       — fast README-honesty gate (~4 min)
 #   hardening-gates  — sanitizer / soak / stress gates (~9 min)
 #   fuzz             — ASAN/UBSAN fuzz targets on a runner all to itself
+#   cmake            — the CMake build (the only Windows/MinGW path) links,
+#                      and its source lists match the Makefile's (#28)
 
 on:
   push:
@@ -151,7 +153,29 @@ jobs:
             make test-phase$p
           done
 
-  hardening-gates:
+  # The CMake build is the only Windows (MinGW) path and nothing else
+  # exercises it: it silently lost swarmrt_varena.c and could not link (#28).
+  # Build it on Linux, smoke-run the result, and fail when the Makefile and
+  # CMakeLists.txt source lists drift apart.
+  cmake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install README-listed system dependencies (+ cmake)
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list*  # third-party mirror 403s fail the job; we need nothing from it
+          for i in 1 2 3; do sudo apt-get update -qq && break; sleep 10; done
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Makefile and CMakeLists.txt source lists match
+        run: make check-sources
+
+      - name: CMake build + smoke (swc --version, swc run, swc build)
+        run: make check-cmake
+
     # No `needs: quickstart` — runs in parallel for fastest signal. A
     # README regression and a sanitizer regression are independent facts;
     # serializing them only delays whichever one you broke.
