@@ -810,7 +810,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 ### JSON
 | | |
 |---|---|
-| `json_encode(v)` | sw value → JSON string. Auto-grows; no 256KB cap |
+| `json_encode(v)` | sw value → JSON string. Auto-grows; no 256KB cap. Floats always carry a `.` or exponent (`2.0` → `2.0`, not `2`) in the shortest text that reads back exactly, so they decode as floats; NaN and ±Inf encode as `null` |
 | `json_decode(s)` | JSON string → sw value (`\uXXXX` escapes decoded to UTF-8) |
 
 ### HTTP & WebSocket

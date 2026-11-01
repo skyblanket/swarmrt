@@ -2756,6 +2756,22 @@ sw_val_t *sw_file_read_string(const char *path) {
     return r;
 }
 
+/* json_encode's float text (#195): the shortest %.{15,16,17}g that reads
+ * back as the same double, with ".0" added when that text would otherwise
+ * parse as a JSON integer. "2" decoded as an int, so a whole-number float did
+ * not survive a round trip and `/` on it became integer division. Shared by
+ * the interpreter and compiled encoders. Caller handles NaN/Inf (-> null). */
+void sw_json_format_float(double d, char *buf, size_t bufsz) {
+    for (int prec = 15; prec <= 17; prec++) {
+        snprintf(buf, bufsz, "%.*g", prec, d);
+        if (prec == 17 || strtod(buf, NULL) == d) break;
+    }
+    if (!strpbrk(buf, ".eEn")) {           /* "n": nan/inf never get here */
+        size_t l = strlen(buf);
+        if (l + 2 < bufsz) { buf[l] = '.'; buf[l + 1] = '0'; buf[l + 2] = '\0'; }
+    }
+}
+
 /* uuid(): a random RFC-4122 v4 UUID string. */
 sw_val_t *sw_make_uuid(void) {
     uint8_t b[16];
@@ -4417,7 +4433,7 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
         if (isnan(v->v.f) || isinf(v->v.f)) { interp_json_append(buf, cap, pos, "null"); }
         else {
             char tmp[64];
-            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            sw_json_format_float(v->v.f, tmp, sizeof(tmp));
             interp_json_append(buf, cap, pos, tmp);
         }
     } else if (v->type == SW_VAL_STRING) {

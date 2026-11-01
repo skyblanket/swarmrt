@@ -6700,7 +6700,7 @@ static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) 
         if (isnan(v->v.f) || isinf(v->v.f)) { _json_append(buf, cap, pos, "null"); }
         else {
             char tmp[64];
-            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            sw_json_format_float(v->v.f, tmp, sizeof(tmp));
             _json_append(buf, cap, pos, tmp);
         }
     } else if (v->type == SW_VAL_STRING) {
