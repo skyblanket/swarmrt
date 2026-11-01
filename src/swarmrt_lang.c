@@ -6376,7 +6376,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         if (nargs < 1 || args[0]->type != SW_VAL_PID || !args[0]->v.pid)
             return sw_val_nil();
         sw_process_t *proc = args[0]->v.pid;
-        sw_val_t *keys[12], *vals[12];
+        sw_val_t *keys[16], *vals[16];
         int c = 0;
         keys[c] = sw_val_atom("pid");     vals[c] = sw_val_int((int64_t)proc->pid); c++;
         keys[c] = sw_val_atom("status");
@@ -6411,6 +6411,16 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
                 pthread_mutex_unlock(&g_swarm->link_lock);
             }
             keys[c] = sw_val_atom("memory"); vals[c] = sw_val_int(mem); c++;
+            /* frame_bytes / mailbox_bytes / resident_bytes: as the compiled
+             * builtin (sw_proc_resident_parts). */
+            int64_t fb = 0, mbb = 0;
+            sw_proc_resident_parts(proc, &fb, &mbb);
+            keys[c] = sw_val_atom("frame_bytes");   vals[c] = sw_val_int(fb); c++;
+            keys[c] = sw_val_atom("mailbox_bytes"); vals[c] = sw_val_int(mbb); c++;
+            keys[c] = sw_val_atom("resident_bytes");
+            vals[c] = sw_val_int((int64_t)sizeof(sw_process_t)
+                                 + (int64_t)((proc->heap.top - proc->heap.start) * sizeof(uint64_t))
+                                 + fb + mem + mbb); c++;
         }
         keys[c] = sw_val_atom("mailbox_len");
         vals[c] = sw_val_int((int64_t)atomic_load_explicit(&proc->mb_len, memory_order_relaxed)); c++;
@@ -6517,6 +6527,7 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         keys[c] = sw_val_atom("msgsize_dropped"); vals[c] = sw_val_int((int64_t)sw_msgsize_dropped()); c++;
         keys[c] = sw_val_atom("overflow_queue");  vals[c] = sw_val_int(overflow); c++;
         keys[c] = sw_val_atom("draining");        vals[c] = sw_val_atom(sw_is_draining() ? "true" : "false"); c++;
+        keys[c] = sw_val_atom("resident_bytes");  vals[c] = sw_val_int(sw_resident_bytes()); c++;
         keys[c] = sw_val_atom("scheduler_stats"); vals[c] = sched_list; c++;
         return sw_val_map_new(keys, vals, c);
     }

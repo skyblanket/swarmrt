@@ -94,6 +94,38 @@ fun test_swarm_stats() {
     fails
 }
 
+# --- resident memory: per-process (process_info) and node (swarm_stats) -----
+# #168 / PROCESS_WEIGHT.md Phase 6. A parked process with 4 pending messages
+# reports mailbox_bytes > 0 (the queued headers), frame_bytes >= 0, and a
+# resident_bytes that is at least its parts plus the process struct; the
+# node reports its current OS RSS (Linux and macOS: > 0; -1 only where the
+# platform cannot say).
+fun test_resident_bytes() {
+    p = spawn(parked())
+    send(p, 'a')
+    send(p, 'b')
+    send(p, 'c')
+    send(p, 'd')
+    info = process_info(p)
+    fails = 0
+    fb = map_get(info, 'frame_bytes')
+    mb = map_get(info, 'mailbox_bytes')
+    rb = map_get(info, 'resident_bytes')
+    fails = fails + assert_eq("pi_frame_bytes_present", fb == nil, false)
+    fails = fails + assert_eq("pi_frame_bytes_nonneg", fb >= 0, true)
+    fails = fails + assert_eq("pi_mailbox_bytes_queued", mb > 0, true)
+    fails = fails + assert_eq("pi_resident_covers_parts",
+                              rb > (fb + mb + map_get(info, 'memory')), true)
+    empty = process_info(spawn(parked()))
+    fails = fails + assert_eq("pi_mailbox_bytes_scales",
+                              mb >= 4 * (map_get(empty, 'mailbox_bytes') + 1), true)
+    node = map_get(swarm_stats(), 'resident_bytes')
+    fails = fails + assert_eq("ss_resident_bytes_positive", node > 0, true)
+    fails = fails + assert_eq("ss_resident_bytes_covers_proc", node > rb, true)
+    send(p, 'release')
+    fails
+}
+
 # --- crashes: abnormal exits bump the node counter ------------------------
 fun test_crash_counter() {
     c0 = map_get(swarm_stats(), 'crashes')
@@ -123,8 +155,9 @@ fun main() {
     fails = fails + test_process_info_counters()
     fails = fails + test_mailbox_depth()
     fails = fails + test_swarm_stats()
+    fails = fails + test_resident_bytes()
     fails = fails + test_crash_counter()
     fails = fails + test_restart_counter()
-    if (fails == 0) { print("OK observability 23/23") ; sys_exit(0) }
+    if (fails == 0) { print("OK observability 30/30") ; sys_exit(0) }
     else { print("FAIL observability " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }

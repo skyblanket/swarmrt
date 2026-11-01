@@ -663,6 +663,14 @@ int sw_shutdown_grace_ms(void);
  * (`draining`) so a readiness probe can fail during the drain window. */
 int sw_is_draining(void);
 
+/* Current OS resident set size in bytes; -1 where the platform cannot say.
+ * swarm_stats().resident_bytes. */
+int64_t sw_resident_bytes(void);
+
+/* Per-process heap-frame bytes and queued-message-header bytes (process_info
+ * frame_bytes / mailbox_bytes; see swarmrt_native.c for what each covers). */
+void sw_proc_resident_parts(const sw_process_t *p, int64_t *frames, int64_t *mailbox);
+
 /* Install async-signal-safe SIGTERM + SIGINT handlers that request graceful
  * shutdown. The handler ONLY sets an atomic flag (a second signal hard-exits
  * via _exit, an operator escape hatch); the actual drain runs from the
