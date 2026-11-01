@@ -41,8 +41,10 @@ to contain what it documents.
 
 - **Distribution** (`node_start`) listens on `127.0.0.1` unless `SW_NODE_BIND`
   says otherwise. Set the same `SW_NODE_COOKIE` on every node to authenticate
-  frames (SHA-256 MAC per frame; frames are not encrypted or replay-protected,
-  so run clusters on a private network or through a tunnel). A remote peer can
+  frames (SHA-256 MAC per frame). Plaintext frames are not encrypted or
+  replay-protected; add `SW_NODE_TLS=1` on every node to run each link over
+  TLS 1.3 keyed from the cookie (encrypted, replay-protected, plaintext peers
+  refused; on macOS build with `make SWARMRT_TLS=1`). A remote peer can
   only deliver plain value messages — never runtime-internal signals.
 - **LLM builtins** have no default endpoint: a prompt goes only where the
   program or its environment points it (`opts.url`, `LLM_URL` or a provider).

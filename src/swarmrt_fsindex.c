@@ -28,6 +28,7 @@
   #include <direct.h>
   #define sw_sleep(s) Sleep((s) * 1000)
   #define sw_lstat(p, s) stat(p, s)
+  #define mkdir(p, mode) _mkdir(p)   /* MinGW's mkdir takes no mode */
   /* Simple fnmatch replacement for Windows (supports * and ? only) */
   static int fnmatch(const char *pat, const char *str, int flags) {
       (void)flags;

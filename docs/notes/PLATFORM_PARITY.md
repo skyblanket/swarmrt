@@ -10,19 +10,24 @@
 
 | Category | Linux | Windows (MinGW-w64) |
 |----------|-------|---------------------|
-| Core runtime (scheduler, actors, messaging) | **Works** | **FIXED** — VirtualAlloc, preemption timer |
+| Core runtime (scheduler, actors, messaging) | **Works** | **Does not compile** — `swarmrt_native.c` still uses POSIX signals, `sigaltstack`, `execinfo.h` (see T2) |
 | IO system (TCP, event loop) | **Works** (epoll) | **FIXED** — WSAPoll event loop |
 | Assembly context switch | **Works** (x86_64 + ARM64) | **FIXED** — Windows x64 ABI + XMM regs |
-| HTTP/WebSocket server | **Works** (needs OpenSSL) | **Needs testing** — Winsock compat |
+| HTTP/WebSocket server | **Works** (needs OpenSSL) | **Does not compile** — needs a MinGW OpenSSL (see T2, T3) |
 | Desktop automation | **Works** (uinput + X11/Wayland) | **Works** (SendInput + Win32) |
 | Clipboard | **Works** (wl-copy/xclip) | **Works** (Win32 API) |
 | Search/SIMD | **Works** (SSE + NEON) | **Works** (MinGW uses same intrinsics) |
-| Compiler (swc) | **Works** | **FIXED** — temp paths, platform macros |
-| FS Index (sws) | **Works** | **FIXED** — HOME dir, signal, fnmatch |
-| Build system | **Works** (Makefile) | **Works** (`CMakeLists.txt` + `mingw-w64.cmake` exist; MinGW cross-build not yet run) |
+| Compiler (swc) | **Works** | swc's own units compile; `swc.exe` cannot link until the core runtime does. `swc add/install/...` and `swc new` are stubs on Windows (#50) |
+| FS Index (sws) | **Works** | **Works** — cross-compiled `sws.exe` indexes and searches under wine (`make win-xcheck`, CI `windows-cross`) |
+| Build system | **Works** (Makefile) | `cmake -DCMAKE_TOOLCHAIN_FILE=mingw-w64.cmake` configures and builds `sws`; the core library stops at the units in T2 |
 
 **Linux: Fully functional.**
-**Windows: All code-level blockers FIXED. `CMakeLists.txt` and `mingw-w64.cmake` exist (CMake configure verified on Linux, 2026-10-19); MinGW cross-compilation test still needed.**
+**Windows: not buildable yet.** The MinGW-w64 cross-compile was run on 2026-11-01
+(`make win-xcheck`, also the CI job `windows-cross`): 25 of the 29 units of
+libswarmrt, swc and sws compile and `sws.exe` runs under wine, but four core units
+do not compile (T2), so no sw program and no `swc.exe` can be built for Windows.
+The "FIXED" entries below are the code changes made in March; they were never
+compiled until this check, and the units in T2 show they were incomplete.
 
 ---
 
@@ -106,21 +111,52 @@ Linux (checked 2026-10-19). Covers the MinGW-w64 toolchain file, `.S` assembly s
 platform link flags (`ws2_32` on Windows, pthread/zlib elsewhere). The cross-compile itself is
 unverified until T2 runs.
 
-### T2. Windows Cross-Compile Verification
-- Install MinGW-w64 cross-compiler (x86_64-w64-mingw32-gcc)
-- Verify all `.c` and `.S` files compile
-- Run basic tests under Wine or Windows VM
+### T2. Windows Cross-Compile — run; four units blocked
+Run it: `make win-xcheck` (needs `gcc-mingw-w64-x86-64` and `libz-mingw-w64-dev`, plus
+`wine64` to run `sws.exe`). CI: the `windows-cross` job runs it with the compiler
+required. Last result (2026-11-01, MinGW-w64 GCC 13, wine 9.0):
+
+| Unit | State | First blockers |
+|---|---|---|
+| `swarmrt_asm.S`, otp, task, ets, phase4, phase5, hotload, io, gc, pdf, varena | compile | — |
+| swc units (`swc.c`, codegen, obfusc, repl, test, lsp, battery_interp, new, swc_pkg, swc_imports) | compile | — |
+| `swarmrt_desktop.c`, `swarmrt_clipboard.c` | compile | not run (need a real desktop) |
+| `swarmrt_fsindex.c`, `swarmrt_search.c` → `sws.exe` | compile, link, **run under wine** (index + search) | — |
+| `swarmrt_native.c` | **does not compile** | `sigaction`/`sigaltstack`/`siginfo_t`/`stack_t` (crash and SIGPIPE handlers; needs SEH / `SetUnhandledExceptionFilter`), `execinfo.h` `backtrace` (needs `CaptureStackBackTrace`), `sysconf`, `usleep` |
+| `swarmrt_node.c` | **does not compile** | `arpa/inet.h` (needs `winsock2.h`/`ws2tcpip.h`), OpenSSL headers |
+| `swarmrt_lang.c` | **does not compile** | `sys/wait.h`, `fork`/`waitpid` (needs `CreateProcess`), SQLite headers |
+| `swarmrt_http.c` | **does not compile** | OpenSSL (`SHA1`, TLS) |
+
+Dependencies: Ubuntu packages MinGW zlib, but not MinGW OpenSSL or SQLite. A Windows
+build needs them from MSYS2 (`mingw-w64-x86_64-openssl`, `-sqlite3`) or vendored.
+Unverified: everything that needs `swarmrt_native.c`, i.e. the scheduler, the
+`swarmrt_asm.S` Windows x64 context switch at runtime, preemption timers, and every
+sw program.
 
 ### T3. HTTP Server — Winsock Testing
-`swarmrt_http.c` and `swarmrt_node.c` use BSD socket API. MinGW provides
-POSIX-like wrappers, but edge cases (SO_REUSEPORT, TCP_NODELAY behavior)
-need verification.
+Unverified, and blocked on T2: `swarmrt_http.c` and `swarmrt_node.c` do not compile
+for Windows yet. `swarmrt_io.c` (the WSAPoll event loop) compiles but has never run.
+Edge cases to check once it links: `SO_REUSEADDR` semantics (Windows allows port
+stealing; use `SO_EXCLUSIVEADDRUSE`), `TCP_NODELAY`, `WSAEWOULDBLOCK` vs `EAGAIN`
+in `sw_tcp_send` (callers check `errno`), and non-blocking `connect`.
 
 ### T4. Agent.c — Windows Fiber Integration
-Current `SwitchToFiber()` placeholder needs proper fiber setup:
-- `ConvertThreadToFiber()` in scheduler init
-- `CreateFiber()` per process
-- Or just use the assembly context switch (preferred)
+Not on any build path: `swarmrt_agent.c` / `swarmrt_full.c` are legacy and are not
+part of libswarmrt, swc or sws (they include `ucontext.h` and do not compile for
+Windows). The runtime switches contexts with `swarmrt_asm.S`, which has a Windows
+x64 path that compiles but has not run. Recommendation: drop the fiber placeholder
+rather than finish it.
+
+### T5. Platform gaps that are loud errors, not silent ones
+- `shell_managed` returns `{-1, "error: shell_managed unsupported on this platform"}`
+  on Windows (process groups and `setsid` have no direct equivalent; a Job Object
+  port is the path).
+- `swc add/install/update/remove/deps` and `swc new` print "not supported on Windows
+  yet" and exit 1 (#50). The code compiles for Windows; enabling it means replacing
+  `fork`/`execvp` of git with `_spawnvp`/`CreateProcess`, and `realpath` with
+  `_fullpath`. It cannot be verified until `swc.exe` links (T2).
+- Linux mouse position (`sw_desktop_get_mouse_pos`) shells out to `xdotool` and
+  returns `SWD_ERR_PLATFORM` when it is missing.
 
 ---
 
@@ -139,6 +175,6 @@ make swc sws  # needs: gcc, libz-dev, libssl-dev
 ### Windows (MinGW-w64 cross-compile from macOS/Linux)
 ```bash
 cmake -DCMAKE_TOOLCHAIN_FILE=mingw-w64.cmake -B build-win .
-cmake --build build-win
-# Manual fallback: x86_64-w64-mingw32-gcc with explicit flags
+cmake --build build-win --target sws   # builds today; the core library stops at T2
+make win-xcheck                        # per-unit status + sws.exe under wine
 ```

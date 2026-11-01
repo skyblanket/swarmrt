@@ -54,6 +54,7 @@ set(CORE_SOURCES
     ${SRC_DIR}/swarmrt_lang.c
     ${SRC_DIR}/swarmrt_http.c
     ${SRC_DIR}/swarmrt_pdf.c
+    ${SRC_DIR}/swarmrt_varena.c
 )
 
 # swarmrt_native.c needs -fno-stack-protector (processes migrate between
@@ -91,6 +92,9 @@ add_library(swarmrt_search STATIC ${SRC_DIR}/swarmrt_search.c)
 target_include_directories(swarmrt_search PUBLIC ${SRC_DIR})
 if(NOT WIN32)
     target_compile_options(swarmrt_search PRIVATE -march=native)
+else()
+    # SSE3/SSE4 intrinsics; x86-64-v2 is the Windows 11 hardware floor.
+    target_compile_options(swarmrt_search PRIVATE -march=x86-64-v2)
 endif()
 
 # Filesystem search CLI (sws)
@@ -98,6 +102,8 @@ add_executable(sws ${SRC_DIR}/swarmrt_fsindex.c)
 target_link_libraries(sws swarmrt_search pthread z m ${PLATFORM_LIBS})
 if(NOT WIN32)
     target_compile_options(sws PRIVATE -march=native)
+else()
+    target_compile_options(sws PRIVATE -march=x86-64-v2)
 endif()
 
 # Native benchmark

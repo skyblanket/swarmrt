@@ -248,7 +248,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 - **Local-first by default.** A scaffolded agent sends nothing anywhere until you set `LLM_URL` or `LLM_PROVIDER`. There is no default cloud endpoint.
 - **Localhost binds.** Servers bind `127.0.0.1` unless you say otherwise.
 - **Keys stay in your environment.** API keys come from env vars you set and are passed to the model endpoint via a 0600 header file, out of `ps` - and there is no default endpoint to send them to.
-- **Audited.** An internal security audit (September 2026) fixed its findings on `main`, each with a regression test that fails on the old code - see [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). Distribution binds localhost by default and supports an optional per-frame MAC (`SW_NODE_COOKIE`); frames are not encrypted or replay-protected.
+- **Audited.** An internal security audit (September 2026) fixed its findings on `main`, each with a regression test that fails on the old code - see [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). Distribution binds localhost by default and supports an optional per-frame MAC (`SW_NODE_COOKIE`); plaintext links are not encrypted or replay-protected unless you opt into TLS 1.3 with `SW_NODE_TLS=1`.
 - **Sandboxed tool dispatch.** `shell_sandboxed(cmd, opts)` uses sandbox-exec on macOS / firejail on Linux with the network blocked by default; `exec_argv` forks without a shell so user-supplied arguments can't inject.
 
 Reports: [SECURITY.md](SECURITY.md).
@@ -444,7 +444,7 @@ The point is to surface real gaps — the first baseline run flagged several qui
 
 ## Build
 
-Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
+Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows does not build yet: four core units still fail the MinGW-w64 cross-compile (`make win-xcheck`; status in [docs/notes/PLATFORM_PARITY.md](docs/notes/PLATFORM_PARITY.md)).
 
 ```bash
 make                             # default goal (= make all): bin/swc + bin/libswarmrt.a
@@ -491,7 +491,7 @@ docs/                      Long-form documentation
 
 ## Status
 
-Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; both macOS ARM64 and Linux x86_64 build, test, and run the gate suite in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)); Linux ARM64 is built and released via the release workflow. Windows is best-effort.
+Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; both macOS ARM64 and Linux x86_64 build, test, and run the gate suite in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)); Linux ARM64 is built and released via the release workflow. Windows does not build yet: four core units still fail the MinGW-w64 cross-compile (`make win-xcheck`; status in [docs/notes/PLATFORM_PARITY.md](docs/notes/PLATFORM_PARITY.md)).
 
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)

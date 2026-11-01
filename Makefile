@@ -185,6 +185,26 @@ phase9: core-objs
 test-phase9: phase9
 	./$(BIN_DIR)/test-phase9
 
+# Windows cross-compile check (#51): MinGW-w64 per-unit compile + sws.exe
+# under wine. Prints SKIP when the MinGW compiler is not installed.
+.PHONY: win-xcheck
+win-xcheck:
+	@bash scripts/win_xcheck.sh
+
+# Distribution over TLS (SW_NODE_TLS=1, #40). Needs OpenSSL: always on Linux,
+# `make SWARMRT_TLS=1` on macOS (skipped otherwise).
+.PHONY: node-tls test-node-tls
+node-tls: core-objs
+	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/test_node_tls.c -o $(BIN_DIR)/test-node-tls $(LDFLAGS)
+
+ifeq ($(shell uname)$(SWARMRT_TLS),Darwin)
+test-node-tls:
+	@echo "test-node-tls: skipped (macOS build without SWARMRT_TLS=1 has no OpenSSL)"
+else
+test-node-tls: node-tls
+	./$(BIN_DIR)/test-node-tls
+endif
+
 # Phase 10 tests (Language Frontend)
 phase10: core-objs
 	$(CC) $(CFLAGS) $(CORE_OBJS) $(SRC_DIR)/test_phase10.c -o $(BIN_DIR)/test-phase10 $(LDFLAGS)
@@ -208,7 +228,7 @@ test-all: test-core
 
 # Full runtime gate: core tests + OTP + all phase tests + search + tools.
 # This is the target CI and reviewers should run before claiming green.
-test-full: test-core test-otp test-phase2 test-frames test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-phase10 test-search mcp sws test-injection ets-outlive-gate
+test-full: test-core test-otp test-phase2 test-frames test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 test-phase8 test-phase9 test-node-tls test-phase10 test-search mcp sws test-injection ets-outlive-gate
 
 # Compile every example that has a fun main() as a quick smoke-test of
 # the compiler and core runtime across real programs.
