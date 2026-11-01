@@ -723,10 +723,33 @@ alloc-fault: swc
 # + ETS churn + timers) run for SOAK_SECONDS while sampling RSS. Asserts clean
 # exit + peak RSS under budget — the whole mix stays flat under sustained
 # churn, not just the per-owner slope probes. CI runs the 60s smoke; the full
-# 24h soak is the same binary with SOAK_SECONDS=86400 on a dedicated host.
+# 24h sign-off is `make soak-signoff` (below) on a dedicated host.
 .PHONY: soak
 soak: swc libswarmrt
 	@./tests/soak/run_soak.sh
+
+# Soak sign-off (#48): the release's 24h soak, self-reporting. Runs soak.sw
+# for SOAK_HOURS (default 24), samples OS RSS and the in-process swarm_stats()
+# heartbeat, classifies stderr, and writes verdict.md / verdict.json / CSVs
+# under build/soak/<timestamp>/ (SOAK_OUT overrides). Exit 1 on any FAIL.
+# See tests/soak/signoff.py for the criteria and docs/RELEASING.md for use.
+SOAK_HOURS ?= 24
+.PHONY: soak-signoff soak-signoff-selftest
+soak-signoff: swc libswarmrt
+	@python3 tests/soak/signoff.py --hours $(SOAK_HOURS) $(if $(SOAK_OUT),--out $(SOAK_OUT)) -v
+
+# Both directions of the sign-off's judgement, in ~2 minutes: a clean 60s run
+# must PASS, and the same run with a deliberate 1 KB/round leak must FAIL on
+# rss_flat. The clean run allows +25% RSS growth because a 60s run is mostly
+# allocator warm-up; the real sign-off uses the 10% default over hours.
+soak-signoff-selftest: swc libswarmrt
+	@python3 tests/soak/signoff.py --seconds 60 --rss-growth-pct 25 --out build/soak/selftest-clean > build/soak-selftest-clean.log 2>&1 \
+	   || { cat build/soak-selftest-clean.log; echo "soak-signoff-selftest: FAIL (clean run did not PASS)"; exit 1; }
+	@if python3 tests/soak/signoff.py --seconds 60 --leak-kb 1 --out build/soak/selftest-leak > build/soak-selftest-leak.log 2>&1; then \
+	   cat build/soak-selftest-leak.log; echo "soak-signoff-selftest: FAIL (a leaking run passed)"; exit 1; fi
+	@python3 -c "import json,sys; c=json.load(open('build/soak/selftest-leak/verdict.json'))['criteria']; sys.exit(0 if not c['rss_flat']['pass'] else 1)" \
+	   || { cat build/soak-selftest-leak.log; echo "soak-signoff-selftest: FAIL (leak run failed, but not on rss_flat)"; exit 1; }
+	@echo "soak-signoff-selftest: PASS (clean 60s run PASS; 1 KB/round leak caught by rss_flat)"
 
 # Stress: 80k-spawn microbench across default scheduler count and
 # SW_SCHEDULERS=1. Defaults to 50 runs per variant and requires every

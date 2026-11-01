@@ -266,9 +266,15 @@ jobs:
       - name: Soak smoke (Phase 2.6 — 60s mixed workload, bounded RSS)
         # Actor fan-out + supervisor crash/restart + ETS churn + timers in a
         # tight loop for 60s; asserts clean exit and peak RSS under budget.
-        # The full 24h soak is the same binary (SOAK_SECONDS=86400) on a
+        # The full 24h sign-off is `make soak-signoff` (tests/soak/signoff.py) on a
         # dedicated host — see PRODUCTION_ROADMAP.md 2.6.
         run: make soak
+
+      - name: Soak sign-off self-test (#48 — verdict PASSes clean, FAILs a leak)
+        # tests/soak/signoff.py is the 24h release sign-off harness. Prove
+        # its judgement both ways on a short run: clean -> PASS, a deliberate
+        # 1 KB/round leak -> FAIL on rss_flat.
+        run: make soak-signoff-selftest
 
       - name: Runner diagnostics (post-soak)
         # Second snapshot after the longest-running gate: catches future
