@@ -794,7 +794,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 ### Files
 | | |
 |---|---|
-| `file_read(path)` | full contents as string, or `nil` (current 1 MB cap) |
+| `file_read(path)` | full contents as string (no size cap; an empty file is `""`), or `nil` if it cannot be opened or read. Stops at the first NUL byte: use `file_read_bytes` for binary files |
 | `file_read_bytes(path)` | full contents as **bytes** (NUL-safe — for binary files), or `nil` |
 | `file_write(path, content)` | `'ok'/'error'` — not crash-safe; use `file_atomic_write` for state files |
 | `file_write_bytes(path, b)` | write a bytes value verbatim; `'ok'/'error'` |

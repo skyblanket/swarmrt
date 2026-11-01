@@ -330,6 +330,7 @@ void sw_send_value(sw_process_t *to, uint64_t tag, sw_val_t *v);
 /* Shared builtin helpers — one impl, called by both backends (see swarmrt_lang.c). */
 sw_val_t *sw_coerce_int(sw_val_t *v);    /* to_int:   string/float/int -> int  | nil */
 sw_val_t *sw_coerce_float(sw_val_t *v);  /* to_float: string/int/float -> float | nil */
+sw_val_t *sw_file_read_string(const char *path); /* file_read: whole file, nil if unreadable */
 sw_val_t *sw_make_uuid(void);            /* uuid():    random RFC-4122 v4 string */
 sw_val_t *sw_now_iso(void);              /* now_iso(): current UTC time as ISO-8601 */
 

@@ -850,25 +850,13 @@ static sw_val_t *_builtin_file_write(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_file_read(sw_val_t **a, int n) {
-    if (n < 1 || a[0]->type != SW_VAL_STRING) return sw_val_nil();
-    FILE *fp = fopen(a[0]->v.str, "r");
-    if (!fp) return sw_val_nil();
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || sz > 1048576) { fclose(fp); return sw_val_nil(); }
-    char *buf = (char *)malloc(sz + 1);
-    fread(buf, 1, sz, fp);
-    buf[sz] = 0;
-    fclose(fp);
-    sw_val_t *r = sw_val_string(buf);
-    free(buf);
-    return r;
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    return sw_file_read_string(a[0]->v.str);   /* shared, uncapped (#198) */
 }
 
 /* file_read_bytes(path) → bytes | nil. Binary-safe sibling of file_read:
  * returns a length-carrying SW_VAL_BYTES (survives embedded NULs) and has
- * no ~1MB cap — the whole file is read. The flagship use-case is PCM/WAV/
+ * reads the whole file, like file_read. The flagship use-case is PCM/WAV/
  * protocol frames, which file_read truncates at the first 0x00. */
 static sw_val_t *_builtin_file_read_bytes(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();

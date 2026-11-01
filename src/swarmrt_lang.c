@@ -2717,6 +2717,45 @@ sw_val_t *sw_coerce_float(sw_val_t *v) {
     return sw_val_nil();
 }
 
+/* file_read(path): the whole file as a string, or nil when it cannot be
+ * opened or read. No size cap (#198: the compiled path used to return nil for
+ * anything over 1 MiB, which callers saw as "" — silent data loss). Reads in
+ * chunks rather than trusting ftell, so pipes and /proc files work too. Shared
+ * by the interpreter and compiled builtins. An allocation failure is reported
+ * on stderr rather than passing for a missing file. */
+sw_val_t *sw_file_read_string(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return sw_val_nil();
+    size_t cap = 64 * 1024, len = 0;
+    char *buf = (char *)malloc(cap + 1);
+    while (buf) {
+        if (len == cap) {
+            size_t ncap = cap * 2;
+            char *nb = (ncap > cap) ? (char *)realloc(buf, ncap + 1) : NULL;
+            if (!nb) { free(buf); buf = NULL; break; }
+            buf = nb; cap = ncap;
+        }
+        size_t got = fread(buf + len, 1, cap - len, fp);
+        len += got;
+        if (got == 0) break;
+    }
+    int rd_err = ferror(fp);
+    fclose(fp);
+    if (!buf) {
+        fprintf(stderr, "file_read: out of memory reading %s (%zu bytes read so far)\n", path, len);
+        return sw_val_nil();
+    }
+    if (rd_err) {
+        fprintf(stderr, "file_read: read error on %s after %zu bytes\n", path, len);
+        free(buf);
+        return sw_val_nil();
+    }
+    buf[len] = '\0';
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
 /* uuid(): a random RFC-4122 v4 UUID string. */
 sw_val_t *sw_make_uuid(void) {
     uint8_t b[16];
@@ -5139,15 +5178,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     }
 
     /* === File ================================================== */
-    if (strcmp(fname, "file_read") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-        FILE *fp = fopen(args[0]->v.str, "rb");
-        if (!fp) return sw_val_nil();
-        fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
-        if (sz < 0 || sz > 64 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
-        char *buf = (char *)malloc(sz + 1);
-        size_t got = fread(buf, 1, sz, fp); buf[got] = '\0'; fclose(fp);
-        sw_val_t *r = sw_val_string(buf); free(buf); return r;
-    }
+    if (strcmp(fname, "file_read") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
+        return sw_file_read_string(args[0]->v.str);
     if (strcmp(fname, "file_write") == 0 && nargs >= 2 &&
         args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
         FILE *fp = fopen(args[0]->v.str, "wb");
