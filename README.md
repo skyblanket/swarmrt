@@ -444,7 +444,7 @@ The point is to surface real gaps — the first baseline run flagged several qui
 
 ## Build
 
-Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows is best-effort.
+Requires: a C compiler (cc/clang/gcc) and pthreads. Developed and daily-driven on macOS Apple Silicon; Linux x86_64 is CI-gated (the README quickstart, examples, sw + phase tests, and stress run on every push — see [`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)). Windows does not build yet: four core units still fail the MinGW-w64 cross-compile (`make win-xcheck`; status in [docs/notes/PLATFORM_PARITY.md](docs/notes/PLATFORM_PARITY.md)).
 
 ```bash
 make                             # default goal (= make all): bin/swc + bin/libswarmrt.a
@@ -491,7 +491,7 @@ docs/                      Long-form documentation
 
 ## Status
 
-Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; both macOS ARM64 and Linux x86_64 build, test, and run the gate suite in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)); Linux ARM64 is built and released via the release workflow. Windows is best-effort.
+Stable enough to be the substrate for [swarm-code](https://github.com/skyblanket/swarm-code). Daily-driven on macOS Apple Silicon; both macOS ARM64 and Linux x86_64 build, test, and run the gate suite in CI ([`.github/workflows/linux-quickstart.yml`](.github/workflows/linux-quickstart.yml)); Linux ARM64 is built and released via the release workflow. Windows does not build yet: four core units still fail the MinGW-w64 cross-compile (`make win-xcheck`; status in [docs/notes/PLATFORM_PARITY.md](docs/notes/PLATFORM_PARITY.md)).
 
 **What CI gates on, every push:**
 - README quickstart (`counter.sw`) + a few more example programs (`hello.sw`, `lambda.sw`)

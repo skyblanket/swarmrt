@@ -152,6 +152,24 @@ jobs:
           done
           make test-node-tls
 
+  windows-cross:
+    # Windows cross-compile check (#51): every unit that compiles with
+    # MinGW-w64 keeps compiling, and sws.exe runs under wine. The units the
+    # Windows port has not reached yet are listed in scripts/win_xcheck.sh.
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64 + wine
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list*
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 libz-mingw-w64-dev wine64
+      - name: Cross-compile check (make win-xcheck)
+        run: WIN_XCHECK_REQUIRED=1 make win-xcheck
+
   hardening-gates:
     # No `needs: quickstart` — runs in parallel for fastest signal. A
     # README regression and a sanitizer regression are independent facts;

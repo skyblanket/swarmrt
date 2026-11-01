@@ -185,6 +185,12 @@ phase9: core-objs
 test-phase9: phase9
 	./$(BIN_DIR)/test-phase9
 
+# Windows cross-compile check (#51): MinGW-w64 per-unit compile + sws.exe
+# under wine. Prints SKIP when the MinGW compiler is not installed.
+.PHONY: win-xcheck
+win-xcheck:
+	@bash scripts/win_xcheck.sh
+
 # Distribution over TLS (SW_NODE_TLS=1, #40). Needs OpenSSL: always on Linux,
 # `make SWARMRT_TLS=1` on macOS (skipped otherwise).
 .PHONY: node-tls test-node-tls
