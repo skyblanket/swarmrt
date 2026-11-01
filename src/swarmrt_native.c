@@ -1526,6 +1526,25 @@ static void sched_trace_maybe_start(void) {
 
 static void overflow_rq_push(sw_process_t *proc);
 static void wake_one_idle_scheduler(void);
+static uint64_t now_ns(void);
+static uint64_t next_timer_deadline_ns(void);
+
+/* Longest an idle scheduler parks without a signal: SW_IDLE_PARK_MS, default
+ * 100, clamped to [1, 10000]. Nothing depends on it — producers signal and
+ * the park also ends at the next timer deadline — so it is only a backstop. */
+static uint64_t idle_park_cap_ns(void) {
+    static _Atomic int64_t cap = -1;
+    int64_t v = atomic_load_explicit(&cap, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("SW_IDLE_PARK_MS");
+        long ms = e ? atol(e) : 100;
+        if (ms < 1) ms = 1;
+        if (ms > 10000) ms = 10000;
+        v = (int64_t)ms * 1000000LL;
+        atomic_store_explicit(&cap, v, memory_order_relaxed);
+    }
+    return (uint64_t)v;
+}
 
 void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     uint32_t prio = proc->priority;
@@ -1554,6 +1573,14 @@ void sw_add_to_runq(sw_runq_t *rq, sw_process_t *proc) {
     /* Wake scheduler if it was idle (rare — only when queue was empty) */
     if (g_sched_trace >= 1) atomic_fetch_add_explicit(&g_tr_enq, 1, memory_order_relaxed);
     trev(TREV_ENQ, proc->pid, (uint64_t)(uintptr_t)rq);
+    /* Dekker with the park path (scheduler_loop): the scheduler stores
+     * idle=1, fences, then re-polls its queue; we link, fence, then load
+     * idle. One of the two must see the other, so a parked scheduler is
+     * never left asleep over work — which is what lets the park be
+     * untimed (#4). Without the fences the link store and the idle load
+     * could pass each other in the store buffer, and the 0.5 ms timed
+     * park used to paper over that. */
+    atomic_thread_fence(memory_order_seq_cst);
     if (atomic_load_explicit(&rq->idle, memory_order_relaxed)) {
         if (g_sched_trace >= 1) atomic_fetch_add_explicit(&g_tr_idle_seen, 1, memory_order_relaxed);
         pthread_mutex_lock(&rq->idle_lock);
@@ -1668,8 +1695,10 @@ sw_process_t *sw_steal_work(sw_scheduler_t *sched) {
     return proc;
 }
 
-/* Signal one parked scheduler so overflow work is picked up at once (the
- * idle loop's 0.5ms timed park would find it anyway). */
+/* Signal one parked scheduler so overflow work (or a new earliest timer) is
+ * picked up at once. Callers publish under a mutex the parking scheduler also
+ * takes after storing idle=1 (overflow_rq.lock, timers.lock), so either it
+ * sees the work or this sees idle=1. */
 static void wake_one_idle_scheduler(void) {
     if (!g_swarm) return;
     for (uint32_t i = 0; i < g_swarm->num_schedulers; i++) {
@@ -1878,8 +1907,8 @@ static void scheduler_loop(sw_scheduler_t *sched) {
          * so the producer's sw_add_to_runq pays NOTHING (no lock, no
          * signal) and the consumer picks the work up within ~ns.
          * Budget is per-idle-transition, env-tunable: SW_SPIN_US
-         * (default 60, 0 disables, capped 1000); the 0.5ms park below is
-         * the safety net. Default ON since the deadlock that briefly
+         * (default 60, 0 disables, capped 1000); the signalled park below
+         * takes over after it. Default ON since the deadlock that briefly
          * forced it opt-in was root-caused to the Dekker StoreLoad bug
          * in the receive waiting-flag handshake (see sw_receive_any) and
          * fixed with seq_cst — 0/200 wedge-hunt runs post-fix vs ~15%
@@ -2077,16 +2106,21 @@ static void scheduler_loop(sw_scheduler_t *sched) {
              * LOST-WAKEUP GUARD (standard sleeper protocol): a producer
              * that enqueues between our last failed pick and the idle=1
              * store sees idle==0 and SKIPS the signal — the work then
-             * sits for the full 0.5ms timeout. A serial message chain
+             * sits until the park times out. A serial message chain
              * can phase-lock into that miss on EVERY hop: observed as a
              * gc-slope message probe degrading from ~100ms to 25+
-             * MINUTES (each hop eating a 0.5ms park). Publish idle=1
-             * first, then RE-POLL once; only park if still empty. The
-             * producer now either sees idle=1 (and signals) or its
-             * enqueue happens-before our re-poll (and we find it). */
+             * MINUTES (each hop eating a then-0.5ms park). Publish idle=1
+             * first, fence, then RE-POLL once; only park if still empty.
+             * The producer now either sees idle=1 (and signals) or its
+             * enqueue is visible to our re-poll (and we find it). */
             sw_runq_t *rq = &sched->runq;
             pthread_mutex_lock(&rq->idle_lock);
             atomic_store_explicit(&rq->idle, 1, memory_order_release);
+            /* Pairs with the fence in sw_add_to_runq (store idle, fence,
+             * re-poll vs link, fence, load idle). The overflow queue and
+             * the timer list are ordered by their own mutexes instead:
+             * their producers load idle after unlocking. */
+            atomic_thread_fence(memory_order_seq_cst);
             sw_process_t *late = sw_pick_next(sched);
             if (!late) late = sw_steal_work(sched);
             if (late) {
@@ -2101,14 +2135,35 @@ static void scheduler_loop(sw_scheduler_t *sched) {
             }
             if (g_sched_trace >= 1)
                 atomic_fetch_add_explicit(&g_tr_park, 1, memory_order_relaxed);
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 500000;  /* +0.5ms (safety net; signals do the work) */
-            if (ts.tv_nsec >= 1000000000) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000;
+            /* Park until the next timer is due, capped at SW_IDLE_PARK_MS
+             * (#4). This used to be a blind 0.5 ms timed wait — 2000 wakes
+             * a second per idle scheduler, each paying the spin window and
+             * steal probes, so an idle node burned ~10% of a core per
+             * scheduler. Every producer now signals a parked scheduler
+             * (runq: the fence above; overflow queue and timers: their
+             * locks), so the wait only has to end for the next timer. The
+             * timer head is read after idle=1 is published: a timer
+             * inserted after this read finds idle=1 and wakes us
+             * (sw_send_after → wake_one_idle_scheduler). */
+            uint64_t park_ns = idle_park_cap_ns();
+            uint64_t due = next_timer_deadline_ns();
+            if (due != UINT64_MAX) {
+                uint64_t now = now_ns();
+                uint64_t until = due > now ? due - now : 0;
+                if (until < park_ns) park_ns = until;
             }
-            int _twrc = pthread_cond_timedwait(&rq->idle_cond, &rq->idle_lock, &ts);
+            int _twrc = 0;
+            if (park_ns > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += (time_t)(park_ns / 1000000000ULL);
+                ts.tv_nsec += (long)(park_ns % 1000000000ULL);
+                if (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec++;
+                    ts.tv_nsec -= 1000000000L;
+                }
+                _twrc = pthread_cond_timedwait(&rq->idle_cond, &rq->idle_lock, &ts);
+            }
             if (g_sched_trace >= 1)
                 atomic_fetch_add_explicit(_twrc == 0 ? &g_tr_park_signal : &g_tr_park_timeout,
                                           1, memory_order_relaxed);
@@ -3996,9 +4051,23 @@ uint64_t sw_send_after(uint64_t delay_ms, sw_process_t *dest, uint64_t tag, void
     }
     t->next = *pp;
     *pp = t;
+    int new_head = (tl->head == t);
 
     pthread_mutex_unlock(&tl->lock);
+    /* Idle schedulers park until the old earliest deadline (#4); a new
+     * earliest one needs one of them awake to re-arm on it. */
+    if (new_head) wake_one_idle_scheduler();
     return ref;
+}
+
+/* Earliest pending timer's fire time (CLOCK_MONOTONIC ns), or UINT64_MAX. */
+static uint64_t next_timer_deadline_ns(void) {
+    if (!g_swarm) return UINT64_MAX;
+    sw_timer_list_t *tl = &g_swarm->timers;
+    pthread_mutex_lock(&tl->lock);
+    uint64_t due = tl->head ? tl->head->fire_at_ns : UINT64_MAX;
+    pthread_mutex_unlock(&tl->lock);
+    return due;
 }
 
 int sw_cancel_timer(uint64_t ref) {
@@ -4760,9 +4829,16 @@ void sw_stats(int swarm_id) {
 
     sw_arena_t *arena = &g_swarm->arena;
     uint32_t free_slots = 0, free_blocks = 0;
+    /* Under each partition's lock: schedulers push freed slots while this
+     * runs (process_destroy). The read used to be unlocked; TSan only stopped
+     * missing it once idle schedulers no longer woke every 0.5 ms (#4) to
+     * take locks the caller also takes. */
     for (uint32_t p = 0; p < arena->num_partitions; p++) {
-        free_slots += arena->partitions[p].pid_top;
-        free_blocks += arena->partitions[p].block_top;
+        sw_arena_partition_t *part = &arena->partitions[p];
+        sw_spin_lock(&part->lock);
+        free_slots += part->pid_top;
+        free_blocks += part->block_top;
+        sw_spin_unlock(&part->lock);
     }
 
     printf("\n=== SwarmRT '%s' Statistics ===\n", g_swarm->name);
