@@ -4829,9 +4829,16 @@ void sw_stats(int swarm_id) {
 
     sw_arena_t *arena = &g_swarm->arena;
     uint32_t free_slots = 0, free_blocks = 0;
+    /* Under each partition's lock: schedulers push freed slots while this
+     * runs (process_destroy). The read used to be unlocked; TSan only stopped
+     * missing it once idle schedulers no longer woke every 0.5 ms (#4) to
+     * take locks the caller also takes. */
     for (uint32_t p = 0; p < arena->num_partitions; p++) {
-        free_slots += arena->partitions[p].pid_top;
-        free_blocks += arena->partitions[p].block_top;
+        sw_arena_partition_t *part = &arena->partitions[p];
+        sw_spin_lock(&part->lock);
+        free_slots += part->pid_top;
+        free_blocks += part->block_top;
+        sw_spin_unlock(&part->lock);
     }
 
     printf("\n=== SwarmRT '%s' Statistics ===\n", g_swarm->name);
