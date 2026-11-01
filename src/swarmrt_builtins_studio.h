@@ -764,25 +764,13 @@ static sw_val_t *_builtin_string_replace(sw_val_t **a, int n) {
     return r;
 }
 
-/* string_sub(str, start, len) — substring extraction */
+/* string_sub(str, start, len) — substring by byte offsets, cut on UTF-8
+ * character boundaries (#170; shared with the interpreter). */
 static sw_val_t *_builtin_string_sub(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING ||
         a[1]->type != SW_VAL_INT || a[2]->type != SW_VAL_INT)
         return sw_val_string("");
-    const char *s = a[0]->v.str;
-    int slen = (int)strlen(s);
-    int start = (int)a[1]->v.i;
-    int len = (int)a[2]->v.i;
-    if (start < 0) start = 0;
-    if (start >= slen) return sw_val_string("");
-    if (start + len > slen) len = slen - start;
-    if (len <= 0) return sw_val_string("");
-    char *buf = (char *)malloc(len + 1);
-    memcpy(buf, s + start, len);
-    buf[len] = 0;
-    sw_val_t *r = sw_val_string(buf);
-    free(buf);
-    return r;
+    return sw_string_sub_utf8(a[0]->v.str, a[1]->v.i, a[2]->v.i);
 }
 
 /* string_length(str) — returns string length as int */
@@ -7695,17 +7683,7 @@ static sw_val_t *_builtin_string_ends_with(sw_val_t **a, int n) {
 static sw_val_t *_builtin_string_truncate(sw_val_t **a, int n) {
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING || a[1]->type != SW_VAL_INT)
         return n >= 1 ? a[0] : sw_val_string("");
-    const char *s = a[0]->v.str;
-    int64_t max_len = a[1]->v.i;
-    if (max_len <= 0) return sw_val_string("");
-    size_t slen = strlen(s);
-    if ((int64_t)slen <= max_len) return a[0];
-    char *buf = (char *)malloc((size_t)max_len + 1);
-    memcpy(buf, s, (size_t)max_len);
-    buf[max_len] = 0;
-    sw_val_t *r = sw_val_string(buf);
-    free(buf);
-    return r;
+    return sw_string_truncate_utf8(a[0], a[1]->v.i);   /* never mid-character (#170) */
 }
 
 /* clean_json(str) → str with markdown code fences stripped

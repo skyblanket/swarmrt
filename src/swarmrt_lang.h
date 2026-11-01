@@ -332,6 +332,8 @@ sw_val_t *sw_coerce_int(sw_val_t *v);    /* to_int:   string/float/int -> int  |
 sw_val_t *sw_coerce_float(sw_val_t *v);  /* to_float: string/int/float -> float | nil */
 sw_val_t *sw_file_read_string(const char *path); /* file_read: whole file, nil if unreadable */
 void sw_json_format_float(double d, char *buf, size_t bufsz); /* json_encode float text, always reads back as a float */
+sw_val_t *sw_string_sub_utf8(const char *s, int64_t start, int64_t len); /* string_sub: byte offsets, cuts on UTF-8 boundaries */
+sw_val_t *sw_string_truncate_utf8(sw_val_t *str, int64_t max);           /* string_truncate: same rule */
 sw_val_t *sw_make_uuid(void);            /* uuid():    random RFC-4122 v4 string */
 sw_val_t *sw_now_iso(void);              /* now_iso(): current UTC time as ISO-8601 */
 

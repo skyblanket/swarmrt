@@ -2772,6 +2772,50 @@ void sw_json_format_float(double d, char *buf, size_t bufsz) {
     }
 }
 
+/* string_sub / string_truncate (#170): byte offsets, as string_length is in
+ * bytes, but never split a UTF-8 character. The end moves back to the start
+ * of a character it would cut; the start moves forward past continuation
+ * bytes ((b & 0xC0) == 0x80). A result can be up to 3 bytes shorter than
+ * asked. Shared by the interpreter and compiled builtins. */
+#define UTF8_CONT(c) (((unsigned char)(c) & 0xC0) == 0x80)
+/* At most 3 steps either way: a character is at most 4 bytes, so a longer
+ * run of continuation bytes is not valid UTF-8 and is cut where asked. */
+static size_t utf8_back_to_boundary(const char *s, size_t i, size_t lo) {
+    size_t j = i;
+    while (j > lo && i - j < 3 && UTF8_CONT(s[j])) j--;
+    return UTF8_CONT(s[j]) ? i : j;
+}
+static size_t utf8_fwd_to_boundary(const char *s, size_t i, size_t hi) {
+    size_t j = i;
+    while (j < hi && j - i < 3 && UTF8_CONT(s[j])) j++;
+    return (j < hi && UTF8_CONT(s[j])) ? i : j;
+}
+
+sw_val_t *sw_string_sub_utf8(const char *s, int64_t start, int64_t len) {
+    size_t slen = strlen(s);
+    if (start < 0) start = 0;
+    if ((uint64_t)start >= slen || len <= 0) return sw_val_string("");
+    size_t b = (size_t)start;
+    size_t e = (len >= (int64_t)(slen - b)) ? slen : b + (size_t)len;
+    b = utf8_fwd_to_boundary(s, b, e);
+    if (e < slen) e = utf8_back_to_boundary(s, e, b);
+    if (e <= b) return sw_val_string("");
+    char *buf = (char *)malloc(e - b + 1);
+    memcpy(buf, s + b, e - b); buf[e - b] = '\0';
+    sw_val_t *r = sw_val_string(buf); free(buf); return r;
+}
+
+sw_val_t *sw_string_truncate_utf8(sw_val_t *str, int64_t max) {
+    const char *s = str->v.str;
+    if (max <= 0) return sw_val_string("");
+    size_t slen = strlen(s);
+    if ((uint64_t)max >= slen) return str;
+    size_t e = utf8_back_to_boundary(s, (size_t)max, 0);
+    char *buf = (char *)malloc(e + 1);
+    memcpy(buf, s, e); buf[e] = '\0';
+    sw_val_t *r = sw_val_string(buf); free(buf); return r;
+}
+
 /* uuid(): a random RFC-4122 v4 UUID string. */
 sw_val_t *sw_make_uuid(void) {
     uint8_t b[16];
@@ -5142,19 +5186,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
 
     /* === Strings ================================================ */
     if (strcmp(fname, "string_sub") == 0 && nargs >= 3 &&
-        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
-        const char *s = args[0]->v.str;
-        int slen = (int)strlen(s);
-        int start = (int)args[1]->v.i;
-        int len = (int)args[2]->v.i;
-        if (start < 0) start = 0;
-        if (start >= slen) return sw_val_string("");
-        if (start + len > slen) len = slen - start;
-        if (len <= 0) return sw_val_string("");
-        char *buf = (char *)malloc(len + 1);
-        memcpy(buf, s + start, len); buf[len] = '\0';
-        sw_val_t *r = sw_val_string(buf); free(buf); return r;
-    }
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT)
+        return sw_string_sub_utf8(args[0]->v.str, args[1]->v.i, args[2]->v.i);
     if (strcmp(fname, "string_replace") == 0 && nargs >= 3 &&
         args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING && args[2]->type == SW_VAL_STRING) {
         const char *src = args[0]->v.str, *old = args[1]->v.str, *rep = args[2]->v.str;
@@ -5181,17 +5214,9 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_string(buf); free(buf); return r;
     }
     if (strcmp(fname, "string_truncate") == 0 && nargs >= 2 &&
-        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT) {
-        /* Matches codegen: hard truncate to max_len, no ellipsis. */
-        const char *s = args[0]->v.str;
-        int64_t max = args[1]->v.i;
-        if (max <= 0) return sw_val_string("");
-        size_t slen = strlen(s);
-        if ((int64_t)slen <= max) return args[0];
-        char *r = (char *)malloc((size_t)max + 1);
-        memcpy(r, s, (size_t)max); r[max] = '\0';
-        sw_val_t *v = sw_val_string(r); free(r); return v;
-    }
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT)
+        /* Matches codegen: hard truncate, no ellipsis, never mid-character. */
+        return sw_string_truncate_utf8(args[0], args[1]->v.i);
 
     /* === File ================================================== */
     if (strcmp(fname, "file_read") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)

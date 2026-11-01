@@ -670,7 +670,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | | |
 |---|---|
 | `string_length(s)` | byte length |
-| `string_sub(s, start, len)` | substring |
+| `string_sub(s, start, len)` | substring by **byte** offsets (like `string_length`), never splitting a UTF-8 character: an end inside a character moves back to its start, a start inside one moves forward past it, so the result can be up to 3 bytes shorter than `len`. Use `string_chars` to slice by codepoint |
 | `string_split(s, sep)` | list of strings |
 | `string_replace(s, old, new)` | replace ALL |
 | `string_contains(s, sub)` | `'true'/'false'` |
@@ -679,7 +679,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `string_index_of(s, sub)` | int (-1 if not found) |
 | `string_trim(s)` | strip whitespace |
 | `string_upper(s)` / `string_lower(s)` | case |
-| `string_truncate(s, max_len)` | truncate to max_len |
+| `string_truncate(s, max_len)` | first `max_len` bytes, cut back to a UTF-8 character boundary (never returns part of a character) |
 | `to_string(v)` | any → string (tuples / lists / maps render via the formatter) |
 | `format(template, args...)` | `format("hi {} ({} req)", name, n)` — positional `{}` placeholders, `{{` / `}}` escape to literal braces. (For inline-expression interpolation use an f-string: `f"hi {name} #{n}"`.) |
 | `strip_html(html)` | tags stripped, entities decoded |
