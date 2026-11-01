@@ -29,6 +29,7 @@ export [
     string_indent,
     # ---- concurrency ----
     task_stream,
+    task_stream_each,
     # ---- structured output ----
     json_expect
 ]
@@ -420,6 +421,18 @@ fun _indent_lines(lines, pad, acc) {
 #   on_timeout      : atom — 'error' (default) records {'error','timeout'};
 #                            'keep' leaves the slot open and waits forever
 #                            (timeout disabled for that item)
+#   on_result       : fn(index, item, cell) — called once per item, in
+#                            COMPLETION order, the moment its cell is known
+#                            ({'ok', v}, {'error', 'timeout'} or
+#                            {'error', reason}). Use it to make results durable
+#                            as they happen (append a JSONL row, checkpoint):
+#                            a runner killed partway then loses only the items
+#                            in flight. index is 0-based in the input list.
+#
+# on_result guarantee: each item's callback runs exactly once, on the calling
+# process, before task_stream returns, with the same cell the returned list
+# holds; unless the OS process dies first. A callback that raises raises out
+# of task_stream (it is the caller's code); its workers are left to finish.
 #
 # Implementation: pure sw over spawn_monitor + selective receive. The
 # calling process is the coordinator. It keeps at most N workers alive,
@@ -443,11 +456,50 @@ fun task_stream(lst, fn, opts) {
         # threaded through the loop: `pending` holds the undispatched items
         # (in order, starting at index next_idx) and `results` maps
         # idx -> tagged result.
-        k = _ts_min(max_c, n)
-        started = _ts_refill([], lst, 0, k, fn, tmo, coord)
-        results = _ts_loop(elem(started, 0), elem(started, 1), elem(started, 2),
-                           n, max_c, fn, tmo, on_tmo, coord, %{})
+        on_res = map_get(opts, 'on_result')
+        results = _ts_run(lst, n, max_c, fn, tmo, on_tmo, coord, {on_res, 'true'})
         _ts_collect(0, n, results, [])
+    }
+}
+
+# task_stream_each(list, fn, opts) — task_stream for runs too big to hold every
+# result: the same opts (on_result is where the results go), but the return
+# value is only the counts %{ok: k, error: e, timeout: t}. The coordinator
+# keeps one small atom per item, never fn's return values.
+fun task_stream_each(lst, fn, opts) {
+    n = length(lst)
+    if (n == 0) { %{ok: 0, error: 0, timeout: 0} }
+    else {
+        max_c = case map_get(opts, 'max_concurrency') {
+            nil -> n
+            m   -> if (m < 1) { 1 } else { m }
+        }
+        tmo = case map_get(opts, 'timeout_ms') { nil -> 0 ; t -> t }
+        on_tmo = case map_get(opts, 'on_timeout') { nil -> 'error' ; o -> o }
+        on_res = map_get(opts, 'on_result')
+        results = _ts_run(lst, n, max_c, fn, tmo, on_tmo, self(), {on_res, 'false'})
+        _ts_count(0, n, results, 0, 0, 0)
+    }
+}
+
+# Shared body of task_stream / task_stream_each. `cb` is {on_result or nil,
+# keep}: keep 'true' stores each cell in the results map, 'false' stores only
+# its class ('ok' | 'error' | 'timeout').
+fun _ts_run(lst, n, max_c, fn, tmo, on_tmo, coord, cb) {
+    k = _ts_min(max_c, n)
+    started = _ts_refill([], lst, 0, k, fn, tmo, coord)
+    _ts_loop(elem(started, 0), elem(started, 1), elem(started, 2),
+             n, max_c, fn, tmo, on_tmo, coord, cb, %{})
+}
+
+fun _ts_count(i, n, results, ok, err, tmo) {
+    if (i >= n) { %{ok: ok, error: err, timeout: tmo} }
+    else {
+        case map_get(results, i) {
+            'ok'      -> _ts_count(i + 1, n, results, ok + 1, err, tmo)
+            'timeout' -> _ts_count(i + 1, n, results, ok, err, tmo + 1)
+            _         -> _ts_count(i + 1, n, results, ok, err + 1, tmo)
+        }
     }
 }
 
@@ -463,7 +515,7 @@ fun _ts_refill(in_flight, pending, next_idx, max_c, fn, tmo, coord) {
     }
 }
 
-# Spawn one monitored worker for index `idx`. Returns {ref, pid, idx, deadline}.
+# Spawn one monitored worker for index `idx`. Returns {ref, pid, idx, deadline, item}.
 # deadline is an absolute ms timestamp; 0 means "no timeout". The worker runs
 # fn(item) inside a try so a panic becomes {'error', reason} (never a hang).
 fun _ts_spawn_one(idx, item, fn, tmo, coord) {
@@ -472,7 +524,7 @@ fun _ts_spawn_one(idx, item, fn, tmo, coord) {
         send(coord, {'task_done', idx, tagged})
     })
     deadline = if (tmo > 0) { timestamp() + tmo } else { 0 }
-    {elem(pair, 1), elem(pair, 0), idx, deadline}
+    {elem(pair, 1), elem(pair, 0), idx, deadline, item}
 }
 
 # Stop watching a finished worker and drop its DOWN if it is already queued,
@@ -490,25 +542,47 @@ fun _ts_forget(entry) {
     }
 }
 
-fun _ts_record(results, idx, tagged) {
-    if (map_has_key(results, idx)) { results } else { map_put(results, idx, tagged) }
+# Record the cell for in-flight `entry` (nil: already recorded and gone) and
+# hand it to on_result. Each index is recorded, and called back, exactly once.
+fun _ts_record(results, entry, tagged, cb) {
+    case entry {
+        nil -> results
+        e ->
+            idx = elem(e, 2)
+            if (map_has_key(results, idx)) { results }
+            else {
+                on_res = elem(cb, 0)
+                if (on_res != nil) { on_res(idx, elem(e, 4), tagged) }
+                stored = if (elem(cb, 1) == 'true') { tagged } else { _ts_class(tagged) }
+                map_put(results, idx, stored)
+            }
+    }
+}
+
+fun _ts_class(cell) {
+    case cell {
+        {'ok', _}            -> 'ok'
+        {'error', 'timeout'} -> 'timeout'
+        _                    -> 'error'
+    }
 }
 
 # The coordinator loop. Returns the results map once all n are recorded.
-#   in_flight : [{ref, pid, idx, deadline}, ...] currently-running workers
+#   in_flight : [{ref, pid, idx, deadline, item}, ...] currently-running workers
 #   pending   : undispatched items, the first of which has index next_idx
-fun _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, results) {
+fun _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, cb, results) {
     if (map_size(results) >= n) { results }
     else {
         wait = _ts_wait_ms(in_flight, tmo, on_tmo)
         receive {
             {'task_done', idx, tagged} ->
-                _ts_forget(_ts_find_idx(in_flight, idx))
-                recorded = _ts_record(results, idx, tagged)
+                entry = _ts_find_idx(in_flight, idx)
+                _ts_forget(entry)
+                recorded = _ts_record(results, entry, tagged, cb)
                 rest = _ts_remove_idx(in_flight, idx, [])
                 refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
                 _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
-                         fn, tmo, on_tmo, coord, recorded)
+                         fn, tmo, on_tmo, coord, cb, recorded)
 
             {'DOWN', ref, _, _, reason} ->
                 # A worker died. If we already recorded its task_done the ref
@@ -517,24 +591,24 @@ fun _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, res
                 entry = _ts_find_ref(in_flight, ref)
                 case entry {
                     nil ->
-                        _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, results)
+                        _ts_loop(in_flight, pending, next_idx, n, max_c, fn, tmo, on_tmo, coord, cb, results)
                     e ->
-                        recorded = _ts_record(results, elem(e, 2), {'error', reason})
+                        recorded = _ts_record(results, e, {'error', reason}, cb)
                         rest = _ts_remove_ref(in_flight, ref, [])
                         refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
                         _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
-                                 fn, tmo, on_tmo, coord, recorded)
+                                 fn, tmo, on_tmo, coord, cb, recorded)
                 }
 
             after wait {
                 # Deadline reached: time out every expired in-flight worker.
                 now = timestamp()
                 expired = _ts_expired(in_flight, now, [])
-                recorded = _ts_timeout_each(expired, results)
+                recorded = _ts_timeout_each(expired, results, cb)
                 rest = _ts_keep_unexpired(in_flight, now, [])
                 refilled = _ts_refill(rest, pending, next_idx, max_c, fn, tmo, coord)
                 _ts_loop(elem(refilled, 0), elem(refilled, 1), elem(refilled, 2), n, max_c,
-                         fn, tmo, on_tmo, coord, recorded)
+                         fn, tmo, on_tmo, coord, cb, recorded)
             }
         }
     }
@@ -563,13 +637,13 @@ fun _ts_soonest_deadline(in_flight, best) {
 
 # Record {'error','timeout'} for each expired worker, kill it, and forget its
 # monitor. Returns the updated results map.
-fun _ts_timeout_each(expired, results) {
+fun _ts_timeout_each(expired, results, cb) {
     if (length(expired) == 0) { results }
     else {
         e = hd(expired)
         exit_proc(elem(e, 1), 'kill')
         _ts_forget(e)
-        _ts_timeout_each(tl(expired), _ts_record(results, elem(e, 2), {'error', 'timeout'}))
+        _ts_timeout_each(tl(expired), _ts_record(results, e, {'error', 'timeout'}, cb), cb)
     }
 }
 

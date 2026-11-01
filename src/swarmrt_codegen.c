@@ -205,7 +205,7 @@ static void emit_raise_exit(cg_ctx_t *ctx) {
  * (SW_OFFLOAD_BUILTIN in swarmrt_builtins_studio.h). */
 static int cg_async_builtin(const char *name) {
     static const char *names[] = {
-        "sleep", "llm_complete", "http_post", "http_post_stream", "http_get", "http_request",
+        "sleep", "llm_complete", "llm_request", "http_post", "http_post_stream", "http_get", "http_request",
         "shell", "shell_sandboxed", "shell_managed", "exec_argv", "exec_managed", NULL
     };
     for (int i = 0; names[i]; i++) if (strcmp(name, names[i]) == 0) return 1;
@@ -390,6 +390,7 @@ static int is_builtin(const char *name) {
            strcmp(name, "file_atomic_write") == 0 || strcmp(name, "file_temp") == 0 ||
            strcmp(name, "delay") == 0 || strcmp(name, "interval") == 0 ||
            strcmp(name, "llm_complete") == 0 ||
+           strcmp(name, "llm_request") == 0 || strcmp(name, "llm_limit") == 0 ||
            strcmp(name, "string_split") == 0 || strcmp(name, "string_trim") == 0 ||
            strcmp(name, "string_upper") == 0 || strcmp(name, "string_lower") == 0 ||
            strcmp(name, "string_starts_with") == 0 ||
@@ -3143,6 +3144,7 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "file_atomic_write") == 0 || strcmp(fname, "file_temp") == 0 ||
              strcmp(fname, "delay") == 0 || strcmp(fname, "interval") == 0 ||
              strcmp(fname, "llm_complete") == 0 ||
+             strcmp(fname, "llm_request") == 0 || strcmp(fname, "llm_limit") == 0 ||
              strcmp(fname, "string_split") == 0 || strcmp(fname, "string_trim") == 0 ||
              strcmp(fname, "string_upper") == 0 || strcmp(fname, "string_lower") == 0 ||
              strcmp(fname, "string_starts_with") == 0 ||

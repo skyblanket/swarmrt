@@ -9,6 +9,9 @@ Expected outcomes (see README.md):
   id % 100 == 29  crash (the grader raises)
   id % 100 == 53  timeout, in the "runaway" scenario (the grader never returns)
   otherwise       ok and correct (every episode, in the "clean" scenario)
+Rows are either the Python runner's {id, status, kind, correct} or
+lib/Rollout.sw's trajectory rows {task_id, status, kind, reward, ...}, where
+kind "done" with reward 1 is a correct episode and "env_crash" is a crash.
 Prints one JSON object.
 """
 import json
@@ -30,6 +33,15 @@ def expected(i, scenario):
     return "ok"
 
 
+def normalize(r):
+    """A Rollout.sw row as the {id, status, kind, correct} the checks use."""
+    if "task_id" not in r:
+        return r
+    kind = {"done": "done", "env_crash": "crash"}.get(r["kind"], r["kind"])
+    return {"id": r["task_id"], "status": r["status"], "kind": kind,
+            "correct": r["status"] == "ok" and r.get("reward") == 1}
+
+
 def main():
     path, n = sys.argv[1], int(sys.argv[2])
     scenario = sys.argv[3] if len(sys.argv) > 3 else "api"
@@ -43,6 +55,7 @@ def main():
                     pass
     except FileNotFoundError:
         pass
+    rows = [normalize(r) for r in rows]
     count = Counter(r["id"] for r in rows)
     last = {r["id"]: r for r in rows}
     got = Counter()
