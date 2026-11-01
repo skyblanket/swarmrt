@@ -73,6 +73,21 @@ a SwarmRT server bug can't skew SwarmRT's own numbers.
 Each run prints one JSON line. Per-run results, logs and timings go to
 `bench/rollout/out/`.
 
+## CI gate
+
+`make bench-rollout-gate` runs the SwarmRT runner alone (`RUN_PY=0`) on the sw
+mock (`MOCK=sw`, so no Python packages are needed): 500 episodes at 64, in
+the api, runaway and resume scenarios (`SCENARIOS`). Then `ci_gate.py`
+asserts that every outcome is right, no healthy episode is lost, nothing is
+duplicated after the resume, and no `sleep 300` or `curl` is left behind.
+It runs in CI on Linux and macOS in about 75 s. Throughput is printed but
+never asserted, because shared runners are too noisy.
+
+Tools that are in flight when the runner itself is SIGKILLed outlive it,
+because no process is left to kill their process groups. The resume scenario
+reports them as `orphans_from_kill` and the gate warns but doesn't fail on
+them. It does gate the restarted run.
+
 ## Results
 
 See `RESULTS.md`. It records the numbers from one run on a 4-core Linux
