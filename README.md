@@ -248,7 +248,7 @@ The reason swarmrt exists. If you've ever built an agent in Python with threadin
 - **Local-first by default.** A scaffolded agent sends nothing anywhere until you set `LLM_URL` or `LLM_PROVIDER`. There is no default cloud endpoint.
 - **Localhost binds.** Servers bind `127.0.0.1` unless you say otherwise.
 - **Keys stay in your environment.** API keys come from env vars you set and are passed to the model endpoint via a 0600 header file, out of `ps` - and there is no default endpoint to send them to.
-- **Audited.** An internal security audit (September 2026) fixed its findings on `main`, each with a regression test that fails on the old code - see [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). Distribution binds localhost by default and supports an optional per-frame MAC (`SW_NODE_COOKIE`); frames are not encrypted or replay-protected.
+- **Audited.** An internal security audit (September 2026) fixed its findings on `main`, each with a regression test that fails on the old code - see [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). Distribution binds localhost by default and supports an optional per-frame MAC (`SW_NODE_COOKIE`); plaintext links are not encrypted or replay-protected unless you opt into TLS 1.3 with `SW_NODE_TLS=1`.
 - **Sandboxed tool dispatch.** `shell_sandboxed(cmd, opts)` uses sandbox-exec on macOS / firejail on Linux with the network blocked by default; `exec_argv` forks without a shell so user-supplied arguments can't inject.
 
 Reports: [SECURITY.md](SECURITY.md).

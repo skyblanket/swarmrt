@@ -150,6 +150,7 @@ jobs:
           for p in 2 3 4 5 6 7 8 9 10; do
             make test-phase$p
           done
+          make test-node-tls
 
   hardening-gates:
     # No `needs: quickstart` — runs in parallel for fastest signal. A

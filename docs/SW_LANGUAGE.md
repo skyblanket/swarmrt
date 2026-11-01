@@ -989,6 +989,10 @@ fun worker_loop(n) {
 | `node_connect(name, host, port)` / `node_disconnect(name)` | mesh |
 | `node_send(node, regname, msg)` | cross-node send |
 
+Links are plaintext with an optional per-frame MAC (`SW_NODE_COOKIE`). Set
+`SW_NODE_TLS=1` (plus the cookie) on every node to run them over TLS 1.3;
+`node_connect` then fails if the peer's cookie differs or it runs without TLS.
+
 ### LLM (built-in)
 | | |
 |---|---|

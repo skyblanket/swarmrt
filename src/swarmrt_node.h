@@ -79,6 +79,7 @@ typedef struct sw_peer {
     uint8_t *rx_buf;
     uint32_t rx_len;
     uint32_t rx_cap;
+    void *tls;                  /* SSL* when SW_NODE_TLS=1 (see swarmrt_node.c) */
 } sw_peer_t;
 
 /* Remote message envelope (serialized over TCP) */
