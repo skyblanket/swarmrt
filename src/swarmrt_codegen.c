@@ -458,6 +458,10 @@ static int is_builtin(const char *name) {
            strcmp(name, "to_int") == 0 ||
            strcmp(name, "uuid") == 0 ||
            strcmp(name, "now_iso") == 0 ||
+           strcmp(name, "random") == 0 || strcmp(name, "random_seed") == 0 ||
+           strcmp(name, "band") == 0 || strcmp(name, "bor") == 0 || strcmp(name, "bxor") == 0 ||
+           strcmp(name, "bnot") == 0 || strcmp(name, "bsl") == 0 || strcmp(name, "bsr") == 0 ||
+           strcmp(name, "string_repeat") == 0 ||
            strcmp(name, "math_sqrt") == 0 || strcmp(name, "math_sin") == 0 ||
            strcmp(name, "math_cos") == 0 || strcmp(name, "math_pow") == 0 ||
            strcmp(name, "math_exp") == 0 || strcmp(name, "math_log") == 0 ||
@@ -2752,6 +2756,7 @@ static const char *_common_builtins[] = {
     "string_chars",
     "bytes_from_ints", "byte", "ord", "codepoint_at", "to_float",
     "to_int", "uuid", "now_iso",
+    "random", "random_seed", "band", "bor", "bxor", "bnot", "bsl", "bsr", "string_repeat",
     "math_sqrt", "math_sin", "math_cos", "math_pow", "math_exp", "math_log",
     "math_floor", "math_ceil", "math_round",
     "audio_ulaw_to_pcm16_b", "audio_pcm16_to_ulaw_b", "audio_resample_b",
@@ -3211,6 +3216,10 @@ static void emit_call(cg_ctx_t *ctx, node_t *n, int tail, char *out, int osz) {
              strcmp(fname, "to_int") == 0 ||
              strcmp(fname, "uuid") == 0 ||
              strcmp(fname, "now_iso") == 0 ||
+             strcmp(fname, "random") == 0 || strcmp(fname, "random_seed") == 0 ||
+             strcmp(fname, "band") == 0 || strcmp(fname, "bor") == 0 || strcmp(fname, "bxor") == 0 ||
+             strcmp(fname, "bnot") == 0 || strcmp(fname, "bsl") == 0 || strcmp(fname, "bsr") == 0 ||
+             strcmp(fname, "string_repeat") == 0 ||
              strcmp(fname, "math_sqrt") == 0 || strcmp(fname, "math_sin") == 0 ||
              strcmp(fname, "math_cos") == 0 || strcmp(fname, "math_pow") == 0 ||
              strcmp(fname, "math_exp") == 0 || strcmp(fname, "math_log") == 0 ||

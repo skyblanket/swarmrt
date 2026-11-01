@@ -684,6 +684,25 @@ static sw_val_t *_builtin_to_int(sw_val_t **a, int n) {
 static sw_val_t *_builtin_uuid(sw_val_t **a, int n) { (void)a; (void)n; return sw_make_uuid(); }
 static sw_val_t *_builtin_now_iso(sw_val_t **a, int n) { (void)a; (void)n; return sw_now_iso(); }
 
+/* random / random_seed / bit ops / string_repeat (#166): the shared helper
+ * in swarmrt_lang.c; bad arguments panic with its message. */
+static void _sw_runtime_panic(const char *fmt, ...);
+static sw_val_t *_sw_rand_bits(const char *fname, sw_val_t **a, int n) {
+    char err[160] = "";
+    sw_val_t *r = sw_rand_bits_builtin(fname, a, n, err, sizeof(err));
+    if (!r) { _sw_runtime_panic("%s", err[0] ? err : fname); return sw_val_nil(); }
+    return r;
+}
+static sw_val_t *_builtin_random(sw_val_t **a, int n)        { return _sw_rand_bits("random", a, n); }
+static sw_val_t *_builtin_random_seed(sw_val_t **a, int n)   { return _sw_rand_bits("random_seed", a, n); }
+static sw_val_t *_builtin_band(sw_val_t **a, int n)          { return _sw_rand_bits("band", a, n); }
+static sw_val_t *_builtin_bor(sw_val_t **a, int n)           { return _sw_rand_bits("bor", a, n); }
+static sw_val_t *_builtin_bxor(sw_val_t **a, int n)          { return _sw_rand_bits("bxor", a, n); }
+static sw_val_t *_builtin_bnot(sw_val_t **a, int n)          { return _sw_rand_bits("bnot", a, n); }
+static sw_val_t *_builtin_bsl(sw_val_t **a, int n)           { return _sw_rand_bits("bsl", a, n); }
+static sw_val_t *_builtin_bsr(sw_val_t **a, int n)           { return _sw_rand_bits("bsr", a, n); }
+static sw_val_t *_builtin_string_repeat(sw_val_t **a, int n) { return _sw_rand_bits("string_repeat", a, n); }
+
 static sw_val_t *_builtin_math_sqrt(sw_val_t **a, int n) {
     if (n < 1 || !a[0]) return sw_val_float(0.0);
     return sw_val_float(sqrt(_sw_to_double(a[0])));

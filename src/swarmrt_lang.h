@@ -334,6 +334,9 @@ sw_val_t *sw_file_read_string(const char *path); /* file_read: whole file, nil i
 void sw_json_format_float(double d, char *buf, size_t bufsz); /* json_encode float text, always reads back as a float */
 sw_val_t *sw_string_sub_utf8(const char *s, int64_t start, int64_t len); /* string_sub: byte offsets, cuts on UTF-8 boundaries */
 sw_val_t *sw_string_truncate_utf8(sw_val_t *str, int64_t max);           /* string_truncate: same rule */
+/* random/random_seed/band/bor/bxor/bnot/bsl/bsr/string_repeat (#166). NULL if
+ * fname is none of them; NULL with err set on bad arguments (caller panics). */
+sw_val_t *sw_rand_bits_builtin(const char *fname, sw_val_t **a, int n, char *err, size_t errsz);
 sw_val_t *sw_make_uuid(void);            /* uuid():    random RFC-4122 v4 string */
 sw_val_t *sw_now_iso(void);              /* now_iso(): current UTC time as ISO-8601 */
 
