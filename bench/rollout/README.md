@@ -3,8 +3,10 @@
 An eval-style workload run by two runners that do the same work against the
 same mock model server:
 
-- `swarmrt_runner.sw` uses only what SwarmRT ships: `Std.task_stream`,
-  `llm_complete` and `exec_managed`.
+- `swarmrt_runner.sw` uses only what SwarmRT ships: `Rollout.run`
+  (`lib/Rollout.sw`, on `Std.task_stream_each`), `llm_request` through
+  `Rollout.llm`, and `exec_managed` through `Rollout.tool`. Its JSONL rows are
+  Rollout trajectory rows; `analyze.py` reads both formats.
 - `python_runner.py` is written the way a careful asyncio harness would be.
   It uses one aiohttp session, a semaphore, `asyncio.wait_for` per episode,
   `gather(return_exceptions=True)`, `Retry-After` on 429, backoff on 5xx and
