@@ -229,9 +229,20 @@ test-sw: swc libswarmrt
 	@./tests/sw/run_stub_warn.sh
 	@bash ./tests/sw/run_stdin.sh
 	@bash ./tests/sw/run_spawn_limit.sh
+	@bash ./tests/sw/run_rollout_resume.sh
 
 # The install path end to end: swc on PATH from an install laid out like a
 # release archive, `swc new`, and the new project's own tests.
+# bench/rollout as a regression gate (#70): the SwarmRT runner on the sw mock,
+# 500 episodes at 64, the api / runaway / resume scenarios. Fails on a wrong
+# outcome, a lost healthy episode, a duplicate after resume, or an orphaned
+# `sleep 300` / `curl`. No Python deps (MOCK=sw, RUN_PY=0). ~1-2 min.
+.PHONY: bench-rollout-gate
+bench-rollout-gate: swc libswarmrt
+	@bash -c 'set -o pipefail; MOCK=sw RUN_PY=0 SCENARIOS="api runaway resume" KILL_AT=$${KILL_AT:-4} \
+	    OUT_DIR=$${OUT_DIR:-/tmp/sw_bench_rollout} RUN_TIMEOUT=240 \
+	    bash bench/rollout/run_bench.sh 500 64 | python3 bench/rollout/ci_gate.py'
+
 .PHONY: test-install
 test-install: swc libswarmrt
 	@bash scripts/install_smoke.sh

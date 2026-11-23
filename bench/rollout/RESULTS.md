@@ -7,6 +7,11 @@ Python mock server):
 - SwarmRT: swarmrt `v2.1.0`, `swc 2.1.0` at commit `98c4dcf`.
 - Python baseline: Python 3.11.15 and aiohttp 3.14.5.
 
+These numbers predate the runner's move to `Rollout.run` and `llm_request`
+(#62, #63, #64): that runner honours `Retry-After`, records failures as they
+happen, and kills a dead episode's `curl`. They have not been re-measured at
+10,000 episodes.
+
 ## Summary
 
 SwarmRT got every one of the 10,000 episodes right in every scenario, killed

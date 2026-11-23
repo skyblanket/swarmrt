@@ -28,6 +28,14 @@ cd eval
 EVAL_K=5 ./runner.sh           # the eval — 5 samples/cell, pass@1 mean ± stdev
 ```
 
+`runner.sw` is the same eval on `lib/Rollout.sw` (see `docs/ROLLOUT.md`):
+`../bin/swc build runner.sw -o .runner && EVAL_K=5 ./.runner`. Each sample is
+an isolated episode with a deadline. A model or infra failure is counted
+apart from a failed sample, and a killed run resumes where it stopped
+(`EVAL_OUT=results/rollout_<ts>.jsonl`). It writes one trajectory row per
+sample, with the request, the reply and the build and run output. It doesn't
+write `runner.sh`'s per-cell directories or `results.md`.
+
 - All vendors are plain **OpenAI chat/completions** drop-ins — the runner sends
   one standard body to every endpoint; no per-vendor request branch.
 - `EVAL_K` controls samples per (prompt × model) cell — **default 5**; results

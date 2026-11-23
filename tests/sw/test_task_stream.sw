@@ -113,6 +113,59 @@ fun test_concurrency_cap() {
     ok_count + ok_first + ok_last + ok_peak
 }
 
+# ---- 4b. on_result: one callback per item, as each cell is known ----
+# One at a time: index 0 hangs past its 200 ms deadline, index 1 is ok,
+# index 2 crashes, and indexes 3-6 take 150 ms each, so the stream ends
+# ~800 ms after index 0's deadline. Each callback records {item, cell, ms
+# since start} in ETS.
+let calls = ets_new()
+
+fun on_result_fn(x) {
+    if (x == 1) { panic("boom on 1") }
+    else if (x == 2) { sleep(5000) ; x }
+    else if (x == 3) { sleep(150) ; x }
+    else { x }
+}
+
+fun test_on_result() {
+    t0 = timestamp()
+    res = Std.task_stream([2, 10, 1, 3, 3, 3, 3], fun(x) { on_result_fn(x) }, %{
+        max_concurrency: 1, timeout_ms: 200,
+        on_result: fun(i, item, cell) {
+            n = ets_update_counter(calls, f"n:{i}", 1, 0)
+            ets_put(calls, i, {item, cell, timestamp() - t0})
+        }})
+    f = 0
+    f = f + assert_eq("on_result_once", Std.all(Std.range(0, 7), fun(i) {
+        if (ets_get(calls, f"n:{i}") == 1) { 'true' } else { 'false' } }), 'true')
+    # The same cell the returned list holds, with the item it came from.
+    f = f + assert_eq("on_result_same_cells", Std.all(Std.range(0, 7), fun(i) {
+        if (elem(ets_get(calls, i), 1) == lat(res, i)) { 'true' } else { 'false' } }), 'true')
+    f = f + assert_eq("on_result_items", Std.map(Std.range(0, 7), fun(i) { elem(ets_get(calls, i), 0) }),
+                      [2, 10, 1, 3, 3, 3, 3])
+    f = f + assert_eq("on_result_timeout_cell", lat(res, 0), {'error', 'timeout'})
+    f = f + assert_eq("on_result_ok_cell", lat(res, 1), {'ok', 10})
+    f = f + assert_eq("on_result_crash_cell", elem(lat(res, 2), 0), 'error')
+    f = f + assert_eq("on_result_slow_cell", lat(res, 6), {'ok', 3})
+    # The timeout is reported at its deadline (+100 ms), not when the stream ends.
+    t_timeout = elem(ets_get(calls, 0), 2)
+    f = f + assert_eq("on_result_timeout_prompt", t_timeout < 300, 'true')
+    f = f + assert_eq("on_result_last_later", elem(ets_get(calls, 6), 2) >= 700, 'true')
+    f
+}
+
+# ---- 4c. task_stream_each: counts only, cells via on_result ----
+let each_seen = ets_new()
+
+fun test_each() {
+    counts = Std.task_stream_each([0, 1, 2, 3, 4], fun(x) {
+        if (x == 1) { panic("boom") } else if (x == 2) { sleep(3000) ; x } else { x * 2 }
+    }, %{max_concurrency: 2, timeout_ms: 200,
+         on_result: fun(i, item, cell) { ets_update_counter(each_seen, 'n', 1, 0) }})
+    f = assert_eq("each_counts", counts, %{ok: 3, error: 1, timeout: 1})
+    f + assert_eq("each_callbacks", ets_get(each_seen, 'n'), 5)
+}
+
 # ---- 5. empty list -> empty list ----
 fun test_empty() {
     assert_eq("empty", Std.task_stream([], fun(x) { x }, %{}), [])
@@ -147,10 +200,12 @@ fun main() {
     fails = fails + test_timeout_is_tagged()
     fails = fails + test_no_bare_nil()
     fails = fails + test_concurrency_cap()
+    fails = fails + test_on_result()
+    fails = fails + test_each()
     fails = fails + test_empty()
     fails = fails + test_json_expect_ok()
     fails = fails + test_json_expect_missing()
     fails = fails + test_json_expect_bad()
-    if (fails == 0) { print("OK task_stream 15/15") ; sys_exit(0) }
+    if (fails == 0) { print("OK task_stream 26/26") ; sys_exit(0) }
     else { print("FAIL task_stream " ++ to_string(fails) ++ " failures") ; sys_exit(1) }
 }
