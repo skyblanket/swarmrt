@@ -209,10 +209,10 @@ Do these in roughly this order. Each is "verify locally, then branch → ff-merg
 - Local result: **20s → 2364 rounds, peak RSS 53 MB** (arena base ~48 MB, so ~5 MB working
   set over the entire mix — dead flat); 180s confirms the same. CI runs the 60s smoke
   (advisory/blocking leg in linux-quickstart.yml).
-- **Remaining (needs infra, not code):** the full **24-hour** run is the same binary —
-  `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512 ./tests/soak/run_soak.sh` — on a dedicated
-  Linux host. Assert bounded RSS + zero sanitizer hits + no leaked process slots over the
-  full day. This is a sign-off that requires a sustained host run; the harness is ready.
+- **Remaining (needs infra, not code):** the full **24-hour** run, `make soak-signoff`
+  (`tests/soak/signoff.py`), on a dedicated Linux host. It writes a verdict for bounded and
+  flat RSS, clean stderr, no hang and no leaked process slots over the full day (#48); CI
+  checks the verdict both ways with `make soak-signoff-selftest`.
 ---
 
 ## Phase 3 — SECURITY & FAULT ISOLATION  ✅ DONE (fuzz boundaries + depth limits + quotas + cross-process isolation)
@@ -395,10 +395,11 @@ paid off — it found a **reproduced P0 use-after-free** the shipping suite miss
 `v2.1.0` exist; `VERSION` is `2.1.0` as of 2026-10-19. The former "bump to 1.0.0" step is no longer pending.
 
 **Still open from the 1.0.0 gate:**
-- **24h soak** on a dedicated Linux host: `SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512
-  ./tests/soak/run_soak.sh` (harness ready; needs a host — the intended box `sushi` was unreachable
-  at 2026-07-03). Assert bounded RSS + zero sanitizer hits + no leaked process slots over the day.
-  No full 24h run is recorded in the repo; §2.6 still lists it as pending.
+- **24h soak** on a dedicated Linux host: `make soak-signoff` (`tests/soak/signoff.py`, 24h by
+  default) runs the mixed workload and writes a PASS/FAIL verdict: bounded and flat RSS, clean
+  stderr, no hang, no leaked process slots, no drops (#48). Needs a host — the intended box
+  `sushi` was unreachable at 2026-07-03. No full 24h run is recorded in the repo; §2.6 still lists
+  it as pending.
 
 ---
 

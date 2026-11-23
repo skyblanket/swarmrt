@@ -169,7 +169,20 @@ fun main() {
   `draining` (true once graceful shutdown has begun — treat as NOT ready),
   `processes`, `crashes`, `restarts`, mailbox/message-drop counters, and
   per-scheduler stats. Point your load balancer / orchestrator readiness probe
-  here so it drains the instance the moment shutdown starts.
+  here so it drains the instance the moment shutdown starts. Also carries
+  `resident_bytes` (the node's current RSS; `-1` where the platform can't
+  report it) and, per scheduler, `utilization`: the percentage of its loop
+  iterations since boot that did not end in an idle wait (iterations, not
+  CPU time).
+- `GET /processes[?limit=N]` → JSON array of `{pid, parent, name, status,
+  mailbox_len, memory, resident_bytes, messages_sent, messages_recv}`. With
+  `limit`, the first N rows plus one `{"summary":true,"omitted":K,...}` row
+  totalling the rest.
+- `GET /tree` → the supervision forest (`Swarm.tree()`) as JSON.
+- `GET /top?by=mailbox|memory|resident|rate&n=20` → the N worst processes,
+  worst first, ranked server-side (`rate` = messages sent + received since
+  spawn; `n` at most 1000).
+- A malformed query (`limit`/`n` not a whole number ≥ 1, unknown `by`) → `400`.
 - Any other path → `404`.
 
 `Health.start(port)` is the non-blocking variant (spawns, returns the pid) so

@@ -49,6 +49,12 @@ fun main() {
     fails = fails + chk("ss_sched_list", length(map_get(s, 'scheduler_stats')),
                         map_get(s, 'schedulers'))
 
+    # resident memory (#168): per-process parts and node RSS
+    fails = fails + chk("pi_frame_bytes_present", map_get(info, 'frame_bytes') == nil, false)
+    fails = fails + chk("pi_mailbox_bytes_present", map_get(info, 'mailbox_bytes') == nil, false)
+    fails = fails + chk("pi_resident_positive", map_get(info, 'resident_bytes') > 0, true)
+    fails = fails + chk("ss_resident_positive", map_get(s, 'resident_bytes') > 0, true)
+
     send(p, 'die')
     if (fails == 0) { print("OBS_INTERP_OK") ; sys_exit(0) }
     else { sys_exit(1) }

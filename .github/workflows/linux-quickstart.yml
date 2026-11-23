@@ -19,6 +19,8 @@ name: Linux quickstart
 #   quickstart       — fast README-honesty gate (~4 min)
 #   hardening-gates  — sanitizer / soak / stress gates (~9 min)
 #   fuzz             — ASAN/UBSAN fuzz targets on a runner all to itself
+#   cmake            — the CMake build (the only Windows/MinGW path) links,
+#                      and its source lists match the Makefile's (#28)
 
 on:
   push:
@@ -151,7 +153,29 @@ jobs:
             make test-phase$p
           done
 
-  hardening-gates:
+  # The CMake build is the only Windows (MinGW) path and nothing else
+  # exercises it: it silently lost swarmrt_varena.c and could not link (#28).
+  # Build it on Linux, smoke-run the result, and fail when the Makefile and
+  # CMakeLists.txt source lists drift apart.
+  cmake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install README-listed system dependencies (+ cmake)
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list*  # third-party mirror 403s fail the job; we need nothing from it
+          for i in 1 2 3; do sudo apt-get update -qq && break; sleep 10; done
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Makefile and CMakeLists.txt source lists match
+        run: make check-sources
+
+      - name: CMake build + smoke (swc --version, swc run, swc build)
+        run: make check-cmake
+
     # No `needs: quickstart` — runs in parallel for fastest signal. A
     # README regression and a sanitizer regression are independent facts;
     # serializing them only delays whichever one you broke.
@@ -242,9 +266,15 @@ jobs:
       - name: Soak smoke (Phase 2.6 — 60s mixed workload, bounded RSS)
         # Actor fan-out + supervisor crash/restart + ETS churn + timers in a
         # tight loop for 60s; asserts clean exit and peak RSS under budget.
-        # The full 24h soak is the same binary (SOAK_SECONDS=86400) on a
+        # The full 24h sign-off is `make soak-signoff` (tests/soak/signoff.py) on a
         # dedicated host — see PRODUCTION_ROADMAP.md 2.6.
         run: make soak
+
+      - name: Soak sign-off self-test (#48 — verdict PASSes clean, FAILs a leak)
+        # tests/soak/signoff.py is the 24h release sign-off harness. Prove
+        # its judgement both ways on a short run: clean -> PASS, a deliberate
+        # 1 KB/round leak -> FAIL on rss_flat.
+        run: make soak-signoff-selftest
 
       - name: Runner diagnostics (post-soak)
         # Second snapshot after the longest-running gate: catches future

@@ -36,6 +36,7 @@
   #include <sys/time.h>
   #ifdef __APPLE__
     #include <dispatch/dispatch.h>
+    #include <mach/mach.h>
   #endif
 #endif
 #include "swarmrt_native.h"
@@ -122,6 +123,51 @@ static _Atomic int g_sw_tearing_down = 0;
 
 int sw_is_draining(void) {
     return atomic_load_explicit(&g_sw_draining, memory_order_relaxed);
+}
+
+/* Current resident set size of this OS process, in bytes, for
+ * swarm_stats().resident_bytes. Linux: /proc/self/statm (resident pages x
+ * page size). macOS: mach task_info resident_size. -1 where the platform
+ * gives no current-RSS reading (never a peak or a guess passed off as
+ * current). Cost: one small file read on Linux; not for a hot path. */
+int64_t sw_resident_bytes(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return -1;
+    long size = 0, rss = 0;
+    int got = fscanf(f, "%ld %ld", &size, &rss);
+    fclose(f);
+    long page = sysconf(_SC_PAGESIZE);
+    if (got != 2 || rss < 0 || page <= 0) return -1;
+    return (int64_t)rss * (int64_t)page;
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) != KERN_SUCCESS)
+        return -1;
+    return (int64_t)info.resident_size;
+#else
+    return -1;
+#endif
+}
+
+/* Per-process resident bytes the runtime can attribute without walking
+ * another thread's data (process_info: frame_bytes, mailbox_bytes,
+ * resident_bytes). Best-effort lock-free reads, like the other
+ * process_info counters:
+ *   frames   heap frames the process holds (spilled or parked continuation
+ *            frames; the counter SW_FRAME_MAX meters)
+ *   mailbox  pending messages x sizeof(sw_msg_t): the queued headers only.
+ *            A message's payload region is not counted here (sizing it means
+ *            walking the queue the owner is draining); once received it is
+ *            adopted into the arena and shows up in `memory`.
+ * The caller adds the arena bytes it read under link_lock. */
+void sw_proc_resident_parts(const sw_process_t *p, int64_t *frames, int64_t *mailbox) {
+    int64_t mb = (int64_t)atomic_load_explicit(&((sw_process_t *)p)->mb_len, memory_order_relaxed);
+    if (mb < 0) mb = 0;
+    *frames = (int64_t)p->frame_bytes;
+    *mailbox = mb * (int64_t)sizeof(sw_msg_t);
 }
 
 int sw_shutdown_requested(void) {

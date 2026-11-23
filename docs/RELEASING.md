@@ -51,8 +51,14 @@ not covered by the stability guarantees above and is published as a GitHub
    for p in 2 3 4 5 6 7 8 9 10; do make phase$p && ./bin/test-phase$p; done
    ```
    Plus the sign-off items in `docs/PRODUCTION_ROADMAP.md` Phase 5: a **24-hour
-   soak** on a dedicated Linux host (`SOAK_SECONDS=86400 SOAK_RSS_BUDGET_MB=512
-   ./tests/soak/run_soak.sh`) and an **independent adversarial review**.
+   soak** on a dedicated Linux host and an **independent adversarial review**.
+   The soak is one command, `make soak-signoff` (`SOAK_HOURS=24` by default):
+   it runs `tests/soak/soak.sw`, samples RSS and the `swarm_stats()`
+   heartbeat, and writes `build/soak/<timestamp>/verdict.md` with a PASS/FAIL
+   per criterion (clean exit, clean stderr, no hang, RSS budget, flat RSS,
+   bounded process count, no drops, progress). Attach `verdict.md` to the
+   release issue; any FAIL blocks the release. Run it under `nohup` or
+   `tmux` so a closed terminal does not end it.
 
 2. **Bump `VERSION`** to the release version (drop the `-rc.N` suffix for a
    final), and add a `docs/CHANGELOG.md` entry (newest first) headed
