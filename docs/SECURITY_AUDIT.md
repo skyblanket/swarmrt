@@ -51,8 +51,12 @@ package-manager tests, and an install smoke test run from outside the checkout.
   stop rebinding. Opt-in: set `SW_HTTP_HOSTS` to the `Host` values the server
   answers to, and any request with another `Host` gets `403`. Gate:
   `tests/sw/test_http_hosts.sw`. Unset, the server has no rebinding defence.
-- **Distribution is authenticated, not encrypted,** and not replay-protected.
-  Run clusters on a private network or through a tunnel.
+- **Distribution is plaintext by default:** authenticated with `SW_NODE_COOKIE`
+  but not encrypted or replay-protected. Opt-in: `SW_NODE_TLS=1` on every node
+  runs each link over TLS 1.3 keyed from the cookie (encrypted, replay-protected,
+  plaintext peers refused). Gates: `make test-node-tls`,
+  `tests/sw/test_node_tls.sw`. Without it, run clusters on a private network or
+  through a tunnel.
 - **No code sandbox.** A compiled program can do anything its user can;
   `shell_sandboxed` contains only the command passed to it.
 - **Durable state** is stored unencrypted in SQLite (`SW_STATE_DB`), in native

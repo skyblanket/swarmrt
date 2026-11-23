@@ -512,6 +512,285 @@ static void peer_rx_consume(sw_peer_t *peer, uint32_t consumed) {
     peer->rx_len -= consumed;
 }
 
+/* === Optional TLS on node links (SW_NODE_TLS=1) ===
+ * Opt-in: with SW_NODE_TLS=1 every node link is TLS 1.3 authenticated by an
+ * external PSK derived from SW_NODE_COOKIE (no certificates). That gives the
+ * link confidentiality, and replay protection both within a link (TLS record
+ * sequence numbers) and across links (each handshake mixes fresh randoms from
+ * both ends and an ephemeral (EC)DHE share, so recorded bytes replayed on a
+ * new connection fail the handshake). A node with TLS on refuses plaintext
+ * peers and vice versa — the handshake fails loudly on both ends.
+ * See docs/design/DIST_TLS.md.
+ *
+ * Data path: the socket stays owned by the IO layer. Each peer has an SSL
+ * with a pair of memory BIOs: ciphertext from PORT_DATA goes into the read
+ * BIO, plaintext comes out of SSL_read into the existing frame buffer, and
+ * whatever SSL writes into the write BIO is pushed to the socket. The
+ * connecting side runs its handshake synchronously (node_connect already
+ * blocks on connect()), so a failed handshake is node_connect's error; the
+ * accepting side runs its handshake from dist_handler as bytes arrive. Every
+ * SSL call is made under g_dist_lock. */
+#if !defined(__APPLE__) || defined(SWARMRT_TLS)
+#define SW_NODE_HAVE_TLS 1
+#include <poll.h>
+#include <errno.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#ifdef __APPLE__
+#include <openssl/evp.h>
+#endif
+#endif
+
+#define SW_NODE_TLS_TIMEOUT_MS 5000
+
+static int node_tls_wanted(void) {
+    const char *t = getenv("SW_NODE_TLS");
+    return t && *t && strcmp(t, "0") != 0;
+}
+
+/* Write all of `buf` to the socket. The fd is non-blocking, so a short
+ * send waits (bounded) for room instead of dropping the tail — under TLS a
+ * dropped tail corrupts every record after it. */
+static int conn_send_all(sw_port_t *conn, const uint8_t *buf, uint32_t len) {
+    uint32_t off = 0;
+    int waited_ms = 0;
+    while (off < len) {
+        errno = 0;
+        int n = sw_tcp_send(conn, buf + off, len - off);
+        if (n > 0) { off += (uint32_t)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
+            waited_ms < SW_NODE_TLS_TIMEOUT_MS) {
+            struct pollfd pfd = { .fd = conn->fd, .events = POLLOUT, .revents = 0 };
+            if (pfd.fd < 0) return -1;
+            poll(&pfd, 1, 50);
+            waited_ms += 50;
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+#ifdef SW_NODE_HAVE_TLS
+static SSL_CTX *g_tls_client_ctx = NULL;
+static SSL_CTX *g_tls_server_ctx = NULL;
+static uint8_t g_tls_psk[32];
+static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
+static int g_tls_init_ok = 0;
+static const unsigned char g_tls_psk_identity[] = "swarmrt-dist-v1";
+
+static void tls_report(const char *what) {
+    unsigned long e = ERR_get_error();
+    char buf[256] = "";
+    if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    ERR_clear_error();
+    fprintf(stderr, "swarmrt: distribution TLS: %s%s%s\n", what, buf[0] ? ": " : "", buf);
+}
+
+static SSL_SESSION *tls_psk_session(SSL *ssl) {
+    static const unsigned char aes128gcm_sha256[] = { 0x13, 0x01 };
+    const SSL_CIPHER *cipher = SSL_CIPHER_find(ssl, aes128gcm_sha256);
+    if (!cipher) return NULL;
+    SSL_SESSION *sess = SSL_SESSION_new();
+    if (!sess) return NULL;
+    if (!SSL_SESSION_set1_master_key(sess, g_tls_psk, sizeof(g_tls_psk)) ||
+        !SSL_SESSION_set_cipher(sess, cipher) ||
+        !SSL_SESSION_set_protocol_version(sess, TLS1_3_VERSION)) {
+        SSL_SESSION_free(sess);
+        return NULL;
+    }
+    return sess;
+}
+
+static int tls_use_psk_cb(SSL *ssl, const EVP_MD *md, const unsigned char **id,
+                          size_t *idlen, SSL_SESSION **sess) {
+    SSL_SESSION *s = tls_psk_session(ssl);
+    if (!s) return 0;
+    if (md && md != SSL_CIPHER_get_handshake_digest(SSL_SESSION_get0_cipher(s))) {
+        SSL_SESSION_free(s);       /* hash mismatch: offer no PSK for this one */
+        *sess = NULL; *id = NULL; *idlen = 0;
+        return 1;
+    }
+    *sess = s;
+    *id = g_tls_psk_identity;
+    *idlen = sizeof(g_tls_psk_identity) - 1;
+    return 1;
+}
+
+static int tls_find_psk_cb(SSL *ssl, const unsigned char *id, size_t idlen,
+                           SSL_SESSION **sess) {
+    if (idlen != sizeof(g_tls_psk_identity) - 1 ||
+        memcmp(id, g_tls_psk_identity, idlen) != 0) {
+        *sess = NULL;              /* unknown identity: handshake fails */
+        return 1;
+    }
+    *sess = tls_psk_session(ssl);
+    return *sess ? 1 : 0;
+}
+
+static SSL_CTX *tls_new_ctx(const SSL_METHOD *m) {
+    SSL_CTX *ctx = SSL_CTX_new(m);
+    if (!ctx) return NULL;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
+    SSL_CTX_set_num_tickets(ctx, 0);      /* no resumption: every link is a full PSK+DHE handshake */
+    SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+    /* The PSK is bound to SHA-256, so only SHA-256 suites can use it. */
+    if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256") != 1) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+static void tls_init_once(void) {
+    const char *cookie = node_cookie();
+    if (!cookie) return;
+    /* PSK = SHA-256(label || cookie). The label keeps this key distinct from
+     * the per-frame MAC, which also hashes the cookie. */
+    static const char label[] = "swarmrt distribution tls psk v1";
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    unsigned int olen = 0;
+    int ok = md && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1 &&
+             EVP_DigestUpdate(md, label, sizeof(label)) == 1 &&
+             EVP_DigestUpdate(md, cookie, strlen(cookie)) == 1 &&
+             EVP_DigestFinal_ex(md, g_tls_psk, &olen) == 1 && olen == 32;
+    EVP_MD_CTX_free(md);
+    if (!ok) { tls_report("deriving the PSK failed"); return; }
+    g_tls_client_ctx = tls_new_ctx(TLS_client_method());
+    g_tls_server_ctx = tls_new_ctx(TLS_server_method());
+    if (!g_tls_client_ctx || !g_tls_server_ctx) { tls_report("SSL_CTX_new failed"); return; }
+    SSL_CTX_set_psk_use_session_callback(g_tls_client_ctx, tls_use_psk_cb);
+    SSL_CTX_set_psk_find_session_callback(g_tls_server_ctx, tls_find_psk_cb);
+    g_tls_init_ok = 1;
+}
+#endif /* SW_NODE_HAVE_TLS */
+
+/* 1 = TLS on and ready, 0 = TLS off, -1 = TLS asked for but unusable
+ * (reported on stderr; callers refuse to fall back to plaintext). */
+static int node_tls_mode(void) {
+    if (!node_tls_wanted()) return 0;
+#ifdef SW_NODE_HAVE_TLS
+    if (!node_cookie()) {
+        static _Atomic int warned = 0;
+        if (!atomic_exchange(&warned, 1))
+            fprintf(stderr, "swarmrt: SW_NODE_TLS=1 needs SW_NODE_COOKIE (the TLS key is "
+                            "derived from it); refusing distribution\n");
+        return -1;
+    }
+    pthread_once(&g_tls_once, tls_init_once);
+    return g_tls_init_ok ? 1 : -1;
+#else
+    static _Atomic int warned = 0;
+    if (!atomic_exchange(&warned, 1))
+        fprintf(stderr, "swarmrt: SW_NODE_TLS=1 but this build has no OpenSSL "
+                        "(macOS: rebuild with `make SWARMRT_TLS=1`); refusing distribution\n");
+    return -1;
+#endif
+}
+
+#ifdef SW_NODE_HAVE_TLS
+static SSL *tls_new_ssl(int server) {
+    SSL *ssl = SSL_new(server ? g_tls_server_ctx : g_tls_client_ctx);
+    if (!ssl) return NULL;
+    BIO *rb = BIO_new(BIO_s_mem()), *wb = BIO_new(BIO_s_mem());
+    if (!rb || !wb) { BIO_free(rb); BIO_free(wb); SSL_free(ssl); return NULL; }
+    SSL_set_bio(ssl, rb, wb);
+    if (server) SSL_set_accept_state(ssl); else SSL_set_connect_state(ssl);
+    return ssl;
+}
+
+/* Push everything SSL has queued in its write BIO to the socket. */
+static int tls_flush(SSL *ssl, sw_port_t *conn) {
+    BIO *wb = SSL_get_wbio(ssl);
+    uint8_t buf[16384];
+    int n;
+    while ((n = BIO_read(wb, buf, sizeof(buf))) > 0)
+        if (conn_send_all(conn, buf, (uint32_t)n) != 0) return -1;
+    return 0;
+}
+
+/* Connecting side: run the whole handshake on the socket before the
+ * connection is published. The port's read interest is off meanwhile so
+ * the IO thread does not consume handshake bytes. */
+static SSL *tls_client_handshake(sw_port_t *conn, const char *peer_name) {
+    SSL *ssl = tls_new_ssl(0);
+    if (!ssl) { tls_report("SSL_new failed"); return NULL; }
+    sw_port_set_active(conn, 0);
+    int waited = 0, hung_up = 0, rc;
+    while ((rc = SSL_do_handshake(ssl)) != 1) {
+        int err = SSL_get_error(ssl, rc);
+        if (tls_flush(ssl, conn) != 0) err = SSL_ERROR_SYSCALL;
+        if (err != SSL_ERROR_WANT_READ || hung_up || waited >= SW_NODE_TLS_TIMEOUT_MS) {
+            fprintf(stderr, "swarmrt: distribution TLS handshake with %s failed%s "
+                            "(different SW_NODE_COOKIE, or the peer runs without SW_NODE_TLS?)\n",
+                    peer_name, hung_up ? " (peer closed the connection)"
+                             : waited >= SW_NODE_TLS_TIMEOUT_MS ? " (timed out)" : "");
+            tls_report("handshake");
+            SSL_free(ssl);
+            return NULL;
+        }
+        struct pollfd pfd = { .fd = conn->fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, 100);
+        waited += 100;
+        if (pr > 0) {
+            uint8_t buf[16384];
+            ssize_t got = recv(conn->fd, buf, sizeof(buf), 0);
+            if (got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                hung_up = 1;               /* reported at the top of the loop */
+                continue;
+            }
+            if (got > 0) BIO_write(SSL_get_rbio(ssl), buf, (int)got);
+        }
+    }
+    if (tls_flush(ssl, conn) != 0) { SSL_free(ssl); return NULL; }
+    sw_port_set_active(conn, 1);
+    return ssl;
+}
+
+/* Accepting side: feed ciphertext, advance the handshake, and append any
+ * plaintext to the peer's frame buffer. Called under g_dist_lock.
+ * Returns -1 when the link must be dropped. */
+static int tls_ingest_locked(sw_peer_t *peer, const uint8_t *data, uint32_t len) {
+    SSL *ssl = (SSL *)peer->tls;
+    if (len && BIO_write(SSL_get_rbio(ssl), data, (int)len) != (int)len) return -1;
+    if (!SSL_is_init_finished(ssl)) {
+        int rc = SSL_do_handshake(ssl);
+        int err = rc == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl, rc);
+        if (tls_flush(ssl, peer->conn) != 0) return -1;
+        if (rc != 1) {
+            if (err == SSL_ERROR_WANT_READ) return 0;
+            fprintf(stderr, "swarmrt: distribution TLS handshake from an incoming peer failed "
+                            "(different SW_NODE_COOKIE, a plaintext peer, or a replayed "
+                            "stream?); dropping the connection\n");
+            tls_report("handshake");
+            return -1;
+        }
+    }
+    for (;;) {
+        uint8_t buf[16384];
+        int n = SSL_read(ssl, buf, sizeof(buf));
+        if (n > 0) {
+            if (peer_rx_append(peer, buf, (uint32_t)n) != 0) return -1;
+            continue;
+        }
+        int err = SSL_get_error(ssl, n);
+        if (tls_flush(ssl, peer->conn) != 0) return -1;
+        if (err == SSL_ERROR_WANT_READ) return 0;
+        if (err != SSL_ERROR_ZERO_RETURN) tls_report("record rejected; dropping the connection");
+        return -1;
+    }
+}
+#endif /* SW_NODE_HAVE_TLS */
+
+static void peer_tls_free(sw_peer_t *peer) {
+#ifdef SW_NODE_HAVE_TLS
+    if (peer->tls) SSL_free((SSL *)peer->tls);
+#endif
+    peer->tls = NULL;
+}
+
 /* Create a placeholder peer for a freshly-accepted incoming connection.
  * The name is filled in lazily by handle_remote_data when the first
  * framed message arrives (we don't know who connected to us until we
@@ -538,27 +817,37 @@ static sw_peer_t *register_inbound_conn(sw_port_t *conn) {
     return p;
 }
 
-/* Serialize and send a remote message over TCP */
-static int send_remote_msg(sw_port_t *conn, sw_remote_msg_t *hdr,
+/* Serialize and send a remote message to a peer (TLS-wrapped when the
+ * link has TLS). Called under g_dist_lock. */
+static int send_remote_msg(sw_peer_t *peer, sw_remote_msg_t *hdr,
                            const void *payload, uint32_t payload_len) {
+    sw_port_t *conn = peer->conn;
+    uint8_t head[4 + sizeof(sw_remote_msg_t)];
     uint32_t total = sizeof(sw_remote_msg_t) + payload_len;
     uint32_t net_len = htonl(total);
 
-    /* Send length prefix */
-    if (sw_tcp_send(conn, &net_len, 4) < 0) return -1;
-
-    /* Send header */
     hdr->payload_len = payload_len;
     memset(hdr->mac, 0, sizeof(hdr->mac));
     const char *cookie = node_cookie();
     if (cookie) frame_mac(cookie, hdr, payload, payload_len, hdr->mac);
-    if (sw_tcp_send(conn, hdr, sizeof(sw_remote_msg_t)) < 0) return -1;
+    memcpy(head, &net_len, 4);
+    memcpy(head + 4, hdr, sizeof(sw_remote_msg_t));
 
-    /* Send payload */
-    if (payload_len > 0 && payload) {
-        if (sw_tcp_send(conn, payload, payload_len) < 0) return -1;
+#ifdef SW_NODE_HAVE_TLS
+    if (peer->tls) {
+        SSL *ssl = (SSL *)peer->tls;
+        if (!SSL_is_init_finished(ssl)) return -1;
+        if (SSL_write(ssl, head, (int)sizeof(head)) <= 0) { tls_report("SSL_write"); return -1; }
+        if (payload_len > 0 && payload &&
+            SSL_write(ssl, payload, (int)payload_len) <= 0) { tls_report("SSL_write"); return -1; }
+        return tls_flush(ssl, conn);
     }
-
+#endif
+    /* TLS asked for but this link has none: never fall back to plaintext. */
+    if (node_tls_mode() != 0) return -1;
+    if (conn_send_all(conn, head, sizeof(head)) != 0) return -1;
+    if (payload_len > 0 && payload &&
+        conn_send_all(conn, (const uint8_t *)payload, payload_len) != 0) return -1;
     return 0;
 }
 
@@ -705,7 +994,19 @@ static void dist_handler(void *arg) {
             /* Pre-register a placeholder peer keyed by conn so PORT_DATA
              * has somewhere to buffer bytes. handle_remote_data fills in
              * the peer name on the first complete frame. */
-            register_inbound_conn(acc->conn);
+            sw_peer_t *ip = register_inbound_conn(acc->conn);
+            int tls = node_tls_mode();
+            if (tls != 0) {
+                /* TLS links only: the accepting side handshakes as bytes arrive. */
+                pthread_mutex_lock(&g_dist_lock);
+#ifdef SW_NODE_HAVE_TLS
+                if (ip && tls == 1 && !ip->tls) ip->tls = tls_new_ssl(1);
+#endif
+                int drop = !ip || !ip->tls;
+                if (drop && ip) { ip->conn = NULL; ip->connected = 0; }
+                pthread_mutex_unlock(&g_dist_lock);
+                if (drop) sw_port_close(acc->conn);
+            }
             free(msg);
 
         } else if (tag == SW_TAG_PORT_DATA) {
@@ -713,14 +1014,30 @@ static void dist_handler(void *arg) {
 
             pthread_mutex_lock(&g_dist_lock);
             sw_peer_t *peer = find_peer_by_conn_locked(data->port);
+            int tls_drop = 0, tls_link = 0;
+            if (peer && peer->tls) {
+#ifdef SW_NODE_HAVE_TLS
+                tls_link = 1;
+                tls_drop = tls_ingest_locked(peer, data->data, data->len) != 0;
+#endif
+            } else if (node_tls_mode() != 0) {
+                tls_drop = 1;            /* plaintext bytes on a TLS node */
+            }
+            if (tls_drop && peer) {
+                peer_tls_free(peer);
+                peer->conn = NULL;
+                peer->connected = 0;
+                peer->rx_len = 0;
+            }
             pthread_mutex_unlock(&g_dist_lock);
-
-            if (peer) {
+            if (tls_drop) {
+                sw_port_close(data->port);
+            } else if (peer) {
                 /* Append to peer rx buffer and drain every complete
                  * length-prefixed frame. TCP is a byte stream so the
                  * kernel can hand us multiple frames in one read, or a
                  * frame split across reads. */
-                if (peer_rx_append(peer, data->data, data->len) != 0) {
+                if (!tls_link && peer_rx_append(peer, data->data, data->len) != 0) {
                     /* Oversized / overflowing / OOM append — this stream
                      * is abusive or we're out of memory. Reset the rx
                      * buffer so we resync on the next frame boundary
@@ -757,7 +1074,18 @@ static void dist_handler(void *arg) {
             free(data);
 
         } else if (tag == SW_TAG_PORT_CLOSED) {
-            if (msg) free(msg);
+            /* The link is gone: release its TLS state and stop routing to it. */
+            if (msg) {
+                sw_port_t *cp = ((sw_port_event_t *)msg)->port;
+                pthread_mutex_lock(&g_dist_lock);
+                sw_peer_t *cpeer = find_peer_by_conn_locked(cp);
+                if (cpeer && cpeer->tls) {
+                    peer_tls_free(cpeer);
+                    cpeer->connected = 0;
+                }
+                pthread_mutex_unlock(&g_dist_lock);
+                free(msg);
+            }
 
         } else if (tag == SW_TAG_STOP) {
             if (msg) free(msg);
@@ -781,6 +1109,7 @@ int sw_node_start(const char *name, uint16_t port) {
      * can connect may message any process. */
     const char *bind_addr = getenv("SW_NODE_BIND");
     if (!bind_addr || !*bind_addr) bind_addr = "127.0.0.1";
+    if (node_tls_mode() < 0) return -1;   /* reason already on stderr */
     snprintf(g_node.host, sizeof(g_node.host), "%s", bind_addr);
 
     /* Start distribution handler process */
@@ -818,6 +1147,7 @@ void sw_node_stop(void) {
         if (g_peers[i].conn) {
             sw_port_close(g_peers[i].conn);
         }
+        peer_tls_free(&g_peers[i]);
         if (g_peers[i].rx_buf) {
             free(g_peers[i].rx_buf);
             g_peers[i].rx_buf = NULL;
@@ -857,12 +1187,24 @@ int sw_node_connect(const char *name, const char *host, uint16_t port) {
 
     pthread_mutex_unlock(&g_dist_lock);
 
+    int tls = node_tls_mode();
+    if (tls < 0) return -1;          /* TLS asked for but unusable: reported */
+
     /* Connect (blocking) */
     sw_port_t *conn = sw_tcp_connect(host, port);
     if (!conn) return -1;
 
     /* Transfer ownership to dist handler so it receives data */
     sw_port_controlling_process(conn, g_dist_proc);
+
+    void *ssl = NULL;
+#ifdef SW_NODE_HAVE_TLS
+    if (tls == 1) {
+        /* Blocking, like connect() above; a failed handshake is our error. */
+        ssl = tls_client_handshake(conn, name);
+        if (!ssl) { sw_port_close(conn); return -1; }
+    }
+#endif
 
     pthread_mutex_lock(&g_dist_lock);
     sw_peer_t *peer = &g_peers[g_peer_count++];
@@ -872,6 +1214,7 @@ int sw_node_connect(const char *name, const char *host, uint16_t port) {
     peer->port = port;
     peer->conn = conn;
     peer->connected = 1;
+    peer->tls = ssl;
     pthread_mutex_unlock(&g_dist_lock);
 
     return 0;
@@ -891,6 +1234,7 @@ int sw_node_disconnect(const char *name) {
         sw_port_close(peer->conn);
         peer->conn = NULL;
     }
+    peer_tls_free(peer);
     peer->connected = 0;
     if (peer->rx_buf) {
         free(peer->rx_buf);
@@ -923,7 +1267,7 @@ int sw_node_send(const char *node, const char *name, uint64_t tag,
     strncpy(hdr.to_name, name, SW_REG_NAME_MAX - 1);
     hdr.tag = tag;
 
-    int result = send_remote_msg(peer->conn, &hdr, data, len);
+    int result = send_remote_msg(peer, &hdr, data, len);
     pthread_mutex_unlock(&g_dist_lock);
 
     return result;
@@ -949,7 +1293,7 @@ int sw_node_send_pid(const char *node, uint64_t pid, uint64_t tag,
     hdr.to_name[0] = '\0';
     hdr.tag = tag;
 
-    int result = send_remote_msg(peer->conn, &hdr, data, len);
+    int result = send_remote_msg(peer, &hdr, data, len);
     pthread_mutex_unlock(&g_dist_lock);
 
     return result;

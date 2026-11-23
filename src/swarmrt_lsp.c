@@ -33,7 +33,15 @@
 #include <string.h>
 #include <ctype.h>
 #include <strings.h>   /* strncasecmp */
-#include <unistd.h>    /* pipe, close */
+#include <unistd.h>    /* pipe, dup, dup2, read, close */
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+/* 64 KB, like a Linux pipe, so a long parser message does not block it. */
+static int sw_lsp_pipe(int fds[2]) { return _pipe(fds, 65536, _O_BINARY); }
+#else
+static int sw_lsp_pipe(int fds[2]) { return pipe(fds); }
+#endif
 #include "swarmrt_lang.h"
 
 extern void *sw_lang_parse(const char *src);
@@ -190,25 +198,30 @@ static void drop_doc(const char *uri) {
  * ------------------------------------------------------------ */
 
 static void emit_diagnostics(const char *uri, const char *source) {
-    /* Capture parser stderr so we can scrape `line N` / `expected`. */
+    /* Capture parser stderr so we can scrape `line N` / `expected`.
+     * Redirect file descriptor 2 rather than assigning to `stderr`: the C
+     * standard does not make `stderr` an lvalue (MinGW's is a function-call
+     * macro), and the parser writes through the stdio stream either way. */
     char errbuf[4096] = {0};
     int errpipe[2];
-    FILE *saved = stderr;
-    if (pipe(errpipe) == 0) {
-        FILE *tmp = fdopen(errpipe[1], "w");
-        if (tmp) {
-            stderr = tmp;
+    if (sw_lsp_pipe(errpipe) == 0) {
+        fflush(stderr);
+        int saved = dup(2);
+        if (saved >= 0 && dup2(errpipe[1], 2) >= 0) {
+            close(errpipe[1]);
             void *ast = sw_lang_parse(source);
-            fclose(tmp);
-            stderr = saved;
-            FILE *rd = fdopen(errpipe[0], "r");
-            if (rd) {
-                int rn = (int)fread(errbuf, 1, sizeof(errbuf) - 1, rd);
-                errbuf[rn] = '\0';
-                fclose(rd);
-            }
+            fflush(stderr);
+            dup2(saved, 2);             /* last write end closed: reader sees EOF */
+            close(saved);
+            int rn = 0, got;
+            while (rn < (int)sizeof(errbuf) - 1 &&
+                   (got = (int)read(errpipe[0], errbuf + rn, sizeof(errbuf) - 1 - (size_t)rn)) > 0)
+                rn += got;
+            errbuf[rn] = '\0';
+            close(errpipe[0]);
             (void)ast;  /* see header note; we accept the leak. */
         } else {
+            if (saved >= 0) close(saved);
             close(errpipe[0]);
             close(errpipe[1]);
         }
