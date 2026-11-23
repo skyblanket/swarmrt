@@ -670,7 +670,7 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | | |
 |---|---|
 | `string_length(s)` | byte length |
-| `string_sub(s, start, len)` | substring |
+| `string_sub(s, start, len)` | substring by **byte** offsets (like `string_length`), never splitting a UTF-8 character: an end inside a character moves back to its start, a start inside one moves forward past it, so the result can be up to 3 bytes shorter than `len`. Use `string_chars` to slice by codepoint |
 | `string_split(s, sep)` | list of strings |
 | `string_replace(s, old, new)` | replace ALL |
 | `string_contains(s, sub)` | `'true'/'false'` |
@@ -679,11 +679,12 @@ Every function callable directly without `Module.` prefix. Grouped by category.
 | `string_index_of(s, sub)` | int (-1 if not found) |
 | `string_trim(s)` | strip whitespace |
 | `string_upper(s)` / `string_lower(s)` | case |
-| `string_truncate(s, max_len)` | truncate to max_len |
+| `string_truncate(s, max_len)` | first `max_len` bytes, cut back to a UTF-8 character boundary (never returns part of a character) |
 | `to_string(v)` | any → string (tuples / lists / maps render via the formatter) |
 | `format(template, args...)` | `format("hi {} ({} req)", name, n)` — positional `{}` placeholders, `{{` / `}}` escape to literal braces. (For inline-expression interpolation use an f-string: `f"hi {name} #{n}"`.) |
 | `strip_html(html)` | tags stripped, entities decoded |
 | `clean_json(s)` | strip code fences and trailing commas |
+| `string_repeat(s, n)` | `s` repeated `n` times (`string_repeat("ab", 3)` → `"ababab"`); `""` when `n <= 0`. Panics on a non-string `s` or non-int `n` |
 
 ### Base64
 | | |
@@ -760,6 +761,10 @@ base64). Wrong-length / undecodable input returns `'false'` (never crashes).
 | `to_int(v)` | parse a string (`to_int("42")` → `42`), truncate a float, or pass an int; **`nil`** on a non-numeric string |
 | `to_float(v)` | parse a string (`to_float("3.14")` → `3.14`) or widen a number; **`nil`** on a non-numeric string |
 | `uuid()` | a random RFC-4122 v4 UUID string (e.g. `"f47ac10b-58cc-4372-a567-0e02b2c3d479"`) |
+| `random()` / `random(n)` | pseudo-random numbers (xoshiro256\*\*, one stream per scheduler, no lock): `random()` → float in `[0, 1)`; `random(n)` → int in `[0, n)`, uniform (no modulo bias). Panics unless `n` is a positive int. Not cryptographic: `uuid()` draws from the OS CSPRNG if you need unguessable values |
+| `random_seed(n)` | reseed the **calling scheduler's** stream with int `n` and return `'ok'`, so later `random` draws repeat exactly (the same seed gives the same draws in compiled and `swc run` code). Unseeded streams start from the OS CSPRNG. A process can move between schedulers and other processes share the stream, so for a reproducible run draw from one process, or run with `SW_SCHEDULERS=1` |
+| `band(a, b)` `bor(a, b)` `bxor(a, b)` `bnot(a)` | 64-bit two's-complement bitwise and / or / xor / not on ints (`band(12, 10)` → `8`) |
+| `bsl(a, n)` `bsr(a, n)` | shift left / arithmetic shift right by `n` bits (`bsl(1, 4)` → `16`, `bsr(-256, 4)` → `-16`). `bsl` wraps at 64 bits. Panics unless `n` is in `0..63`. All bit ops panic on non-int arguments |
 | `now_iso()` | current UTC time as ISO-8601 (`"2026-06-06T13:08:05Z"`) |
 | `ord(s)` | first byte of a string as an int (`ord("A")` → `65`) |
 | `typeof(v)` | type as a string: `"int"`, `"float"`, `"string"`, `"atom"`, `"list"`, `"map"`, `"tuple"`, `"bytes"`, `"pid"`, … |
@@ -794,7 +799,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 ### Files
 | | |
 |---|---|
-| `file_read(path)` | full contents as string, or `nil` (current 1 MB cap) |
+| `file_read(path)` | full contents as string (no size cap; an empty file is `""`), or `nil` if it cannot be opened or read. Stops at the first NUL byte: use `file_read_bytes` for binary files |
 | `file_read_bytes(path)` | full contents as **bytes** (NUL-safe — for binary files), or `nil` |
 | `file_write(path, content)` | `'ok'/'error'` — not crash-safe; use `file_atomic_write` for state files |
 | `file_write_bytes(path, b)` | write a bytes value verbatim; `'ok'/'error'` |
@@ -810,7 +815,7 @@ Thin wrappers over the libm-backed builtins plus a few pure-sw helpers. All trig
 ### JSON
 | | |
 |---|---|
-| `json_encode(v)` | sw value → JSON string. Auto-grows; no 256KB cap |
+| `json_encode(v)` | sw value → JSON string. Auto-grows; no 256KB cap. Floats always carry a `.` or exponent (`2.0` → `2.0`, not `2`) in the shortest text that reads back exactly, so they decode as floats; NaN and ±Inf encode as `null` |
 | `json_decode(s)` | JSON string → sw value (`\uXXXX` escapes decoded to UTF-8) |
 
 ### HTTP & WebSocket

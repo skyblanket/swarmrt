@@ -684,6 +684,25 @@ static sw_val_t *_builtin_to_int(sw_val_t **a, int n) {
 static sw_val_t *_builtin_uuid(sw_val_t **a, int n) { (void)a; (void)n; return sw_make_uuid(); }
 static sw_val_t *_builtin_now_iso(sw_val_t **a, int n) { (void)a; (void)n; return sw_now_iso(); }
 
+/* random / random_seed / bit ops / string_repeat (#166): the shared helper
+ * in swarmrt_lang.c; bad arguments panic with its message. */
+static void _sw_runtime_panic(const char *fmt, ...);
+static sw_val_t *_sw_rand_bits(const char *fname, sw_val_t **a, int n) {
+    char err[160] = "";
+    sw_val_t *r = sw_rand_bits_builtin(fname, a, n, err, sizeof(err));
+    if (!r) { _sw_runtime_panic("%s", err[0] ? err : fname); return sw_val_nil(); }
+    return r;
+}
+static sw_val_t *_builtin_random(sw_val_t **a, int n)        { return _sw_rand_bits("random", a, n); }
+static sw_val_t *_builtin_random_seed(sw_val_t **a, int n)   { return _sw_rand_bits("random_seed", a, n); }
+static sw_val_t *_builtin_band(sw_val_t **a, int n)          { return _sw_rand_bits("band", a, n); }
+static sw_val_t *_builtin_bor(sw_val_t **a, int n)           { return _sw_rand_bits("bor", a, n); }
+static sw_val_t *_builtin_bxor(sw_val_t **a, int n)          { return _sw_rand_bits("bxor", a, n); }
+static sw_val_t *_builtin_bnot(sw_val_t **a, int n)          { return _sw_rand_bits("bnot", a, n); }
+static sw_val_t *_builtin_bsl(sw_val_t **a, int n)           { return _sw_rand_bits("bsl", a, n); }
+static sw_val_t *_builtin_bsr(sw_val_t **a, int n)           { return _sw_rand_bits("bsr", a, n); }
+static sw_val_t *_builtin_string_repeat(sw_val_t **a, int n) { return _sw_rand_bits("string_repeat", a, n); }
+
 static sw_val_t *_builtin_math_sqrt(sw_val_t **a, int n) {
     if (n < 1 || !a[0]) return sw_val_float(0.0);
     return sw_val_float(sqrt(_sw_to_double(a[0])));
@@ -764,25 +783,13 @@ static sw_val_t *_builtin_string_replace(sw_val_t **a, int n) {
     return r;
 }
 
-/* string_sub(str, start, len) — substring extraction */
+/* string_sub(str, start, len) — substring by byte offsets, cut on UTF-8
+ * character boundaries (#170; shared with the interpreter). */
 static sw_val_t *_builtin_string_sub(sw_val_t **a, int n) {
     if (n < 3 || a[0]->type != SW_VAL_STRING ||
         a[1]->type != SW_VAL_INT || a[2]->type != SW_VAL_INT)
         return sw_val_string("");
-    const char *s = a[0]->v.str;
-    int slen = (int)strlen(s);
-    int start = (int)a[1]->v.i;
-    int len = (int)a[2]->v.i;
-    if (start < 0) start = 0;
-    if (start >= slen) return sw_val_string("");
-    if (start + len > slen) len = slen - start;
-    if (len <= 0) return sw_val_string("");
-    char *buf = (char *)malloc(len + 1);
-    memcpy(buf, s + start, len);
-    buf[len] = 0;
-    sw_val_t *r = sw_val_string(buf);
-    free(buf);
-    return r;
+    return sw_string_sub_utf8(a[0]->v.str, a[1]->v.i, a[2]->v.i);
 }
 
 /* string_length(str) — returns string length as int */
@@ -850,25 +857,13 @@ static sw_val_t *_builtin_file_write(sw_val_t **a, int n) {
 }
 
 static sw_val_t *_builtin_file_read(sw_val_t **a, int n) {
-    if (n < 1 || a[0]->type != SW_VAL_STRING) return sw_val_nil();
-    FILE *fp = fopen(a[0]->v.str, "r");
-    if (!fp) return sw_val_nil();
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || sz > 1048576) { fclose(fp); return sw_val_nil(); }
-    char *buf = (char *)malloc(sz + 1);
-    fread(buf, 1, sz, fp);
-    buf[sz] = 0;
-    fclose(fp);
-    sw_val_t *r = sw_val_string(buf);
-    free(buf);
-    return r;
+    if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
+    return sw_file_read_string(a[0]->v.str);   /* shared, uncapped (#198) */
 }
 
 /* file_read_bytes(path) → bytes | nil. Binary-safe sibling of file_read:
  * returns a length-carrying SW_VAL_BYTES (survives embedded NULs) and has
- * no ~1MB cap — the whole file is read. The flagship use-case is PCM/WAV/
+ * reads the whole file, like file_read. The flagship use-case is PCM/WAV/
  * protocol frames, which file_read truncates at the first 0x00. */
 static sw_val_t *_builtin_file_read_bytes(sw_val_t **a, int n) {
     if (n < 1 || !a[0] || a[0]->type != SW_VAL_STRING) return sw_val_nil();
@@ -6712,7 +6707,7 @@ static void _json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t *pos) 
         if (isnan(v->v.f) || isinf(v->v.f)) { _json_append(buf, cap, pos, "null"); }
         else {
             char tmp[64];
-            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            sw_json_format_float(v->v.f, tmp, sizeof(tmp));
             _json_append(buf, cap, pos, tmp);
         }
     } else if (v->type == SW_VAL_STRING) {
@@ -7707,17 +7702,7 @@ static sw_val_t *_builtin_string_ends_with(sw_val_t **a, int n) {
 static sw_val_t *_builtin_string_truncate(sw_val_t **a, int n) {
     if (n < 2 || !a[0] || a[0]->type != SW_VAL_STRING || a[1]->type != SW_VAL_INT)
         return n >= 1 ? a[0] : sw_val_string("");
-    const char *s = a[0]->v.str;
-    int64_t max_len = a[1]->v.i;
-    if (max_len <= 0) return sw_val_string("");
-    size_t slen = strlen(s);
-    if ((int64_t)slen <= max_len) return a[0];
-    char *buf = (char *)malloc((size_t)max_len + 1);
-    memcpy(buf, s, (size_t)max_len);
-    buf[max_len] = 0;
-    sw_val_t *r = sw_val_string(buf);
-    free(buf);
-    return r;
+    return sw_string_truncate_utf8(a[0], a[1]->v.i);   /* never mid-character (#170) */
 }
 
 /* clean_json(str) → str with markdown code fences stripped

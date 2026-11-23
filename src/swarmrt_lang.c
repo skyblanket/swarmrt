@@ -2717,6 +2717,246 @@ sw_val_t *sw_coerce_float(sw_val_t *v) {
     return sw_val_nil();
 }
 
+/* file_read(path): the whole file as a string, or nil when it cannot be
+ * opened or read. No size cap (#198: the compiled path used to return nil for
+ * anything over 1 MiB, which callers saw as "" — silent data loss). Reads in
+ * chunks rather than trusting ftell, so pipes and /proc files work too. Shared
+ * by the interpreter and compiled builtins. An allocation failure is reported
+ * on stderr rather than passing for a missing file. */
+sw_val_t *sw_file_read_string(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return sw_val_nil();
+    size_t cap = 64 * 1024, len = 0;
+    char *buf = (char *)malloc(cap + 1);
+    while (buf) {
+        if (len == cap) {
+            size_t ncap = cap * 2;
+            char *nb = (ncap > cap) ? (char *)realloc(buf, ncap + 1) : NULL;
+            if (!nb) { free(buf); buf = NULL; break; }
+            buf = nb; cap = ncap;
+        }
+        size_t got = fread(buf + len, 1, cap - len, fp);
+        len += got;
+        if (got == 0) break;
+    }
+    int rd_err = ferror(fp);
+    fclose(fp);
+    if (!buf) {
+        fprintf(stderr, "file_read: out of memory reading %s (%zu bytes read so far)\n", path, len);
+        return sw_val_nil();
+    }
+    if (rd_err) {
+        fprintf(stderr, "file_read: read error on %s after %zu bytes\n", path, len);
+        free(buf);
+        return sw_val_nil();
+    }
+    buf[len] = '\0';
+    sw_val_t *r = sw_val_string(buf);
+    free(buf);
+    return r;
+}
+
+/* json_encode's float text (#195): the shortest %.{15,16,17}g that reads
+ * back as the same double, with ".0" added when that text would otherwise
+ * parse as a JSON integer. "2" decoded as an int, so a whole-number float did
+ * not survive a round trip and `/` on it became integer division. Shared by
+ * the interpreter and compiled encoders. Caller handles NaN/Inf (-> null). */
+void sw_json_format_float(double d, char *buf, size_t bufsz) {
+    for (int prec = 15; prec <= 17; prec++) {
+        snprintf(buf, bufsz, "%.*g", prec, d);
+        if (prec == 17 || strtod(buf, NULL) == d) break;
+    }
+    if (!strpbrk(buf, ".eEn")) {           /* "n": nan/inf never get here */
+        size_t l = strlen(buf);
+        if (l + 2 < bufsz) { buf[l] = '.'; buf[l + 1] = '0'; buf[l + 2] = '\0'; }
+    }
+}
+
+/* string_sub / string_truncate (#170): byte offsets, as string_length is in
+ * bytes, but never split a UTF-8 character. The end moves back to the start
+ * of a character it would cut; the start moves forward past continuation
+ * bytes ((b & 0xC0) == 0x80). A result can be up to 3 bytes shorter than
+ * asked. Shared by the interpreter and compiled builtins. */
+#define UTF8_CONT(c) (((unsigned char)(c) & 0xC0) == 0x80)
+/* At most 3 steps either way: a character is at most 4 bytes, so a longer
+ * run of continuation bytes is not valid UTF-8 and is cut where asked. */
+static size_t utf8_back_to_boundary(const char *s, size_t i, size_t lo) {
+    size_t j = i;
+    while (j > lo && i - j < 3 && UTF8_CONT(s[j])) j--;
+    return UTF8_CONT(s[j]) ? i : j;
+}
+static size_t utf8_fwd_to_boundary(const char *s, size_t i, size_t hi) {
+    size_t j = i;
+    while (j < hi && j - i < 3 && UTF8_CONT(s[j])) j++;
+    return (j < hi && UTF8_CONT(s[j])) ? i : j;
+}
+
+sw_val_t *sw_string_sub_utf8(const char *s, int64_t start, int64_t len) {
+    size_t slen = strlen(s);
+    if (start < 0) start = 0;
+    if ((uint64_t)start >= slen || len <= 0) return sw_val_string("");
+    size_t b = (size_t)start;
+    size_t e = (len >= (int64_t)(slen - b)) ? slen : b + (size_t)len;
+    b = utf8_fwd_to_boundary(s, b, e);
+    if (e < slen) e = utf8_back_to_boundary(s, e, b);
+    if (e <= b) return sw_val_string("");
+    char *buf = (char *)malloc(e - b + 1);
+    memcpy(buf, s + b, e - b); buf[e - b] = '\0';
+    sw_val_t *r = sw_val_string(buf); free(buf); return r;
+}
+
+sw_val_t *sw_string_truncate_utf8(sw_val_t *str, int64_t max) {
+    const char *s = str->v.str;
+    if (max <= 0) return sw_val_string("");
+    size_t slen = strlen(s);
+    if ((uint64_t)max >= slen) return str;
+    size_t e = utf8_back_to_boundary(s, (size_t)max, 0);
+    char *buf = (char *)malloc(e + 1);
+    memcpy(buf, s, e); buf[e] = '\0';
+    sw_val_t *r = sw_val_string(buf); free(buf); return r;
+}
+
+/* === random / random_seed / bit ops / string_repeat (#166) ================
+ * Shared by the interpreter and the compiled builtins, so both agree.
+ *
+ * PRNG: xoshiro256** with one state per scheduler thread (__thread), so a
+ * draw takes no lock. Each thread's stream is seeded lazily from the OS
+ * CSPRNG; random_seed(n) reseeds the CALLING scheduler's stream, which makes
+ * draws reproducible as long as one process draws on one scheduler (e.g.
+ * SW_SCHEDULERS=1, or a run with no other process drawing). Not
+ * cryptographic: use uuid() or crypto_* for secrets. */
+static __thread uint64_t g_prng[4];
+static __thread int g_prng_ready;
+
+static uint64_t prng_splitmix(uint64_t *x) {
+    uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+static void prng_seed(uint64_t seed) {
+    for (int i = 0; i < 4; i++) g_prng[i] = prng_splitmix(&seed);
+    g_prng_ready = 1;
+}
+static inline uint64_t prng_rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+static uint64_t prng_next(void) {
+    if (!g_prng_ready) {
+        uint64_t seed;
+        arc4random_buf(&seed, sizeof(seed));
+        prng_seed(seed);
+    }
+    uint64_t *st = g_prng;
+    uint64_t r = prng_rotl(st[1] * 5, 7) * 9;
+    uint64_t t = st[1] << 17;
+    st[2] ^= st[0]; st[3] ^= st[1]; st[1] ^= st[2]; st[0] ^= st[3];
+    st[2] ^= t;
+    st[3] = prng_rotl(st[3], 45);
+    return r;
+}
+
+static const char *rb_type(sw_val_t *v) {
+    if (!v) return "nil";
+    switch (v->type) {
+    case SW_VAL_NIL: return "nil";       case SW_VAL_INT: return "int";
+    case SW_VAL_FLOAT: return "float";   case SW_VAL_STRING: return "string";
+    case SW_VAL_ATOM: return "atom";     case SW_VAL_LIST: return "list";
+    case SW_VAL_MAP: return "map";       case SW_VAL_TUPLE: return "tuple";
+    default: return "value";
+    }
+}
+static int rb_is_int(sw_val_t *v) { return v && v->type == SW_VAL_INT; }
+
+/* random, random_seed, band, bor, bxor, bnot, bsl, bsr, string_repeat.
+ * Returns NULL when `fname` is none of them (err untouched). On bad
+ * arguments returns NULL with a message in err: the caller panics with it,
+ * since a quiet 0 or "" would hide the bug (rule: no silent failures). */
+sw_val_t *sw_rand_bits_builtin(const char *fname, sw_val_t **a, int n,
+                               char *err, size_t errsz) {
+    if (fname[0] == 'r') {
+        if (strcmp(fname, "random") == 0) {
+            if (n == 0)
+                return sw_val_float((double)(prng_next() >> 11) * 0x1.0p-53);
+            if (n != 1) { snprintf(err, errsz, "random: takes 0 or 1 arguments, got %d", n); return NULL; }
+            if (!rb_is_int(a[0]) || a[0]->v.i <= 0) {
+                if (rb_is_int(a[0]))
+                    snprintf(err, errsz, "random(n): n must be a positive int, got %lld", (long long)a[0]->v.i);
+                else
+                    snprintf(err, errsz, "random(n): n must be a positive int, got a %s", rb_type(a[0]));
+                return NULL;
+            }
+            /* Rejection sampling: [0, limit) holds a whole number of
+             * n-sized blocks, so r % n has no modulo bias. */
+            uint64_t un = (uint64_t)a[0]->v.i, limit = UINT64_MAX - (UINT64_MAX % un), r;
+            do { r = prng_next(); } while (r >= limit);
+            return sw_val_int((int64_t)(r % un));
+        }
+        if (strcmp(fname, "random_seed") == 0) {
+            if (n != 1 || !rb_is_int(a[0])) {
+                snprintf(err, errsz, "random_seed(n): n must be an int, got %s",
+                         n == 1 ? rb_type(a[0]) : "the wrong number of arguments");
+                return NULL;
+            }
+            prng_seed((uint64_t)a[0]->v.i);
+            return sw_val_atom("ok");
+        }
+        return NULL;
+    }
+    if (fname[0] == 'b') {
+        int unary = strcmp(fname, "bnot") == 0;
+        if (!unary && strcmp(fname, "band") && strcmp(fname, "bor") && strcmp(fname, "bxor") &&
+            strcmp(fname, "bsl") && strcmp(fname, "bsr")) return NULL;
+        int want = unary ? 1 : 2;
+        if (n != want || !rb_is_int(a[0]) || (!unary && !rb_is_int(a[1]))) {
+            if (n != want)
+                snprintf(err, errsz, "%s: takes %d int argument%s, got %d arguments",
+                         fname, want, want == 1 ? "" : "s", n);
+            else
+                snprintf(err, errsz, "%s: expected int%s, got %s%s%s", fname, unary ? "" : ", int",
+                         rb_type(a[0]), unary ? "" : ", ", unary ? "" : rb_type(a[1]));
+            return NULL;
+        }
+        int64_t x = a[0]->v.i;
+        if (unary) return sw_val_int(~x);
+        int64_t y = a[1]->v.i;
+        if (strcmp(fname, "band") == 0) return sw_val_int(x & y);
+        if (strcmp(fname, "bor") == 0)  return sw_val_int(x | y);
+        if (strcmp(fname, "bxor") == 0) return sw_val_int(x ^ y);
+        if (y < 0 || y > 63) {
+            snprintf(err, errsz, "%s: shift count must be 0..63, got %lld", fname, (long long)y);
+            return NULL;
+        }
+        if (strcmp(fname, "bsl") == 0) return sw_val_int((int64_t)((uint64_t)x << y));
+        return sw_val_int(x >> y);           /* bsr: arithmetic, keeps the sign */
+    }
+    if (strcmp(fname, "string_repeat") == 0) {
+        if (n != 2 || !a[0] || a[0]->type != SW_VAL_STRING || !rb_is_int(a[1])) {
+            if (n != 2) snprintf(err, errsz, "string_repeat: takes 2 arguments (string, int), got %d", n);
+            else snprintf(err, errsz, "string_repeat: expected (string, int), got (%s, %s)",
+                          rb_type(a[0]), rb_type(a[1]));
+            return NULL;
+        }
+        int64_t times = a[1]->v.i;
+        size_t len = strlen(a[0]->v.str);
+        if (times <= 0 || len == 0) return sw_val_string("");
+        if ((uint64_t)times > (SIZE_MAX / 2) / len) {
+            snprintf(err, errsz, "string_repeat: result too large (%zu bytes x %lld)", len, (long long)times);
+            return NULL;
+        }
+        size_t total = len * (size_t)times;
+        char *buf = (char *)malloc(total + 1);
+        if (!buf) {
+            snprintf(err, errsz, "string_repeat: out of memory for %zu bytes", total);
+            return NULL;
+        }
+        for (size_t off = 0; off < total; off += len) memcpy(buf + off, a[0]->v.str, len);
+        buf[total] = '\0';
+        sw_val_t *r = sw_val_string(buf);
+        free(buf);
+        return r;
+    }
+    return NULL;
+}
+
 /* uuid(): a random RFC-4122 v4 UUID string. */
 sw_val_t *sw_make_uuid(void) {
     uint8_t b[16];
@@ -4378,7 +4618,7 @@ static void interp_json_encode_val(sw_val_t *v, char **buf, size_t *cap, size_t 
         if (isnan(v->v.f) || isinf(v->v.f)) { interp_json_append(buf, cap, pos, "null"); }
         else {
             char tmp[64];
-            snprintf(tmp, sizeof(tmp), "%.17g", v->v.f);
+            sw_json_format_float(v->v.f, tmp, sizeof(tmp));
             interp_json_append(buf, cap, pos, tmp);
         }
     } else if (v->type == SW_VAL_STRING) {
@@ -5087,19 +5327,8 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
 
     /* === Strings ================================================ */
     if (strcmp(fname, "string_sub") == 0 && nargs >= 3 &&
-        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT) {
-        const char *s = args[0]->v.str;
-        int slen = (int)strlen(s);
-        int start = (int)args[1]->v.i;
-        int len = (int)args[2]->v.i;
-        if (start < 0) start = 0;
-        if (start >= slen) return sw_val_string("");
-        if (start + len > slen) len = slen - start;
-        if (len <= 0) return sw_val_string("");
-        char *buf = (char *)malloc(len + 1);
-        memcpy(buf, s + start, len); buf[len] = '\0';
-        sw_val_t *r = sw_val_string(buf); free(buf); return r;
-    }
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT && args[2]->type == SW_VAL_INT)
+        return sw_string_sub_utf8(args[0]->v.str, args[1]->v.i, args[2]->v.i);
     if (strcmp(fname, "string_replace") == 0 && nargs >= 3 &&
         args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING && args[2]->type == SW_VAL_STRING) {
         const char *src = args[0]->v.str, *old = args[1]->v.str, *rep = args[2]->v.str;
@@ -5126,28 +5355,13 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
         sw_val_t *r = sw_val_string(buf); free(buf); return r;
     }
     if (strcmp(fname, "string_truncate") == 0 && nargs >= 2 &&
-        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT) {
-        /* Matches codegen: hard truncate to max_len, no ellipsis. */
-        const char *s = args[0]->v.str;
-        int64_t max = args[1]->v.i;
-        if (max <= 0) return sw_val_string("");
-        size_t slen = strlen(s);
-        if ((int64_t)slen <= max) return args[0];
-        char *r = (char *)malloc((size_t)max + 1);
-        memcpy(r, s, (size_t)max); r[max] = '\0';
-        sw_val_t *v = sw_val_string(r); free(r); return v;
-    }
+        args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_INT)
+        /* Matches codegen: hard truncate, no ellipsis, never mid-character. */
+        return sw_string_truncate_utf8(args[0], args[1]->v.i);
 
     /* === File ================================================== */
-    if (strcmp(fname, "file_read") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING) {
-        FILE *fp = fopen(args[0]->v.str, "rb");
-        if (!fp) return sw_val_nil();
-        fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
-        if (sz < 0 || sz > 64 * 1024 * 1024) { fclose(fp); return sw_val_nil(); }
-        char *buf = (char *)malloc(sz + 1);
-        size_t got = fread(buf, 1, sz, fp); buf[got] = '\0'; fclose(fp);
-        sw_val_t *r = sw_val_string(buf); free(buf); return r;
-    }
+    if (strcmp(fname, "file_read") == 0 && nargs >= 1 && args[0]->type == SW_VAL_STRING)
+        return sw_file_read_string(args[0]->v.str);
     if (strcmp(fname, "file_write") == 0 && nargs >= 2 &&
         args[0]->type == SW_VAL_STRING && args[1]->type == SW_VAL_STRING) {
         FILE *fp = fopen(args[0]->v.str, "wb");
@@ -6276,6 +6490,14 @@ static sw_val_t *interp_extra_builtin(sw_interp_t *interp, const char *fname,
     if (strcmp(fname, "to_float") == 0 && nargs >= 1) return sw_coerce_float(args[0]);
     if (strcmp(fname, "uuid") == 0)                   return sw_make_uuid();
     if (strcmp(fname, "now_iso") == 0)                return sw_now_iso();
+    /* random / random_seed / bit ops / string_repeat (#166): shared helper;
+     * bad arguments panic with its message, as in the compiled path. */
+    if (fname[0] == 'r' || fname[0] == 'b' || fname[0] == 's') {
+        char rb_err[160] = "";
+        sw_val_t *rb = sw_rand_bits_builtin(fname, args, nargs, rb_err, sizeof(rb_err));
+        if (rb) return rb;
+        if (rb_err[0]) { interp_raise_panic(interp, line, "%s", rb_err); return sw_val_nil(); }
+    }
 
     /* === Math (libm-backed; parity with codegen) =============== */
     if ((strcmp(fname, "to_float") == 0 || strcmp(fname, "math_sqrt") == 0 ||
@@ -7736,6 +7958,7 @@ static const char *k_interp_builtins[] = {
     "stdin_pending_push","stdin_take_pending","string_replace",
     "string_sub","string_to_bytes","string_chars","string_truncate","sys_exit","to_float",
     "to_int","uuid","now_iso",
+    "random","random_seed","band","bor","bxor","bnot","bsl","bsr","string_repeat",
     NULL
 };
 int interp_is_known_builtin(const char *name) {

@@ -31,7 +31,7 @@ fun from_file(path, vars) {
     render(content, vars)
 }
 
-# Internal: scan the template char by char, copying literals into acc.
+# Internal: scan the template, copying literal runs into acc.
 # When we hit `{{`, find the matching `}}`, look up the trimmed var
 # name in vars, and append its rendered value. Unmatched `{{` is
 # emitted verbatim (so braces don't have to be escaped if the user
@@ -58,7 +58,15 @@ fun walk(t, vars, i, acc, strict) {
                 walk(t, vars, i + 2 + close_at + 2, acc ++ rendered, strict)
             }
         } else {
-            walk(t, vars, i + 1, acc ++ string_sub(t, i, 1), strict)
+            # Copy the literal run up to the next `{{` in one piece. (A
+            # byte-at-a-time string_sub would now drop multi-byte UTF-8
+            # characters: string_sub never returns part of one, #170.)
+            rest = string_sub(t, i, string_length(t) - i)
+            # rest does not start with `{{` (else the branch above ran), so
+            # nxt is -1 or >= 1 and the walk always advances.
+            nxt = string_index_of(rest, "{{")
+            if (nxt < 0) { acc ++ rest }
+            else { walk(t, vars, i + nxt, acc ++ string_sub(rest, 0, nxt), strict) }
         }
     }
 }
